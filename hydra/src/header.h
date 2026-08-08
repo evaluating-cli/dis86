@@ -13,7 +13,7 @@
 #define FAIL(...) do { fprintf(stderr, "FAIL: "); fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); abort(); } while(0)
 #define UNIMPL() FAIL("UNIMPLEMENTED at %s:%d", __FILE__, __LINE__)
 #define ASSUME(cond) do { if (!(cond)) FAIL("ASSUMPTION FAILED: (" #cond ") at %s:%d", __FILE__, __LINE__); } while(0)
-#define BARRIER() __asm__ volatile("dsb sy" ::: "memory")
+#define BARRIER() __atomic_thread_fence(__ATOMIC_SEQ_CST)
 
 #define ARRAY_SIZE(arr) (sizeof(arr)/sizeof((arr)[0]))
 #define MIN(a, b) (((a)<(b))?(a):(b))
@@ -88,7 +88,7 @@ static inline void file_write(const char *name, u8 *mem, size_t len)
   if (!fp) FAIL("Failed to open file: %s", name);
 
   size_t n = fwrite(mem, 1, len, fp);
-  if (n != len) FAIL("Failed to write everything to file: %s", name);
+  if (n != len) FAIL("Failed to write everything from file: %s", name);
 
   fclose(fp);
 }
