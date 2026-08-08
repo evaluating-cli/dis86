@@ -1,13 +1,17 @@
 use std::ffi::CString;
 use std::ptr;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 //// IMPORTANT!! THIS MUST MATCH THE STRUCT DEFINED IN hydra/src/remote/shmdata.h
-#[repr(C, packed)]
+// Keep the control fields naturally aligned: req/ack are accessed atomically on
+// both sides of the shared-memory ABI and AtomicU64 requires 8-byte alignment.
+#[repr(C)]
 #[derive(Debug)]
 pub struct ShmDataRaw {
   pub init: u32,
   pub end: u32,
   pub pid: u32,
+  pub reserved0: u32,
   pub req: u64,  // request step by incrementing
   pub ack: u64,  // ack step by matching 'req' value
 
@@ -31,6 +35,8 @@ pub struct ShmDataRaw {
   // TODO...
 }
 
+// These macros are for snapshot payload fields only. Synchronization/control
+// fields (init/end/req/ack) must use the atomic accessors on ShmData.
 #[macro_export]
 macro_rules! shmdata_read {
   ($dat:expr, $field:ident) => {
@@ -57,7 +63,52 @@ pub struct ShmData {
 
 impl ShmData {
   fn size() -> usize {
-    (std::mem::size_of::<ShmData>() + 4095) & !4095
+    (std::mem::size_of::<ShmDataRaw>() + 4095) & !4095
+  }
+
+  fn load_u32(&self, ptr: *mut u32, ordering: Ordering) -> u32 {
+    debug_assert_eq!((ptr as usize) % std::mem::align_of::<AtomicU32>(), 0);
+    unsafe { AtomicU32::from_ptr(ptr).load(ordering) }
+  }
+
+  fn store_u32(&self, ptr: *mut u32, value: u32, ordering: Ordering) {
+    debug_assert_eq!((ptr as usize) % std::mem::align_of::<AtomicU32>(), 0);
+    unsafe { AtomicU32::from_ptr(ptr).store(value, ordering) }
+  }
+
+  fn load_u64(&self, ptr: *mut u64, ordering: Ordering) -> u64 {
+    debug_assert_eq!((ptr as usize) % std::mem::align_of::<AtomicU64>(), 0);
+    unsafe { AtomicU64::from_ptr(ptr).load(ordering) }
+  }
+
+  fn store_u64(&self, ptr: *mut u64, value: u64, ordering: Ordering) {
+    debug_assert_eq!((ptr as usize) % std::mem::align_of::<AtomicU64>(), 0);
+    unsafe { AtomicU64::from_ptr(ptr).store(value, ordering) }
+  }
+
+  pub fn load_init(&self, ordering: Ordering) -> u32 {
+    let ptr = unsafe { std::ptr::addr_of_mut!((*self.raw).init) };
+    self.load_u32(ptr, ordering)
+  }
+
+  pub fn store_end(&self, value: u32, ordering: Ordering) {
+    let ptr = unsafe { std::ptr::addr_of_mut!((*self.raw).end) };
+    self.store_u32(ptr, value, ordering);
+  }
+
+  pub fn load_req(&self, ordering: Ordering) -> u64 {
+    let ptr = unsafe { std::ptr::addr_of_mut!((*self.raw).req) };
+    self.load_u64(ptr, ordering)
+  }
+
+  pub fn store_req(&self, value: u64, ordering: Ordering) {
+    let ptr = unsafe { std::ptr::addr_of_mut!((*self.raw).req) };
+    self.store_u64(ptr, value, ordering);
+  }
+
+  pub fn load_ack(&self, ordering: Ordering) -> u64 {
+    let ptr = unsafe { std::ptr::addr_of_mut!((*self.raw).ack) };
+    self.load_u64(ptr, ordering)
   }
 
   pub fn attach(path: &str) -> Result<Self, String> {
