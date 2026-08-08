@@ -12,6 +12,8 @@ use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
+const HYDRA_SHM_PATH: &str = "/dev/shm/hydra_remote";
+const DOSBOX_MEM_PATH: &str = "/dev/shm/dosbox_mem";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const STEP_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -26,25 +28,31 @@ pub struct HydraProcess {
 }
 
 impl HydraProcess {
+  fn remove_stale_mapping(path: &str) -> Result<(), String> {
+    match std::fs::remove_file(path) {
+      Ok(()) => Ok(()),
+      Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+      Err(e) => Err(format!("Failed to remove stale shared memory {}: {}", path, e)),
+    }
+  }
+
   fn wait_for_mapping<T, F>(hydra: &mut Child, name: &str, mut attach: F) -> Result<T, String>
   where
     F: FnMut() -> Result<T, String>,
   {
     let deadline = Instant::now() + STARTUP_TIMEOUT;
-    let mut last_error = String::new();
 
     loop {
       match attach() {
         Ok(mapping) => return Ok(mapping),
-        Err(e) => last_error = e,
-      }
-
-      if let Some(status) = hydra.try_wait().map_err(|e| format!("Failed to query DOSBox-X status: {}", e))? {
-        return Err(format!("DOSBox-X exited before {} was ready: {}", name, status));
-      }
-
-      if Instant::now() >= deadline {
-        return Err(format!("Timed out waiting for {}: {}", name, last_error));
+        Err(e) => {
+          if let Some(status) = hydra.try_wait().map_err(|err| format!("Failed to query DOSBox-X status: {}", err))? {
+            return Err(format!("DOSBox-X exited before {} was ready: {}", name, status));
+          }
+          if Instant::now() >= deadline {
+            return Err(format!("Timed out waiting for {}: {}", name, e));
+          }
+        }
       }
 
       std::thread::sleep(Duration::from_millis(10));
@@ -55,6 +63,13 @@ impl HydraProcess {
     let current_exe = std::env::current_exe().unwrap();
     let dir = current_exe.parent().unwrap().parent().unwrap().parent().unwrap().parent().unwrap();
     let exe = Path::new(exe_path);
+
+    // These paths are process-global in the current Hydra/DOSBox-X ABI. Clear
+    // leftovers before launching so a crashed prior run cannot be mistaken for
+    // the new emulator's mappings.
+    Self::remove_stale_mapping(HYDRA_SHM_PATH)?;
+    Self::remove_stale_mapping(DOSBOX_MEM_PATH)?;
+
     let mut hydra = Command::new(&format!("{}/hydra/src/dosbox-x/src/dosbox-x", dir.display()))
       .args(&[
         "-conf", &format!("{}/hydra/conf/dosbox.conf", dir.display()),
@@ -71,10 +86,10 @@ impl HydraProcess {
       .map_err(|e| format!("Failed to execute DOSBox-X: {}", e))?;
 
     let data = Self::wait_for_mapping(&mut hydra, "hydra_remote shared memory", || {
-      ShmData::attach("/dev/shm/hydra_remote")
+      ShmData::attach(HYDRA_SHM_PATH)
     })?;
     let mem = Self::wait_for_mapping(&mut hydra, "dosbox_mem shared memory", || {
-      ShmMem::attach("/dev/shm/dosbox_mem")
+      ShmMem::attach(DOSBOX_MEM_PATH)
     })?;
 
     let mut this = HydraProcess {
@@ -101,6 +116,13 @@ impl HydraProcess {
         return Err("Timed out waiting for Hydra initialization".to_string());
       }
       std::thread::sleep(Duration::from_millis(1));
+    }
+
+    // pid is published before the release-store to init, so the acquire load
+    // above makes this ordinary read safe and lets us reject stale mappings.
+    let shared_pid = shmdata_read!(self.data, pid);
+    if shared_pid != self.hydra.id() {
+      return Err(format!("hydra_remote belongs to PID {}, expected {}", shared_pid, self.hydra.id()));
     }
 
     Ok(())
