@@ -20,6 +20,7 @@ pub mod analyze;
 pub mod decompile;
 
 // Emulator
+#[cfg(feature = "emu86")]
 pub mod emu86;
 
 // Main application glue
