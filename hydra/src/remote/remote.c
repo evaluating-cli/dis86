@@ -3,7 +3,6 @@
 
 enum {
   STATE_INIT,
-  STATE_INIT2,
   STATE_WAIT,
   STATE_RUN,
 };
@@ -22,7 +21,7 @@ void remote_init(void)
   shm->pid = getpid();
   shm->reserved0 = 0;
   __atomic_store_n(&shm->req, 0, __ATOMIC_RELAXED);
-  __atomic_store_n(&shm->ack, 1, __ATOMIC_RELAXED);
+  __atomic_store_n(&shm->ack, 0, __ATOMIC_RELAXED);
 
   printf("waiting for init\n");
 }
@@ -98,11 +97,6 @@ void remote_step_hook(hydra_machine_t *m)
 
   while (1) {
     switch (state) {
-      /* case STATE_INIT: { */
-      /*   if (!(cs == 0x823 && ip == 0)) return; */
-      /*   state = STATE_INIT2; */
-      /*   return; */
-      /* } break; */
       case STATE_INIT: {
         if (!(cs == 0x823 && ip == 0)) return;
         //printf("init\n");
@@ -121,7 +115,7 @@ void remote_step_hook(hydra_machine_t *m)
           // register writes performed before the request are visible below.
           u64 req = __atomic_load_n(&shm->req, __ATOMIC_ACQUIRE);
           u64 ack = __atomic_load_n(&shm->ack, __ATOMIC_RELAXED);
-          if (req <= ack) continue;
+          if (req == ack) continue;
           //printf("run %04x:%04x\n", cs, ip);
           update_hydra_from_shmdata(m);
           state = STATE_RUN;
