@@ -14,7 +14,7 @@ The revision resolves the original review findings and the follow-up source inve
 - preserves upper EFLAGS/register halves on 16-bit ABI import;
 - rejects protected-mode segment mutation instead of silently leaving stale descriptor caches;
 - replaces the unsafe global `do_open_pshm()` rename with a `MAPPING_LOWMEM`-only named POSIX-SHM backing path;
-- explicitly selects `mapshm` in validator mode because full-sim `softmmu` low memory is anonymous;
+- explicitly selects `mapshm` through dosemu2's verified `$_mapping` configuration interface because full-sim `softmmu` low memory is anonymous;
 - makes `end` an execution stop barrier so no further guest instruction executes;
 - replaces hard-coded/inequality entry gating with an exact MZ entry predicate derived from runtime PSP + MZ-relative `CS:IP`;
 - defines validator normalization for REP micro-iterations and the `STI` / `MOV SS` / `POP SS` interrupt-shadow node cases;
