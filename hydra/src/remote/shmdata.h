@@ -3,11 +3,16 @@
 
 typedef struct shmdata shmdata_t;
 
-struct __attribute__((packed)) shmdata
+// IMPORTANT: this layout must match dis86/src/emu86/validator/shmdata.rs.
+// req/ack are accessed atomically by both processes and therefore must remain
+// naturally aligned. Keep the explicit reserved word so their offsets are
+// stable across the supported 64-bit host ABIs.
+struct shmdata
 {
   u32 init;
   u32 end;
   u32 pid;
+  u32 reserved0;
   u64 req;  // request step by incrementing
   u64 ack;  // ack step by matching 'req' value
 
