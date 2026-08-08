@@ -88,7 +88,7 @@ static inline void file_write(const char *name, u8 *mem, size_t len)
   if (!fp) FAIL("Failed to open file: %s", name);
 
   size_t n = fwrite(mem, 1, len, fp);
-  if (n != len) FAIL("Failed to write everything from file: %s", name);
+  if (n != len) FAIL("Failed to write everything to file: %s", name);
 
   fclose(fp);
 }
