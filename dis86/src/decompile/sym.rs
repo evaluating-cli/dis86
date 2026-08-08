@@ -291,7 +291,7 @@ pub fn symbolize_stack(ir: &mut IR) {
       if mem_instr.operands[0] != ss { continue; }
 
       let addr_ref = mem_instr.operands[1];
-      let addr_instr = ir.instr(addr_ref).unwrap();
+      let Some(addr_instr) = ir.instr(addr_ref) else { continue; };
       if addr_instr.operands[0] != sp { continue; }
 
       let off = match addr_instr.opcode {
