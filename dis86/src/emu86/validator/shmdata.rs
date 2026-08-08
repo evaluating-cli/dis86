@@ -35,6 +35,10 @@ pub struct ShmDataRaw {
   // TODO...
 }
 
+// Keep the Rust side pinned to the C ABI in hydra/src/remote/shmdata.h.
+static_assertions::const_assert_eq!(std::mem::size_of::<ShmDataRaw>(), 64);
+static_assertions::const_assert_eq!(std::mem::align_of::<ShmDataRaw>(), 8);
+
 // These macros are for snapshot payload fields only. Synchronization/control
 // fields (init/end/req/ack) must use the atomic accessors on ShmData.
 #[macro_export]
@@ -68,22 +72,22 @@ impl ShmData {
 
   fn load_u32(&self, ptr: *mut u32, ordering: Ordering) -> u32 {
     debug_assert_eq!((ptr as usize) % std::mem::align_of::<AtomicU32>(), 0);
-    unsafe { AtomicU32::from_ptr(ptr).load(ordering) }
+    unsafe { (&*(ptr as *const AtomicU32)).load(ordering) }
   }
 
   fn store_u32(&self, ptr: *mut u32, value: u32, ordering: Ordering) {
     debug_assert_eq!((ptr as usize) % std::mem::align_of::<AtomicU32>(), 0);
-    unsafe { AtomicU32::from_ptr(ptr).store(value, ordering) }
+    unsafe { (&*(ptr as *const AtomicU32)).store(value, ordering) }
   }
 
   fn load_u64(&self, ptr: *mut u64, ordering: Ordering) -> u64 {
     debug_assert_eq!((ptr as usize) % std::mem::align_of::<AtomicU64>(), 0);
-    unsafe { AtomicU64::from_ptr(ptr).load(ordering) }
+    unsafe { (&*(ptr as *const AtomicU64)).load(ordering) }
   }
 
   fn store_u64(&self, ptr: *mut u64, value: u64, ordering: Ordering) {
     debug_assert_eq!((ptr as usize) % std::mem::align_of::<AtomicU64>(), 0);
-    unsafe { AtomicU64::from_ptr(ptr).store(value, ordering) }
+    unsafe { (&*(ptr as *const AtomicU64)).store(value, ordering) }
   }
 
   pub fn load_init(&self, ordering: Ordering) -> u32 {
