@@ -39,13 +39,23 @@ impl ShmMem {
   pub fn attach(path: &str) -> Result<Self, String> {
     let cpath = CString::new(path).map_err(|e| e.to_string())?;
 
-    let size = std::fs::metadata(path).unwrap().len() as usize;
-    assert!(size % 4096 == 0);
-
     let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDWR, 0o600u32) };
     if fd < 0 {
       return Err(last_os_error("open"));
     }
+
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut stat) } < 0 {
+      let err = last_os_error("fstat");
+      unsafe { libc::close(fd); }
+      return Err(err);
+    }
+
+    if stat.st_size <= 0 || stat.st_size % 4096 != 0 {
+      unsafe { libc::close(fd); }
+      return Err(format!("shared memory is not ready: {} bytes", stat.st_size));
+    }
+    let size = stat.st_size as usize;
 
     let addr = unsafe {
       libc::mmap(
