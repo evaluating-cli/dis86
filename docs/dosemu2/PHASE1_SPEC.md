@@ -1,155 +1,111 @@
 # Phase 1 Specification: `simx86` Core Hook Integration & Lockstep Synchronization
 
 **Target Milestone:** Phase 1 — `simx86` Core Hook Integration  
-**Target Projects:** `dosemu2` (`src/base/emu-i386/simx86/`), `dis86` (`dis86/src/emu86/validator/`)  
-**Status:** Implementation Blueprint & Architecture Specification  
+**Target Projects:** `dosemu2` (`src/base/emu-i386/simx86/`, `src/base/lib/mapping/`), `dis86` (`dis86/src/emu86/validator/`)  
+**Status:** Source-verified implementation contract
 
 ---
 
-## 1. Executive Summary & Objective
+## 1. Executive Summary
 
-The objective of **Phase 1** is to establish deterministic instruction-level stepping and bidirectional shared-memory synchronization between `dosemu2`'s `simx86` CPU simulator and `dis86`'s `emu86_validator` differential testing engine.
+Phase 1 establishes deterministic validator stepping and bidirectional shared-memory synchronization between `dosemu2`'s `simx86` CPU simulator and `dis86`'s `emu86_validator`.
 
-This integration replaces the intrusive `core_normal_286.cpp` patches from DosBox-X with a small, explicit `simx86` instrumentation surface that:
-1. Forces one decoded guest instruction per generated node by reasserting `MSSTP` inside `FindExecCode()` after its normal mode reset.
-2. Extracts complete 14-register architectural state (`AX..FLAGS`, `CS:IP`, segments) at instruction boundaries.
-3. Synchronizes with the existing Phase 0 `DosemuProcess` ABI over `/dev/shm/hydra_remote` using acquire/release atomic ordering.
-4. Applies external register mutations before execution, recomputes real-mode segment caches with `SetSegReal()`, and restarts dispatch from a recomputed linear `PC` when `CS:IP` changes.
-5. Validates lockstep execution against `emu86` on a dedicated x86-16 test corpus.
+The source-verified contract is:
 
-Phase 1 is deliberately scoped to **16-bit real-mode execution**. Protected-mode segment mutation is out of scope for this milestone and must not be implemented by calling `SetSegReal()` while `PROTMODE()` is active.
+1. Instrument the persistent `FindExecCode()` dispatch loop, with separate pre-execution request/apply and post-execution publish/ack phases.
+2. Reassert `MSSTP` after `FindExecCode()` clears `MSSTP|MTRAP`; do **not** use `TNode::seqlen` as an instruction count.
+3. Treat the local `PC` in `FindExecCode()` as authoritative. External `CS:IP` mutations recompute `PC` before node lookup, and post-step `IP` is published as `PC - LONG_CS`.
+4. Do **not** use `EXCP_EMULEAVE` for normal validator control redirection. In current dosemu2 it leaves instruction-simulation mode via `instr_sim_leave()`.
+5. Preserve high halves of 32-bit registers and EFLAGS when importing the 16-bit validator ABI.
+6. Keep Phase 1 strictly real-mode. Segment mutation while `PROTMODE()` is true is a validation error; it is not silently ignored.
+7. Normalize `simx86` node boundaries to the validator's decoded-instruction comparison boundary. `MSSTP` exposes REP iterations separately, while `STI`, `MOV SS`, and `POP SS` may include the following instruction in the same generated node.
+8. Engage lockstep only at the exact MZ program entry, derived from the runtime PSP plus the executable header's relative `CS:IP`.
+9. Export low memory through a dedicated named POSIX-SHM backing object for the `MAPPING_LOWMEM` allocation only. The generic mapping-object allocator remains unchanged.
+
+Phase 1 is deliberately scoped to **16-bit real-mode MZ executables** and a single validator/dosemu2 instance using the fixed Phase 0 paths `/dev/shm/hydra_remote` and `/dev/shm/dosemu_mem`.
 
 ---
 
-## 2. `simx86` Execution Loop & Hook Injection Point
+## 2. `simx86` Dispatch Integration
 
-### 2.1 Control Flow in `interp.c`
-`Interp86()` computes the initial linear `PC` and delegates execution to `FindExecCode()` in `src/base/emu-i386/simx86/interp.c`. The persistent dispatch loop is in `FindExecCode()`, not `Interp86()` itself.
+### 2.1 Hook placement
 
-The Phase 1 hook therefore belongs around the existing node lookup / execution sequence in `FindExecCode()`:
+`Interp86()` computes the initial linear address and calls `FindExecCode()`. `FindExecCode()` owns the persistent dispatch loop and local `PC`, so the synchronization surface belongs there:
 
-```
-                       ┌─────────────────────────┐
-                       │      Interp86(void)     │
-                       │ PC = LONG_CS + EIP      │
-                       └───────────┬─────────────┘
-                                   │
-                                   ▼
-                       ┌─────────────────────────┐
-                       │    FindExecCode(PC)     │◄────────────────────┐
-                       │       while (1)         │                     │
-                       └───────────┬─────────────┘                     │
-                                   │                                   │
-                      Hydra wait for req / end                         │
-                      apply register mutations                         │
-                      recompute PC if CS:IP changed                    │
-                                   │                                   │
-                                   ▼                                   │
-                      reset normal mode bits                           │
-                      reassert MSSTP if Hydra active                   │
-                                   │                                   │
-                                   ▼                                   │
-                       ┌─────────────────────────┐                     │
-                       │ FindTree(PC) or         │                     │
-                       │ _Interp86(..., MSSTP)   │                     │
-                       │ -> one guest instruction│                     │
-                       └───────────┬─────────────┘                     │
-                                   │                                   │
-                                   ▼                                   │
-                       ┌─────────────────────────┐                     │
-                       │       PC = DoExec(G)    │                     │
-                       └───────────┬─────────────┘                     │
-                                   │                                   │
-                      publish post-step state                           │
-                      ack = req (release)                              │
-                                   │                                   │
-                                   └───────────────────────────────────┘
+```text
+FindExecCode(PC):
+  while (1):
+    validator pre-step:
+      gate on exact target entry until initialized
+      wait for req or end
+      apply register mutations
+      PC = LONG_CS + TheCPU.eip
+
+    normal mode reset
+    reassert MSSTP when validator is active
+
+    lookup/generate node
+    PC = DoExec(G)
+
+    validator post-step:
+      publish state using returned PC
+      ack = req
 ```
 
-This avoids executing an already-selected stale node after an external `CS:IP` rewrite: mutations are consumed before node lookup, and a changed code address is converted back to the local linear `PC` used by the dispatcher.
+The pre-step phase runs **before** node lookup. This prevents an externally rewritten `CS:IP` from executing a node selected for the old address.
 
-### 2.2 Enforcing Single-Instruction Mode (`MSSTP`)
-`MSSTP` is defined in `codegen.h`:
+### 2.2 `MSSTP` means one outer `InterpOne()` call, not universally one decoded instruction
+
+Current `codegen.h` defines:
 
 ```c
 #define MSSTP 0x02000000 /* generate only one instruction */
 ```
 
-`FindExecCode()` currently clears `MSSTP|MTRAP` at the top of every dispatch iteration and re-enables them only when guest `TF` is set. Therefore setting `TheCPU.mode |= MSSTP` once before entering `FindExecCode()` is insufficient.
-
-Hydra mode must reassert `MSSTP` after the existing reset/`TF` handling:
+`FindExecCode()` clears `MSSTP|MTRAP` each iteration, so validator mode must reassert it after the normal reset:
 
 ```c
 TheCPU.mode &= ~(MSSTP | MTRAP);
 if (EFLAGS & TF)
     TheCPU.mode |= MSSTP | MTRAP;
-
-#if USE_HYDRA
-if (hydra_active)
+if (dosemu_hydra_active())
     TheCPU.mode |= MSSTP;
-#endif
 ```
 
-With `MSSTP`, `_Interp86()` breaks after one `InterpOne()` call, so each generated node represents one decoded guest instruction. **`TNode::seqlen` is the number of guest code bytes spanned by the node, not an instruction count, and may be greater than 1.**
+`_Interp86()` then stops after one outer `InterpOne()` call. Two qualifications are essential:
 
-Because `GoodNode()` compares the cached node's `mode` with `TheCPU.mode`, nodes generated without `MSSTP` are not reused for Hydra single-step execution.
+- `TNode::seqlen` is **guest byte length**, not instruction count, and can be greater than one.
+- `InterpOne()` has architectural special cases. With `MSSTP`, REP string instructions are converted to loop-style execution so a node can represent one REP iteration. Conversely, `POP SS`, `MOV SS`, and non-trap `STI` can recursively compile the following decoded instruction into the same node to preserve the interrupt-shadow semantics.
 
-### 2.3 Request / Execute / Acknowledge Placement
-The hook is intentionally split into pre-execution and post-execution phases:
+Therefore Phase 1 defines a **normalized comparison boundary**, not a false one-node-equals-one-instruction invariant.
+
+### 2.3 No `EXCP_EMULEAVE` for control mutation
+
+Normal validator redirection is handled entirely before node lookup:
 
 ```c
-/* Sketch inside FindExecCode(); exact helper names are illustrative. */
-while (1) {
-#if USE_HYDRA
-    uint64_t hydra_req = 0;
-    if (hydra_active) {
-        if (!dosemu_hydra_wait_request(&hydra_req))
-            return PC; /* end/shutdown path */
-
-        /* Applies register mutations and returns LONG_CS + TheCPU.eip. */
-        PC = dosemu_hydra_apply_state(PC);
-    }
-#endif
-
-    TheCPU.mode &= ~(MSSTP | MTRAP);
-    if (EFLAGS & TF)
-        TheCPU.mode |= MSSTP | MTRAP;
-#if USE_HYDRA
-    if (hydra_active)
-        TheCPU.mode |= MSSTP;
-#endif
-
-    /* Existing FindTree() / _Interp86() logic selects one-instruction node. */
-
-    PC = DoExec(G);
-
-#if USE_HYDRA
-    if (hydra_active) {
-        /*
-         * PC is the authoritative post-node linear address here.
-         * TheCPU.eip is normally synchronized by Interp86() only when
-         * FindExecCode() returns, so publish IP as PC - LONG_CS.
-         */
-        dosemu_hydra_publish_and_ack(hydra_req, PC);
-    }
-#endif
-
-    if (TheCPU.err)
-        return PC;
-}
+PC = dosemu_hydra_apply_state(); /* returns LONG_CS + TheCPU.eip */
 ```
 
-The first implementation should not use `EXCP_EMULEAVE` merely to handle a pre-execution `CS:IP` mutation. `Interp86()` writes `TheCPU.eip = PC - LONG_CS` when `FindExecCode()` returns; returning an old local `PC` after changing `CS` can therefore overwrite the externally requested `IP`. Restarting dispatch with `PC = LONG_CS + TheCPU.eip` avoids that ambiguity.
+Do not set `TheCPU.err = EXCP_EMULEAVE`. Current `cpu-emu.c` handles that exception by calling `instr_sim_leave()`, which leaves instruction simulation rather than merely restarting `FindExecCode()`.
+
+### 2.4 Shutdown is a stop barrier
+
+An observed `shm->end` must prevent any further guest instruction from executing. The pre-step helper returns a stop status and `FindExecCode()` immediately returns its current `PC`.
+
+`end` is not the sole process-lifetime mechanism. `DosemuProcess::Drop` already owns process teardown and may terminate the child after publishing `end`. This keeps shutdown synchronization separate from dosemu2's global exit machinery.
 
 ---
 
-## 3. Register Synchronization & Segment Descriptor Management
+## 3. Register and Segment State
 
-### 3.1 State Serialization (`TheCPU` -> `shmdata`)
-The Phase 0 `shmdata` ABI already contains the 14 x86-16 register fields required by the validator. At a post-execution boundary, use the `PC` returned by `DoExec()` for `IP`, because `TheCPU.eip` is synchronized by `Interp86()` only after `FindExecCode()` returns:
+### 3.1 Publish from authoritative `PC`
+
+At the post-node boundary:
 
 ```c
-void dosemu_update_shmdata_from_cpu(shmdata_t *shm, unsigned int pc) {
+static void publish_cpu(shmdata_t *shm, unsigned int pc)
+{
     shm->ax    = (uint16_t)TheCPU.eax;
     shm->bx    = (uint16_t)TheCPU.ebx;
     shm->cx    = (uint16_t)TheCPU.ecx;
@@ -167,13 +123,15 @@ void dosemu_update_shmdata_from_cpu(shmdata_t *shm, unsigned int pc) {
 }
 ```
 
-For the initial published state, pass `LONG_CS + TheCPU.eip` as `pc`.
+Inside `FindExecCode()`, `PC = DoExec(G)` is authoritative. `TheCPU.eip` is synchronized by `Interp86()` when `FindExecCode()` returns, so publishing `TheCPU.eip` after every node is stale.
 
-### 3.2 State Deserialization (`shmdata` -> `TheCPU`)
-When the validator mutates registers, preserve the high halves of the 32-bit general registers and EFLAGS, update real-mode segment caches through `SetSegReal()`, then return the linear address that must be used for the next node lookup:
+### 3.2 Import validator mutations
 
 ```c
-unsigned int dosemu_update_cpu_from_shmdata(const shmdata_t *shm) {
+static unsigned int apply_cpu(const shmdata_t *shm)
+{
+    assert(!PROTMODE());
+
     TheCPU.eax = (TheCPU.eax & 0xffff0000u) | shm->ax;
     TheCPU.ebx = (TheCPU.ebx & 0xffff0000u) | shm->bx;
     TheCPU.ecx = (TheCPU.ecx & 0xffff0000u) | shm->cx;
@@ -185,9 +143,6 @@ unsigned int dosemu_update_cpu_from_shmdata(const shmdata_t *shm) {
     TheCPU.eip = shm->ip;
     TheCPU.eflags = (TheCPU.eflags & 0xffff0000u) | shm->flags;
 
-    /* Phase 1 is real-mode only. */
-    assert(!PROTMODE());
-
     if (TheCPU.cs != shm->cs) SetSegReal(shm->cs, Ofs_CS);
     if (TheCPU.ds != shm->ds) SetSegReal(shm->ds, Ofs_DS);
     if (TheCPU.es != shm->es) SetSegReal(shm->es, Ofs_ES);
@@ -197,80 +152,167 @@ unsigned int dosemu_update_cpu_from_shmdata(const shmdata_t *shm) {
 }
 ```
 
-### 3.3 Segment Recomputation Guarantee
-In current `simx86`, `SetSegReal(sel, ofs)`:
-1. Writes the segment selector with `CPUWORD(ofs) = sel`.
-2. Recomputes the cached real-mode bounds as `sel << 4` through `+ 0xffff`.
-3. Makes `LONG_CS + TheCPU.eip` valid for the next real-mode decode.
-
-This is sufficient for Phase 1's real-mode contract. Protected-mode selector updates require the protected-mode validation/cache path and are explicitly deferred.
+Protected-mode segment mutation is out of scope and must fail loudly. A guard that merely skips `SetSegReal()` while still accepting the new selector would leave the selector and cached descriptor inconsistent.
 
 ---
 
-## 4. Shared-Memory IPC Handshake Protocol
+## 4. Exact Program-Entry Gate
 
-The Phase 0 Rust side already uses 64-bit `req`/`ack` counters and acquire/release ordering. Phase 1 implements the matching dosemu2 side. Register payload fields remain non-atomic and are ordered by the control atomics:
+The validator must not engage during BIOS, DOS, or command-shell startup.
 
-```
-   dosemu2 (simx86)                            dis86 (DosemuProcess)
-  ─────────────────                            ──────────────────────
-  remote_init():
-    shm->init = 0
-    shm->pid = getpid()
-    shm->req = 0
-    shm->ack = 0
+`emu86` already models MZ loading with:
 
-  [Reaches Entry CS:IP]:
-    publish registers using current PC
-    atomic_store_release(shm->init, 1) ───────► wait_for_init():
-                                                  load_acquire(init) == 1
-                                                  verify pid == child.id()
+- `PSP_SEGMENT` as the process segment;
+- image load segment `PSP + 0x10`;
+- initial `CS = PSP + 0x10 + mz_header.cs`;
+- initial `IP = mz_header.ip`;
+- initial `DS = ES = PSP`.
 
-  ┌► wait_for_request():                       register mutation:
-  │    if load_acquire(end) -> shutdown          reg_write()/flag_write()
-  │    req = load_acquire(shm->req)              update payload fields
-  │    if req == ack: keep waiting
-  │                                              step():
-  │    acquire(req) orders payload reads ◄────── store_release(req, ack + 1)
-  │    apply payload to TheCPU
-  │    recompute PC = LONG_CS + EIP
-  │
-  │  [Execute exactly 1 guest instruction]
-  │    PC = DoExec(G)
-  │
-  │    publish registers using returned PC
-  │    store_release(shm->ack, req) ───────────► spin_wait():
-  │                                              load_acquire(ack) == req
-  │                                              read_cpu_state()
-  └──────────────────────────────────────────────compare_with_emu86()
+`DosemuProcess` therefore supplies the target executable's **relative** MZ `CS` and `IP` to the patched dosemu2 process, for example through validator-only environment variables. The dosemu2 hook derives the runtime PSP from the architectural startup state instead of hard-coding `0x813` or accepting `CS >= load_seg`.
+
+A source-compatible gate is:
+
+```c
+static bool at_target_entry(unsigned int pc)
+{
+    uint16_t psp;
+    uint16_t ip;
+    uint16_t expected_cs;
+
+    if (PROTMODE())
+        return false;
+    if (TheCPU.ds != TheCPU.es)
+        return false;
+
+    psp = TheCPU.ds;
+    if (READ_WORD((dosaddr_t)psp << 4) != 0x20cd) /* PSP starts CD 20 */
+        return false;
+
+    ip = (uint16_t)(pc - LONG_CS);
+    expected_cs = (uint16_t)(psp + 0x10u + g_target_mz_cs);
+
+    return TheCPU.cs == expected_cs && ip == g_target_mz_ip;
+}
 ```
 
-The release store to `req` publishes any register mutations written by `DosemuProcess` before the step. The acquire load of `req` on the dosemu2 side must occur before reading payload fields. In the opposite direction, dosemu2 writes the register snapshot before its release store to `ack`, and `DosemuProcess` reads the snapshot only after an acquire load observes that acknowledgement.
+On the first match, publish the complete initial state and release-store `init = 1`. Before the match, no request wait occurs and dosemu2 continues normal startup execution.
+
+This gate is intentionally scoped to the MZ executable path already used by `Emulator::new()`; COM support is a separate extension.
 
 ---
 
-## 5. Test Corpus & Known-Good Validation Plan
+## 5. Normalized Validator Step Contract
 
-To satisfy the Phase 0 and Phase 1 gate requirements, a dedicated x86-16 test corpus exercises:
+### 5.1 Raw dosemu2 step
 
-| Test Group | Instructions Tested | Validation Target |
-| :--- | :--- | :--- |
-| **Arithmetic & Logic** | `MOV`, `ADD`, `ADC`, `SUB`, `SBB`, `AND`, `OR`, `XOR`, `SHL`, `SHR`, `IMUL` | Register values and `FLAGS` parity across every step. |
-| **Stack Operations** | `PUSH reg/imm`, `POP reg`, `PUSHA`, `POPA`, `PUSHF`, `POPF` | Stack pointer alignment (`SP -= 2/4`) and memory integrity. |
-| **Control Flow** | `JMP short/near`, `JZ`, `JNZ`, `CALL NEAR`, `RET`, `CALL FAR`, `RETF` | Target `CS:IP` landing and return address stack frame layout. |
-| **String Operations** | `REP MOVSB`, `REP MOVSW`, `REP STOSB`, `REP STOSW` | Single-step atomicity contract vs iteration visibility. |
-| **External Redirection** | `CS:IP` rewrite + segment change | Recompute real-mode segment cache and restart dispatch without executing the stale node. |
+A raw request/ack advances one `simx86` generated node in validator mode.
+
+### 5.2 REP normalization
+
+Under `MSSTP`, `simx86` makes REP string operations visible one iteration at a time, while `emu86` currently completes the REP loop inside one `Machine::step()`.
+
+`DosemuProcess::step()` therefore coalesces raw dosemu2 requests when the starting decoded instruction is a REP string instruction:
+
+1. Record starting `CS:IP`.
+2. Issue raw request/ack steps.
+3. Continue while the published `CS:IP` remains the starting address.
+4. Return one normalized step when `CS:IP` advances.
+
+This covers count exhaustion and REP/REPNE condition termination without pretending each raw node is a decoded instruction.
+
+### 5.3 Interrupt-shadow normalization
+
+Current `simx86` may execute the instruction following `STI`, `MOV SS`, or `POP SS` in the same node. `DosemuProcess` records a comparison span of **two decoded instructions** for that raw step. The validator advances `emu86` twice before comparing state.
+
+The backend interface should expose the number of decoded instructions consumed by the last normalized step, with a default of one for `Emulator` and `HydraProcess`. `DosemuProcess` reports two only for the verified interrupt-shadow cases.
+
+This keeps dosemu2's existing interrupt-shadow implementation intact and moves backend-boundary normalization into the validator, where the semantic mismatch belongs.
 
 ---
 
-## 6. Implementation Deliverables
+## 6. Shared-Memory Ordering
 
-1. **`dosemu2` core hook patch**:
-   * `src/base/emu-i386/simx86/interp.c`: Request/execute/ack hook integration and `MSSTP` reassertion.
-   * A small Hydra remote helper (location to be chosen during implementation) for shared-memory lifecycle and register serialization.
-   * `cpu-emu.c` changes only if required by the final entry/exit integration; do not add them solely for register copying.
-2. **`dis86` validator test runner**:
-   * Reuse the Phase 0 `dis86/src/emu86/validator/dosemu_process.rs` adapter and complete any behavior exposed by end-to-end testing.
-   * CLI test harness: `emu86_validator --backend dosemu2 --exe <test_binary>`.
-3. **CI automated check**:
-   * Integration test in GitHub Actions running headless `dosemu2` against reference binaries.
+The Phase 0 ABI remains:
+
+```text
+validator writes payload
+store_release(req)
+        |
+        v
+load_acquire(req)
+dosemu2 applies payload
+executes normalized raw node(s)
+publishes payload
+store_release(ack)
+        |
+        v
+load_acquire(ack)
+validator reads payload
+```
+
+`req`/`ack` are 64-bit atomics. Register payload fields remain ordinary shared-memory fields ordered by those control atomics.
+
+---
+
+## 7. Low-Memory Export Contract
+
+The generic `do_open_pshm()` must remain unchanged. It services generic file-backed mappings and currently creates PID-specific objects which are immediately unlinked.
+
+Full-simulation dosemu2 normally selects the `softmmu` mapping driver first; its allocator uses anonymous memory (`fd = -1`). Such memory has no pathname or fd that `ShmMem::attach()` can reopen.
+
+Phase 1 therefore makes validator mode explicit:
+
+1. `DosemuProcess` selects the existing POSIX-SHM backend by setting `dosemu__mapping=mapshm` for the child process.
+2. `DosemuProcess` also sets a validator-only marker such as `DIIS_DOSEMU_VALIDATOR=1`.
+3. In `alloc_mapping_file()`, only when that marker is active **and** `cap & MAPPING_LOWMEM`, create `/dosemu_mem` as the backing object instead of calling generic `mfops->open()`.
+4. All EMS/XMS/DPMI/VGA/other allocations continue through the normal PID-unique/unlinked object path.
+5. Use `O_EXCL` after stale-path cleanup so a second live validator cannot silently truncate the first process's memory.
+6. Keep the named object until dosemu2 mapping shutdown; `ShmMem` maps the same fd-backed pages with `MAP_SHARED`, providing true zero-copy visibility.
+
+The fixed `/dosemu_mem` and `/hydra_remote` names deliberately imply a single concurrent Phase 1 validator instance. PID-scoped names require an ABI change and are deferred.
+
+---
+
+## 8. Launch Contract
+
+The patched dosemu2 binary contains the core hook; it is not a DOSBox-X Hydra plugin.
+
+Therefore `DosemuProcess` must remove the inherited DOSBox-X-only arguments:
+
+```text
+-hydra ...
+-hydra-conf normal
+```
+
+Upstream dosemu2 has no such options.
+
+The Phase 1 launch path is:
+
+```text
+DOSEMU_BIN=<patched dosemu2> \
+dosemu__mapping=mapshm \
+DIIS_DOSEMU_VALIDATOR=1 \
+DIIS_DOSEMU_MZ_CS=<relative header CS> \
+DIIS_DOSEMU_MZ_IP=<header IP> \
+  dosemu -dumb -quiet -K <test_dir> -E <test_exe>
+```
+
+Exact environment-variable names may be changed in the implementation patch, but the data flow and absence of DOSBox-X plugin flags are mandatory.
+
+---
+
+## 9. Verification Gate
+
+Phase 1 is complete only when tests demonstrate:
+
+- ordinary ALU, stack, near/far control-flow, and flag instructions compare at every normalized boundary;
+- REP MOVS/STOS/SCAS/CMPS cases cross the raw-node/decoded-instruction boundary correctly;
+- `STI`, `MOV SS`, and `POP SS` comparison spans are normalized correctly;
+- external `CS:IP` mutation performs fresh node lookup at the requested address;
+- DS/ES/SS/CS mutations refresh real-mode descriptor caches;
+- upper EFLAGS bits survive 16-bit ABI imports;
+- protected-mode mutation is rejected;
+- `end` executes no further guest instruction;
+- `/dosemu_mem` aliases the same pages dosemu2 uses for `lowmem_base`;
+- generic mapping allocations remain independent and are never redirected to `/dosemu_mem`;
+- lockstep engages only at the exact target MZ entry point.
