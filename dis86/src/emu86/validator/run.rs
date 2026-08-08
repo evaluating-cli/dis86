@@ -1,6 +1,7 @@
 use super::super::emu::{Emu, Emulator};
 use super::super::cpu::*;
 use super::hydra_process::HydraProcess;
+use super::dosemu_process::DosemuProcess;
 use crate::segoff::SegOff;
 use super::mirroring::apply_overrides;
 
@@ -18,6 +19,20 @@ fn detect_interrupts(emu: &dyn Emu) -> Interrupt {
   }
 }
 
+pub enum EmulatorBackend {
+  DosboxX,
+  Dosemu2,
+}
+
+impl EmulatorBackend {
+  pub fn from_env() -> Self {
+    match std::env::var("EMULATOR_BACKEND").as_deref() {
+      Ok("dosemu2") | Ok("dosemu") => EmulatorBackend::Dosemu2,
+      _ => EmulatorBackend::DosboxX,
+    }
+  }
+}
+
 struct Validator {
   hydra: Box<dyn Emu>,
   emu86: Box<dyn Emu>,
@@ -25,11 +40,18 @@ struct Validator {
 
 impl Validator {
   fn new(exe_path: &str) -> Result<Self, String> {
+    Self::new_with_backend(exe_path, EmulatorBackend::from_env())
+  }
+
+  fn new_with_backend(exe_path: &str, backend: EmulatorBackend) -> Result<Self, String> {
     let emu86_impl = Emulator::new(exe_path)?;
-    let hydra_impl = HydraProcess::spawn(exe_path)?;
+    let hydra_impl: Box<dyn Emu> = match backend {
+      EmulatorBackend::DosboxX => Box::new(HydraProcess::spawn(exe_path)?),
+      EmulatorBackend::Dosemu2 => Box::new(DosemuProcess::spawn(exe_path)?),
+    };
 
     Ok(Self {
-      hydra: Box::new(hydra_impl),
+      hydra: hydra_impl,
       emu86: Box::new(emu86_impl),
     })
   }
@@ -116,6 +138,9 @@ pub fn run(exe_path: &str) -> Result<(), String> {
   Validator::new(exe_path)?.run()
 }
 
+pub fn run_with_backend(exe_path: &str, backend: EmulatorBackend) -> Result<(), String> {
+  Validator::new_with_backend(exe_path, backend)?.run()
+}
 
 fn print_changes(prev: &Cpu, cur: &Cpu) {
   print_change_reg("AX", AX, prev, cur);

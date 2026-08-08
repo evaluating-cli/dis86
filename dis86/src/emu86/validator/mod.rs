@@ -1,7 +1,8 @@
 mod hydra_process;
+pub mod dosemu_process;
 mod shmdata;
 mod shmmem;
 mod mirroring;
 
-mod run;
-pub use run::run;
+pub mod run;
+pub use run::{run, run_with_backend, EmulatorBackend};
