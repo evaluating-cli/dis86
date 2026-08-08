@@ -188,6 +188,8 @@ impl<'a> IRBuilder<'a> {
       instr::Opcode::OP_JP   => (0, true),
       instr::Opcode::OP_JS   => (0, true),
       instr::Opcode::OP_LOOP => (1, true),
+      instr::Opcode::OP_LOOPE => (1, true),
+      instr::Opcode::OP_LOOPNE => (1, true),
       _ => return None,
     };
 
@@ -778,21 +780,37 @@ impl IRBuilder<'_> {
         self.append_asm_dst_operand(&ins.operands[0], vref);
         self.append_update_flags(vref);
       }
-      instr::Opcode::OP_LOOP => {
-        // Step 1: Update CX := CX - 1
+      instr::Opcode::OP_LOOP | instr::Opcode::OP_LOOPE | instr::Opcode::OP_LOOPNE => {
+        // LOOPcc decrements CX without modifying FLAGS. LOOPE/LOOPNE test the
+        // ZF value produced by an earlier instruction, so preserve the current
+        // flags SSA value before updating CX.
+        let flags = match ins.opcode {
+          instr::Opcode::OP_LOOPE | instr::Opcode::OP_LOOPNE => Some(self.get_flags()),
+          _ => None,
+        };
         let cx = self.append_asm_src_operand(&ins.operands[0]);
         let one = self.ir.const_new(1);
         let cx = self.append_instr(Type::U16, Opcode::Sub, vec![cx, one]);
         self.append_asm_dst_operand(&ins.operands[0], cx);
 
-        // Step 2: Jump when CX != 0
-        let instr::Operand::Rel(rel) = &ins.operands[1] else { panic!("Expected relative offset operand for LOOP") };
-
+        let instr::Operand::Rel(rel) = &ins.operands[1] else { panic!("Expected relative offset operand for LOOPcc") };
         let false_blk = self.get_block(ins.end_addr());
         let true_blk = self.get_block(ins.rel_addr(rel));
 
         let z = self.ir.const_new(0);
-        let cond = self.append_instr(Type::U16, Opcode::Neq, vec![cx, z]);
+        let cx_nonzero = self.append_instr(Type::U16, Opcode::Neq, vec![cx, z]);
+        let cond = match ins.opcode {
+          instr::Opcode::OP_LOOP => cx_nonzero,
+          instr::Opcode::OP_LOOPE => {
+            let zf_set = self.append_instr(Type::U16, Opcode::EqFlags, vec![flags.unwrap()]);
+            self.append_instr(Type::U16, Opcode::And, vec![cx_nonzero, zf_set])
+          }
+          instr::Opcode::OP_LOOPNE => {
+            let zf_clear = self.append_instr(Type::U16, Opcode::NeqFlags, vec![flags.unwrap()]);
+            self.append_instr(Type::U16, Opcode::And, vec![cx_nonzero, zf_clear])
+          }
+          _ => unreachable!(),
+        };
 
         self.append_jne(cond, true_blk, false_blk);
       }
@@ -813,6 +831,31 @@ impl IRBuilder<'_> {
       instr::Opcode::OP_POP => {
         let vref = self.append_pop();
         self.append_asm_dst_operand(&ins.operands[0], vref);
+      }
+      instr::Opcode::OP_PUSHA => {
+        // PUSHA stores the value SP had before the first push.
+        let original_sp = self.ir.get_var(instr::Reg::SP, self.cur);
+        for reg in [instr::Reg::AX, instr::Reg::CX, instr::Reg::DX, instr::Reg::BX] {
+          let vref = self.ir.get_var(reg, self.cur);
+          self.append_push(vref);
+        }
+        self.append_push(original_sp);
+        for reg in [instr::Reg::BP, instr::Reg::SI, instr::Reg::DI] {
+          let vref = self.ir.get_var(reg, self.cur);
+          self.append_push(vref);
+        }
+      }
+      instr::Opcode::OP_POPA => {
+        // POPA consumes all eight stack words, but discards the saved-SP word.
+        for reg in [instr::Reg::DI, instr::Reg::SI, instr::Reg::BP] {
+          let vref = self.append_pop();
+          self.ir.set_var(reg, self.cur, vref);
+        }
+        let _saved_sp = self.append_pop();
+        for reg in [instr::Reg::BX, instr::Reg::DX, instr::Reg::CX, instr::Reg::AX] {
+          let vref = self.append_pop();
+          self.ir.set_var(reg, self.cur, vref);
+        }
       }
       instr::Opcode::OP_LEAVE => {
         // mov sp, bp
@@ -868,8 +911,7 @@ impl IRBuilder<'_> {
         // Sanity check the form we have
         assert!(
           matches!(ins.operands[0], instr::Operand::Reg(instr::OperandReg(instr::Reg::DX))) &&
-          matches!(ins.operands[1], instr::Operand::Reg(instr::OperandReg(instr::Reg::AX))) &&
-          matches!(ins.operands[2], instr::Operand::Reg(_)));
+          matches!(ins.operands[1], instr::Operand::Reg(instr::OperandReg(instr::Reg::AX))));
 
         let lhs = self.append_asm_src_operand(&ins.operands[1]);
         let rhs = self.append_asm_src_operand(&ins.operands[2]);
@@ -1004,7 +1046,7 @@ impl IRBuilder<'_> {
 
         self.append_asm_dst_operand(&ins.operands[0], addr);
       }
-      instr::Opcode::OP_LES => {
+      instr::Opcode::OP_LES | instr::Opcode::OP_LDS => {
         let vref = self.append_asm_src_operand(&ins.operands[2]);
         let (upper, lower) = self.append_upper_lower_split(vref);
         self.append_asm_dst_operand(&ins.operands[0], upper);
