@@ -116,7 +116,7 @@ static inline u64 parse_hex_u64(const char *s, size_t len)
 
 static inline u32 parse_hex_u32(const char *s, size_t len)
 {
-  if (len > 8) FAIL("Hex string too long to fit in u16");
+  if (len > 8) FAIL("Hex string too long to fit in u32");
   return (u32)parse_hex_u64(s, len);
 }
 
@@ -128,8 +128,8 @@ static inline u16 parse_hex_u16(const char *s, size_t len)
 
 static inline u8 parse_hex_u8(const char *s, size_t len)
 {
-  if (len > 2) FAIL("Hex string too long to fit in u16");
-  return (u16)parse_hex_u64(s, len);
+  if (len > 2) FAIL("Hex string too long to fit in u8");
+  return (u8)parse_hex_u64(s, len);
 }
 
 static inline bool parse_u64(const char *s, uint64_t *_num)
