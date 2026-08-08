@@ -3,6 +3,7 @@ use super::machine::Machine;
 use super::cpu::{Cpu, Register};
 use super::cpu_flags::Flag;
 use super::value::Value;
+#[cfg(feature = "sdl")]
 use super::sdl;
 use std::path::Path;
 use crate::segoff::{Seg, SegOff};
@@ -13,9 +14,24 @@ pub struct Emulator {
   #[allow(dead_code)]
   exe: mz::Exe,
   pub machine: Machine,
-  app: sdl::App,
+  app: App,
   step_count: u64,
   last_cpu_state: Cpu,
+}
+
+#[cfg(feature = "sdl")]
+type App = sdl::App;
+
+// Validator and unit-test runs are headless. Keeping this tiny frontend in the
+// same emulator path ensures they exercise the same CPU implementation without
+// pulling in a graphical host dependency.
+#[cfg(not(feature = "sdl"))]
+struct App;
+
+#[cfg(not(feature = "sdl"))]
+impl App {
+  fn new() -> Self { Self }
+  fn update(&mut self) -> Result<bool, String> { Ok(false) }
 }
 
 impl Emulator {
@@ -32,7 +48,7 @@ impl Emulator {
     let mut machine = Machine::new(Some(root_dir));
     machine.load_exe(&exe)?;
 
-    let app = sdl::App::new();
+    let app = App::new();
 
     Ok(Emulator {
       exe_path: exe_path.to_string(),

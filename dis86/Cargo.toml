@@ -3,6 +3,12 @@ name = "dis86"
 version = "0.1.0"
 edition = "2021"
 
+[features]
+default = []
+# The interactive emu86 frontend is optional.  The decompiler, its unit tests,
+# and the dosemu2 validator do not need a host display or SDL development files.
+sdl = ["dep:sdl2"]
+
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
@@ -10,7 +16,12 @@ pico-args = "0.5.0"
 itertools = "0.12.1"
 static_assertions = "1.1.0"
 libc = "0.2"
-sdl2 = { version = "0.38", features = ["use-pkgconfig", "unsafe_textures"] } ## Used for emu86 only
+sdl2 = { version = "0.38", features = ["use-pkgconfig", "unsafe_textures"], optional = true } ## Used for the interactive emu86 frontend only
 
 [build-dependencies]
 cc = "1.0.87"
+
+[[bin]]
+name = "emu86"
+path = "src/bin/emu86.rs"
+required-features = ["sdl"]
