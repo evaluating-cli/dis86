@@ -1,7 +1,7 @@
 # Phase 1 Implementation: `simx86` Core Hook & Low-Memory Export Architecture
 
 **Status:** Source-verified implementation blueprint  
-**Target:** current `dosemu2/devel` `simx86` + mapping subsystem and `dis86` validator  
+**Target:** dosemu2 `devel` verified at `604ce0cdd1a71f657e2a2df623d216d5ab289313` and current `dis86` validator  
 **Scope:** 16-bit real-mode MZ executables; one concurrent validator instance
 
 ---
@@ -540,7 +540,7 @@ Before Phase 1 can be called implemented, verify all of the following against a 
 
 ## 13. Source locations verified for this blueprint
 
-Current dosemu2 `devel`:
+Dosemu2 `devel` at `604ce0cdd1a71f657e2a2df623d216d5ab289313`:
 
 - `src/base/emu-i386/simx86/interp.c`
 - `src/base/emu-i386/simx86/codegen.h`
