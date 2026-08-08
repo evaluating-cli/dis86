@@ -10,6 +10,10 @@ use crate::segoff::SegOff;
 use crate::{shmdata_read, shmdata_write};
 use std::path::Path;
 use std::sync::atomic::Ordering;
+use std::time::{Duration, Instant};
+
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
+const STEP_TIMEOUT: Duration = Duration::from_secs(5);
 
 pub struct HydraProcess {
   hydra: Child,
@@ -22,11 +26,36 @@ pub struct HydraProcess {
 }
 
 impl HydraProcess {
+  fn wait_for_mapping<T, F>(hydra: &mut Child, name: &str, mut attach: F) -> Result<T, String>
+  where
+    F: FnMut() -> Result<T, String>,
+  {
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+    let mut last_error = String::new();
+
+    loop {
+      match attach() {
+        Ok(mapping) => return Ok(mapping),
+        Err(e) => last_error = e,
+      }
+
+      if let Some(status) = hydra.try_wait().map_err(|e| format!("Failed to query DOSBox-X status: {}", e))? {
+        return Err(format!("DOSBox-X exited before {} was ready: {}", name, status));
+      }
+
+      if Instant::now() >= deadline {
+        return Err(format!("Timed out waiting for {}: {}", name, last_error));
+      }
+
+      std::thread::sleep(Duration::from_millis(10));
+    }
+  }
+
   pub fn spawn(exe_path: &str) -> Result<HydraProcess, String> {
     let current_exe = std::env::current_exe().unwrap();
     let dir = current_exe.parent().unwrap().parent().unwrap().parent().unwrap().parent().unwrap();
     let exe = Path::new(exe_path);
-    let hydra = Command::new(&format!("{}/hydra/src/dosbox-x/src/dosbox-x", dir.display()))
+    let mut hydra = Command::new(&format!("{}/hydra/src/dosbox-x/src/dosbox-x", dir.display()))
       .args(&[
         "-conf", &format!("{}/hydra/conf/dosbox.conf", dir.display()),
         "-hydra", &format!("{}/hydra/build/src/remote/libhydraremote.so", dir.display()),
@@ -41,12 +70,12 @@ impl HydraProcess {
       .spawn()
       .map_err(|e| format!("Failed to execute DOSBox-X: {}", e))?;
 
-    std::thread::sleep(std::time::Duration::from_millis(1000));
-
-    let data = ShmData::attach("/dev/shm/hydra_remote")
-      .map_err(|e| format!("Failed to attach hydra_remote shared memory: {}", e))?;
-    let mem = ShmMem::attach("/dev/shm/dosbox_mem")
-      .map_err(|e| format!("Failed to attach dosbox_mem shared memory: {}", e))?;
+    let data = Self::wait_for_mapping(&mut hydra, "hydra_remote shared memory", || {
+      ShmData::attach("/dev/shm/hydra_remote")
+    })?;
+    let mem = Self::wait_for_mapping(&mut hydra, "dosbox_mem shared memory", || {
+      ShmMem::attach("/dev/shm/dosbox_mem")
+    })?;
 
     let mut this = HydraProcess {
       hydra,
@@ -56,15 +85,25 @@ impl HydraProcess {
       last_cpu_state: Cpu::default(),
     };
 
-    this.wait_for_init();
+    this.wait_for_init()?;
 
     Ok(this)
   }
 
-  fn wait_for_init(&mut self) {
+  fn wait_for_init(&mut self) -> Result<(), String> {
+    let deadline = Instant::now() + STARTUP_TIMEOUT;
+
     while self.data.load_init(Ordering::Acquire) == 0 {
-      std::hint::spin_loop();
+      if let Some(status) = self.hydra.try_wait().map_err(|e| format!("Failed to query DOSBox-X status: {}", e))? {
+        return Err(format!("DOSBox-X exited before Hydra initialized: {}", status));
+      }
+      if Instant::now() >= deadline {
+        return Err("Timed out waiting for Hydra initialization".to_string());
+      }
+      std::thread::sleep(Duration::from_millis(1));
     }
+
+    Ok(())
   }
 
   pub fn read_cpu_state(&mut self) {
@@ -105,8 +144,8 @@ impl HydraProcess {
     shmdata_write!(self.data, flags, regs[FLAGS.idx as usize]);
   }
 
-  pub fn step(&mut self) {
-    self.wait_for_init();
+  pub fn step(&mut self) -> Result<(), String> {
+    self.wait_for_init()?;
 
     let ack = self.data.load_ack(Ordering::Acquire);
     let next_ack = ack.wrapping_add(1);
@@ -114,13 +153,28 @@ impl HydraProcess {
     // Publish any register changes before making the request visible to Hydra.
     self.data.store_req(next_ack, Ordering::Release);
 
+    let deadline = Instant::now() + STEP_TIMEOUT;
+    let mut spins = 0u32;
     while next_ack != self.data.load_ack(Ordering::Acquire) {
       std::hint::spin_loop();
+      spins = spins.wrapping_add(1);
+
+      // Keep the hot path as a spin wait, but periodically detect a dead or
+      // wedged emulator so validator failures surface as errors rather than hangs.
+      if spins & 0xffff == 0 {
+        if let Some(status) = self.hydra.try_wait().map_err(|e| format!("Failed to query DOSBox-X status: {}", e))? {
+          return Err(format!("DOSBox-X exited while waiting for step acknowledgement: {}", status));
+        }
+        if Instant::now() >= deadline {
+          return Err(format!("Timed out waiting for Hydra step acknowledgement {}", next_ack));
+        }
+      }
     }
 
     // The acquire load above synchronizes with Hydra's release store to ack,
     // making the newly published register snapshot visible here.
-    self.read_cpu_state()
+    self.read_cpu_state();
+    Ok(())
   }
 }
 
@@ -134,8 +188,7 @@ impl Drop for HydraProcess {
 impl Emu for HydraProcess {
   fn step(&mut self) -> Result<(), String> {
     self.last_cpu_state = self.cpu_state();
-    Self::step(self);
-    Ok(())
+    Self::step(self)
   }
   fn cpu_state(&self) -> Cpu {
     self.cpu_state.clone()
