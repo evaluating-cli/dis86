@@ -28,6 +28,6 @@ The revision resolves the original review findings and the follow-up source inve
 
 ## Source verification
 
-The revised blueprint was checked against current dosemu2 `devel` execution and mapping code, including `interp.c`, `codegen.h`, `cpu-emu.c`, `protmode.c`, `mapping.c`, `mapfile.c`, `mapping.h`, and `etc/global.conf`, plus the current dis86 MZ loader, validator adapter, REP implementation, and shared-memory ABI.
+The revised blueprint was checked against current dosemu2 `devel` at commit `604ce0cdd1a71f657e2a2df623d216d5ab289313`, including `interp.c`, `codegen.h`, `cpu-emu.c`, `protmode.c`, `mapping.c`, `mapfile.c`, `mapping.h`, and `etc/global.conf`, plus the current dis86 MZ loader, validator adapter, REP implementation, and shared-memory ABI.
 
 This remains a documentation/architecture PR: it does not claim that the downstream dosemu2 implementation has been compiled or integration-tested yet. The implementation checklist now states the exact behaviors that the subsequent code patch must prove.
