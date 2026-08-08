@@ -1,86 +1,119 @@
-# Investigation review findings
+# Dosemu2 port: revised technical stance and Phase 0 gate
 
-The original migration direction is credible, but several source-level claims need to be treated as hypotheses rather than settled design decisions.
+The migration remains technically credible, but several source-level conclusions should be treated as explicit hypotheses until the simulator behavior is proven experimentally.
 
-## Critical findings
+## Revised technical hypotheses
 
-### 1. A pure plugin is unlikely to be sufficient
+| Area | Current stance |
+| --- | --- |
+| Core integration | A pure out-of-band plugin is insufficient; the likely design is hybrid integration using a core callback, single-instruction block mode, generated instrumentation, or another `simx86` mechanism established in Phase 0. |
+| Workload performance | JIT block execution may substantially improve normal Hydra runs, but strict lockstep validation is a separate workload and must be benchmarked independently. |
+| Memory subsystem | Investigate reuse/export of dosemu2's existing `lowmem_base` backing before introducing a second shared-memory allocation; verify that its mirror semantics match validator requirements. |
+| REP contract | Phase 0 must define and verify whether a REP-prefixed instruction is one observable architectural step or whether sub-iterations must be externally visible. |
+| Control redirection | Hydra must escape stale translated execution and resynchronize CPU/segment-derived state after control-flow changes; the exact `simx86` mechanism remains a Phase 0 question. |
 
-Hydra requires interception at arbitrary guest instruction boundaries and at arbitrary original function addresses. Current `simx86` builds translated instruction sequences and executes them as blocks. A normal plugin callback therefore cannot simply run between every guest instruction while retaining normal block-JIT behavior.
+## 1. Integration model: likely hybrid integration
 
-Likely options are:
+A pure out-of-band plugin is insufficient because `simx86` translates and executes multi-instruction blocks. However, the minimal integration mechanism is not yet established.
 
-- a deliberate single-step / one-instruction-block mode; or
-- instrumentation generated into translated code so each architectural instruction can call the Hydra boundary hook.
+Candidate approaches include:
 
-Either approach implies some `simx86` core integration.
+- a direct core callback at an architectural instruction boundary;
+- forcing a single-instruction / one-block stepping mode;
+- generating Hydra instrumentation into translated blocks; or
+- another existing `simx86` facility discovered during prototype work.
 
-### 2. Lockstep validation and JIT throughput are different workloads
+Phase 0 must determine the smallest patch surface that provides the required semantics. The project should not commit to a particular `interp.c` hook or instrumentation strategy before that experiment succeeds.
+
+## 2. Workload separation and performance qualification
+
+Two workloads must be measured independently.
+
+### Normal Hydra hybrid execution
+
+`simx86` may retain translated block execution between native/decompiled and emulated boundaries, so it may provide substantial speedups over interpreted execution. This must be benchmarked on representative DOS binaries rather than inferred from raw simulator throughput.
+
+### `emu86_validator` differential testing
 
 Strict differential validation is effectively:
 
 1. execute one guest instruction;
-2. expose/register state;
+2. expose architectural state;
 3. synchronize with the peer emulator;
 4. compare state;
 5. repeat.
 
-That execution pattern removes much of the benefit of normal multi-instruction JIT blocks. Performance claims for normal Hydra execution must therefore be separated from performance claims for lockstep validation.
+This pattern fragments normal JIT block execution and introduces synchronization overhead. The original 10–50x validator-speedup estimate is therefore not established and should not be used as a planning assumption.
 
-The proposed 10–50x validator speedup should not be treated as established until benchmarked.
+## 3. Low-memory backing: investigate `lowmem_base` first
 
-### 3. Reuse dosemu2's low-memory backing before replacing allocation
+Before introducing an independent `/dev/shm/dosemu_mem` allocation, investigate whether dosemu2's existing `lowmem_base` backing can be exported to the external validator.
 
-Current dosemu2 already maintains a shared low-memory image (`lowmem_base`) for the simulator. The first memory experiment should determine whether its existing backing object can be exported to the external validator.
+The memory investigation must determine whether the validator needs:
 
-This is preferable to adding an unrelated second `/dev/shm/dosemu_mem` allocation.
+- the simulator's low-memory image exposed through `lowmem_base`;
+- logical DOS memory semantics through `MEM_BASE32(addr)` or related accessors; or
+- a deliberately defined combination of the two.
 
-Also, `MEM_BASE32(addr)` and `lowmem_base + addr` should not be assumed to have identical semantics. The former represents the logical DOS memory mapping, while the latter is used as the simulator's low-memory image.
+Do not assume `MEM_BASE32(addr)` and `lowmem_base + addr` are interchangeable. Their semantics can differ around logical mappings, holes, video memory, and protection behavior.
 
-### 4. REP handling depends on the stepping contract
+This memory validation follows the CPU-control architectural gate and should be treated as its own experiment rather than silently folded into Phase 0.
 
-The primary question is not whether REP MOVS/STOS needs a special callback placement. The architectural contract must first define whether a REP-prefixed instruction is observed as one guest instruction or whether individual iterations are externally visible.
+## 4. REP stepping contract
 
-Once single-step semantics are specified, REP behavior should be tested against that contract.
+The primary issue is the validator's architectural stepping contract, not callback placement for string operations in isolation.
 
-### 5. coopth / HLT facilities do not replace arbitrary CS:IP interception
+Phase 0 must formally define and test whether a REP-prefixed instruction such as `REP MOVS` or `REP STOS` is observed as:
 
-Dosemu2 cooperative threading and HLT handlers may be useful for control transfers or asynchronous services, but they do not inherently provide a hook when existing guest execution reaches an arbitrary original function address.
+- one guest instruction whose internal repetitions complete before the next architectural boundary; or
+- a sequence in which individual repetitions are externally observable.
 
-They should therefore be considered supporting facilities, not substitutes for the CPU hook.
+The intended contract must then be checked against both `emu86` and `simx86`. Until that source-level verification is recorded, REP atomicity should remain a tested hypothesis rather than a settled compatibility claim.
 
-### 6. Register updates must account for translated simulator state
+## 5. coopth and HLT do not replace arbitrary `CS:IP` interception
 
-Assigning `_AX`, `_IP`, `_CS`, etc. is not by itself proof that execution can safely continue after Hydra redirects control flow. `simx86` also maintains translated execution state and segment-derived state.
+Dosemu2 cooperative threading and HLT handlers may be useful supporting facilities for control transfers, asynchronous services, or implementation structure. They do not by themselves provide a callback when existing guest execution reaches an arbitrary original function address.
 
-After Hydra modifies control flow, the integration may need to:
+Hydra therefore still requires an execution-address interception mechanism at the CPU boundary.
 
-- leave the current translated block;
-- avoid or invalidate stale translated state;
-- recompute segment bases/state through the normal synchronization path;
-- re-enter execution cleanly.
+## 6. Control redirection and translated simulator state
 
-This is one of the first behaviors the prototype must prove.
+Assigning `_AX`, `_IP`, `_CS`, or other register macros is not by itself proof that execution can safely continue after Hydra redirects control flow with operations such as `RETURN_FAR` or `RETURN_JUMP`.
 
-## What remains sound
+The architectural requirement is to:
 
-The high-level Hydra model remains a good fit for the migration:
+- leave or terminate the currently active translated execution path when necessary;
+- avoid or invalidate translated state that is no longer valid;
+- resynchronize segment-derived and CPU state through the appropriate simulator path; and
+- resume execution at the redirected architectural state without stale execution artifacts.
 
-- native/decompiled functions are selected by original x86-16 address;
-- native code can inspect and modify guest registers and memory;
-- native code can call back into x86-16 execution;
-- differential validation still benefits from a separately observable emulator state.
+Phase 0 must establish the exact `simx86` mechanism and API. It should not assume that a specific helper such as `leave_block()` or global translation-cache invalidation is required until demonstrated.
 
-The dosemu2 `mmap_min_addr`/non-zero-base model also reinforces the requirement to use dosemu2's memory abstraction instead of assuming identity-mapped low memory.
+## Phase 0: architectural gate
 
-## Revised first milestone
+Before implementing the full Hydra ABI, validator transport, or memory-sharing design, prove the following with a minimal `simx86` experiment:
 
-Before implementing the full shared-memory protocol or Hydra ABI, build a minimal simulator experiment that proves all of the following:
+1. Step exactly one guest instruction.
+2. Extract complete architectural state: general registers, segment registers, `CS:IP`, and FLAGS.
+3. Mutate `CS:IP` and register state externally.
+4. Escape any active translated execution state that is no longer valid and resynchronize CPU/segment state cleanly.
+5. Resume execution and compare the resulting architectural state against a known-good execution path, proving that state manipulation does not violate x86 architectural semantics.
+6. Verify deterministic behavior for CALL, RET, RETF, INT, instruction prefixes, and REP-prefixed string operations.
 
-1. exactly one guest instruction can be executed;
-2. complete architectural state can be read at that boundary;
-3. `CS:IP` can be modified externally;
-4. execution resumes at the new target without stale translated state;
-5. CALL, RET, RETF, interrupts, prefixes and REP behave deterministically.
+Passing this gate establishes that Hydra-style interception is technically sound on `simx86` and reveals the minimal core patch surface. Failing it still produces a useful result: the simulator integration requirements become concrete before substantial validator or plugin code is written.
 
-If this milestone succeeds, the rest of the port becomes a tractable integration exercise. If it fails, the required simulator patch surface will be clearer before significant validator/plugin code is written.
+## Follow-on sequence
+
+After Phase 0 succeeds:
+
+1. define the dosemu2-side register snapshot ABI;
+2. investigate/export the appropriate low-memory backing and validate its semantics;
+3. implement `/dev/shm/hydra_remote` synchronization;
+4. adapt `emu86_validator` to launch and drive dosemu2;
+5. validate a small differential corpus;
+6. implement Hydra address interception and native-function execution;
+7. validate overlays and other edge cases;
+8. benchmark normal Hydra execution and lockstep validation separately;
+9. decide the final boundary between the isolated `simx86` patch and the surrounding Hydra module.
+
+The migration should proceed from verified CPU semantics rather than early implementation assumptions.
