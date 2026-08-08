@@ -9,11 +9,7 @@ use super::shmmem::ShmMem;
 use crate::segoff::SegOff;
 use crate::{shmdata_read, shmdata_write};
 use std::path::Path;
-
-use std::sync::atomic::{fence, Ordering};
-fn mem_barrier() {
-  fence(Ordering::SeqCst);
-}
+use std::sync::atomic::Ordering;
 
 pub struct HydraProcess {
   hydra: Child,
@@ -43,12 +39,14 @@ impl HydraProcess {
       .stdout(Stdio::null())
       .stderr(Stdio::null())
       .spawn()
-      .map_err(|_| format!("Failed to execute"))?;
+      .map_err(|e| format!("Failed to execute DOSBox-X: {}", e))?;
 
     std::thread::sleep(std::time::Duration::from_millis(1000));
 
-    let data = ShmData::attach("/dev/shm/hydra_remote").unwrap();
-    let mem = ShmMem::attach("/dev/shm/dosbox_mem").unwrap();
+    let data = ShmData::attach("/dev/shm/hydra_remote")
+      .map_err(|e| format!("Failed to attach hydra_remote shared memory: {}", e))?;
+    let mem = ShmMem::attach("/dev/shm/dosbox_mem")
+      .map_err(|e| format!("Failed to attach dosbox_mem shared memory: {}", e))?;
 
     let mut this = HydraProcess {
       hydra,
@@ -64,10 +62,8 @@ impl HydraProcess {
   }
 
   fn wait_for_init(&mut self) {
-    loop {
-      mem_barrier();
-      let init = shmdata_read!(self.data, init);
-      if init != 0 { break };
+    while self.data.load_init(Ordering::Acquire) == 0 {
+      std::hint::spin_loop();
     }
   }
 
@@ -112,26 +108,25 @@ impl HydraProcess {
   pub fn step(&mut self) {
     self.wait_for_init();
 
-    let ack = shmdata_read!(self.data, ack);
-    let next_ack = ack + 1;
+    let ack = self.data.load_ack(Ordering::Acquire);
+    let next_ack = ack.wrapping_add(1);
 
-    mem_barrier();
-    shmdata_write!(self.data, req, next_ack);
-    mem_barrier();
+    // Publish any register changes before making the request visible to Hydra.
+    self.data.store_req(next_ack, Ordering::Release);
 
-    loop {
-      if next_ack == shmdata_read!(self.data, ack) {
-        break;
-      }
+    while next_ack != self.data.load_ack(Ordering::Acquire) {
+      std::hint::spin_loop();
     }
 
+    // The acquire load above synchronizes with Hydra's release store to ack,
+    // making the newly published register snapshot visible here.
     self.read_cpu_state()
   }
 }
 
 impl Drop for HydraProcess {
   fn drop(&mut self) {
-    shmdata_write!(self.data, end, 1);
+    self.data.store_end(1, Ordering::Release);
     let _ = self.hydra.kill();
   }
 }
@@ -149,7 +144,8 @@ impl Emu for HydraProcess {
     self.last_cpu_state.clone()
   }
   fn instr_addr(&self) -> SegOff {
-    mem_barrier();
+    // Synchronize with the most recent register snapshot published by Hydra.
+    let _ = self.data.load_ack(Ordering::Acquire);
     let cs = shmdata_read!(self.data, cs);
     let ip = shmdata_read!(self.data, ip);
     SegOff::new(cs, ip)
