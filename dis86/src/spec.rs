@@ -9,11 +9,9 @@ pub struct Spec<'a> {
 }
 
 impl<'a> Spec<'a> {
-  pub fn from_config_name(cfg: &'a Config, name: &str) -> Self {
-    let Some(func) = cfg.func_lookup_by_name(name) else {
-      panic!("Failed to lookup function named: {}", name);
-    };
-    Self::from_func(func)
+  pub fn from_config_name(cfg: &'a Config, name: &str) -> Option<Self> {
+    let func = cfg.func_lookup_by_name(name)?;
+    Some(Self::from_func(func))
   }
 
   pub fn from_func(func: &'a Func) -> Self {
