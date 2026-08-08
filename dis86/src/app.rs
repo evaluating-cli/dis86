@@ -187,25 +187,36 @@ pub fn run() -> i32 {
 
   let specs =
     if let Some(name) = &args.name {
-      vec![spec::Spec::from_config_name(&cfg, name)]
+      match spec::Spec::from_config_name(&cfg, name) {
+        Some(spec) => vec![spec],
+        None => {
+          eprintln!("Error: Failed to lookup function named: {}", name);
+          return 1;
+        }
+      }
     } else if let Some(name) = &args.codeseg_name {
       spec::specs_from_codeseg_name(&cfg, name)
     } else {
       vec![spec::Spec::from_start_and_end(args.start_addr, args.end_addr)]
     };
 
+  let mut all_code = String::new();
   for spec in specs {
-    let ret = decompile_spec(&args, &cfg, &binary, spec);
+    let ret = decompile_spec(&args, &cfg, &binary, spec, &mut all_code);
     if ret != 0 {
       eprintln!("Error: Failed to decompile.");
       return ret;
     }
   }
 
+  if let Some(path) = args.emit_code.as_ref() {
+    write_to_path(path, &all_code);
+  }
+
   0
 }
 
-fn decompile_spec(args: &Args, cfg: &Config, binary: &Binary, spec: Spec<'_>) -> i32 {
+fn decompile_spec(args: &Args, cfg: &Config, binary: &Binary, spec: Spec<'_>, all_code: &mut String) -> i32 {
   let region = binary.region_iter(spec.start, spec.end);
   let decoder = Decoder::new(region);
   let mut instr_list = vec![];
@@ -293,10 +304,11 @@ fn decompile_spec(args: &Args, cfg: &Config, binary: &Binary, spec: Spec<'_>) ->
     return 0;
   }
 
-  if let Some(path) = args.emit_code.as_ref() {
+  if args.emit_code.is_some() {
     let flavor = if args.codegen_hydra { gen::Flavor::Hydra } else { gen::Flavor::Standard };
     let code = gen::generate(&ast, flavor).unwrap();
-    write_to_path(path, &code);
+    all_code.push_str(&code);
+    all_code.push('\n');
     return 0;
   }
 
