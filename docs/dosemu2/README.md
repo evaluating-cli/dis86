@@ -1,69 +1,96 @@
 # Porting dis86 / Hydra to dosemu2
 
-This directory tracks the investigation and implementation plan for replacing the patched DosBox-X execution backend used by Hydra and the `emu86` differential validator with `dosemu2`.
+This directory tracks the investigation, architectural design, and implementation plan for replacing the patched DosBox-X execution backend used by Hydra and the `emu86` differential validator with `dosemu2`.
 
-## Current conclusion
+---
 
-The migration appears technically viable, but the initial idea of implementing it as a pure `dosemu2` plugin is too optimistic. Hydra needs control at guest instruction boundaries and arbitrary `CS:IP` interception. Current `simx86` executes translated multi-instruction blocks, so the likely design is:
+## Architectural Hypotheses
 
-1. a small, isolated `simx86` instrumentation patch that provides deterministic instruction-boundary control;
-2. a Hydra integration module around that CPU hook;
-3. reuse/export of dosemu2's existing low-memory shared backing where possible;
-4. adaptation of `dis86`'s validator/process tooling to the new backend.
+The porting investigation identifies the following key architectural hypotheses that guide the implementation:
 
-## Recommended implementation order
+### 1. Integration Model: *Likely Hybrid Integration*
+A pure out-of-band plugin is unlikely to be sufficient because `simx86` translates and executes multi-instruction blocks. Hydra requires control at guest instruction boundaries and arbitrary `CS:IP` interception. Whether the minimal solution is a core callback, a single-instruction block mode, or instrumentation generated into translated code is an open question that Phase 0 must determine.
 
-### Phase 0 — prove CPU control semantics
+### 2. Workload Separation & Performance Qualification
+* **Normal Hydra Hybrid Execution:** `simx86` can retain block execution across native C and emulated boundaries and therefore **may** provide substantial speedups over interpreted execution; this must be benchmarked separately against concrete binary workloads.
+* **`emu86_validator` Differential Testing:** Strict one-instruction lockstep validation (`[1 step -> state snapshot -> IPC sync -> wait for peer]`) removes the benefit of multi-instruction JIT blocks. Performance claims for lockstep validation must be measured independently rather than assuming JIT acceleration.
 
-Before designing the full integration:
+### 3. Memory Subsystem: *Investigate `lowmem_base` First*
+`dosemu2` already maintains a shared low-memory image (`lowmem_base`) for the simulator. The initial memory investigation will evaluate whether its existing backing object can be exported directly to the external validator rather than adding an unrelated second `/dev/shm/dosemu_mem` allocation. Note that `MEM_BASE32(addr)` (logical DOS mapping) and `lowmem_base + addr` (simulator low-memory image) have distinct semantics.
 
-- stop execution after exactly one guest instruction;
-- extract `CS:IP`, FLAGS and all general/segment registers;
-- alter `CS:IP` externally and resume safely;
-- verify translated-state invalidation/re-entry behavior;
-- test CALL/RET/RETF, interrupts, prefixes and REP string operations.
+### 4. REP Stepping Contract
+The validator stepping contract for `REP`-prefixed string instructions (`REP MOVS`, `REP STOS`) must be explicitly defined and tested. Phase 0 must determine whether the validator contract should treat `REP` as a single atomic architectural step or expose individual loop iterations.
 
-This is the architectural gate. A plugin API is not useful unless the CPU backend can provide the required execution semantics.
+### 5. Escaping Stale Translated State on Control Redirection
+When Hydra intercepts a function and alters control flow (`RETURN_FAR`, `RETURN_JUMP`), assigning `_AX`, `_IP`, `_CS` is not sufficient on its own. `simx86` maintains translated execution state and segment-derived state. The integration must escape the current translated block, avoid or invalidate stale cached translation, and recompute segment bases/state through the normal synchronization path before re-entering execution.
 
-### Phase 1 — validator transport
+---
 
-- define the dosemu2-side register snapshot ABI;
-- implement `/dev/shm/hydra_remote` synchronization;
-- adapt `src/emu86/validator/hydra_process.rs` to launch dosemu2;
-- validate a small instruction corpus before optimizing anything.
+## Implementation Roadmap
 
-### Phase 2 — memory sharing
+```
+┌────────────────────────────────────────────────────────────────────────────┐
+│                    Phase 0: Minimal Simulator Gate                         │
+├────────────────────────────────────────────────────────────────────────────┤
+│ 1. Step exactly ONE guest instruction in simx86.                           │
+│ 2. Extract full architectural state (AX..FLAGS, CS:IP, Segments).          │
+│ 3. Mutate CS:IP / register state externally.                               │
+│ 4. Escape active translation cache and resynchronize CPU/segment state.    │
+│ 5. Resume execution and compare the resulting architectural state against  │
+│    a known-good execution path to prove x86 semantic correctness.          │
+│ 6. Verify deterministic behavior for CALL, RET, RETF, INT, prefixes, REP.  │
+└────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌────────────────────────────────────────────────────────────────────────────┐
+│                    Phase 1: Validator Transport & IPC                      │
+├────────────────────────────────────────────────────────────────────────────┤
+│ • Define the dosemu2-side register snapshot ABI.                           │
+│ • Implement /dev/shm/hydra_remote synchronization protocol.                │
+│ • Adapt src/emu86/validator/hydra_process.rs to spawn dosemu2.             │
+│ • Validate lockstep execution against a small instruction corpus.          │
+└────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌────────────────────────────────────────────────────────────────────────────┐
+│                    Phase 2: Low-Memory Export & Sharing                    │
+├────────────────────────────────────────────────────────────────────────────┤
+│ • Investigate exporting lowmem_base backing directly to the validator.     │
+│ • Validate memory read/write consistency against logical DOS mappings.     │
+└────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌────────────────────────────────────────────────────────────────────────────┐
+│                    Phase 3: Hydra Hybrid Execution Hooks                   │
+├────────────────────────────────────────────────────────────────────────────┤
+│ • Intercept registered Hydra function addresses at CS:IP dispatch.         │
+│ • Transfer guest register state into Hydra C runtime.                      │
+│ • Execute native/decompiled C functions and handle return types.           │
+│ • Ensure clean exit from translated blocks on Hydra-directed jumps.        │
+└────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌────────────────────────────────────────────────────────────────────────────┐
+│                    Phase 4: Overlays & Edge Cases                          │
+├────────────────────────────────────────────────────────────────────────────┤
+│ • Validate INT 3Fh dynamic overlay segment remapping.                      │
+│ • Calibrate FLAGS comparison masks against simx86 behavior.                │
+│ • Verify dynamic code-load offsets (CODE_START_SEG).                       │
+└────────────────────────────────────────────────────────────────────────────┘
+                                      │
+                                      ▼
+┌────────────────────────────────────────────────────────────────────────────┐
+│                    Phase 5: Benchmark & CI Automation                      │
+├────────────────────────────────────────────────────────────────────────────┤
+│ • Benchmark normal Hydra hybrid execution vs. DosBox-X baseline.           │
+│ • Benchmark strict lockstep validator throughput separately.               │
+│ • Configure headless batch execution for Docker / CI pipelines.            │
+└────────────────────────────────────────────────────────────────────────────┘
+```
 
-Current dosemu2 already maintains a shared low-memory image (`lowmem_base`) for simx86. Investigate exporting that existing backing object to the validator rather than introducing a second independent mapping.
+---
 
-Do not assume `MEM_BASE32(addr)` and `lowmem_base + addr` are interchangeable; their semantics differ around logical DOS mappings and protected/video-memory regions.
+## Repository Split
 
-### Phase 3 — Hydra execution hooks
-
-Once precise instruction control works:
-
-- intercept registered Hydra function addresses;
-- transfer guest register state into Hydra;
-- run the native/decompiled function;
-- handle Hydra result types (near/far return, call, jump, resume);
-- force a safe exit from the current translated block whenever Hydra changes control flow.
-
-### Phase 4 — overlays and edge cases
-
-- validate INT 3Fh overlay behavior;
-- define whether REP is one architectural step or exposes iterations to the validator;
-- calibrate FLAGS comparison masks against simx86 behavior;
-- verify dynamic code-load offsets.
-
-### Phase 5 — benchmark and CI
-
-Benchmark two workloads separately:
-
-- normal Hydra hybrid execution, where JIT execution can provide a substantial benefit;
-- strict instruction-lockstep validation, where synchronization and forced stepping may dominate runtime.
-
-Do not assume the original 10–50x validation speedup until measured.
-
-## Expected repository split
-
-This fork should contain the `dis86`-side validator/tooling changes. Any required simx86 instrumentation belongs in a coordinated `dosemu2` fork rather than being vendored into this repository.
+- **`dis86` repository (this fork)**: Contains `dis86`-side validator updates, `hydra_process.rs` process management, tooling scripts (`run.py`), and documentation.
+- **`dosemu2` repository**: Contains any required `simx86` instrumentation patches, shared memory export, and the Hydra plugin integration.
