@@ -36,5 +36,10 @@ struct shmdata
   // TODO...
 };
 
+_Static_assert(offsetof(shmdata_t, req) == 16, "shmdata.req ABI offset changed");
+_Static_assert(offsetof(shmdata_t, ack) == 24, "shmdata.ack ABI offset changed");
+_Static_assert(offsetof(shmdata_t, ax) == 32, "shmdata register ABI offset changed");
+_Static_assert(sizeof(shmdata_t) == 64, "shmdata ABI size changed");
+
 shmdata_t *shmdata_create(const char *path);
 shmdata_t *shmdata_attach(const char *path);
