@@ -120,6 +120,17 @@ impl ShmData {
       return Err(last_os_error("open"));
     }
 
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut stat) } < 0 {
+      let err = last_os_error("fstat");
+      unsafe { libc::close(fd); }
+      return Err(err);
+    }
+    if stat.st_size < size as libc::off_t {
+      unsafe { libc::close(fd); }
+      return Err(format!("shared memory is not ready: {} bytes, need {}", stat.st_size, size));
+    }
+
     let addr = unsafe {
       libc::mmap(
         ptr::null_mut(),
