@@ -59,6 +59,17 @@ impl HydraProcess {
     }
   }
 
+  fn kill_on_startup_error<T>(hydra: &mut Child, result: Result<T, String>) -> Result<T, String> {
+    match result {
+      Ok(value) => Ok(value),
+      Err(e) => {
+        let _ = hydra.kill();
+        let _ = hydra.wait();
+        Err(e)
+      }
+    }
+  }
+
   pub fn spawn(exe_path: &str) -> Result<HydraProcess, String> {
     let current_exe = std::env::current_exe().unwrap();
     let dir = current_exe.parent().unwrap().parent().unwrap().parent().unwrap().parent().unwrap();
@@ -85,12 +96,15 @@ impl HydraProcess {
       .spawn()
       .map_err(|e| format!("Failed to execute DOSBox-X: {}", e))?;
 
-    let data = Self::wait_for_mapping(&mut hydra, "hydra_remote shared memory", || {
+    let data_result = Self::wait_for_mapping(&mut hydra, "hydra_remote shared memory", || {
       ShmData::attach(HYDRA_SHM_PATH)
-    })?;
-    let mem = Self::wait_for_mapping(&mut hydra, "dosbox_mem shared memory", || {
+    });
+    let data = Self::kill_on_startup_error(&mut hydra, data_result)?;
+
+    let mem_result = Self::wait_for_mapping(&mut hydra, "dosbox_mem shared memory", || {
       ShmMem::attach(DOSBOX_MEM_PATH)
-    })?;
+    });
+    let mem = Self::kill_on_startup_error(&mut hydra, mem_result)?;
 
     let mut this = HydraProcess {
       hydra,
