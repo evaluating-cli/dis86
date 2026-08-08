@@ -10,9 +10,9 @@ use crate::segoff::SegOff;
 use crate::{shmdata_read, shmdata_write};
 use std::path::Path;
 
-use std::arch::asm;
+use std::sync::atomic::{fence, Ordering};
 fn mem_barrier() {
-  unsafe { asm!("dsb sy", options(nostack, preserves_flags)) };
+  fence(Ordering::SeqCst);
 }
 
 pub struct HydraProcess {
@@ -37,7 +37,7 @@ impl HydraProcess {
         "-hydra-conf", "normal",
         "-c", &format!("mount d {}", exe.parent().unwrap().display()),
         "-c", "D:",
-        "-c", &format!("{}", exe.file_name().unwrap().display()),
+        "-c", &format!("{}", exe.file_name().unwrap().to_string_lossy()),
         "-c", "exit"
       ])
       .stdout(Stdio::null())
