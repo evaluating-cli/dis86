@@ -1,13 +1,17 @@
 use std::ffi::CString;
 use std::ptr;
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 //// IMPORTANT!! THIS MUST MATCH THE STRUCT DEFINED IN hydra/src/remote/shmdata.h
-#[repr(C, packed)]
+// Keep the control fields naturally aligned: req/ack are accessed atomically on
+// both sides of the shared-memory ABI and AtomicU64 requires 8-byte alignment.
+#[repr(C)]
 #[derive(Debug)]
 pub struct ShmDataRaw {
   pub init: u32,
   pub end: u32,
   pub pid: u32,
+  pub reserved0: u32,
   pub req: u64,  // request step by incrementing
   pub ack: u64,  // ack step by matching 'req' value
 
@@ -31,6 +35,12 @@ pub struct ShmDataRaw {
   // TODO...
 }
 
+// Keep the Rust side pinned to the C ABI in hydra/src/remote/shmdata.h.
+static_assertions::const_assert_eq!(std::mem::size_of::<ShmDataRaw>(), 64);
+static_assertions::const_assert_eq!(std::mem::align_of::<ShmDataRaw>(), 8);
+
+// These macros are for snapshot payload fields only. Synchronization/control
+// fields (init/end/req/ack) must use the atomic accessors on ShmData.
 #[macro_export]
 macro_rules! shmdata_read {
   ($dat:expr, $field:ident) => {
@@ -57,7 +67,52 @@ pub struct ShmData {
 
 impl ShmData {
   fn size() -> usize {
-    (std::mem::size_of::<ShmData>() + 4095) & !4095
+    (std::mem::size_of::<ShmDataRaw>() + 4095) & !4095
+  }
+
+  fn load_u32(&self, ptr: *mut u32, ordering: Ordering) -> u32 {
+    debug_assert_eq!((ptr as usize) % std::mem::align_of::<AtomicU32>(), 0);
+    unsafe { (&*(ptr as *const AtomicU32)).load(ordering) }
+  }
+
+  fn store_u32(&self, ptr: *mut u32, value: u32, ordering: Ordering) {
+    debug_assert_eq!((ptr as usize) % std::mem::align_of::<AtomicU32>(), 0);
+    unsafe { (&*(ptr as *const AtomicU32)).store(value, ordering) }
+  }
+
+  fn load_u64(&self, ptr: *mut u64, ordering: Ordering) -> u64 {
+    debug_assert_eq!((ptr as usize) % std::mem::align_of::<AtomicU64>(), 0);
+    unsafe { (&*(ptr as *const AtomicU64)).load(ordering) }
+  }
+
+  fn store_u64(&self, ptr: *mut u64, value: u64, ordering: Ordering) {
+    debug_assert_eq!((ptr as usize) % std::mem::align_of::<AtomicU64>(), 0);
+    unsafe { (&*(ptr as *const AtomicU64)).store(value, ordering) }
+  }
+
+  pub fn load_init(&self, ordering: Ordering) -> u32 {
+    let ptr = unsafe { std::ptr::addr_of_mut!((*self.raw).init) };
+    self.load_u32(ptr, ordering)
+  }
+
+  pub fn store_end(&self, value: u32, ordering: Ordering) {
+    let ptr = unsafe { std::ptr::addr_of_mut!((*self.raw).end) };
+    self.store_u32(ptr, value, ordering);
+  }
+
+  pub fn load_req(&self, ordering: Ordering) -> u64 {
+    let ptr = unsafe { std::ptr::addr_of_mut!((*self.raw).req) };
+    self.load_u64(ptr, ordering)
+  }
+
+  pub fn store_req(&self, value: u64, ordering: Ordering) {
+    let ptr = unsafe { std::ptr::addr_of_mut!((*self.raw).req) };
+    self.store_u64(ptr, value, ordering);
+  }
+
+  pub fn load_ack(&self, ordering: Ordering) -> u64 {
+    let ptr = unsafe { std::ptr::addr_of_mut!((*self.raw).ack) };
+    self.load_u64(ptr, ordering)
   }
 
   pub fn attach(path: &str) -> Result<Self, String> {
@@ -67,6 +122,17 @@ impl ShmData {
     let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDWR, 0o600u32) };
     if fd < 0 {
       return Err(last_os_error("open"));
+    }
+
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &mut stat) } < 0 {
+      let err = last_os_error("fstat");
+      unsafe { libc::close(fd); }
+      return Err(err);
+    }
+    if stat.st_size < size as libc::off_t {
+      unsafe { libc::close(fd); }
+      return Err(format!("shared memory is not ready: {} bytes, need {}", stat.st_size, size));
     }
 
     let addr = unsafe {

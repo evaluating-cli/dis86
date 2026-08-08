@@ -14,7 +14,7 @@ shmdata_t *shmdata_create(const char *path)
   int fd = open(path, O_RDWR | O_CREAT | O_TRUNC, 0600);
   if (fd < 0) {
     perror("open");
-    return  NULL;
+    return NULL;
   }
 
   if (ftruncate(fd, (off_t)size) < 0) {
@@ -53,5 +53,6 @@ shmdata_t *shmdata_attach(const char *path)
     return NULL;
   }
 
+  close(fd);
   return (shmdata_t*)addr;
 }

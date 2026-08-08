@@ -38,6 +38,16 @@ Assuming you have rust and cargo installed:
 just build
 ```
 
+For the host-independent test suite used by pull requests (no DosBox-X or SDL
+required), install `just` and run:
+
+```
+just check
+```
+
+See [`docs/dosemu2/TESTING.md`](docs/dosemu2/TESTING.md) for the dosemu2
+migration testing strategy and the optional interactive `emu86` build.
+
 ## Some Commands
 
 Emit Disassembly:

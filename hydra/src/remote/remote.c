@@ -3,24 +3,24 @@
 
 enum {
   STATE_INIT,
-  STATE_INIT2,
   STATE_WAIT,
   STATE_RUN,
 };
 
 static shmdata_t * shm;
 static int         state = STATE_INIT;
-static addr_t      last_addr;
 
 void remote_init(void)
 {
   shm = shmdata_create("/dev/shm/hydra_remote");
   if (!shm) FAIL("Failed to create shmdata");
 
-  shm->init = 0;
+  __atomic_store_n(&shm->init, 0, __ATOMIC_RELAXED);
+  __atomic_store_n(&shm->end, 0, __ATOMIC_RELAXED);
   shm->pid = getpid();
-  shm->req = 0;
-  shm->ack = 1;
+  shm->reserved0 = 0;
+  __atomic_store_n(&shm->req, 0, __ATOMIC_RELAXED);
+  __atomic_store_n(&shm->ack, 0, __ATOMIC_RELAXED);
 
   printf("waiting for init\n");
 }
@@ -45,7 +45,8 @@ void update_shmdata_from_hydra(hydra_machine_t *m)
 
 void update_hydra_from_shmdata(hydra_machine_t *m)
 {
-  // Copy over register values
+  // Copy over register values. The caller must first acquire req so these
+  // ordinary shared-memory reads observe the validator's published snapshot.
   m->registers->ax    = shm->ax;
   m->registers->bx    = shm->bx;
   m->registers->cx    = shm->cx;
@@ -86,37 +87,31 @@ void remote_step_hook(hydra_machine_t *m)
 {
   u16 cs = m->registers->cs;
   u16 ip = m->registers->ip;
-  addr_t addr = ADDR_MAKE(cs, ip);
 
   if (cs < 0x823) return;
   if (cs & 0x8000) return;
-  if (addr_equal(last_addr, addr)) return;
-  last_addr = addr;
 
   while (1) {
     switch (state) {
-      /* case STATE_INIT: { */
-      /*   if (!(cs == 0x823 && ip == 0)) return; */
-      /*   state = STATE_INIT2; */
-      /*   return; */
-      /* } break; */
       case STATE_INIT: {
         if (!(cs == 0x823 && ip == 0)) return;
         //printf("init\n");
         post_init_state(m);
         update_shmdata_from_hydra(m);
-        BARRIER();
-        shm->init = 1;
-        BARRIER();
+        // Publish the complete initial register snapshot.
+        __atomic_store_n(&shm->init, 1, __ATOMIC_RELEASE);
         state = STATE_WAIT;
       } break;
       case STATE_WAIT: {
         //printf("wait\n");
         while (1) {
-          BARRIER();
-          u64 req = shm->req;
-          u64 ack = shm->ack;
-          if (req <= ack) continue;
+          if (__atomic_load_n(&shm->end, __ATOMIC_ACQUIRE)) return;
+
+          // Acquire pairs with the validator's release store to req, so the
+          // register writes performed before the request are visible below.
+          u64 req = __atomic_load_n(&shm->req, __ATOMIC_ACQUIRE);
+          u64 ack = __atomic_load_n(&shm->ack, __ATOMIC_RELAXED);
+          if (req == ack) continue;
           //printf("run %04x:%04x\n", cs, ip);
           update_hydra_from_shmdata(m);
           state = STATE_RUN;
@@ -126,10 +121,10 @@ void remote_step_hook(hydra_machine_t *m)
       case STATE_RUN: {
         //printf("run\n");
         update_shmdata_from_hydra(m);
-        BARRIER();
-        shm->ack = shm->req;
-        BARRIER();
-       state = STATE_WAIT;
+        u64 req = __atomic_load_n(&shm->req, __ATOMIC_RELAXED);
+        // Publish the completed register snapshot to the validator.
+        __atomic_store_n(&shm->ack, req, __ATOMIC_RELEASE);
+        state = STATE_WAIT;
       } break;
     }
   }
