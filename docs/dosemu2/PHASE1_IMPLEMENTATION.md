@@ -350,16 +350,16 @@ It must remain unchanged.
 
 Current full-sim dosemu2 otherwise selects `softmmu`, whose `alloc_mapping_softmmu()` uses anonymous memory.
 
-`DosemuProcess::spawn()` must select the existing `mapshm` backend for the child:
+Dosemu2's configuration script reads the `$_mapping` variable and passes its value to the `mappingdriver` command. The documented `-I string` interface supplies additional configuration statements on the command line. `DosemuProcess::spawn()` should therefore select the existing POSIX-SHM backend through that verified configuration interface rather than relying on an inferred environment-variable spelling:
 
 ```rust
 Command::new(&dosemu_bin)
-    .env("dosemu__mapping", "mapshm")
+    .args(["-I", "$_mapping = \"mapshm\""])
     .env("DIIS_DOSEMU_VALIDATOR", "1")
     // entry metadata ...
 ```
 
-`mapshm` is the current mapping-driver key for the POSIX-SHM backend.
+Equivalent configuration-file injection of `$_mapping = "mapshm"` is also valid. `mapshm` is the current mapping-driver key for the POSIX-SHM backend. The implementation must verify from dosemu2's resulting runtime configuration that `mappingdriver mapshm` was selected before low-memory allocation.
 
 ### 8.3 Special-case only `MAPPING_LOWMEM`
 
@@ -441,13 +441,13 @@ The patched dosemu2 core owns the new hook directly. The launch becomes conceptu
 ```rust
 let mut cmd = Command::new(&dosemu_bin);
 cmd.args(["-dumb", "-quiet", "-K", test_dir, "-E", test_exe]);
-cmd.env("dosemu__mapping", "mapshm");
+cmd.args(["-I", "$_mapping = \"mapshm\""]);
 cmd.env("DIIS_DOSEMU_VALIDATOR", "1");
 cmd.env("DIIS_DOSEMU_MZ_CS", format!("{}", mz.hdr.cs));
 cmd.env("DIIS_DOSEMU_MZ_IP", format!("{}", mz.hdr.ip));
 ```
 
-The exact environment-variable spelling is implementation-local. Their semantics are not optional.
+`$_mapping = "mapshm"` uses dosemu2's verified configuration interface. The `DIIS_DOSEMU_*` variables are implementation-local metadata for the new validator hook; their exact names may change, but their semantics are required.
 
 ---
 
@@ -530,7 +530,7 @@ Before Phase 1 can be called implemented, verify all of the following against a 
 - [ ] REP string instructions normalize correctly;
 - [ ] `STI`, `MOV SS`, and `POP SS` normalize to a two-instruction comparison span when simx86 combines them;
 - [ ] `end` executes zero additional guest instructions;
-- [ ] validator mode selects `mapshm` rather than anonymous `softmmu`;
+- [ ] validator mode selects `mapshm` through the verified `$_mapping` configuration path rather than anonymous `softmmu`;
 - [ ] `/dev/shm/dosemu_mem` and `lowmem_base` observe identical writes in both directions;
 - [ ] a second live validator cannot truncate the first mapping;
 - [ ] generic mapping allocations remain distinct from `/dosemu_mem`;
