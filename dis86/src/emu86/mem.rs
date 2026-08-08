@@ -22,7 +22,7 @@ impl Memory {
 
   pub fn asciiz(&self, addr: SegOff) -> &str {
     let slice = self.slice_starting_at(addr);
-    let cstr = unsafe { std::ffi::CStr::from_ptr(slice.as_ptr()) };
+    let cstr = unsafe { std::ffi::CStr::from_ptr(slice.as_ptr().cast()) };
     cstr.to_str().unwrap()
   }
 
