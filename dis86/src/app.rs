@@ -218,12 +218,21 @@ pub fn run() -> i32 {
 
 fn decompile_spec(args: &Args, cfg: &Config, binary: &Binary, spec: Spec<'_>, all_code: &mut String) -> i32 {
   let region = binary.region_iter(spec.start, spec.end);
-  let decoder = Decoder::new(region);
+  let mut decoder = Decoder::new(region);
   let mut instr_list = vec![];
   let mut raw_list = vec![];
-  for (instr, raw) in decoder {
-    instr_list.push(instr);
-    raw_list.push(raw);
+  loop {
+    match decoder.try_next() {
+      Ok(Some((instr, raw))) => {
+        instr_list.push(instr);
+        raw_list.push(raw);
+      }
+      Ok(None) => break,
+      Err(e) => {
+        eprintln!("Error: Failed to decode instruction: {}", e);
+        return 1;
+      }
+    }
   }
   // FIXME: SIMPLIFY!!
   if let Some(path) = args.emit_dis.as_ref() {
