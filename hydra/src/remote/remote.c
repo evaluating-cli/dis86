@@ -9,7 +9,6 @@ enum {
 
 static shmdata_t * shm;
 static int         state = STATE_INIT;
-static addr_t      last_addr;
 
 void remote_init(void)
 {
@@ -88,12 +87,9 @@ void remote_step_hook(hydra_machine_t *m)
 {
   u16 cs = m->registers->cs;
   u16 ip = m->registers->ip;
-  addr_t addr = ADDR_MAKE(cs, ip);
 
   if (cs < 0x823) return;
   if (cs & 0x8000) return;
-  if (addr_equal(last_addr, addr)) return;
-  last_addr = addr;
 
   while (1) {
     switch (state) {
