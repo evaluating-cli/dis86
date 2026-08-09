@@ -116,7 +116,7 @@ jobs:
           git -C /tmp/thunk_gen checkout --detach FETCH_HEAD
           test "$(git -C /tmp/thunk_gen rev-parse HEAD)" = "$THUNK_GEN_SHA"
           cd /tmp/thunk_gen
-          ./configure --prefix=/usr/local
+          ./configure
           meson compile -C build
           sudo meson install -C build
           pkg-config --modversion thunk_gen
