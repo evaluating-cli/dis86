@@ -35,16 +35,25 @@ The series is being built in small source-auditable stages:
    - raw node-boundary `step_flags`
    - final end acknowledgement before execution stops
 
-2. Planned: target lifecycle hardening
+2. `0002-mapping-export-validator-lowmem.patch`
+   - requires the POSIX `mapshm` mapping driver in validator mode
+   - keeps the actual `MAPPING_LOWMEM` POSIX SHM object named `/dosemu_mem`
+   - uses the same fd that backs `lowmem_base`; no second DOS-memory copy
+   - creates a temporary second `MAP_SHARED` view before guest boot and proves
+     writes are visible in both directions, restoring the original bytes
+   - verifies before validator `init` publication that the selected driver is
+     `mapshm`, the exported object is the live `lowmem_base` allocation, and
+     conventional address zero resolves through that backing
+   - unlinks `/dosemu_mem` when the backing mapping is freed
+
+3. Planned: target lifecycle hardening
    - explicit target-termination invalidation/cleanup
    - child/helper process scoping proof
    - stale-runtime-PSP rejection
 
-3. Planned: low-memory export
-   - force/verify `mapshm`
-   - export the actual `lowmem_base` backing as `/dosemu_mem`
-   - prove bidirectional aliasing before publication
-   - safe cleanup and one-validator-instance behavior
+The lifecycle patch is intentionally still open: the pinned dosemu2 source has
+not yet yielded a sufficiently direct, DOS-version-independent current-PSP or
+target-termination hook. We will not infer target death from CS:IP alone.
 
 ## Validator launch contract
 
@@ -56,7 +65,9 @@ $_cpuemu = (1)
 $_mapping = "mapshm"
 ```
 
-Patch 0001 also fails closed if the simx86 interpreter is not selected.
+Patch 0001 fails closed if the simx86 interpreter is not selected. Patch 0002
+fails closed unless the live low-memory backing is the verified `mapshm`
+export at `/dosemu_mem`.
 
 The exact target gate expects these environment variables:
 
@@ -81,6 +92,27 @@ Activation occurs only when all of the following are true at a simx86 boundary:
 Only after that match is `runtime_psp` published and `init` release-stored.
 This prevents startup helper programs from activating the hook merely because
 they happen to execute under simx86.
+
+## Low-memory provenance
+
+The pinned source establishes the chain used by patch 0002:
+
+1. `mapping.c::do_alloc_mapping()` assigns `lowmem_base` from an allocation
+   only when the allocation capability contains `MAPPING_LOWMEM`.
+2. `mapshm` uses the `mapfile.c` POSIX-SHM backend.
+3. `alloc_mapping_file()` `ftruncate`s one fd and maps it with `MAP_SHARED`.
+4. `alias_mapping_file()` creates aliases from the fd stored for that same
+   allocation.
+5. In validator mode, patch 0002 names that low-memory fd `/dosemu_mem`, proves
+   a second shared view has bidirectional visibility, and records that exact
+   allocation as the export.
+6. At the first simx86 validator boundary, `mapping.c` confirms the selected
+   driver is `mapshm`, the recorded export equals `lowmem_base` with the full
+   `LOWMEM_SIZE + HMASIZE` size, and address zero resolves through that backing.
+7. Only after this proof can patch 0001 publish validator `init`.
+
+This is deliberately different from allocating another shared-memory buffer
+and copying low memory into it.
 
 ## Node-boundary metadata
 
@@ -116,11 +148,19 @@ ready for an upstream/fork PR.
 From the `dis86` checkout:
 
 ```sh
-scripts/apply-dosemu2-patches.sh /path/to/dosemu2
+bash scripts/apply-dosemu2-patches.sh /path/to/dosemu2
 ```
 
 The script refuses to apply to a dosemu2 checkout whose `HEAD` is not the
-pinned base commit.
+pinned base commit or whose worktree/index is dirty.
+
+## CI verification
+
+The carrier branch includes a workflow that fetches exactly the pinned dosemu2
+commit and applies every entry in `patches/dosemu2/series` with `git am`, then
+runs `git diff --check`. This is the authoritative patch-context check until
+we have a writable dosemu2 fork and a full build environment for the patched
+upstream tree.
 
 ## Upstreaming later
 
