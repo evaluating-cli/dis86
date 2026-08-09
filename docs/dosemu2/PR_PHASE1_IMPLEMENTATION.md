@@ -1,74 +1,101 @@
-# Draft Pull Request: Correct Phase 1 `simx86` Architecture Blueprint
+# Draft Pull Request: Phase 1 `simx86` Validator Architecture
 
-> **Draft — documentation/architecture.** PR #10 defines the Phase 1 contract. It does not by itself complete the downstream dosemu2 hook or the `dis86` adapter, and it must not be presented as fixing the runtime integration.
+> **Draft — architecture/documentation.** PR #10 defines the contract for the dosemu2-backed differential validator. Concrete implementation is split across merged emu86 prerequisites, draft dosemu2 carrier #17, and a still-pending Rust adapter.
 
-## What is happening right now
+## Current status
 
-PR #10 is the architecture contract against which the implementation work is reviewed.
+- **#12 merged:** CMPS/REP behavior, configurable runtime PSP loading, and initial-state normalization.
+- **#14 merged:** SHL/SHR/SAR semantics aligned with the pinned dosemu2 `simx86` interpreter.
+- **#17 draft:** four-patch dosemu2 carrier implementing the control ABI/hook, live low-memory export, target lifecycle policy, and atomic lifecycle flags.
+- **Rust adapter pending:** corrected dosemu2 launch, extended ABI handling, runtime-PSP handshake, boundary-driven normalized stepping, lifecycle handling, and explicit child reaping remain to be implemented.
 
-Concrete implementation work now exists:
+At this consolidation point, #17's ordinary `test` workflow passes but its current `dosemu2 patch series` workflow fails. PR #10 must therefore not claim that the current #17 head has a green apply/compile/link proof.
 
-- **emu86/dis86:** #12 landed CMPS, configurable runtime-PSP loading, and initial-state normalization. #14 subsequently aligned SHL/SHR/SAR semantics with the pinned dosemu2 `simx86` interpreter.
-- **dosemu2:** #17 is the draft carrier PR for the pinned dosemu2 patch series. The patches apply, compile, and link in CI, but the remaining runtime proof items are still open.
-- **Rust validator adapter:** the final dosemu2 launch contract and boundary-driven step integration still need to be implemented against the dosemu2-reported node metadata.
+## Consolidated architecture contract
 
-Keep PR #10 as a draft until the remaining runtime proof items in #17 are resolved and the Rust adapter implementation is linked here.
+PR #10 now requires:
 
-## Summary
+- hook placement around the persistent `FindExecCode()` node boundary;
+- authoritative post-node state from the returned local `PC`;
+- local `PC` recomputation before lookup after imported `CS:IP`;
+- no `EXCP_EMULEAVE` for normal validator state redirection;
+- explicit release-build protected-mode rejection **before** any state import;
+- the versioned 80-byte control ABI from #17, including `runtime_psp`, `decoded_instructions`, and `step_flags`;
+- page-sized `/hydra_remote` backing;
+- forced `$_cpu_vm = "emulated"`, `$_cpuemu = (1)`, and `$_mapping = "mapshm"` launch configuration;
+- target identity from the requested DOS path plus validated PSP/MCB/environment/current-PSP state;
+- target/descendant/exit lifecycle tracking through `sda_cur_psp()` and dosemu's PSP parent field;
+- actual translated-node consumption from `TNode.seqnum`, not `seqlen` or opcode guesses;
+- REP and interrupt-shadow normalization that never double-consumes an already-executed first REP iteration;
+- `/dosemu_mem` as the verified live `MAPPING_LOWMEM` backing, not a copy;
+- `END_ACK`/`TARGET_EXIT` lifecycle publication through release-ordered `step_flags`;
+- parent-owned process cleanup that terminates **and explicitly reaps** dosemu2.
 
-This PR replaces the initial Phase 1 draft with a reviewed architecture contract for integrating dosemu2 `simx86` with the `dis86` differential validator.
+## Superseded material removed
 
-The contract:
+The consolidated docs no longer treat any of the following as the Phase 1 contract:
 
-- removes the false `G->seqlen == 1` invariant;
-- splits request/apply and publish/ack around `DoExec(G)`;
-- publishes post-step `IP` from the authoritative local `PC`;
-- recomputes local `PC` before lookup after external `CS:IP` mutation;
-- removes `EXCP_EMULEAVE` from normal validator redirection;
-- preserves upper EFLAGS/register halves on 16-bit ABI import;
-- requires explicit runtime rejection of protected-mode state import before any CPU mutation;
-- replaces the unsafe global `do_open_pshm()` rename with a `MAPPING_LOWMEM`-only named POSIX-SHM backing path;
-- selects `mapshm` through dosemu2's verified `$_mapping` configuration interface because full-sim `softmmu` low memory is anonymous;
-- treats `shm->end` as an execution stop barrier, separate from parent-owned process termination and explicit child reaping;
-- binds the MZ entry gate to the requested executable and its captured runtime PSP, not merely a generic PSP signature plus relative entry coordinates;
-- derives interrupt-shadow comparison spans from actual translated-node consumption plus the authoritative post-node PC rather than opcode guesses;
-- coalesces REP micro-iterations without executing or comparing an already-consumed first REP iteration twice; and
-- removes inherited DOSBox-X `-hydra` / `-hydra-conf` launch arguments, which upstream dosemu2 does not implement.
+- the old 64-byte Phase 0 shared-memory layout;
+- `DIIS_DOSEMU_EXE` as the current target-path variable;
+- a DOS-exec callback/`g_target_exec_seen` mechanism as required implementation;
+- `assert(!PROTMODE())` as acceptable protected-mode handling;
+- `$_mapping = "mapshm"` alone as sufficient to reach the simx86 hook;
+- CMPS/configurable PSP loading as unimplemented future work;
+- a fixed emu86 PSP of `0x0813` as a validator constraint;
+- an inferred fixed comparison span for STI/MOV SS/POP SS;
+- “three patches” as the current #17 carrier series;
+- a current claim that #17's patch-series CI is green.
 
-## Patch review notes
+## Known implementation gaps
 
-The follow-up patches are directionally correct, with these required clarifications:
-
-1. **Requested-executable entry gate:** accept. The target identity must be captured by the DOS exec/load path and cleared/lifecycle-managed with the target process; the PSP signature is only a sanity check, not executable identity.
-2. **REP + interrupt-shadow normalization:** accept the two-case model. Use actual node-consumption metadata reported by the dosemu2 hook (the implementation work in #17 reports decoded-node consumption) together with the authoritative returned PC. A combined shadow-plus-REP node must account for the first REP iteration already consumed before issuing more raw requests.
-3. **Shutdown:** the stop-barrier wording is correct but incomplete unless `DosemuProcess::Drop` explicitly reaps the child. After termination, call `wait()` or an equivalent reap operation; do not use `EXCP_EMULEAVE` or dosemu2 global-exit machinery as the normal simx86 hook path.
-4. **Protected mode:** an `assert(!PROTMODE())` is insufficient. The implementation must take an explicit runtime error/stop path before changing any register or segment state.
-
-## Non-goals
-
-This PR itself does not:
-
-- patch or build dosemu2;
-- complete `DosemuProcess::spawn()` / normalized stepping;
-- claim successful end-to-end runtime or integration testing; or
-- replace the implementation work tracked in #12, #14, and #17.
+1. **Protected-mode import in #17:** the current carrier `apply_cpu()` still needs an explicit real-mode guard/error-stop path before any register or segment mutation.
+2. **#17 patch-series CI:** current head is red in the dedicated dosemu2 patch-series workflow; the build-gate evidence must be restored.
+3. **Rust adapter:** main still uses the Phase-0/DOSBox-X launch and old req/ack-only shared contract.
+4. **Shutdown:** Rust `Drop` still needs an explicit `wait()`/equivalent reap after termination.
+5. **Runtime proof:** end barrier, target child/exit lifecycle, external low-memory visibility, normalized REP/shadow boundaries, and DOS/INT 21h boundary visibility remain unproven end-to-end.
 
 ## Draft exit criteria
 
-- [x] **emu86/dis86 prerequisites exist:** CMPS, configurable PSP loading, and initial-state normalization landed in #12; shift semantics were aligned in #14.
-- [ ] **dosemu2 runtime proof:** #17's patch series passes its source/apply/compile/link gates, but its stated runtime proof items remain open.
-- [ ] **Rust adapter implementation:** corrected dosemu2 launch, initialization handshake, and boundary-driven normalized stepping are implemented and linked here.
+### Landed prerequisites
 
-The architecture PR can become ready for review once reviewers can validate the contract against those concrete implementation paths. Completing the runtime verification checklist remains the Phase 1 completion criterion.
+- [x] #12 CMPS/configurable PSP/initial normalization
+- [x] #14 shift-semantic alignment
+
+### dosemu2 carrier
+
+- [x] concrete four-patch source implementation exists in #17
+- [x] versioned ABI and node metadata are represented
+- [x] live low-memory export/provenance checks are represented
+- [x] target lifecycle and atomic lifecycle flags are represented
+- [ ] protected-mode import is explicitly fail-closed
+- [ ] current dedicated patch-series CI is green
+
+### Rust integration
+
+- [ ] corrected launch contract implemented
+- [ ] 80-byte ABI/version validation implemented
+- [ ] runtime PSP initialization handshake implemented
+- [ ] metadata-driven normalized stepping implemented
+- [ ] target-exit/fault/end lifecycle events handled
+- [ ] dosemu2 child explicitly reaped
+
+### Runtime proof
+
+- [ ] zero additional controlled guest nodes after end barrier
+- [ ] target -> child -> target lifecycle verified
+- [ ] target -> parent / stale-PSP lifecycle verified
+- [ ] external `/dosemu_mem` bidirectional runtime visibility verified
+- [ ] REP and interrupt-shadow composition verified
+- [ ] DOS/INT 21h boundary visibility characterized
+
+Keep PR #10 as draft until the remaining implementation and runtime-proof work is linked and reviewable.
 
 ## Files
 
-- `docs/dosemu2/PHASE1_SPEC.md` — architecture and normalized-stepping contract.
-- `docs/dosemu2/PHASE1_IMPLEMENTATION.md` — source-verified implementation blueprint and verification checklist.
-- `docs/dosemu2/PR_PHASE1_IMPLEMENTATION.md` — current PR status and review notes.
+- `docs/dosemu2/PHASE1_SPEC.md` — normative architecture contract.
+- `docs/dosemu2/PHASE1_IMPLEMENTATION.md` — implementation map and remaining work.
+- `docs/dosemu2/PR_PHASE1_IMPLEMENTATION.md` — PR status and review summary.
 
-## Source verification
+## Source basis
 
-The blueprint is pinned to dosemu2 `devel` commit `604ce0cdd1a71f657e2a2df623d216d5ab289313`. The follow-up implementation work in #17 additionally source-verifies translated-node instruction consumption and the dosemu2 process/low-memory mechanisms used by the carrier patch series.
-
-This remains an architecture PR. It does not claim that the remaining runtime behaviors have been proven until the corresponding implementation branches demonstrate them.
+The architecture remains pinned to dosemu2 `604ce0cdd1a71f657e2a2df623d216d5ab289313`. #17 is the concrete carrier used to refine the contract: its current four patches establish the ABI, `TNode.seqnum` metadata, mapshm low-memory provenance, current-PSP/ancestry lifecycle handling, and release-ordered lifecycle flags.
