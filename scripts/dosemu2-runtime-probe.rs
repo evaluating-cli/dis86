@@ -126,6 +126,10 @@ impl Drop for Mapping {
     }
 }
 
+fn stage(name: &str) {
+    eprintln!("PROBE_STAGE={name}");
+}
+
 fn wait_until(deadline: Instant, mut predicate: impl FnMut() -> bool, what: &str) -> Result<(), String> {
     while !predicate() {
         if Instant::now() >= deadline {
@@ -134,6 +138,24 @@ fn wait_until(deadline: Instant, mut predicate: impl FnMut() -> bool, what: &str
         thread::sleep(Duration::from_millis(1));
     }
     Ok(())
+}
+
+fn control_snapshot(control: &Mapping) -> String {
+    unsafe {
+        format!(
+            "init={} end={} runtime_psp={:04x} req={} ack={} decoded={} step_flags={:#010x} ax={:04x} cs={:04x} ip={:04x}",
+            control.atomic_u32(OFF_INIT).load(Ordering::Acquire),
+            control.atomic_u32(OFF_END).load(Ordering::Acquire),
+            control.read_u16(OFF_RUNTIME_PSP),
+            control.atomic_u64(OFF_REQ).load(Ordering::Acquire),
+            control.atomic_u64(OFF_ACK).load(Ordering::Acquire),
+            control.read_u32(OFF_DECODED),
+            control.atomic_u32(OFF_STEP_FLAGS).load(Ordering::Acquire),
+            control.read_u16(OFF_AX),
+            control.read_u16(OFF_CS),
+            control.read_u16(OFF_IP),
+        )
+    }
 }
 
 fn step(
@@ -147,7 +169,9 @@ fn step(
     let ack = unsafe { control.atomic_u64(OFF_ACK) };
     let step_flags = unsafe { control.atomic_u32(OFF_STEP_FLAGS) };
 
+    eprintln!("PROBE_STAGE=request_{req_value}_publish");
     req.store(req_value, Ordering::Release);
+    eprintln!("PROBE_STAGE=request_{req_value}_wait_ack");
     wait_until(
         deadline,
         || {
@@ -158,27 +182,37 @@ fn step(
             ack.load(Ordering::Acquire) == req_value
         },
         &format!("ack {req_value}"),
-    )?;
+    )
+    .map_err(|e| format!("{e}; {}", control_snapshot(control)))?;
 
     let flags = step_flags.load(Ordering::Acquire);
     if flags & DIIS_STEP_TARGET_EXIT != 0 {
-        return Err(format!("target exited while waiting for request {req_value}"));
+        return Err(format!(
+            "target exited while waiting for request {req_value}; {}",
+            control_snapshot(control)
+        ));
     }
     if flags & DIIS_STEP_END_ACK != 0 {
-        return Err(format!("unexpected END_ACK while waiting for request {req_value}"));
+        return Err(format!(
+            "unexpected END_ACK while waiting for request {req_value}; {}",
+            control_snapshot(control)
+        ));
     }
 
+    eprintln!("PROBE_STAGE=request_{req_value}_validate");
     let decoded = unsafe { control.read_u32(OFF_DECODED) };
     let ax = unsafe { control.read_u16(OFF_AX) };
     let ip = unsafe { control.read_u16(OFF_IP) };
     if decoded != 1 {
         return Err(format!(
-            "request {req_value}: expected one decoded instruction, got {decoded}"
+            "request {req_value}: expected one decoded instruction, got {decoded}; {}",
+            control_snapshot(control)
         ));
     }
     if ax != expected_ax || ip != expected_ip {
         return Err(format!(
-            "request {req_value}: expected AX={expected_ax:04x} IP={expected_ip:04x}, got AX={ax:04x} IP={ip:04x}"
+            "request {req_value}: expected AX={expected_ax:04x} IP={expected_ip:04x}, got AX={ax:04x} IP={ip:04x}; {}",
+            control_snapshot(control)
         ));
     }
     Ok(())
@@ -186,6 +220,8 @@ fn step(
 
 fn run() -> Result<(), String> {
     let deadline = Instant::now() + Duration::from_secs(20);
+
+    stage("open_control");
     let control = Mapping::open(CONTROL_PATH, ABI_SIZE, deadline)
         .map_err(|e| format!("map control: {e}"))?;
 
@@ -193,30 +229,39 @@ fn run() -> Result<(), String> {
     let end = unsafe { control.atomic_u32(OFF_END) };
     let step_flags = unsafe { control.atomic_u32(OFF_STEP_FLAGS) };
 
-    wait_until(deadline, || init.load(Ordering::Acquire) == 1, "validator init")?;
+    stage("wait_init");
+    wait_until(deadline, || init.load(Ordering::Acquire) == 1, "validator init")
+        .map_err(|e| format!("{e}; {}", control_snapshot(&control)))?;
 
+    stage("validate_control");
     let abi = unsafe { control.read_u32(OFF_ABI_VERSION) };
     let struct_size = unsafe { control.read_u32(OFF_STRUCT_SIZE) } as usize;
     if abi != ABI_VERSION || struct_size != ABI_SIZE {
         return Err(format!(
-            "unexpected control ABI: version={abi}, size={struct_size}"
+            "unexpected control ABI: version={abi}, size={struct_size}; {}",
+            control_snapshot(&control)
         ));
     }
 
     let runtime_psp = unsafe { control.read_u16(OFF_RUNTIME_PSP) };
     if runtime_psp == 0 {
-        return Err("runtime PSP was not published".into());
+        return Err(format!(
+            "runtime PSP was not published; {}",
+            control_snapshot(&control)
+        ));
     }
     let image_seg = runtime_psp.wrapping_add(0x10);
     let expected_cs = unsafe { control.read_u16(OFF_CS) };
     if expected_cs != image_seg {
         return Err(format!(
-            "expected entry CS={image_seg:04x} from PSP={runtime_psp:04x}, got {expected_cs:04x}"
+            "expected entry CS={image_seg:04x} from PSP={runtime_psp:04x}, got {expected_cs:04x}; {}",
+            control_snapshot(&control)
         ));
     }
 
+    stage("open_lowmem");
     let lowmem = Mapping::open(LOWMEM_PATH, 2, deadline)
-        .map_err(|e| format!("map low memory: {e}"))?;
+        .map_err(|e| format!("map low memory: {e}; {}", control_snapshot(&control)))?;
     let sentinel = ((image_seg as usize) << 4) + 0x10;
     if sentinel + 2 > lowmem.len {
         return Err(format!(
@@ -225,6 +270,7 @@ fn run() -> Result<(), String> {
         ));
     }
 
+    stage("validate_initial_sentinel");
     let loaded = unsafe { lowmem.read_u16(sentinel) };
     if loaded != 0x1111 {
         return Err(format!(
@@ -233,13 +279,16 @@ fn run() -> Result<(), String> {
     }
 
     // External -> guest: the next guest instruction must read this value.
+    stage("alias_external_to_guest");
     unsafe { lowmem.write_u16(sentinel, 0x1234) };
     step(&control, 1, 0x0004, 0x1234, deadline)?;
 
     // Pure register step.
+    stage("register_step");
     step(&control, 2, 0x0005, 0x1235, deadline)?;
 
     // Guest -> external: store AX into the same shared low-memory word.
+    stage("alias_guest_to_external");
     step(&control, 3, 0x0009, 0x1235, deadline)?;
     let guest_written = unsafe { lowmem.read_u16(sentinel) };
     if guest_written != 0x1235 {
@@ -251,13 +300,17 @@ fn run() -> Result<(), String> {
     // The instruction at IP=0009 would increment the sentinel to 1236. End is
     // release-stored while dosemu is stopped at the pre-node barrier; END_ACK
     // must be acquire-visible without that instruction ever beginning.
+    stage("end_request");
     end.store(1, Ordering::Release);
+    stage("wait_end_ack");
     wait_until(
         deadline,
         || step_flags.load(Ordering::Acquire) & DIIS_STEP_END_ACK != 0,
         "END_ACK",
-    )?;
+    )
+    .map_err(|e| format!("{e}; {}", control_snapshot(&control)))?;
 
+    stage("validate_end_barrier");
     let after_end = unsafe { lowmem.read_u16(sentinel) };
     if after_end != 0x1235 {
         return Err(format!(
@@ -272,6 +325,7 @@ fn run() -> Result<(), String> {
         ));
     }
 
+    stage("complete");
     println!(
         "runtime probe passed: PSP={runtime_psp:04x}, image={image_seg:04x}, sentinel={sentinel:#x}"
     );
