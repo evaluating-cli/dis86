@@ -123,7 +123,7 @@ diff --git a/src/base/lib/mapping/mapfile.c b/src/base/lib/mapping/mapfile.c
  
  static struct file_mapping *find_file_mapping(unsigned char *target)
  {
-@@ -213,6 +237,9 @@ static void do_free_mapping(struct file_mapping *p)
+@@ -213,4 +237,7 @@ static void do_free_mapping(struct file_mapping *p)
  {
 +  if (p->addr == validator_lowmem_addr)
 +    validator_lowmem_reset();
