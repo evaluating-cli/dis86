@@ -68,7 +68,7 @@ diff --git a/src/base/lib/mapping/mapping.c b/src/base/lib/mapping/mapping.c
  static unsigned char *lowmem_aliasmap[ALIAS_SIZE/PAGE_SIZE];
  struct hardware_ram;
  static dosaddr_t do_get_hardware_ram(unsigned addr, uint32_t size,
-@@ -153,6 +155,21 @@ void *physaddr_to_unixaddr(unsigned int addr)
+@@ -153,6 +155,22 @@ void *physaddr_to_unixaddr(unsigned int addr)
    return MAP_FAILED;
  }
  
@@ -170,7 +170,7 @@ diff --git a/src/base/lib/mapping/mapfile.c b/src/base/lib/mapping/mapfile.c
 +}
 +
  static void *alloc_mapping_file(int cap, size_t mapsize, void *target)
-@@ -266,14 +326,61 @@ static void *alloc_mapping_file(int cap, size_t mapsize, void *target)
+@@ -266,17 +326,74 @@ static void *alloc_mapping_file(int cap, size_t mapsize, void *target)
  {
    int prot = PROT_READ | PROT_WRITE;
    int fd, rc;
@@ -239,7 +239,7 @@ diff --git a/src/base/lib/mapping/mapfile.c b/src/base/lib/mapping/mapfile.c
 +  }
 +  return addr;
  }
-+ 
++
 +int mapfile_validator_lowmem_export_ready(void *addr, size_t size)
 +{
 +  return validator_lowmem_named && validator_lowmem_verified &&
