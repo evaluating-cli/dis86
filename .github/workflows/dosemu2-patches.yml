@@ -46,3 +46,23 @@ jobs:
           done < patches/dosemu2/series
           git -C /tmp/dosemu2 diff --check "$DOSEMU2_BASE"..HEAD
           git -C /tmp/dosemu2 log --oneline --decorate "$DOSEMU2_BASE"..HEAD
+
+      - name: Install core build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            autoconf automake libtool build-essential \
+            bison flex gawk pkg-config libbsd-dev
+
+      - name: Configure interpreter-only core build
+        working-directory: /tmp/dosemu2
+        run: |
+          ./autogen.sh
+          ./configure \
+            --enable-plugins=no \
+            --disable-cpuemu-jit \
+            --disable-dlplugins
+
+      - name: Compile patched dosemu2
+        working-directory: /tmp/dosemu2
+        run: make -j2
