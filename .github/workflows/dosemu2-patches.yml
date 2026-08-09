@@ -66,6 +66,10 @@ jobs:
             --disable-cpuemu-jit \
             --disable-dlplugins
 
+      - name: Generate library build prerequisites
+        working-directory: /tmp/dosemu2
+        run: make -C src ../version.hh ../src/plugin/plugin_config.hh
+
       - name: Compile patched simx86 and mapping libraries
         working-directory: /tmp/dosemu2
         shell: bash
