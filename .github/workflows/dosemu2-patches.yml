@@ -102,5 +102,5 @@ jobs:
             exit "$status"
           fi
           test -x bin/dosemu
-          test -x 2.0pre9/bin/dosemu.bin
+          test -x 2.0-pre9/bin/dosemu2.bin
           echo 'minimal patched dosemu2 runtime linked successfully'
