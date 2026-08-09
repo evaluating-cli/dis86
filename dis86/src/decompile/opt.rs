@@ -679,6 +679,69 @@ pub fn simplify_branch_conds(ir: &mut IR) {
   }
 }
 
+/*
+From:
+--------------------------------------------
+  t2 = eq  t1  #0
+  t3 = eq  t2  #0
+
+To:
+--------------------------------------------
+  t3 = neq t1  #0
+
+Simplifies a comparison-result test against zero. Comparison opcodes produce
+0/1 values, so `(x cmp 0) == 0` is the inverse comparison and
+`(x cmp 0) != 0` is the original comparison.
+*/
+pub fn simplify_chained_comparisons(ir: &mut IR) {
+  let cmp_ops: &[(Opcode, Opcode)] = &[
+    (Opcode::Eq,   Opcode::Neq),
+    (Opcode::Neq,  Opcode::Eq),
+    (Opcode::Gt,   Opcode::Leq),
+    (Opcode::Geq,  Opcode::Lt),
+    (Opcode::Lt,   Opcode::Geq),
+    (Opcode::Leq,  Opcode::Gt),
+    (Opcode::UGt,  Opcode::ULeq),
+    (Opcode::UGeq, Opcode::ULt),
+    (Opcode::ULt,  Opcode::UGeq),
+    (Opcode::ULeq, Opcode::UGt),
+  ];
+
+  for b in ir.iter_blocks() {
+    for r in ir.iter_instrs(b) {
+      let instr = ir.instr(r).unwrap();
+
+      let outer_op = match instr.opcode {
+        Opcode::Eq  => Opcode::Eq,
+        Opcode::Neq => Opcode::Neq,
+        _ => continue,
+      };
+      if instr.operands.len() != 2 { continue; }
+
+      let outer_rhs = instr.operands[1];
+      let Some(0) = ir.const_lookup(outer_rhs) else { continue; };
+
+      let inner_ref = instr.operands[0];
+      let Some(inner_instr) = ir.instr(inner_ref) else { continue };
+      // Comparisons are binary. Besides preventing out-of-bounds access, an
+      // exact arity check avoids rewriting malformed IR by silently ignoring
+      // extra operands.
+      if inner_instr.operands.len() != 2 { continue; }
+
+      let inner_lhs = inner_instr.operands[0];
+      let inner_rhs = inner_instr.operands[1];
+      let Some(0) = ir.const_lookup(inner_rhs) else { continue; };
+
+      let Some(&(_, flipped)) = cmp_ops.iter().find(|&&(op, _)| op == inner_instr.opcode) else { continue };
+
+      let new_op = if outer_op == Opcode::Eq { flipped } else { inner_instr.opcode };
+      let instr = ir.instr_mut(r).unwrap();
+      instr.opcode = new_op;
+      instr.operands = vec![inner_lhs, inner_rhs];
+    }
+  }
+}
+
 const N_OPT_PASSES: usize = 5;
 pub fn optimize(ir: &mut IR) {
   deadblock_elimination(ir);
@@ -693,10 +756,116 @@ pub fn optimize(ir: &mut IR) {
     simplify_sign_conds(ir);
     // note: reduce_trivial_or() after simplify_branch_conds() is important
     reduce_trivial_or(ir);
+    simplify_chained_comparisons(ir);
     stack_ptr_accumulation(ir);
     value_propagation(ir);
     common_subexpression_elimination(ir);
     value_propagation(ir);
   }
   deadcode_elimination(ir);
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::types::TypeDatabase;
+  use std::rc::Rc;
+
+  fn test_ir() -> (IR, BlockRef) {
+    let mut ir = IR::new(Rc::new(TypeDatabase::new()));
+    let blk = ir.add_block("entry");
+    (ir, blk)
+  }
+
+  fn append(ir: &mut IR, blk: BlockRef, opcode: Opcode, operands: Vec<Ref>) -> Ref {
+    ir.block_instr_append(blk, Instr {
+      typ: Type::U16,
+      attrs: Attribute::NONE,
+      opcode,
+      operands,
+    })
+  }
+
+  #[test]
+  fn chained_comparison_inverts_eq_zero_and_preserves_neq_zero() {
+    let pairs = [
+      (Opcode::Eq, Opcode::Neq),
+      (Opcode::Neq, Opcode::Eq),
+      (Opcode::Gt, Opcode::Leq),
+      (Opcode::Geq, Opcode::Lt),
+      (Opcode::Lt, Opcode::Geq),
+      (Opcode::Leq, Opcode::Gt),
+      (Opcode::UGt, Opcode::ULeq),
+      (Opcode::UGeq, Opcode::ULt),
+      (Opcode::ULt, Opcode::UGeq),
+      (Opcode::ULeq, Opcode::UGt),
+    ];
+
+    for (inner_op, inverse_op) in pairs {
+      for (outer_op, expected_op) in [(Opcode::Eq, inverse_op), (Opcode::Neq, inner_op)] {
+        let (mut ir, blk) = test_ir();
+        let x = ir.const_new(5);
+        let zero = ir.const_new(0);
+        let inner = append(&mut ir, blk, inner_op, vec![x, zero]);
+        let outer = append(&mut ir, blk, outer_op, vec![inner, zero]);
+
+        simplify_chained_comparisons(&mut ir);
+
+        let instr = ir.instr(outer).unwrap();
+        assert_eq!(instr.opcode, expected_op);
+        assert_eq!(instr.operands, vec![x, zero]);
+      }
+    }
+  }
+
+  #[test]
+  fn chained_comparison_requires_zero_on_both_rhs_operands() {
+    for (inner_rhs_val, outer_rhs_val) in [(1, 0), (0, 1)] {
+      let (mut ir, blk) = test_ir();
+      let x = ir.const_new(5);
+      let inner_rhs = ir.const_new(inner_rhs_val);
+      let outer_rhs = ir.const_new(outer_rhs_val);
+      let inner = append(&mut ir, blk, Opcode::Eq, vec![x, inner_rhs]);
+      let outer = append(&mut ir, blk, Opcode::Eq, vec![inner, outer_rhs]);
+
+      simplify_chained_comparisons(&mut ir);
+
+      let instr = ir.instr(outer).unwrap();
+      assert_eq!(instr.opcode, Opcode::Eq);
+      assert_eq!(instr.operands, vec![inner, outer_rhs]);
+    }
+  }
+
+  #[test]
+  fn chained_comparison_skips_malformed_inner_arity() {
+    for operands_len in [0, 1, 3] {
+      let (mut ir, blk) = test_ir();
+      let zero = ir.const_new(0);
+      let mut operands = vec![zero; operands_len];
+      if operands_len >= 2 { operands[1] = zero; }
+      let inner = append(&mut ir, blk, Opcode::Eq, operands);
+      let outer = append(&mut ir, blk, Opcode::Eq, vec![inner, zero]);
+
+      simplify_chained_comparisons(&mut ir);
+
+      let instr = ir.instr(outer).unwrap();
+      assert_eq!(instr.opcode, Opcode::Eq);
+      assert_eq!(instr.operands, vec![inner, zero]);
+    }
+  }
+
+  #[test]
+  fn chained_comparison_skips_non_comparison_inner_opcode() {
+    let (mut ir, blk) = test_ir();
+    let x = ir.const_new(5);
+    let zero = ir.const_new(0);
+    let inner = append(&mut ir, blk, Opcode::Add, vec![x, zero]);
+    let outer = append(&mut ir, blk, Opcode::Eq, vec![inner, zero]);
+
+    simplify_chained_comparisons(&mut ir);
+
+    let instr = ir.instr(outer).unwrap();
+    assert_eq!(instr.opcode, Opcode::Eq);
+    assert_eq!(instr.operands, vec![inner, zero]);
+  }
 }
