@@ -111,6 +111,8 @@ static bool g_lockstep_active;
 static int dosemu_hydra_init(void)
 {
     int fd;
+    long page_size;
+    size_t map_len;
 
     if (!getenv("DIIS_DOSEMU_VALIDATOR"))
         return 0;
@@ -119,12 +121,19 @@ static int dosemu_hydra_init(void)
               O_RDWR | O_CREAT | O_EXCL, 0600);
     if (fd < 0)
         return -1;
-    if (ftruncate(fd, sizeof(*g_shm)) < 0) {
+    page_size = sysconf(_SC_PAGESIZE);
+    if (page_size <= 0) {
+        close(fd);
+        return -1;
+    }
+    map_len = (sizeof(*g_shm) + (size_t)page_size - 1) &
+              ~((size_t)page_size - 1);
+    if (ftruncate(fd, map_len) < 0) {
         close(fd);
         return -1;
     }
 
-    g_shm = mmap(NULL, sizeof(*g_shm), PROT_READ | PROT_WRITE,
+    g_shm = mmap(NULL, map_len, PROT_READ | PROT_WRITE,
                  MAP_SHARED, fd, 0);
     close(fd);
     if (g_shm == MAP_FAILED) {
@@ -139,7 +148,7 @@ static int dosemu_hydra_init(void)
 }
 ```
 
-The parent `DosemuProcess` already removes stale paths before spawning. `O_EXCL` prevents a live second validator from silently truncating an existing control mapping.
+The page-rounded `map_len` is part of the existing Rust `ShmData::attach()` contract (normally 4096 bytes); truncating the file to the 64-byte ABI structure makes attachment fail before `mmap()`. The parent `DosemuProcess` already removes stale paths before spawning. `O_EXCL` prevents a live second validator from silently truncating an existing control mapping.
 
 ---
 
@@ -147,16 +156,17 @@ The parent `DosemuProcess` already removes stale paths before spawning. `O_EXCL`
 
 ### 5.1 Metadata supplied by `DosemuProcess`
 
-`DosemuProcess` already receives `exe_path`. Parse the same MZ header used by `Emulator::new()` and pass the relative entry coordinates to dosemu2:
+`DosemuProcess` already receives `exe_path`. Parse the same MZ header used by `Emulator::new()` and pass the relative entry coordinates plus a canonical executable identity to dosemu2:
 
 ```text
 DIIS_DOSEMU_MZ_CS=<header.cs>
 DIIS_DOSEMU_MZ_IP=<header.ip>
+DIIS_DOSEMU_EXE=<canonical target path or nonce bound to this exec>
 ```
 
 Do not pass a guessed absolute load segment.
 
-### 5.2 Runtime PSP-derived gate
+### 5.2 Exec-bound runtime PSP gate
 
 The current `emu86` MZ loader establishes:
 
@@ -167,7 +177,7 @@ IP = header.ip
 DS = ES = PSP
 ```
 
-Use those same architectural invariants in the dosemu2 hook:
+Instrument the DOS exec/load path to compare the program being successfully loaded with `DIIS_DOSEMU_EXE` (canonicalized under DOS path semantics), and record the PSP allocated for that exec in `g_target_psp`. A PSP signature plus relative entry coordinates alone is not executable identity. Use the recorded value in the hook:
 
 ```c
 static bool at_target_entry(unsigned int pc)
@@ -178,10 +188,12 @@ static bool at_target_entry(unsigned int pc)
 
     if (PROTMODE())
         return false;
-    if (TheCPU.ds != TheCPU.es)
+    if (!g_target_exec_seen)
         return false;
 
-    psp = TheCPU.ds;
+    psp = g_target_psp;
+    if (TheCPU.ds != psp || TheCPU.es != psp)
+        return false;
 
     /* Standard PSP begins with INT 20h: bytes cd 20. */
     if (READ_WORD((dosaddr_t)psp << 4) != 0x20cd)
@@ -194,13 +206,24 @@ static bool at_target_entry(unsigned int pc)
 }
 ```
 
-Before this predicate matches, the hook must not wait for `req`; normal DOS startup continues. On the first match:
+Before the target exec is observed or this predicate matches, the hook must not wait for `req`; normal DOS startup continues. Clear the captured PSP when that DOS process exits. On the first match:
 
 1. publish the initial CPU snapshot using the current `pc`;
 2. `store_release(init, 1)`;
 3. enter request-wait state.
 
 This replaces both the inherited hard-coded `0x823:0000` assumption and the unsafe `CS >= load_seg` predicate.
+
+### 5.3 Align emu86 before request 1
+
+The validator treats the initial snapshot as a setup handshake, not as a completed step. Before sending request 1 it must:
+
+1. instantiate/rebase emu86 at the captured runtime PSP rather than the current fixed `PSP_SEGMENT = 0x813`;
+2. rebuild the PSP and load the image at `PSP + 0x10`, applying MZ relocations with that load segment, and establish matching CS:IP and SS:SP;
+3. perform the existing Hydra `post_init_state()` normalization (AX through BP and FLAGS) against the published dosemu state, then write or confirm the normalized initial state on both sides; and
+4. verify the complete compared register set and load-segment-dependent image/PSP memory before either emulator executes an instruction.
+
+Publishing dosemu's DOS-provided registers alone is insufficient: emu86 starts general registers at zero, FLAGS at IF, and currently uses a fixed PSP. Any unresolved initial mismatch must fail initialization, not be reported as an instruction divergence.
 
 ---
 
@@ -445,6 +468,7 @@ cmd.args(["-I", "$_mapping = \"mapshm\""]);
 cmd.env("DIIS_DOSEMU_VALIDATOR", "1");
 cmd.env("DIIS_DOSEMU_MZ_CS", format!("{}", mz.hdr.cs));
 cmd.env("DIIS_DOSEMU_MZ_IP", format!("{}", mz.hdr.ip));
+cmd.env("DIIS_DOSEMU_EXE", canonical_target_path);
 ```
 
 `$_mapping = "mapshm"` uses dosemu2's verified configuration interface. The `DIIS_DOSEMU_*` variables are implementation-local metadata for the new validator hook; their exact names may change, but their semantics are required.
@@ -477,15 +501,13 @@ comparison_span = 1 decoded instruction
 
 This makes `DosemuProcess::step()` match one `emu86` REP step without changing either CPU implementation's internal behavior.
 
+CMPS is a Phase 1 implementation prerequisite, not merely a corpus entry. Add `OP_CMPS` to `Machine::step()`'s REP-aware special-operation dispatch and implement byte/word comparison of `DS:(E)SI` against `ES:(E)DI`, DF-controlled index updates, CX decrement, subtraction flags, and REPE/REPNE termination. Add focused zero-count, forward/backward, equal/mismatch, byte/word, REPE, and REPNE tests before enabling CMPS lockstep cases.
+
 ### 10.3 `STI`, `MOV SS`, and `POP SS`
 
-Current `simx86` may compile the following instruction into the same node for the interrupt shadow. A normalized dosemu step therefore records:
+Current `simx86` may compile the following instruction into the same node for the interrupt shadow, but trap-mode `STI` can consume only STI. Determine the actual node boundary from simx86 metadata plus the authoritative returned PC (decoding from the starting address to that boundary as needed); never set `comparison_span = 2` solely because the first opcode is STI/MOV SS/POP SS.
 
-```text
-comparison_span = 2
-```
-
-when the starting decoded instruction is one of those three cases.
+If the measured boundary ends after the first iteration of a REP-prefixed second instruction, first record that the shadow instruction was consumed, then issue further raw steps while the published `CS:IP` remains at that REP address. Only after it advances may the normalized step return. This handles both variable shadow spans and the shadow-plus-REP composition.
 
 Extend the backend abstraction with a small post-step span query, defaulting to one. The validator then performs:
 
@@ -519,6 +541,8 @@ Do not set `EXCP_EMULEAVE` and do not let the hook simply return to normal guest
 Before Phase 1 can be called implemented, verify all of the following against a patched dosemu2 build:
 
 - [ ] exact MZ entry gate fires once, at the target program and not DOS startup;
+- [ ] the entry belongs to the requested executable's captured DOS exec/PSP, not a helper with the same relative entry;
+- [ ] emu86 is rebased to the runtime PSP and both initial states are normalized before request 1;
 - [ ] `init` is release-published only after the initial target state is complete;
 - [ ] one normal request produces the expected next decoded-instruction boundary;
 - [ ] post-step `IP` comes from returned `PC`;
@@ -528,7 +552,9 @@ Before Phase 1 can be called implemented, verify all of the following against a 
 - [ ] real-mode segment writes call `SetSegReal()`;
 - [ ] protected-mode segment mutation is rejected;
 - [ ] REP string instructions normalize correctly;
-- [ ] `STI`, `MOV SS`, and `POP SS` normalize to a two-instruction comparison span when simx86 combines them;
+- [ ] `STI`, `MOV SS`, and `POP SS` report the measured one- or two-instruction span, including trap-mode STI;
+- [ ] a combined interrupt-shadow instruction followed by REP coalesces all remaining REP iterations;
+- [ ] CMPS and REP/REPE/REPNE CMPS are implemented in emu86 and covered by focused tests;
 - [ ] `end` executes zero additional guest instructions;
 - [ ] validator mode selects `mapshm` through the verified `$_mapping` configuration path rather than anonymous `softmmu`;
 - [ ] `/dev/shm/dosemu_mem` and `lowmem_base` observe identical writes in both directions;

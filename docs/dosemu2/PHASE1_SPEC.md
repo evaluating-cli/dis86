@@ -19,7 +19,7 @@ The source-verified contract is:
 5. Preserve high halves of 32-bit registers and EFLAGS when importing the 16-bit validator ABI.
 6. Keep Phase 1 strictly real-mode. Segment mutation while `PROTMODE()` is true is a validation error; it is not silently ignored.
 7. Normalize `simx86` node boundaries to the validator's decoded-instruction comparison boundary. `MSSTP` exposes REP iterations separately, while `STI`, `MOV SS`, and `POP SS` may include the following instruction in the same generated node.
-8. Engage lockstep only at the exact MZ program entry, derived from the runtime PSP plus the executable header's relative `CS:IP`.
+8. Engage lockstep only for the DOS process created for the requested executable: capture that process's PSP in the DOS exec path, then require its exact MZ entry coordinates.
 9. Export low memory through a dedicated named POSIX-SHM backing object for the `MAPPING_LOWMEM` allocation only. The generic mapping-object allocator remains unchanged.
 
 Phase 1 is deliberately scoped to **16-bit real-mode MZ executables** and a single validator/dosemu2 instance using the fixed Phase 0 paths `/dev/shm/hydra_remote` and `/dev/shm/dosemu_mem`.
@@ -168,7 +168,7 @@ The validator must not engage during BIOS, DOS, or command-shell startup.
 - initial `IP = mz_header.ip`;
 - initial `DS = ES = PSP`.
 
-`DosemuProcess` therefore supplies the target executable's **relative** MZ `CS` and `IP` to the patched dosemu2 process, for example through validator-only environment variables. The dosemu2 hook derives the runtime PSP from the architectural startup state instead of hard-coding `0x813` or accepting `CS >= load_seg`.
+`DosemuProcess` supplies both the canonical target path (or another unambiguous exec token) and the target executable's **relative** MZ `CS` and `IP`. The patched DOS exec path compares the executable being opened with that identity and records the PSP assigned to that successful exec in `g_target_psp`. A valid PSP with matching entry coordinates is insufficient: an AUTOEXEC/helper MZ can have the same, very common, relative `0:0` entry.
 
 A source-compatible gate is:
 
@@ -184,7 +184,9 @@ static bool at_target_entry(unsigned int pc)
     if (TheCPU.ds != TheCPU.es)
         return false;
 
-    psp = TheCPU.ds;
+    psp = g_target_psp;
+    if (!g_target_exec_seen || TheCPU.ds != psp || TheCPU.es != psp)
+        return false;
     if (READ_WORD((dosaddr_t)psp << 4) != 0x20cd) /* PSP starts CD 20 */
         return false;
 
@@ -195,7 +197,9 @@ static bool at_target_entry(unsigned int pc)
 }
 ```
 
-On the first match, publish the complete initial state and release-store `init = 1`. Before the match, no request wait occurs and dosemu2 continues normal startup execution.
+On the first match, publish the complete initial state and release-store `init = 1`. Before the target exec callback has recorded its PSP, or before this match, no request wait occurs and dosemu2 continues normal startup execution. Clear the captured identity when that DOS process terminates so a later process cannot reuse a stale PSP.
+
+The validator must then construct/rebase emu86 with this runtime PSP (including its PSP, image load at `PSP + 0x10`, relocation fixups, entry segments, and stack) and apply the same initial-register normalization used by the existing Hydra backend before issuing request 1. AX through BP and FLAGS must be copied/normalized explicitly; comparing an emu86 instance loaded at fixed `0x813` against a different dosemu load segment is invalid. The initial shared snapshot is a handshake, not an executed instruction.
 
 This gate is intentionally scoped to the MZ executable path already used by `Emulator::new()`; COM support is a separate extension.
 
@@ -222,9 +226,11 @@ This covers count exhaustion and REP/REPNE condition termination without pretend
 
 ### 5.3 Interrupt-shadow normalization
 
-Current `simx86` may execute the instruction following `STI`, `MOV SS`, or `POP SS` in the same node. `DosemuProcess` records a comparison span of **two decoded instructions** for that raw step. The validator advances `emu86` twice before comparing state.
+Current `simx86` may execute the instruction following `STI`, `MOV SS`, or `POP SS` in the same node, but it does not always do so (notably trap-mode `STI`). The hook or adapter derives the actual consumed boundary from generated-node metadata and the authoritative post-node PC; it must not infer a fixed span from the first opcode. The result is one when no following instruction was combined and two when it was.
 
-The backend interface should expose the number of decoded instructions consumed by the last normalized step, with a default of one for `Emulator` and `HydraProcess`. `DosemuProcess` reports two only for the verified interrupt-shadow cases.
+If the combined second instruction is REP-prefixed and the node exposes only its first iteration, the adapter continues raw requests while `CS:IP` remains at that REP instruction before comparing. Normalization is boundary-driven: account for the instructions actually consumed, then coalesce unfinished REP micro-iterations at the tail.
+
+The backend interface should expose the number of decoded instructions consumed by the last normalized step, with a default of one for `Emulator` and `HydraProcess`. `DosemuProcess` reports the measured decoded-instruction count, not a guessed opcode-based count.
 
 This keeps dosemu2's existing interrupt-shadow implementation intact and moves backend-boundary normalization into the validator, where the semantic mismatch belongs.
 
@@ -262,7 +268,7 @@ Full-simulation dosemu2 normally selects the `softmmu` mapping driver first; its
 
 Phase 1 therefore makes validator mode explicit:
 
-1. `DosemuProcess` selects the existing POSIX-SHM backend by setting `dosemu__mapping=mapshm` for the child process.
+1. `DosemuProcess` selects the existing POSIX-SHM backend with dosemu2's verified command-line configuration interface: `-I '$_mapping = "mapshm"'`. Do not rely on an inferred `dosemu__mapping` environment-variable spelling.
 2. `DosemuProcess` also sets a validator-only marker such as `DIIS_DOSEMU_VALIDATOR=1`.
 3. In `alloc_mapping_file()`, only when that marker is active **and** `cap & MAPPING_LOWMEM`, create `/dosemu_mem` as the backing object instead of calling generic `mfops->open()`.
 4. All EMS/XMS/DPMI/VGA/other allocations continue through the normal PID-unique/unlinked object path.
@@ -290,11 +296,10 @@ The Phase 1 launch path is:
 
 ```text
 DOSEMU_BIN=<patched dosemu2> \
-dosemu__mapping=mapshm \
 DIIS_DOSEMU_VALIDATOR=1 \
 DIIS_DOSEMU_MZ_CS=<relative header CS> \
 DIIS_DOSEMU_MZ_IP=<header IP> \
-  dosemu -dumb -quiet -K <test_dir> -E <test_exe>
+  dosemu -I '$_mapping = "mapshm"' -dumb -quiet -K <test_dir> -E <test_exe>
 ```
 
 Exact environment-variable names may be changed in the implementation patch, but the data flow and absence of DOSBox-X plugin flags are mandatory.
@@ -315,4 +320,7 @@ Phase 1 is complete only when tests demonstrate:
 - `end` executes no further guest instruction;
 - `/dosemu_mem` aliases the same pages dosemu2 uses for `lowmem_base`;
 - generic mapping allocations remain independent and are never redirected to `/dosemu_mem`;
-- lockstep engages only at the exact target MZ entry point.
+- lockstep engages only at the exact target MZ entry point;
+- the DOS exec path associates that entry with the requested executable and rejects a helper MZ with identical relative entry coordinates;
+- initial emu86 registers and its PSP/load-segment-dependent memory layout are aligned before request 1;
+- emu86 implements CMPS (including REP/REPE/REPNE termination) before CMPS lockstep cases are enabled.
