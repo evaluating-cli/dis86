@@ -64,17 +64,23 @@ than embedding a numeric DOS offset.
 
 ## Validator launch contract
 
-The validator launcher must select the deterministic simx86 C interpreter and
-the shared-memory mapping driver explicitly:
+The validator launcher must force CPU emulation, select the deterministic
+simx86 C interpreter, and select the shared-memory mapping driver explicitly:
 
 ```text
+$_cpu_vm = "emulated"
 $_cpuemu = (1)
 $_mapping = "mapshm"
 ```
 
-Patch 0001 fails closed if the simx86 interpreter is not selected. Patch 0002
-fails closed unless the live low-memory backing is the verified `mapshm`
-export at `/dosemu_mem`.
+`$_cpu_vm` defaults to `"auto"`; setting only `$_cpuemu = (1)` chooses the
+interpreter **if CPU emulation is used**, but does not itself prevent KVM or
+vm86 from being selected. The validator hook lives in simx86, so
+`$_cpu_vm = "emulated"` is part of the mandatory launch contract.
+
+Patch 0001 fails closed if it is reached without the simx86 interpreter selected.
+Patch 0002 fails closed unless the live low-memory backing is the verified
+`mapshm` export at `/dosemu_mem`.
 
 The exact target gate expects:
 
@@ -192,20 +198,17 @@ every entry in `patches/dosemu2/series` with `git am`, then runs
 All three current patches have passed that gate together against the exact
 pinned upstream revision.
 
-The workflow then configures an interpreter-only core build using upstream's
-own configure interface, generates the standard `version.hh` and
-`plugin_config.hh` prerequisites, and directly builds the two libraries touched
-by this series:
+The workflow then configures an interpreter-only build, generates the standard
+`version.hh` and `plugin_config.hh` prerequisites, and directly builds the two
+libraries touched by this series:
 
 - `src/base/lib/mapping`
 - `src/base/emu-i386/simx86`
 
-Both patched libraries compile successfully. A deliberately pluginless full
-`make` was also attempted during development and reached the final dosemu
-shared-library link before failing on unrelated upstream plugin symbols
-(`cp437_init`, `utf8_init`, `plugin_msdos`); the carrier CI therefore uses the
-more precise patched-library compile gate rather than treating that unrelated
-final link as part of this patch proof.
+Both patched libraries compile successfully. The workflow also performs a
+minimal whole-runtime link with the `charsets`, `msdos`, and `term` plugins,
+which supply the core charset, DOS, and headless-terminal hooks without pulling
+in SDL/audio/network plugins.
 
 Still required:
 
