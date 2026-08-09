@@ -42,3 +42,4 @@ pub mod validator;
 
 // Tests
 #[cfg(test)] mod alu_test;
+#[cfg(test)] mod shift_semantics_test;
