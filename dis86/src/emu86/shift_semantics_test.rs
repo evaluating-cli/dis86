@@ -74,6 +74,19 @@ fn shl_count_gt_1_preserves_of_and_af() {
 }
 
 #[test]
+fn shl_count_above_width_clears_cf() {
+  let input = flags_with(true, true);
+
+  let (byte_result, byte_flags) = alu::shift(ShiftOp::Shl, Value::U8(0xff), 9, input);
+  assert_eq!(byte_result, Value::U8(0x00));
+  assert_flags(byte_flags, false, true, false, true, true, true);
+
+  let (word_result, word_flags) = alu::shift(ShiftOp::Shl, Value::U16(0xffff), 17, input);
+  assert_eq!(word_result, Value::U16(0x0000));
+  assert_flags(word_flags, false, true, false, true, true, true);
+}
+
+#[test]
 fn shr_count_1_uses_original_sign_for_of_and_preserves_af() {
   let input = flags_with(false, true);
   let (result, flags) = alu::shift(ShiftOp::Shr, Value::U8(0x80), 1, input);
@@ -104,6 +117,19 @@ fn shr_operand_width_count_uses_original_msb_for_cf() {
   let (word_result, word_flags) = alu::shift(ShiftOp::Shr, Value::U16(0x8000), 16, input);
   assert_eq!(word_result, Value::U16(0x0000));
   assert_flags(word_flags, true, true, false, true, true, true);
+}
+
+#[test]
+fn shr_count_above_width_clears_cf() {
+  let input = flags_with(true, true);
+
+  let (byte_result, byte_flags) = alu::shift(ShiftOp::Shr, Value::U8(0xff), 9, input);
+  assert_eq!(byte_result, Value::U8(0x00));
+  assert_flags(byte_flags, false, true, false, true, true, true);
+
+  let (word_result, word_flags) = alu::shift(ShiftOp::Shr, Value::U16(0xffff), 17, input);
+  assert_eq!(word_result, Value::U16(0x0000));
+  assert_flags(word_flags, false, true, false, true, true, true);
 }
 
 #[test]
