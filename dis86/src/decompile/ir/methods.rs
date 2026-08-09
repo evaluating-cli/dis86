@@ -3,7 +3,7 @@ use super::block_data::{self, InstrData};
 use crate::decompile::sym;
 use crate::asm::instr;
 use crate::types::{Type, TypeDatabase};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 ////////////////////////////////////////////////////////////////////////////////////
@@ -263,32 +263,48 @@ impl IR {
     vref
   }
 
-  pub fn get_var<S: Into<Name>>(&mut self, sym: S, blk: BlockRef) -> Ref {
+  pub fn get_var<S: Into<Name>>(&mut self, sym: S, mut blk: BlockRef) -> Ref {
     let sym: Name = sym.into();
+    let mut visited = HashSet::new();
 
-    // Defined locally in this block? Easy.
-    match self.block_mut(blk).defs.get(&sym) {
-      Some(val) => return *val,
-      None => (),
-    }
-
-    // Otherwise, search predecessors
-    if !self.block(blk).sealed {
-      // add an empty phi node and mark it for later population
-      let phi = self.phi_create(sym.clone(), blk);
-      self.block_mut(blk).incomplete_phis.push((sym, phi));
-      phi
-    } else {
-      let preds = &self.block(blk).preds;
-      if preds.len() == 1 {
-        let parent = preds[0];
-        self.get_var(sym, parent)
-      } else {
-        // create a phi and immediately populate it
-        let phi = self.phi_create(sym.clone(), blk);
-        self.phi_populate(sym, phi);
-        phi
+    loop {
+      // Defined locally in this block? Easy.
+      match self.block_mut(blk).defs.get(&sym) {
+        Some(val) => return *val,
+        None => (),
       }
+
+      // Otherwise, search predecessors
+      if !self.block(blk).sealed {
+        // add an empty phi node and mark it for later population
+        let phi = self.phi_create(sym.clone(), blk);
+        self.block_mut(blk).incomplete_phis.push((sym, phi));
+        return phi;
+      }
+
+      let pred = match self.block(blk).preds.as_slice() {
+        [pred] => Some(*pred),
+        _ => None,
+      };
+
+      if let Some(parent) = pred {
+        // A sealed single-predecessor SCC can occur in unreachable code. The
+        // recursive implementation overflows the stack there, while a plain
+        // iterative rewrite would loop forever. Materialize a phi to break the
+        // cycle, just as the multi-predecessor case does before recursing.
+        if !visited.insert(blk) {
+          let phi = self.phi_create(sym.clone(), blk);
+          self.phi_populate(sym, phi);
+          return phi;
+        }
+        blk = parent;
+        continue;
+      }
+
+      // create a phi and immediately populate it
+      let phi = self.phi_create(sym.clone(), blk);
+      self.phi_populate(sym, phi);
+      return phi;
     }
   }
 
@@ -376,3 +392,85 @@ impl Ref {
 
 impl From<instr::Reg> for Name { fn from(reg: instr::Reg) -> Self { Self::Reg(reg) } }
 impl From<&instr::Reg> for Name { fn from(reg: &instr::Reg) -> Self { Self::Reg(*reg) } }
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn test_ir() -> IR {
+    IR::new(Rc::new(TypeDatabase::new()))
+  }
+
+  fn var(name: &str) -> Name {
+    Name::Var(name.to_string())
+  }
+
+  #[test]
+  fn get_var_handles_deep_single_predecessor_chain() {
+    let mut ir = test_ir();
+    let entry = ir.add_block("entry");
+    ir.seal_block(entry);
+    let value = ir.const_new(42);
+    ir.set_var(var("x"), entry, value);
+
+    let mut prev = entry;
+    for i in 0..16_384 {
+      let blk = ir.add_block(&format!("b{}", i));
+      ir.block_mut(blk).preds.push(prev);
+      ir.seal_block(blk);
+      prev = blk;
+    }
+
+    assert_eq!(ir.get_var(var("x"), prev), value);
+  }
+
+  #[test]
+  fn get_var_preserves_normal_loop_phi() {
+    let mut ir = test_ir();
+    let entry = ir.add_block("entry");
+    let header = ir.add_block("header");
+    let body = ir.add_block("body");
+    let value = ir.const_new(7);
+
+    ir.block_mut(header).preds.extend([entry, body]);
+    ir.block_mut(body).preds.push(header);
+    ir.seal_block(entry);
+    ir.seal_block(header);
+    ir.seal_block(body);
+    ir.set_var(var("x"), entry, value);
+
+    let phi = ir.get_var(var("x"), header);
+    let instr = ir.instr(phi).unwrap();
+    assert_eq!(instr.opcode, Opcode::Phi);
+    assert_eq!(instr.operands, vec![value, phi]);
+  }
+
+  #[test]
+  fn get_var_terminates_on_unreachable_self_loop() {
+    let mut ir = test_ir();
+    let loop_blk = ir.add_block("loop");
+    ir.block_mut(loop_blk).preds.push(loop_blk);
+    ir.seal_block(loop_blk);
+
+    let phi = ir.get_var(var("x"), loop_blk);
+    let instr = ir.instr(phi).unwrap();
+    assert_eq!(instr.opcode, Opcode::Phi);
+    assert_eq!(instr.operands, vec![phi]);
+  }
+
+  #[test]
+  fn get_var_terminates_on_unreachable_single_predecessor_cycle() {
+    let mut ir = test_ir();
+    let a = ir.add_block("a");
+    let b = ir.add_block("b");
+    ir.block_mut(a).preds.push(b);
+    ir.block_mut(b).preds.push(a);
+    ir.seal_block(a);
+    ir.seal_block(b);
+
+    let phi = ir.get_var(var("x"), a);
+    let instr = ir.instr(phi).unwrap();
+    assert_eq!(instr.opcode, Opcode::Phi);
+    assert_eq!(instr.operands, vec![phi]);
+  }
+}
