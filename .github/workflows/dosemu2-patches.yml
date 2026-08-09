@@ -241,3 +241,13 @@ jobs:
             exit "$status"
           fi
           echo 'dosemu2 runtime hook proof passed'
+
+      - name: Upload runtime diagnostics
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: dosemu2-runtime-diagnostics
+          path: |
+            /tmp/diis-dosemu2-runtime-probe.log
+            /tmp/diis-dosemu2.log
+          if-no-files-found: warn
