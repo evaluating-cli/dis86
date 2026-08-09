@@ -5,11 +5,15 @@ on:
     paths:
       - 'patches/dosemu2/**'
       - 'scripts/apply-dosemu2-patches.sh'
+      - 'scripts/make-dosemu2-runtime-probe.py'
+      - 'scripts/dosemu2-runtime-probe.rs'
       - '.github/workflows/dosemu2-patches.yml'
   pull_request:
     paths:
       - 'patches/dosemu2/**'
       - 'scripts/apply-dosemu2-patches.sh'
+      - 'scripts/make-dosemu2-runtime-probe.py'
+      - 'scripts/dosemu2-runtime-probe.rs'
       - '.github/workflows/dosemu2-patches.yml'
 
 permissions:
@@ -21,8 +25,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Check helper script syntax
-        run: bash -n scripts/apply-dosemu2-patches.sh
+      - name: Check helper/probe syntax
+        run: |
+          bash -n scripts/apply-dosemu2-patches.sh
+          python3 -m py_compile scripts/make-dosemu2-runtime-probe.py
+          rustc --edition=2021 scripts/dosemu2-runtime-probe.rs -o /tmp/dosemu2-runtime-probe
 
       - name: Fetch pinned dosemu2 source
         env:
@@ -153,3 +160,75 @@ jobs:
           test -x bin/dosemu
           test -x 2.0-pre9/bin/dosemu2.bin
           echo 'patched dosemu2 + pinned fdpp runtime stack built successfully'
+
+      - name: Prove lowmem aliasing and end barrier at runtime
+        working-directory: /tmp/dosemu2
+        shell: bash
+        run: |
+          set -euo pipefail
+          probe_dir=/tmp/diis-dosemu2-probe
+          probe_home=/tmp/diis-dosemu2-home
+          log=/tmp/diis-dosemu2.log
+          rm -rf "$probe_dir" "$probe_home"
+          mkdir -p "$probe_dir" "$probe_home"
+          rm -f /dev/shm/hydra_remote /dev/shm/dosemu_mem
+
+          python3 "$GITHUB_WORKSPACE/scripts/make-dosemu2-runtime-probe.py" \
+            "$probe_dir/TEST.EXE"
+          rustc --edition=2021 -O \
+            "$GITHUB_WORKSPACE/scripts/dosemu2-runtime-probe.rs" \
+            -o /tmp/dosemu2-runtime-probe
+
+          config='$_cpu_vm = "emulated"
+          $_cpuemu = (1)
+          $_mapping = "mapshm"'
+
+          HOME="$probe_home" \
+          DIIS_DOSEMU_VALIDATOR=1 \
+          DIIS_DOSEMU_MZ_CS=0 \
+          DIIS_DOSEMU_MZ_IP=0 \
+          DIIS_DOSEMU_TARGET_DOS_PATH='C:\TEST.EXE' \
+            ./bin/dosemu -dumb -q -n \
+              -I "$config" \
+              -K "$probe_dir:C:\" \
+              -E TEST.EXE >"$log" 2>&1 &
+          dosemu_pid=$!
+
+          cleanup() {
+            if kill -0 "$dosemu_pid" 2>/dev/null; then
+              kill "$dosemu_pid" 2>/dev/null || true
+            fi
+          }
+          trap cleanup EXIT
+
+          if ! timeout 25s /tmp/dosemu2-runtime-probe; then
+            echo '--- dosemu2 runtime log ---'
+            cat "$log"
+            exit 1
+          fi
+
+          for _ in $(seq 1 100); do
+            if ! kill -0 "$dosemu_pid" 2>/dev/null; then
+              break
+            fi
+            sleep 0.05
+          done
+          if kill -0 "$dosemu_pid" 2>/dev/null; then
+            echo 'dosemu2 did not terminate after END_ACK' >&2
+            echo '--- dosemu2 runtime log ---'
+            cat "$log"
+            exit 1
+          fi
+
+          set +e
+          wait "$dosemu_pid"
+          status=$?
+          set -e
+          trap - EXIT
+          if [[ $status -ne 0 ]]; then
+            echo "dosemu2 exited with status $status" >&2
+            echo '--- dosemu2 runtime log ---'
+            cat "$log"
+            exit "$status"
+          fi
+          echo 'dosemu2 runtime hook proof passed'
