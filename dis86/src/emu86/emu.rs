@@ -19,6 +19,13 @@ pub struct Emulator {
   last_cpu_state: Cpu,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LoadConfig { pub psp_segment: u16 }
+
+impl Default for LoadConfig {
+  fn default() -> Self { Self { psp_segment: 0x0813 } }
+}
+
 #[cfg(feature = "sdl")]
 type App = sdl::App;
 
@@ -36,6 +43,10 @@ impl App {
 
 impl Emulator {
   pub fn new(exe_path: &str) -> Result<Emulator, String> {
+    Self::new_with_load_config(exe_path, LoadConfig::default())
+  }
+
+  pub fn new_with_load_config(exe_path: &str, config: LoadConfig) -> Result<Emulator, String> {
     let Ok(data) = std::fs::read(exe_path) else {
       panic!("Failed to read file: {}", exe_path);
     };
@@ -45,7 +56,7 @@ impl Emulator {
     let root_dir = Path::new(exe_path).parent().unwrap().to_str().unwrap();
 
     // Init the machine and load up the program
-    let mut machine = Machine::new(Some(root_dir));
+    let mut machine = Machine::new_with_psp_segment(Some(root_dir), config.psp_segment);
     machine.load_exe(&exe)?;
 
     let app = App::new();
@@ -141,6 +152,7 @@ impl Emu for Emulator {
   fn report(&self) {
     self.machine.report().unwrap();
   }
+  fn code_load_seg(&self) -> Seg { self.machine.code_load_seg() }
 }
 
 pub fn run(exe_path: &str) -> Result<(), String> {

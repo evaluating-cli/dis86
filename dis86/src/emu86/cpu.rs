@@ -37,6 +37,53 @@ impl Default for Cpu {
   }
 }
 
+/// Controls deterministic normalization of an initial CPU snapshot.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub struct InitialStatePolicy {
+  /// Clears AX, BX, CX, DX, SI, DI and BP. SP, IP and segment registers are preserved.
+  pub normalize_general_registers: bool,
+  /// FLAGS bits selected for replacement by `flags_value`.
+  pub flags_mask: u16,
+  pub flags_value: u16,
+}
+
+/// Applies `policy` without I/O or shared-memory access. Unmasked FLAGS bits and
+/// SP, IP, CS, DS, ES and SS are always preserved.
+pub fn normalize_initial_state(state: &mut Cpu, policy: InitialStatePolicy) {
+  if policy.normalize_general_registers {
+    for reg in [AX, BX, CX, DX, SI, DI, BP] { state.regs[reg.idx as usize] = 0; }
+  }
+  let flags = state.regs[FLAGS.idx as usize];
+  state.regs[FLAGS.idx as usize] = (flags & !policy.flags_mask) |
+    (policy.flags_value & policy.flags_mask);
+}
+
+#[cfg(test)]
+mod normalization_tests {
+  use super::*;
+
+  #[test]
+  fn policy_enumerates_every_changed_and_preserved_field() {
+    let mut state = Cpu { regs: [0x1000, 0x1001, 0x1002, 0x1003, 0x1004, 0x1005,
+      0x1006, 0x1007, 0x1008, 0x1009, 0x100a, 0x100b, 0x100c, 0xa55a] };
+    normalize_initial_state(&mut state, InitialStatePolicy {
+      normalize_general_registers: true, flags_mask: 0x00f0, flags_value: 0x00a0,
+    });
+    assert_eq!(state.regs, [0, 0, 0, 0, 0, 0, 0, 0x1007, 0x1008, 0x1009,
+      0x100a, 0x100b, 0x100c, 0xa5aa]);
+  }
+
+  #[test]
+  fn disabled_policy_preserves_every_field() {
+    let before = Cpu { regs: [0x1234; 14] };
+    let mut state = before.clone();
+    normalize_initial_state(&mut state, InitialStatePolicy {
+      normalize_general_registers: false, flags_mask: 0, flags_value: 0xffff,
+    });
+    assert_eq!(state, before);
+  }
+}
+
 impl Cpu {
   pub fn reg_read_u8(&self, r: Register) -> u8 {
     self.reg_read(r).unwrap_u8()

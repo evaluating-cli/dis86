@@ -5,6 +5,7 @@ mod cpu;
 #[allow(dead_code)]
 mod cpu_flags;
 mod cpu_scas;
+mod cpu_cmps;
 mod cpu_stos;
 mod cpu_movs;
 
@@ -35,6 +36,8 @@ mod sdl;
 pub mod emu;
 
 pub use emu::run;
+pub use emu::{Emulator, LoadConfig};
+pub use cpu::{InitialStatePolicy, normalize_initial_state};
 pub mod validator;
 
 // Tests

@@ -214,7 +214,7 @@ impl Machine {
     let instr_addr = SegOff::new_normal(cs, ip);
     let instr = decode_instr(&self.mem, instr_addr)?;
 
-    let code_seg = PSP_SEGMENT.unwrap_normal() + 0x10;
+    let code_seg = self.psp_segment + 0x10;
     if cs < code_seg {
       println!("{:6} | unknown", self.exec_count);
     } else {
@@ -242,6 +242,7 @@ impl Machine {
       Opcode::OP_SCAS => return self.opcode_scas(&instr),
       Opcode::OP_STOS => return self.opcode_stos(&instr),
       Opcode::OP_MOVS => return self.opcode_movs(&instr),
+      Opcode::OP_CMPS => return self.opcode_cmps(&instr),
       _ => (),
     }
 
