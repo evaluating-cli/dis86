@@ -1,0 +1,59 @@
+From 0000000000000000000000000000000000000005 Mon Sep 17 00:00:00 2001
+From: evaluating-cli <noreply@github.com>
+Date: Sun, 9 Aug 2026 19:58:00 +0200
+Subject: [PATCH 5/5] simx86: reject protected-mode validator state import
+
+Phase 1 validation is restricted to 16-bit real mode. Refuse an external
+register-state import before mutating any simx86 CPU state when protected mode
+is active.
+
+Publish the current unmodified CPU state with DIIS_STEP_FAULT, acknowledge the
+pending request, and use the existing stop-before-node path. This keeps the
+failure observable to the controller while ensuring selectors, segment caches,
+GPRs, FLAGS, and PC are not partially overwritten in protected mode.
+
+Base: patch 4 on dosemu2/dosemu2@604ce0cdd1a71f657e2a2df623d216d5ab289313
+---
+diff --git a/src/base/emu-i386/simx86/diis-validator.c b/src/base/emu-i386/simx86/diis-validator.c
+--- a/src/base/emu-i386/simx86/diis-validator.c
++++ b/src/base/emu-i386/simx86/diis-validator.c
+@@ -338,8 +338,15 @@ static void publish_cpu(unsigned int pc, uint32_t decoded, uint32_t flags)
+ 	__atomic_store_n(&g_shm->step_flags, flags, __ATOMIC_RELEASE);
+ }
+ 
+-static void apply_cpu(unsigned int *pc)
++static int apply_cpu(unsigned int *pc)
+ {
++	if (PROTMODE()) {
++		error("DIIS validator refuses external CPU state import in protected mode\n");
++		publish_cpu(*pc, 0, DIIS_STEP_FAULT);
++		return -1;
++	}
++
+ 	TheCPU.eax = (TheCPU.eax & 0xffff0000u) | g_shm->ax;
+ 	TheCPU.ebx = (TheCPU.ebx & 0xffff0000u) | g_shm->bx;
+ 	TheCPU.ecx = (TheCPU.ecx & 0xffff0000u) | g_shm->cx;
+@@ -365,6 +372,7 @@ static void apply_cpu(unsigned int *pc)
+ 	TheCPU.eip = g_shm->ip;
+ 	*pc = LONG_CS + TheCPU.eip;
+ 	TheCPU.key = *pc;
++	return 0;
+ }
+ 
+ int diis_validator_before_node(unsigned int *pc)
+@@ -421,7 +429,12 @@ int diis_validator_before_node(unsigned int *pc)
+ 		usleep(50);
+ 	}
+ 
+-	apply_cpu(pc);
++	if (apply_cpu(pc)) {
++		req = __atomic_load_n(&g_shm->req, __ATOMIC_RELAXED);
++		__atomic_store_n(&g_shm->ack, req, __ATOMIC_RELEASE);
++		return -1;
++	}
++
+ 	g_node_controlled = 1;
+ 	return 1;
+ }
+-- 
+2.47.0
