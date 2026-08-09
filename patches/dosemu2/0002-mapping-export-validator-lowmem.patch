@@ -21,23 +21,17 @@ mappable view of the same backing simx86 uses.
 
 Base: patch 1 on dosemu2/dosemu2@604ce0cdd1a71f657e2a2df623d216d5ab289313
 ---
- src/base/emu-i386/simx86/diis-validator.c |  7 ++
- src/base/lib/mapping/mapfile.c            | 101 ++++++++++++++++++++---
- src/base/lib/mapping/mapping.c            | 17 ++++
- src/base/lib/mapping/mapping.h            |  1 +
- 4 files changed, 116 insertions(+), 10 deletions(-)
-
 diff --git a/src/base/emu-i386/simx86/diis-validator.c b/src/base/emu-i386/simx86/diis-validator.c
 --- a/src/base/emu-i386/simx86/diis-validator.c
 +++ b/src/base/emu-i386/simx86/diis-validator.c
-@@ -15,6 +15,7 @@
+@@ -13,6 +13,7 @@
+ #include "emu86.h"
  #include "codegen.h"
  #include "diis-validator.h"
  #include "memory.h"
 +#include "mapping/mapping.h"
  #include "protmode.h"
  #include "utilities.h"
- 
 @@ -103,6 +104,12 @@ static int diis_validator_init(void)
  		error("DIIS validator requires $_cpuemu = (1)\n");
  		return 0;
@@ -87,8 +81,7 @@ diff --git a/src/base/lib/mapping/mapping.c b/src/base/lib/mapping/mapping.c
 +    return 0;
 +  if (!mapfile_validator_lowmem_export_ready(lowmem_base, ALIAS_SIZE))
 +    return 0;
-+  /* Conventional address zero must currently resolve through the backing
-+   * image that was exported, not through an unrelated allocation. */
++  /* Conventional address zero must resolve through the exported backing. */
 +  return dosaddr_to_unixaddr(0) == lowmem_base;
 +#else
 +  return 0;
@@ -101,16 +94,7 @@ diff --git a/src/base/lib/mapping/mapping.c b/src/base/lib/mapping/mapping.c
 diff --git a/src/base/lib/mapping/mapfile.c b/src/base/lib/mapping/mapfile.c
 --- a/src/base/lib/mapping/mapfile.c
 +++ b/src/base/lib/mapping/mapfile.c
-@@ -39,11 +39,31 @@ static struct file_mapping {
-   int prot;
- } file_mappings[MAX_FILE_MAPPINGS];
- 
--typedef int (*open_cb_t)(void);
-+typedef int (*open_cb_t)(int cap);
- struct mfops_s {
-   open_cb_t open;
- };
- 
+@@ -48,4 +48,28 @@ struct mfops_s {
  static struct mfops_s *mfops;
 +
 +#define DIIS_LOWMEM_SHM_NAME "/dosemu_mem"
@@ -118,8 +102,6 @@ diff --git a/src/base/lib/mapping/mapfile.c b/src/base/lib/mapping/mapfile.c
 +static int validator_lowmem_verified;
 +static void *validator_lowmem_addr;
 +static size_t validator_lowmem_size;
-+
-+int mapfile_validator_lowmem_export_ready(void *addr, size_t size);
 +
 +static int validator_requested(void)
 +{
@@ -141,81 +123,7 @@ diff --git a/src/base/lib/mapping/mapfile.c b/src/base/lib/mapping/mapfile.c
  
  static struct file_mapping *find_file_mapping(unsigned char *target)
  {
-@@ -83,8 +103,9 @@ static void *alias_mapping_file(int cap, void *target, size_t mapsize, int protec
-   return addr;
- }
- 
--static int do_open_file(void)
-+static int do_open_file(int cap)
- {
-   char tmp[PATH_MAX];
-   int fd;
-+
-+  (void)cap;
- 
-   snprintf(tmp, sizeof(tmp), "%s/dosemu2_mapfile_XXXXXX", dosemu_tmpdir);
-   fd = mkstemp(tmp);
-@@ -103,7 +124,7 @@ static int open_mapping_file(int cap)
-   if (cap == MAPPING_PROBE) {
-     open_cb_t o = do_open_file;
--    int fd = o();
-+    int fd = o(cap);
-     if (fd == -1)
-       return 0;
-     close(fd);
-@@ -114,11 +135,19 @@ static int open_mapping_file(int cap)
- }
- 
- #ifdef HAVE_SHM_OPEN
--static int do_open_pshm(void)
-+static int do_open_pshm(int cap)
- {
-   char *name;
-   int ret, fd;
- 
-+	if (validator_requested() && (cap & MAPPING_LOWMEM)) {
-+		fd = shm_open(DIIS_LOWMEM_SHM_NAME,
-+				O_RDWR | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR);
-+		if (fd != -1)
-+			validator_lowmem_named = 1;
-+		return fd;
-+	}
-+
-   ret = asprintf(&name, "/dosemu_%d", getpid());
-   assert(ret != -1);
-   /* FD_CLOEXEC is set by default */
-@@ -141,7 +170,7 @@ static int open_mapping_pshm(int cap)
-   if (cap == MAPPING_PROBE) {
-     open_cb_t o = do_open_pshm;
--    int fd = o();
-+    int fd = o(cap);
-     if (fd == -1)
-       return 0;
-     close(fd);
-@@ -153,10 +182,12 @@ static int open_mapping_pshm(int cap)
- 
- #ifdef HAVE_MEMFD_CREATE
- #if HAVE_DECL_MEMFD_CREATE
--static int do_open_mshm(void)
-+static int do_open_mshm(int cap)
- {
-   char *name;
-   int ret, fd;
- 
-+	(void)cap;
-+
-   ret = asprintf(&name, "dosemu_%d", getpid());
-   assert(ret != -1);
- 
-@@ -176,7 +207,7 @@ static int open_mapping_mshm(int cap)
-   if (cap == MAPPING_PROBE) {
-     open_cb_t o = do_open_mshm;
--    int fd = o();
-+    int fd = o(cap);
-     if (fd == -1)
-       return 0;
-     close(fd);
-@@ -191,6 +222,9 @@ static void do_free_mapping(struct file_mapping *p)
+@@ -213,6 +237,9 @@ static void do_free_mapping(struct file_mapping *p)
  {
 +  if (p->addr == validator_lowmem_addr)
 +    validator_lowmem_reset();
@@ -223,7 +131,8 @@ diff --git a/src/base/lib/mapping/mapfile.c b/src/base/lib/mapping/mapfile.c
    munmap(p->addr, p->size);
    if (p->fd != -1)
      close(p->fd);
-@@ -241,18 +275,70 @@ static void *alloc_tail(int fd, size_t mapsize, int prot, void *target)
+@@ -260,5 +287,38 @@ static void *alloc_tail(int fd, size_t mapsize, int prot, void *target)
+   p->prot = prot;
    return target;
  }
  
@@ -261,6 +170,7 @@ diff --git a/src/base/lib/mapping/mapfile.c b/src/base/lib/mapping/mapfile.c
 +}
 +
  static void *alloc_mapping_file(int cap, size_t mapsize, void *target)
+@@ -266,14 +326,61 @@ static void *alloc_mapping_file(int cap, size_t mapsize, void *target)
  {
    int prot = PROT_READ | PROT_WRITE;
    int fd, rc;
@@ -270,20 +180,29 @@ diff --git a/src/base/lib/mapping/mapfile.c b/src/base/lib/mapping/mapfile.c
    Q__printf("MAPPING: alloc, cap=%s, mapsize=%zx\n", cap, mapsize);
 -  fd = mfops->open();
 +#ifdef HAVE_SHM_OPEN
-+  if (validator_lowmem && mfops != &pshm_mfops) {
-+    error("DIIS validator low memory requires mapshm\n");
-+    errno = EINVAL;
-+    return MAP_FAILED;
-+  }
-+#else
 +  if (validator_lowmem) {
-+    error("DIIS validator low memory requires POSIX shm_open support\n");
-+    errno = ENOTSUP;
-+    return MAP_FAILED;
-+  }
++    if (mfops != &pshm_mfops) {
++      error("DIIS validator low memory requires mapshm\n");
++      errno = EINVAL;
++      return MAP_FAILED;
++    }
++    fd = shm_open(DIIS_LOWMEM_SHM_NAME,
++        O_RDWR | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR);
++    if (fd != -1)
++      validator_lowmem_named = 1;
++  } else
 +#endif
++  {
++#ifndef HAVE_SHM_OPEN
++    if (validator_lowmem) {
++      error("DIIS validator low memory requires POSIX shm_open support\n");
++      errno = ENOTSUP;
++      return MAP_FAILED;
++    }
++#endif
++    fd = mfops->open();
++  }
 +
-+  fd = mfops->open(cap);
    if (fd < 0) {
      error("mapping: open() failed\n");
      return MAP_FAILED;
@@ -320,7 +239,7 @@ diff --git a/src/base/lib/mapping/mapfile.c b/src/base/lib/mapping/mapfile.c
 +  }
 +  return addr;
  }
-+
++ 
 +int mapfile_validator_lowmem_export_ready(void *addr, size_t size)
 +{
 +  return validator_lowmem_named && validator_lowmem_verified &&
