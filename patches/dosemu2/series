@@ -2,3 +2,4 @@
 0002-mapping-export-validator-lowmem.patch
 0003-simx86-harden-validator-target-lifecycle.patch
 0004-simx86-publish-validator-step-flags-atomically.patch
+0005-simx86-reject-protected-mode-state-import.patch
