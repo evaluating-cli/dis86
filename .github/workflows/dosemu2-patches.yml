@@ -52,14 +52,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             autoconf automake libtool build-essential \
-            bison flex gawk pkg-config libbsd-dev
+            bison flex gawk pkg-config libbsd-dev libslang2-dev
 
-      - name: Configure interpreter-only core build
+      - name: Configure minimal interpreter runtime
         working-directory: /tmp/dosemu2
         run: |
           ./autogen.sh
           ./configure \
-            --enable-plugins=no \
+            --enable-plugins=charsets,msdos,term \
             --disable-fdpp \
             --disable-dj64 \
             --disable-searpc \
@@ -87,3 +87,20 @@ jobs:
             exit "$status"
           fi
           echo 'patched mapping and simx86 libraries compiled successfully'
+
+      - name: Link minimal patched dosemu2 runtime
+        working-directory: /tmp/dosemu2
+        shell: bash
+        run: |
+          set +e
+          make -j2 > /tmp/dosemu2-full-build.log 2>&1
+          status=$?
+          set -e
+          if [[ $status -ne 0 ]]; then
+            echo '--- minimal dosemu2 link failure (last 160 lines) ---'
+            tail -n 160 /tmp/dosemu2-full-build.log
+            exit "$status"
+          fi
+          test -x bin/dosemu
+          test -x 2.0pre9/bin/dosemu.bin
+          echo 'minimal patched dosemu2 runtime linked successfully'
