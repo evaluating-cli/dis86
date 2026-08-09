@@ -94,12 +94,14 @@ fn update_flags_shl(f: &mut Flags, _a: u16, n: u8, r32: u32, sign_mask: u16, val
   f.set(FLAG_CF, old_sign);
   f.set(FLAG_ZF, flag_generic_zf(r, value_mask));
   f.set(FLAG_SF, flag_generic_sf(r, sign_mask));
-  f.set(FLAG_OF, old_sign ^ new_sign);  // sign bit changed?
+  // x86 only defines OF for a one-bit shift. Keep it clear for larger
+  // counts rather than deriving it from the final two shifted bits.
+  f.set(FLAG_OF, n == 1 && (old_sign ^ new_sign));
   f.set(FLAG_PF, flag_generic_pf(r));
   f.set(FLAG_AF, false);
 }
 
-fn update_flags_shr(f: &mut Flags, a: u16, n: u8, r: u16, sign_mask: u16, value_mask: u16) {
+fn update_flags_shr(f: &mut Flags, a: u16, n: u8, r: u16, sign_mask: u16, value_mask: u16, is_arithmetic: bool) {
   if n == 0 { return; } // No update to flags if no shift happens
 
   let cf_bit = 1 << (n-1);
@@ -108,8 +110,10 @@ fn update_flags_shr(f: &mut Flags, a: u16, n: u8, r: u16, sign_mask: u16, value_
   f.set(FLAG_CF, cf);
   f.set(FLAG_ZF, flag_generic_zf(r, value_mask));
   f.set(FLAG_SF, flag_generic_sf(r, sign_mask));
-  // I think this flag is ignored? Hard to tell...
-  //f.set(FLAG_OF, (a & sign_mask) != 0);
+  // For a one-bit SHR, OF receives the original sign bit. SAR clears OF.
+  // OF is undefined for larger counts, so keep the emulator's deterministic
+  // convention of clearing it in that case.
+  f.set(FLAG_OF, n == 1 && !is_arithmetic && (a & sign_mask) != 0);
   f.set(FLAG_PF, flag_generic_pf(r));
   f.set(FLAG_AF, false);
 }
@@ -303,7 +307,7 @@ pub fn shift(op: ShiftOp, a: Value, n: u8, mut f: Flags) -> (Value, Flags) {
         0
       };
       result = r32 as u16;
-      update_flags_shr(&mut f, a, n, result, sign_mask, value_mask);
+      update_flags_shr(&mut f, a, n, result, sign_mask, value_mask, false);
     }
     ShiftOp::Sar => {
       result = match size {
@@ -311,7 +315,7 @@ pub fn shift(op: ShiftOp, a: Value, n: u8, mut f: Flags) -> (Value, Flags) {
         2 => (a as i16).wrapping_shr(n as u32) as u16,
         _ => unreachable!(),
       };
-      update_flags_shr(&mut f, a, n, result, sign_mask, value_mask);
+      update_flags_shr(&mut f, a, n, result, sign_mask, value_mask, true);
     }
     ShiftOp::Rol => {
       result = match size {

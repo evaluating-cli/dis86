@@ -168,7 +168,7 @@ pub fn decode_one_impl<'a>(bin: &mut RegionIter<'a>) -> Result<Option<(Instr, &'
   let mut sreg = None;
   let mut rep = None;
   loop {
-    match bin.peek() {
+    match bin.peek_checked()? {
       0x26 => sreg = Some(Reg::ES),
       0x2e => sreg = Some(Reg::CS),
       0x36 => sreg = Some(Reg::SS),
