@@ -18,16 +18,16 @@ Base: patch 3 on dosemu2/dosemu2@604ce0cdd1a71f657e2a2df623d216d5ab289313
 diff --git a/src/base/emu-i386/simx86/diis-validator.c b/src/base/emu-i386/simx86/diis-validator.c
 --- a/src/base/emu-i386/simx86/diis-validator.c
 +++ b/src/base/emu-i386/simx86/diis-validator.c
-@@ -300,3 +300,3 @@ static void publish_cpu(unsigned int pc, uint32_t decoded, uint32_t flags)
- 	g_shm->runtime_psp = g_runtime_psp;
- 	g_shm->decoded_instructions = decoded;
--	g_shm->step_flags = flags;
-+	__atomic_store_n(&g_shm->step_flags, flags, __ATOMIC_RELEASE);
 @@ -276,4 +276,4 @@ static void mark_target_finished(void)
  		return;
  	g_shm->runtime_psp = 0;
  	g_shm->decoded_instructions = 0;
 -	g_shm->step_flags = DIIS_STEP_TARGET_EXIT;
 +	__atomic_store_n(&g_shm->step_flags, DIIS_STEP_TARGET_EXIT, __ATOMIC_RELEASE);
+@@ -300,3 +300,3 @@ static void publish_cpu(unsigned int pc, uint32_t decoded, uint32_t flags)
+ 	g_shm->runtime_psp = g_runtime_psp;
+ 	g_shm->decoded_instructions = decoded;
+-	g_shm->step_flags = flags;
++	__atomic_store_n(&g_shm->step_flags, flags, __ATOMIC_RELEASE);
 -- 
 2.47.0
