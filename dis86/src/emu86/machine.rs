@@ -18,10 +18,15 @@ pub struct Machine {
   pub video: Video,
   pub adlib: Adlib,
   pub exec_count: u64,
+  pub psp_segment: u16,
 }
 
 impl Machine {
   pub fn new(root_dir: Option<&str>) -> Machine {
+    Self::new_with_psp_segment(root_dir, 0x0813)
+  }
+
+  pub fn new_with_psp_segment(root_dir: Option<&str>, psp_segment: u16) -> Machine {
     let mut mem = Memory::default();
     let dos = Dos::new(root_dir, &mut mem);
 
@@ -34,6 +39,7 @@ impl Machine {
       video: Video::new(),
       adlib: Adlib::new(),
       exec_count: 0,
+      psp_segment,
     }
   }
 
