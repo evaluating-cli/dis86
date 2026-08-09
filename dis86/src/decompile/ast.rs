@@ -544,6 +544,7 @@ impl<'a> Builder<'a> {
 
       let typ = symref.get_type(&self.ir.symbols);
       let ptr_sz = match typ {
+        Type::U8 => "PTR_8",
         Type::U16 => "PTR_16",
         Type::U32 => "PTR_32",
         _ => panic!("Unsupported type: {:?}", typ),
@@ -720,6 +721,11 @@ impl<'a> Builder<'a> {
           // the ir finalize, but it's probably good to do sanity checks
           let idx = self.ref_to_expr(instr.operands[0], 1);
           return Some(idx);
+        }
+        ir::Opcode::WriteVar8 => {
+          let lhs = self.symbol_to_expr(instr.operands[0].unwrap_symbol());
+          let rhs = self.ref_to_expr(instr.operands[1], 1);
+          blk.push_stmt(Stmt::Assign(Assign { decltype: None, lhs, rhs }));
         }
         ir::Opcode::WriteVar16 => {
           let lhs = self.symbol_to_expr(instr.operands[0].unwrap_symbol());
