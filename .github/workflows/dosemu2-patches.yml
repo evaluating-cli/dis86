@@ -60,6 +60,9 @@ jobs:
           ./autogen.sh
           ./configure \
             --enable-plugins=no \
+            --disable-fdpp \
+            --disable-dj64 \
+            --disable-searpc \
             --disable-cpuemu-jit \
             --disable-dlplugins
 
