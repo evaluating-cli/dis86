@@ -60,6 +60,54 @@ pub fn reduce_trivial_or(ir: &mut IR) {
 }
 
 /*
+Fold constants only where the IR's 16-bit constant representation is sufficient
+for the operation's full semantics. In particular, do not fold byte/32-bit
+arithmetic, shifts, or multiplication here: those need explicit width/count
+rules rather than inheriting i16 behavior accidentally.
+*/
+pub fn constant_folding(ir: &mut IR) {
+  for b in ir.iter_blocks() {
+    for r in ir.iter_instrs(b) {
+      let instr = ir.instr(r).unwrap();
+      if instr.operands.len() != 2 { continue; }
+
+      let (Some(lhs), Some(rhs)) = (
+        ir.const_lookup(instr.operands[0]),
+        ir.const_lookup(instr.operands[1]),
+      ) else { continue; };
+
+      let fold_word_arith = matches!(instr.typ, Type::U16 | Type::I16);
+      let fold_bool = matches!(instr.typ, Type::U8 | Type::U16);
+
+      let result = match instr.opcode {
+        Opcode::Add if fold_word_arith => lhs.wrapping_add(rhs),
+        Opcode::Sub if fold_word_arith => lhs.wrapping_sub(rhs),
+        Opcode::And if fold_word_arith => lhs & rhs,
+        Opcode::Or  if fold_word_arith => lhs | rhs,
+        Opcode::Xor if fold_word_arith => lhs ^ rhs,
+
+        Opcode::Eq   if fold_bool => if lhs == rhs { 1 } else { 0 },
+        Opcode::Neq  if fold_bool => if lhs != rhs { 1 } else { 0 },
+        Opcode::Lt   if fold_bool => if lhs < rhs { 1 } else { 0 },
+        Opcode::Leq  if fold_bool => if lhs <= rhs { 1 } else { 0 },
+        Opcode::Gt   if fold_bool => if lhs > rhs { 1 } else { 0 },
+        Opcode::Geq  if fold_bool => if lhs >= rhs { 1 } else { 0 },
+        Opcode::ULt  if fold_bool => if (lhs as u16) < (rhs as u16) { 1 } else { 0 },
+        Opcode::ULeq if fold_bool => if (lhs as u16) <= (rhs as u16) { 1 } else { 0 },
+        Opcode::UGt  if fold_bool => if (lhs as u16) > (rhs as u16) { 1 } else { 0 },
+        Opcode::UGeq if fold_bool => if (lhs as u16) >= (rhs as u16) { 1 } else { 0 },
+        _ => continue,
+      };
+
+      let k = ir.const_new(result);
+      let instr = ir.instr_mut(r).unwrap();
+      instr.opcode = Opcode::Ref;
+      instr.operands = vec![k];
+    }
+  }
+}
+
+/*
 From:
 --------------------------------------------
   t36      = signext32  t34
@@ -757,6 +805,7 @@ pub fn optimize(ir: &mut IR) {
     // note: reduce_trivial_or() after simplify_branch_conds() is important
     reduce_trivial_or(ir);
     simplify_chained_comparisons(ir);
+    constant_folding(ir);
     stack_ptr_accumulation(ir);
     value_propagation(ir);
     common_subexpression_elimination(ir);
@@ -777,13 +826,17 @@ mod tests {
     (ir, blk)
   }
 
-  fn append(ir: &mut IR, blk: BlockRef, opcode: Opcode, operands: Vec<Ref>) -> Ref {
+  fn append_typed(ir: &mut IR, blk: BlockRef, typ: Type, opcode: Opcode, operands: Vec<Ref>) -> Ref {
     ir.block_instr_append(blk, Instr {
-      typ: Type::U16,
+      typ,
       attrs: Attribute::NONE,
       opcode,
       operands,
     })
+  }
+
+  fn append(ir: &mut IR, blk: BlockRef, opcode: Opcode, operands: Vec<Ref>) -> Ref {
+    append_typed(ir, blk, Type::U16, opcode, operands)
   }
 
   #[test]
@@ -851,6 +904,109 @@ mod tests {
       let instr = ir.instr(outer).unwrap();
       assert_eq!(instr.opcode, Opcode::Eq);
       assert_eq!(instr.operands, vec![inner, zero]);
+    }
+  }
+
+
+  #[test]
+  fn constant_folding_folds_word_arithmetic_and_bitwise_ops() {
+    let cases = [
+      (Opcode::Add, 0x7fff, 1, i16::MIN),
+      (Opcode::Sub, i16::MIN, 1, i16::MAX),
+      (Opcode::And, -1, 0x00ff, 0x00ff),
+      (Opcode::Or,  0x0f00, 0x00f0, 0x0ff0),
+      (Opcode::Xor, 0x0ff0, 0x00ff, 0x0f0f),
+    ];
+
+    for typ in [Type::U16, Type::I16] {
+      for (opcode, lhs_val, rhs_val, expected) in cases {
+        let (mut ir, blk) = test_ir();
+        let lhs = ir.const_new(lhs_val);
+        let rhs = ir.const_new(rhs_val);
+        let folded = append_typed(&mut ir, blk, typ.clone(), opcode, vec![lhs, rhs]);
+
+        constant_folding(&mut ir);
+
+        let instr = ir.instr(folded).unwrap();
+        assert_eq!(instr.opcode, Opcode::Ref);
+        assert_eq!(ir.const_lookup(instr.operands[0]), Some(expected));
+        assert_eq!(instr.typ, typ);
+      }
+    }
+  }
+
+  #[test]
+  fn constant_folding_folds_signed_and_unsigned_comparisons() {
+    let cases = [
+      (Opcode::Eq,   -1, -1, 1),
+      (Opcode::Neq,  -1,  0, 1),
+      (Opcode::Lt,   -1,  0, 1),
+      (Opcode::Leq,   0,  0, 1),
+      (Opcode::Gt,   -1,  0, 0),
+      (Opcode::Geq,   0, -1, 1),
+      (Opcode::ULt,  -1,  0, 0),
+      (Opcode::ULeq,  0,  0, 1),
+      (Opcode::UGt,  -1,  0, 1),
+      (Opcode::UGeq,  0, -1, 0),
+    ];
+
+    for typ in [Type::U8, Type::U16] {
+      for (opcode, lhs_val, rhs_val, expected) in cases {
+        let (mut ir, blk) = test_ir();
+        let lhs = ir.const_new(lhs_val);
+        let rhs = ir.const_new(rhs_val);
+        let folded = append_typed(&mut ir, blk, typ.clone(), opcode, vec![lhs, rhs]);
+
+        constant_folding(&mut ir);
+
+        let instr = ir.instr(folded).unwrap();
+        assert_eq!(instr.opcode, Opcode::Ref);
+        assert_eq!(ir.const_lookup(instr.operands[0]), Some(expected));
+        assert_eq!(instr.typ, typ);
+      }
+    }
+  }
+
+  #[test]
+  fn constant_folding_skips_width_sensitive_arithmetic() {
+    for typ in [Type::U8, Type::I8, Type::U32, Type::I32, Type::Unknown] {
+      let (mut ir, blk) = test_ir();
+      let lhs = ir.const_new(1);
+      let rhs = ir.const_new(2);
+      let op = append_typed(&mut ir, blk, typ.clone(), Opcode::Add, vec![lhs, rhs]);
+
+      constant_folding(&mut ir);
+
+      let instr = ir.instr(op).unwrap();
+      assert_eq!(instr.opcode, Opcode::Add);
+      assert_eq!(instr.typ, typ);
+    }
+  }
+
+  #[test]
+  fn constant_folding_leaves_shifts_and_multiplication_for_separate_width_rules() {
+    for opcode in [Opcode::Shl, Opcode::Shr, Opcode::UShr, Opcode::IMul, Opcode::UMul] {
+      let (mut ir, blk) = test_ir();
+      let lhs = ir.const_new(3);
+      let rhs = ir.const_new(2);
+      let op = append(&mut ir, blk, opcode, vec![lhs, rhs]);
+
+      constant_folding(&mut ir);
+
+      assert_eq!(ir.instr(op).unwrap().opcode, opcode);
+    }
+  }
+
+  #[test]
+  fn constant_folding_requires_exact_binary_arity() {
+    for operands_len in [0, 1, 3] {
+      let (mut ir, blk) = test_ir();
+      let zero = ir.const_new(0);
+      let op = append(&mut ir, blk, Opcode::Add, vec![zero; operands_len]);
+
+      constant_folding(&mut ir);
+
+      assert_eq!(ir.instr(op).unwrap().opcode, Opcode::Add);
     }
   }
 
