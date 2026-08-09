@@ -189,16 +189,31 @@ The carrier workflow fetches exactly the pinned dosemu2 commit and applies
 every entry in `patches/dosemu2/series` with `git am`, then runs
 `git diff --check`.
 
-All three current patches have passed this gate together against the exact
-pinned upstream revision. This proves patch syntax/context and whitespace, but
-it is **not** a compile or runtime proof.
+All three current patches have passed that gate together against the exact
+pinned upstream revision.
+
+The workflow then configures an interpreter-only core build using upstream's
+own configure interface, generates the standard `version.hh` and
+`plugin_config.hh` prerequisites, and directly builds the two libraries touched
+by this series:
+
+- `src/base/lib/mapping`
+- `src/base/emu-i386/simx86`
+
+Both patched libraries compile successfully. A deliberately pluginless full
+`make` was also attempted during development and reached the final dosemu
+shared-library link before failing on unrelated upstream plugin symbols
+(`cp437_init`, `utf8_init`, `plugin_msdos`); the carrier CI therefore uses the
+more precise patched-library compile gate rather than treating that unrelated
+final link as part of this patch proof.
 
 Still required:
 
-- compile the patched dosemu2 tree;
 - prove the `end` barrier at runtime;
 - exercise target -> child -> target and target -> parent lifecycle transitions;
-- exercise `/dosemu_mem` bidirectional visibility from the external Rust side.
+- exercise `/dosemu_mem` bidirectional visibility from the external controller side;
+- verify whether DOS/INT 21h handler guest nodes become validator-visible while
+  the current PSP remains the target, and define normalization/filtering if so.
 
 ## Upstreaming later
 
