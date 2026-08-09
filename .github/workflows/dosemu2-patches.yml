@@ -147,6 +147,7 @@ jobs:
       - name: Provision official comcom32 command interpreter
         env:
           COMCOM64_SHA: d51e4322f6e5e7d75092a8e86c1d893748a742ff
+          COMCOM32_SHA256: 456dfa987b238a98aeee9ac81b798fcc9717f8e75583520d02b6eac8734c00f3
         run: |
           git init /tmp/comcom64
           git -C /tmp/comcom64 remote add origin https://github.com/dosemu2/comcom64.git
@@ -155,6 +156,7 @@ jobs:
           test "$(git -C /tmp/comcom64 rev-parse HEAD)" = "$COMCOM64_SHA"
           cd /tmp/comcom64
           make fetch
+          echo "$COMCOM32_SHA256  src/32/comcom32.exe" | sha256sum -c -
           sha256sum src/32/comcom32.exe | tee /tmp/comcom32.sha256
           sudo make install_32
           test -r /usr/local/share/comcom32/comcom32.exe
@@ -268,4 +270,5 @@ jobs:
             /tmp/comcom32.sha256
             /tmp/diis-dosemu2-runtime-probe.log
             /tmp/diis-dosemu2.log
+            /tmp/diis-dosemu2-home/.dosemu/boot.log
           if-no-files-found: warn
