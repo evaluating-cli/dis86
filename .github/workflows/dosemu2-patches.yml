@@ -60,7 +60,7 @@ jobs:
           sudo apt-get install -y --no-install-recommends \
             autoconf automake libtool build-essential \
             bison flex gawk pkg-config libbsd-dev libslang2-dev \
-            meson ninja-build nasm libelf-dev clang
+            meson ninja-build nasm libelf-dev clang curl unzip
 
       - name: Configure minimal interpreter runtime
         working-directory: /tmp/dosemu2
@@ -143,6 +143,23 @@ jobs:
           sudo meson install -C build
           sudo ldconfig
           pkg-config --modversion fdpp
+
+      - name: Provision official comcom32 command interpreter
+        env:
+          COMCOM64_SHA: d51e4322f6e5e7d75092a8e86c1d893748a742ff
+        run: |
+          git init /tmp/comcom64
+          git -C /tmp/comcom64 remote add origin https://github.com/dosemu2/comcom64.git
+          git -C /tmp/comcom64 fetch --depth=1 origin "$COMCOM64_SHA"
+          git -C /tmp/comcom64 checkout --detach FETCH_HEAD
+          test "$(git -C /tmp/comcom64 rev-parse HEAD)" = "$COMCOM64_SHA"
+          cd /tmp/comcom64
+          make fetch
+          sha256sum src/32/comcom32.exe | tee /tmp/comcom32.sha256
+          sudo make install_32
+          test -r /usr/local/share/comcom32/comcom32.exe
+          test -r /usr/local/share/comcom32/command.com
+          test "$(readlink /usr/local/share/comcom32/command.com)" = 'comcom32.exe'
 
       - name: Relink patched dosemu2 with pinned fdpp
         working-directory: /tmp/dosemu2
@@ -248,6 +265,7 @@ jobs:
         with:
           name: dosemu2-runtime-diagnostics
           path: |
+            /tmp/comcom32.sha256
             /tmp/diis-dosemu2-runtime-probe.log
             /tmp/diis-dosemu2.log
           if-no-files-found: warn
