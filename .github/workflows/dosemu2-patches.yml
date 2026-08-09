@@ -199,9 +199,7 @@ jobs:
             "$GITHUB_WORKSPACE/scripts/dosemu2-runtime-probe.rs" \
             -o /tmp/dosemu2-runtime-probe
 
-          config='$_cpu_vm = "emulated"
-          $_cpuemu = (1)
-          $_mapping = "mapshm"'
+          config='cpu_vm emulated cpuemu 1 cpu_vm_dpmi emulated mappingdriver mapshm'
 
           HOME="$probe_home" \
           DIIS_DOSEMU_VALIDATOR=1 \
