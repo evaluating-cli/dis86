@@ -66,17 +66,20 @@ jobs:
             --disable-cpuemu-jit \
             --disable-dlplugins
 
-      - name: Compile patched dosemu2
+      - name: Compile patched simx86 and mapping libraries
         working-directory: /tmp/dosemu2
         shell: bash
         run: |
           set +e
-          make -j2 > /tmp/dosemu2-build.log 2>&1
+          {
+            make -C src/base/lib/mapping -j2 &&
+            make -C src/base/emu-i386/simx86 -j2
+          } > /tmp/dosemu2-build.log 2>&1
           status=$?
           set -e
           if [[ $status -ne 0 ]]; then
-            echo '--- dosemu2 build failure (last 160 lines) ---'
+            echo '--- patched-library build failure (last 160 lines) ---'
             tail -n 160 /tmp/dosemu2-build.log
             exit "$status"
           fi
-          echo 'dosemu2 build completed successfully'
+          echo 'patched mapping and simx86 libraries compiled successfully'
