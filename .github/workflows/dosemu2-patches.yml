@@ -169,6 +169,7 @@ jobs:
           probe_home=/tmp/diis-dosemu2-home
           drive_c="$probe_home/.dosemu/drive_c"
           log=/tmp/diis-dosemu2.log
+          probe_log=/tmp/diis-dosemu2-runtime-probe.log
           rm -rf "$probe_home"
           mkdir -p "$drive_c"
           rm -f /dev/shm/hydra_remote /dev/shm/dosemu_mem
@@ -200,10 +201,19 @@ jobs:
           }
           trap cleanup EXIT
 
-          if ! timeout 25s /tmp/dosemu2-runtime-probe; then
+          set +e
+          timeout 25s /tmp/dosemu2-runtime-probe >"$probe_log" 2>&1
+          probe_status=$?
+          set -e
+          if [[ $probe_status -ne 0 ]]; then
+            probe_error="$(tail -n 1 "$probe_log" || true)"
+            [[ -n "$probe_error" ]] || probe_error="probe exited with status $probe_status"
+            echo "::error title=dosemu2 runtime probe failed::$probe_error"
+            echo '--- dosemu2 runtime probe diagnostics ---'
+            cat "$probe_log"
             echo '--- dosemu2 runtime log ---'
             cat "$log"
-            exit 1
+            exit "$probe_status"
           fi
 
           for _ in $(seq 1 100); do
