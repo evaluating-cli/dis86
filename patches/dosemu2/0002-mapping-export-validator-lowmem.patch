@@ -243,7 +243,7 @@ diff --git a/src/base/lib/mapping/mapfile.c b/src/base/lib/mapping/mapfile.c
 +int mapfile_validator_lowmem_export_ready(void *addr, size_t size)
 +{
 +  return validator_lowmem_named && validator_lowmem_verified &&
-+      validator_lowmem_addr == addr && validator_lowmem_size == size;
++      validator_lowmem_addr == addr && validator_lowmem_size >= size;
 +}
  
  static void *attach_mapping_file(int fd, size_t mapsize, int prot)
