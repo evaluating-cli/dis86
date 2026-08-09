@@ -83,35 +83,45 @@ fn update_flags_add(f: &mut Flags, a: u16, b: u16, carry_in: u16, r32: u32, sign
   f.set(FLAG_OF, ((a ^ r) & (b ^ r) & sign_mask) != 0);
 }
 
-fn update_flags_shl(f: &mut Flags, _a: u16, n: u8, r32: u32, sign_mask: u16, value_mask: u16) {
-  if n == 0 { return; } // No update to flags if no shift happens
-
-  let r = r32 as u16;
-
-  let old_sign = ((r32 >> 1) & (sign_mask as u32)) != 0;
-  let new_sign = (r & sign_mask) != 0;
-
-  f.set(FLAG_CF, old_sign);
-  f.set(FLAG_ZF, flag_generic_zf(r, value_mask));
-  f.set(FLAG_SF, flag_generic_sf(r, sign_mask));
-  f.set(FLAG_OF, old_sign ^ new_sign);  // sign bit changed?
-  f.set(FLAG_PF, flag_generic_pf(r));
-  f.set(FLAG_AF, false);
-}
-
-fn update_flags_shr(f: &mut Flags, a: u16, n: u8, r: u16, sign_mask: u16, value_mask: u16) {
-  if n == 0 { return; } // No update to flags if no shift happens
-
-  let cf_bit = 1 << (n-1);
-  let cf = (a & cf_bit) != 0;
-
+fn update_flags_shift_result(f: &mut Flags, cf: bool, r: u16, sign_mask: u16, value_mask: u16) {
   f.set(FLAG_CF, cf);
   f.set(FLAG_ZF, flag_generic_zf(r, value_mask));
   f.set(FLAG_SF, flag_generic_sf(r, sign_mask));
-  // I think this flag is ignored? Hard to tell...
-  //f.set(FLAG_OF, (a & sign_mask) != 0);
   f.set(FLAG_PF, flag_generic_pf(r));
-  f.set(FLAG_AF, false);
+}
+
+fn update_flags_shl(f: &mut Flags, n: u8, r32: u32, sign_mask: u16, value_mask: u16) {
+  if n == 0 { return; }
+
+  let r = r32 as u16;
+  let cf = ((r32 >> 1) & (sign_mask as u32)) != 0;
+  update_flags_shift_result(f, cf, r, sign_mask, value_mask);
+
+  if n == 1 {
+    f.set(FLAG_OF, cf ^ flag_generic_sf(r, sign_mask));
+  }
+}
+
+fn update_flags_shr(f: &mut Flags, a: u16, n: u8, r: u16, sign_mask: u16, value_mask: u16) {
+  if n == 0 { return; }
+
+  let cf = (((a as u32) >> (n - 1)) & 1) != 0;
+  update_flags_shift_result(f, cf, r, sign_mask, value_mask);
+
+  if n == 1 {
+    f.set(FLAG_OF, (a & sign_mask) != 0);
+  }
+}
+
+fn update_flags_sar(f: &mut Flags, a: i32, n: u8, r: u16, sign_mask: u16, value_mask: u16) {
+  if n == 0 { return; }
+
+  let cf = ((a >> (n - 1)) & 1) != 0;
+  update_flags_shift_result(f, cf, r, sign_mask, value_mask);
+
+  if n == 1 {
+    f.set(FLAG_OF, false);
+  }
 }
 
 // Returns (quotient, remainder, flags)
@@ -288,30 +298,37 @@ pub fn shift(op: ShiftOp, a: Value, n: u8, mut f: Flags) -> (Value, Flags) {
   let result;
   match op {
     ShiftOp::Shl => {
-      let r32 = if n < 32 {
-        (a as u32).wrapping_shl(n as u32)
+      let n = n & 0x1f;
+      if n == 0 {
+        result = a;
       } else {
-        0
-      };
-      result = r32 as u16;
-      update_flags_shl(&mut f, a, n, r32, sign_mask, value_mask);
+        let r32 = (a as u32) << (n as u32);
+        result = r32 as u16;
+        update_flags_shl(&mut f, n, r32, sign_mask, value_mask);
+      }
     }
     ShiftOp::Shr => {
-      let r32 = if n < 16 {
-        (a as u32).wrapping_shr(n as u32)
+      let n = n & 0x1f;
+      if n == 0 {
+        result = a;
       } else {
-        0
-      };
-      result = r32 as u16;
-      update_flags_shr(&mut f, a, n, result, sign_mask, value_mask);
+        result = ((a as u32) >> (n as u32)) as u16;
+        update_flags_shr(&mut f, a, n, result, sign_mask, value_mask);
+      }
     }
     ShiftOp::Sar => {
-      result = match size {
-        1 => (a as i8).wrapping_shr(n as u32) as u8 as u16,
-        2 => (a as i16).wrapping_shr(n as u32) as u16,
-        _ => unreachable!(),
-      };
-      update_flags_shr(&mut f, a, n, result, sign_mask, value_mask);
+      let n = n & 0x1f;
+      if n == 0 {
+        result = a;
+      } else {
+        let signed = match size {
+          1 => a as u8 as i8 as i32,
+          2 => a as i16 as i32,
+          _ => unreachable!(),
+        };
+        result = (signed >> (n as u32)) as u16;
+        update_flags_sar(&mut f, signed, n, result, sign_mask, value_mask);
+      }
     }
     ShiftOp::Rol => {
       result = match size {
