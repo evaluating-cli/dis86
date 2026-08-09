@@ -47,12 +47,13 @@ jobs:
           git -C /tmp/dosemu2 diff --check "$DOSEMU2_BASE"..HEAD
           git -C /tmp/dosemu2 log --oneline --decorate "$DOSEMU2_BASE"..HEAD
 
-      - name: Install core build dependencies
+      - name: Install build dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             autoconf automake libtool build-essential \
-            bison flex gawk pkg-config libbsd-dev libslang2-dev
+            bison flex gawk pkg-config libbsd-dev libslang2-dev \
+            meson ninja-build nasm libelf-dev clang
 
       - name: Configure minimal interpreter runtime
         working-directory: /tmp/dosemu2
@@ -104,3 +105,51 @@ jobs:
           test -x bin/dosemu
           test -x 2.0-pre9/bin/dosemu2.bin
           echo 'minimal patched dosemu2 runtime linked successfully'
+
+      - name: Build and install pinned thunk_gen
+        env:
+          THUNK_GEN_SHA: 4967a317e97167640d524f66860908fcb0d88fa8
+        run: |
+          git init /tmp/thunk_gen
+          git -C /tmp/thunk_gen remote add origin https://github.com/stsp/thunk_gen.git
+          git -C /tmp/thunk_gen fetch --depth=1 origin "$THUNK_GEN_SHA"
+          git -C /tmp/thunk_gen checkout --detach FETCH_HEAD
+          test "$(git -C /tmp/thunk_gen rev-parse HEAD)" = "$THUNK_GEN_SHA"
+          cd /tmp/thunk_gen
+          ./configure --prefix=/usr/local
+          meson compile -C build
+          sudo meson install -C build
+          pkg-config --modversion thunk_gen
+
+      - name: Build and install pinned fdpp
+        env:
+          FDPP_SHA: f99457bb28b0728afd7699ac2885892205916a92
+        run: |
+          git init /tmp/fdpp
+          git -C /tmp/fdpp remote add origin https://github.com/dosemu2/fdpp.git
+          git -C /tmp/fdpp fetch --depth=1 origin "$FDPP_SHA"
+          git -C /tmp/fdpp checkout --detach FETCH_HEAD
+          test "$(git -C /tmp/fdpp rev-parse HEAD)" = "$FDPP_SHA"
+          cd /tmp/fdpp
+          ./configure.meson -c -- --prefix=/usr/local
+          meson compile -C build
+          sudo meson install -C build
+          sudo ldconfig
+          pkg-config --modversion fdpp
+
+      - name: Relink patched dosemu2 with pinned fdpp
+        working-directory: /tmp/dosemu2
+        shell: bash
+        run: |
+          git clean -fdx
+          ./autogen.sh
+          ./configure \
+            --enable-plugins=charsets,msdos,term,fdpp \
+            --disable-dj64 \
+            --disable-searpc \
+            --disable-cpuemu-jit \
+            --disable-dlplugins
+          make -j2
+          test -x bin/dosemu
+          test -x 2.0-pre9/bin/dosemu2.bin
+          echo 'patched dosemu2 + pinned fdpp runtime stack built successfully'
