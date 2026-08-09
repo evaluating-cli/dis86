@@ -1,8 +1,10 @@
 # Phase 1 Implementation: `simx86` Core Hook & Low-Memory Export Architecture
 
-**Status:** Source-verified implementation blueprint  
+**Status:** Reviewed architecture blueprint — implementation pending
 **Target:** dosemu2 `devel` verified at `604ce0cdd1a71f657e2a2df623d216d5ab289313` and current `dis86` validator  
 **Scope:** 16-bit real-mode MZ executables; one concurrent validator instance
+
+> **Documentation-only scope:** No dosemu2 core patch or complete Rust adapter implementation is included in this PR. The examples below are required implementation sketches, not code that has been compiled or integration-tested.
 
 ---
 
@@ -17,6 +19,15 @@ Phase 1 adds the minimum core instrumentation needed to use dosemu2 as the diffe
 - validator-side normalization of the few places where a `simx86` node does not equal one `emu86::Machine::step()`.
 
 This document supersedes the original Phase 1 draft. In particular it does **not** rename the generic POSIX-SHM allocator, does **not** use `EXCP_EMULEAVE` for validator jumps, and does **not** claim `G->seqlen == 1`.
+
+### 1.1 Draft exit criteria
+
+Keep the architecture PR in draft until both of the following implementation branches exist and are linked from its description:
+
+- **emu86/dis86:** implement CMPS, configurable PSP loading, the corrected `DosemuProcess` launch, initial-state normalization, and boundary-driven normalized stepping.
+- **dosemu2:** implement the page-sized control mapping, shared-memory core hook, requested-executable/PSP capture, low-memory export, and node-boundary reporting.
+
+These branches provide implementation feedback for the contract. Their existence is the draft exit criterion; completing the verification checklist remains the Phase 1 completion criterion.
 
 ---
 

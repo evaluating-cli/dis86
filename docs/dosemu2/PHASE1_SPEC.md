@@ -2,7 +2,9 @@
 
 **Target Milestone:** Phase 1 — `simx86` Core Hook Integration  
 **Target Projects:** `dosemu2` (`src/base/emu-i386/simx86/`, `src/base/lib/mapping/`), `dis86` (`dis86/src/emu86/validator/`)  
-**Status:** Source-verified implementation contract
+**Status:** Reviewed architecture contract — implementation pending
+
+> **Documentation-only scope:** This file specifies the required behavior. It does not implement the dosemu2 core hook or the corresponding `dis86` adapter changes. Keep the architecture PR in draft until both implementation branches described below exist and are linked.
 
 ---
 
@@ -23,6 +25,15 @@ The source-verified contract is:
 9. Export low memory through a dedicated named POSIX-SHM backing object for the `MAPPING_LOWMEM` allocation only. The generic mapping-object allocator remains unchanged.
 
 Phase 1 is deliberately scoped to **16-bit real-mode MZ executables** and a single validator/dosemu2 instance using the fixed Phase 0 paths `/dev/shm/hydra_remote` and `/dev/shm/dosemu_mem`.
+
+### 1.1 Draft merge gate
+
+The documentation PR is not ready to merge until these two implementation branches exist:
+
+1. **emu86/dis86 branch:** CMPS support, configurable runtime PSP loading, corrected dosemu2 launch, initial-state alignment, and normalized comparison boundaries.
+2. **dosemu2 branch:** page-sized shared-control creation, the `simx86` request/ack hook, executable-bound PSP capture, named low-memory export, and explicit node-boundary reporting.
+
+The branches need not be merged before this contract, but they must be available for review and must demonstrate that the contract is implementable. Until then, unchecked verification items are requirements rather than claims of working behavior.
 
 ---
 
