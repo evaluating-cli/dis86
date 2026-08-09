@@ -166,15 +166,15 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          probe_dir=/tmp/diis-dosemu2-probe
           probe_home=/tmp/diis-dosemu2-home
+          drive_c="$probe_home/.dosemu/drive_c"
           log=/tmp/diis-dosemu2.log
-          rm -rf "$probe_dir" "$probe_home"
-          mkdir -p "$probe_dir" "$probe_home"
+          rm -rf "$probe_home"
+          mkdir -p "$drive_c"
           rm -f /dev/shm/hydra_remote /dev/shm/dosemu_mem
 
           python3 "$GITHUB_WORKSPACE/scripts/make-dosemu2-runtime-probe.py" \
-            "$probe_dir/TEST.EXE"
+            "$drive_c/TEST.EXE"
           rustc --edition=2021 -O \
             "$GITHUB_WORKSPACE/scripts/dosemu2-runtime-probe.rs" \
             -o /tmp/dosemu2-runtime-probe
@@ -190,8 +190,7 @@ jobs:
           DIIS_DOSEMU_TARGET_DOS_PATH='C:\TEST.EXE' \
             ./bin/dosemu -dumb -q -n \
               -I "$config" \
-              -K "$probe_dir:C:\" \
-              -E TEST.EXE >"$log" 2>&1 &
+              -E 'C:\TEST.EXE' >"$log" 2>&1 &
           dosemu_pid=$!
 
           cleanup() {
