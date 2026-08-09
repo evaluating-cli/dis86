@@ -1,0 +1,48 @@
+name: dosemu2 patch series
+
+on:
+  push:
+    paths:
+      - 'patches/dosemu2/**'
+      - 'scripts/apply-dosemu2-patches.sh'
+      - '.github/workflows/dosemu2-patches.yml'
+  pull_request:
+    paths:
+      - 'patches/dosemu2/**'
+      - 'scripts/apply-dosemu2-patches.sh'
+      - '.github/workflows/dosemu2-patches.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  apply-series:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check helper script syntax
+        run: bash -n scripts/apply-dosemu2-patches.sh
+
+      - name: Fetch pinned dosemu2 source
+        env:
+          DOSEMU2_BASE: 604ce0cdd1a71f657e2a2df623d216d5ab289313
+        run: |
+          git init /tmp/dosemu2
+          git -C /tmp/dosemu2 remote add origin https://github.com/dosemu2/dosemu2.git
+          git -C /tmp/dosemu2 fetch --depth=1 origin "$DOSEMU2_BASE"
+          git -C /tmp/dosemu2 checkout --detach FETCH_HEAD
+          test "$(git -C /tmp/dosemu2 rev-parse HEAD)" = "$DOSEMU2_BASE"
+
+      - name: Apply patch series with git am
+        env:
+          DOSEMU2_BASE: 604ce0cdd1a71f657e2a2df623d216d5ab289313
+        run: |
+          git -C /tmp/dosemu2 config user.name 'dis86 patch CI'
+          git -C /tmp/dosemu2 config user.email 'noreply@example.invalid'
+          while IFS= read -r patch; do
+            [[ -z "$patch" || "$patch" == \#* ]] && continue
+            git -C /tmp/dosemu2 am "$GITHUB_WORKSPACE/patches/dosemu2/$patch"
+          done < patches/dosemu2/series
+          git -C /tmp/dosemu2 diff --check "$DOSEMU2_BASE"..HEAD
+          git -C /tmp/dosemu2 log --oneline --decorate "$DOSEMU2_BASE"..HEAD
