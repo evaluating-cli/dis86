@@ -1,5 +1,5 @@
 use std::process::{Command, Child, Stdio};
-use super::super::emu::Emu;
+use super::super::emu::{Emu, StepOutcome};
 use super::super::cpu::*;
 use super::super::cpu_flags::Flag;
 use super::super::machine::Machine;
@@ -222,9 +222,10 @@ impl Drop for HydraProcess {
 }
 
 impl Emu for HydraProcess {
-  fn step(&mut self) -> Result<(), String> {
+  fn step(&mut self) -> Result<StepOutcome, String> {
     self.last_cpu_state = self.cpu_state();
-    Self::step(self)
+    Self::step(self)?;
+    Ok(StepOutcome::single())
   }
   fn cpu_state(&self) -> Cpu {
     self.cpu_state.clone()

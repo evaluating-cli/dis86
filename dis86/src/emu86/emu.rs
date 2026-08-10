@@ -22,6 +22,26 @@ pub struct Emulator {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LoadConfig { pub psp_segment: u16 }
 
+/// Describes how much guest work an emulator consumed at one validation
+/// boundary. A translated backend may execute several decoded instructions in
+/// one node; instruction-at-a-time backends always return `single()`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StepOutcome {
+  pub decoded_instructions: u32,
+  pub step_flags: u32,
+}
+
+impl StepOutcome {
+  pub const MULTI_INSN: u32 = 1 << 0;
+  pub const SAME_PC: u32 = 1 << 1;
+  pub const FAULT: u32 = 1 << 2;
+  pub const END_ACK: u32 = 1 << 3;
+  pub const TARGET_EXIT: u32 = 1 << 4;
+
+  pub fn single() -> Self { Self { decoded_instructions: 1, step_flags: 0 } }
+  pub fn has(self, flag: u32) -> bool { self.step_flags & flag != 0 }
+}
+
 impl Default for LoadConfig {
   fn default() -> Self { Self { psp_segment: 0x0813 } }
 }
@@ -97,7 +117,7 @@ impl Emulator {
 // A generic trait to make a unified interface for doing validation / comparisons of two very
 // different implementations
 pub trait Emu {
-  fn step(&mut self) -> Result<(), String>;
+  fn step(&mut self) -> Result<StepOutcome, String>;
   fn finished(&self) -> bool { false }
   fn cpu_state(&self) -> Cpu;
   fn last_cpu_state(&self) -> Cpu;
@@ -120,8 +140,9 @@ pub trait Emu {
 }
 
 impl Emu for Emulator {
-  fn step(&mut self) -> Result<(), String> {
-    Self::step(self)
+  fn step(&mut self) -> Result<StepOutcome, String> {
+    Self::step(self)?;
+    Ok(StepOutcome::single())
   }
   fn cpu_state(&self) -> Cpu {
     self.machine.cpu.clone()

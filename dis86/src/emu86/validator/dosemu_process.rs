@@ -1,5 +1,5 @@
 use std::process::{Command, Child, Stdio};
-use super::super::emu::Emu;
+use super::super::emu::{Emu, StepOutcome};
 use super::super::cpu::*;
 use super::super::cpu_flags::Flag;
 use super::super::machine::Machine;
@@ -18,7 +18,6 @@ const DOSEMU_MEM_PATH: &str = "/dev/shm/dosemu_mem";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const STEP_TIMEOUT: Duration = Duration::from_secs(5);
 const VALIDATOR_ABI_VERSION: u32 = 1;
-const DIIS_STEP_TARGET_EXIT: u32 = 1 << 4;
 
 pub struct DosemuProcess {
   dosemu: Child,
@@ -131,6 +130,9 @@ impl DosemuProcess {
     };
 
     this.wait_for_init()?;
+    // init is release-published after the first target snapshot. Capture it
+    // before the validator constructs or steps the comparison emulator.
+    this.read_cpu_state();
 
     Ok(this)
   }
@@ -200,7 +202,7 @@ impl DosemuProcess {
     shmdata_write!(self.data, flags, regs[FLAGS.idx as usize]);
   }
 
-  pub fn step(&mut self) -> Result<(), String> {
+  pub fn step(&mut self) -> Result<StepOutcome, String> {
     self.wait_for_init()?;
 
     let ack = self.data.load_ack(Ordering::Acquire);
@@ -224,11 +226,18 @@ impl DosemuProcess {
       }
     }
 
+    // The acquire-load of flags is the publication barrier for both the CPU
+    // snapshot and decoded-instruction count (including terminal outcomes).
+    let step_flags = self.data.load_step_flags(Ordering::Acquire);
+    let outcome = StepOutcome {
+      decoded_instructions: self.data.load_decoded_instructions(),
+      step_flags,
+    };
     self.read_cpu_state();
-    if self.data.load_step_flags(Ordering::Acquire) & DIIS_STEP_TARGET_EXIT != 0 {
+    if outcome.has(StepOutcome::TARGET_EXIT) {
       self.finished = true;
     }
-    Ok(())
+    Ok(outcome)
   }
 
   pub fn runtime_psp(&self) -> u16 {
@@ -244,7 +253,7 @@ impl Drop for DosemuProcess {
 }
 
 impl Emu for DosemuProcess {
-  fn step(&mut self) -> Result<(), String> {
+  fn step(&mut self) -> Result<StepOutcome, String> {
     self.last_cpu_state = self.cpu_state();
     Self::step(self)
   }
