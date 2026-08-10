@@ -1,3 +1,6 @@
+use std::fs::{File, OpenOptions};
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 use std::process::{Command, Child, Stdio};
 use super::super::emu::{Emu, StepOutcome};
 use super::super::cpu::*;
@@ -9,7 +12,6 @@ use super::shmmem::ShmMem;
 use crate::segoff::SegOff;
 use crate::{shmdata_read, shmdata_write};
 use crate::binfmt::mz;
-use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
@@ -17,10 +19,13 @@ const HYDRA_SHM_PATH: &str = "/dev/shm/hydra_remote";
 const DOSEMU_MEM_PATH: &str = "/dev/shm/dosemu_mem";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const STEP_TIMEOUT: Duration = Duration::from_secs(5);
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+const DIAGNOSTIC_LIMIT: u64 = 64 * 1024;
 const VALIDATOR_ABI_VERSION: u32 = 1;
 
 pub struct DosemuProcess {
   dosemu: Child,
+  diagnostic_path: PathBuf,
   data: ShmData,
   #[allow(dead_code)]
   pub mem: ShmMem,
@@ -28,6 +33,7 @@ pub struct DosemuProcess {
   cpu_state: Cpu,
   last_cpu_state: Cpu,
   finished: bool,
+  shut_down: bool,
 }
 
 impl DosemuProcess {
@@ -73,6 +79,48 @@ impl DosemuProcess {
     }
   }
 
+  fn create_diagnostic_log() -> Result<(PathBuf, File), String> {
+    for attempt in 0..100u32 {
+      let path = std::env::temp_dir().join(format!(
+        "dis86-dosemu2-{}-{}.stderr", std::process::id(), attempt));
+      match OpenOptions::new().write(true).create_new(true).open(&path) {
+        Ok(file) => return Ok((path, file)),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+        Err(e) => return Err(format!("Failed to create dosemu2 diagnostic log: {}", e)),
+      }
+    }
+    Err("Failed to allocate a unique dosemu2 diagnostic log".to_string())
+  }
+
+  fn diagnostic_tail(path: &Path) -> String {
+    let mut file = match File::open(path) {
+      Ok(file) => file,
+      Err(e) => return format!("\n[dosemu2 stderr unavailable: {}]", e),
+    };
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let start = len.saturating_sub(DIAGNOSTIC_LIMIT);
+    if file.seek(SeekFrom::Start(start)).is_err() {
+      return "\n[dosemu2 stderr could not be read]".to_string();
+    }
+    let mut bytes = Vec::new();
+    if file.read_to_end(&mut bytes).is_err() {
+      return "\n[dosemu2 stderr could not be read]".to_string();
+    }
+    if bytes.is_empty() { return "\n[dosemu2 produced no stderr]".to_string(); }
+    let prefix = if start == 0 { "" } else { "[earlier output omitted]\n" };
+    format!("\n--- dosemu2 stderr (last {} bytes) ---\n{}{}",
+      bytes.len(), prefix, String::from_utf8_lossy(&bytes))
+  }
+
+  fn with_diagnostics(&self, error: String) -> String {
+    format!("{}{}", error, Self::diagnostic_tail(&self.diagnostic_path))
+  }
+
+  fn terminate(dosemu: &mut Child) {
+    let _ = dosemu.kill();
+    let _ = dosemu.wait();
+  }
+
   pub fn spawn(exe_path: &str) -> Result<DosemuProcess, String> {
     let exe = Path::new(exe_path);
     let image = std::fs::read(exe)
@@ -90,7 +138,8 @@ impl DosemuProcess {
 
     // Spawn dosemu2 in headless batch mode (-dumb -quiet)
     let dosemu_bin = std::env::var("DOSEMU_BIN").unwrap_or_else(|_| "dosemu".to_string());
-    let mut dosemu = Command::new(&dosemu_bin)
+    let (diagnostic_path, diagnostic_file) = Self::create_diagnostic_log()?;
+    let spawn_result = Command::new(&dosemu_bin)
       .args(&[
         "-dumb",
         "-quiet",
@@ -106,30 +155,56 @@ impl DosemuProcess {
       .env("DIIS_DOSEMU_MZ_IP", mz_ip.to_string())
       .env("DIIS_DOSEMU_TARGET_DOS_PATH", target_dos_path)
       .stdout(Stdio::null())
-      .stderr(Stdio::null())
-      .spawn()
-      .map_err(|e| format!("Failed to execute dosemu2 ({}): {}", dosemu_bin, e))?;
+      .stderr(Stdio::from(diagnostic_file))
+      .spawn();
+    let mut dosemu = match spawn_result {
+      Ok(child) => child,
+      Err(e) => {
+        let diagnostics = Self::diagnostic_tail(&diagnostic_path);
+        let _ = std::fs::remove_file(&diagnostic_path);
+        return Err(format!("Failed to execute dosemu2 ({}): {}{}", dosemu_bin, e, diagnostics));
+      }
+    };
 
     let data_result = Self::wait_for_mapping(&mut dosemu, "hydra_remote shared memory", || {
       ShmData::attach(HYDRA_SHM_PATH)
     });
-    let data = Self::kill_on_startup_error(&mut dosemu, data_result)?;
+    let data = match Self::kill_on_startup_error(&mut dosemu, data_result) {
+      Ok(data) => data,
+      Err(e) => {
+        let error = format!("{}{}", e, Self::diagnostic_tail(&diagnostic_path));
+        let _ = std::fs::remove_file(&diagnostic_path);
+        return Err(error);
+      }
+    };
 
     let mem_result = Self::wait_for_mapping(&mut dosemu, "dosemu_mem shared memory", || {
       ShmMem::attach(DOSEMU_MEM_PATH)
     });
-    let mem = Self::kill_on_startup_error(&mut dosemu, mem_result)?;
+    let mem = match Self::kill_on_startup_error(&mut dosemu, mem_result) {
+      Ok(mem) => mem,
+      Err(e) => {
+        let error = format!("{}{}", e, Self::diagnostic_tail(&diagnostic_path));
+        let _ = std::fs::remove_file(&diagnostic_path);
+        return Err(error);
+      }
+    };
 
     let mut this = DosemuProcess {
       dosemu,
+      diagnostic_path,
       data,
       mem,
       cpu_state: Cpu::default(),
       last_cpu_state: Cpu::default(),
       finished: false,
+      shut_down: false,
     };
 
-    this.wait_for_init()?;
+    if let Err(e) = this.wait_for_init() {
+      Self::terminate(&mut this.dosemu);
+      return Err(this.with_diagnostics(e));
+    }
     // init is release-published after the first target snapshot. Capture it
     // before the validator constructs or steps the comparison emulator.
     this.read_cpu_state();
@@ -203,7 +278,7 @@ impl DosemuProcess {
   }
 
   pub fn step(&mut self) -> Result<StepOutcome, String> {
-    self.wait_for_init()?;
+    self.wait_for_init().map_err(|e| self.with_diagnostics(e))?;
 
     let ack = self.data.load_ack(Ordering::Acquire);
     let next_ack = ack.wrapping_add(1);
@@ -217,11 +292,12 @@ impl DosemuProcess {
       spins = spins.wrapping_add(1);
 
       if spins & 0xffff == 0 {
-        if let Some(status) = self.dosemu.try_wait().map_err(|e| format!("Failed to query dosemu2 status: {}", e))? {
-          return Err(format!("dosemu2 exited while waiting for step acknowledgement: {}", status));
+        if let Some(status) = self.dosemu.try_wait()
+          .map_err(|e| self.with_diagnostics(format!("Failed to query dosemu2 status: {}", e)))? {
+          return Err(self.with_diagnostics(format!("dosemu2 exited while waiting for step acknowledgement: {}", status)));
         }
         if Instant::now() >= deadline {
-          return Err(format!("Timed out waiting for dosemu2 step acknowledgement {}", next_ack));
+          return Err(self.with_diagnostics(format!("Timed out waiting for dosemu2 step acknowledgement {}", next_ack)));
         }
       }
     }
@@ -243,12 +319,59 @@ impl DosemuProcess {
   pub fn runtime_psp(&self) -> u16 {
     shmdata_read!(self.data, runtime_psp)
   }
+
+  pub fn shutdown(&mut self) -> Result<(), String> {
+    if self.shut_down { return Ok(()); }
+    if let Some(status) = self.dosemu.try_wait()
+      .map_err(|e| self.with_diagnostics(format!("Failed to query dosemu2 during shutdown: {}", e)))? {
+      self.shut_down = true;
+      return Err(self.with_diagnostics(format!(
+        "dosemu2 exited before shutdown acknowledgement: {}", status)));
+    }
+
+    self.data.store_end(1, Ordering::Release);
+    let ack_deadline = Instant::now() + SHUTDOWN_TIMEOUT;
+    loop {
+      if self.data.load_step_flags(Ordering::Acquire) & StepOutcome::END_ACK != 0 { break; }
+      if let Some(status) = self.dosemu.try_wait()
+        .map_err(|e| self.with_diagnostics(format!("Failed to query dosemu2 during shutdown: {}", e)))? {
+        self.shut_down = true;
+        return Err(self.with_diagnostics(format!("dosemu2 exited before shutdown acknowledgement: {}", status)));
+      }
+      if Instant::now() >= ack_deadline {
+        Self::terminate(&mut self.dosemu);
+        self.shut_down = true;
+        return Err(self.with_diagnostics("Timed out waiting for dosemu2 shutdown acknowledgement".to_string()));
+      }
+      std::thread::sleep(Duration::from_millis(1));
+    }
+
+    let exit_deadline = Instant::now() + SHUTDOWN_TIMEOUT;
+    loop {
+      if let Some(status) = self.dosemu.try_wait()
+        .map_err(|e| self.with_diagnostics(format!("Failed to query dosemu2 during shutdown: {}", e)))? {
+        self.shut_down = true;
+        return if status.success() { Ok(()) } else {
+          Err(self.with_diagnostics(format!("dosemu2 failed after shutdown acknowledgement: {}", status)))
+        };
+      }
+      if Instant::now() >= exit_deadline {
+        Self::terminate(&mut self.dosemu);
+        self.shut_down = true;
+        return Err(self.with_diagnostics("Timed out waiting for dosemu2 to exit after shutdown acknowledgement".to_string()));
+      }
+      std::thread::sleep(Duration::from_millis(1));
+    }
+  }
 }
 
 impl Drop for DosemuProcess {
   fn drop(&mut self) {
-    self.data.store_end(1, Ordering::Release);
-    let _ = self.dosemu.kill();
+    if !self.shut_down {
+      self.data.store_end(1, Ordering::Release);
+      Self::terminate(&mut self.dosemu);
+    }
+    let _ = std::fs::remove_file(&self.diagnostic_path);
   }
 }
 
@@ -257,6 +380,7 @@ impl Emu for DosemuProcess {
     self.last_cpu_state = self.cpu_state();
     Self::step(self)
   }
+  fn shutdown(&mut self) -> Result<(), String> { Self::shutdown(self) }
   fn finished(&self) -> bool { self.finished }
   fn cpu_state(&self) -> Cpu {
     self.cpu_state.clone()

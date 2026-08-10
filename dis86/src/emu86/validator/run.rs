@@ -139,6 +139,17 @@ impl Validator {
   }
 
   fn run(&mut self) -> Result<(), String> {
+    let validation = self.run_inner();
+    let shutdown = self.hydra.shutdown();
+    match (validation, shutdown) {
+      (Ok(()), result) => result,
+      (Err(error), Ok(())) => Err(error),
+      (Err(error), Err(shutdown_error)) =>
+        Err(format!("{}\nAdditionally, backend shutdown failed: {}", error, shutdown_error)),
+    }
+  }
+
+  fn run_inner(&mut self) -> Result<(), String> {
     let mut count = 0;
     loop {
 
