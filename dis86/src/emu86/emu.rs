@@ -118,6 +118,9 @@ impl Emulator {
 // different implementations
 pub trait Emu {
   fn step(&mut self) -> Result<StepOutcome, String>;
+  /// Give process-backed emulators an opportunity to complete their shutdown
+  /// protocol. Implementations without an external process have nothing to do.
+  fn shutdown(&mut self) -> Result<(), String> { Ok(()) }
   fn finished(&self) -> bool { false }
   fn cpu_state(&self) -> Cpu;
   fn last_cpu_state(&self) -> Cpu;
