@@ -136,6 +136,10 @@ impl ShmData {
     self.load_u32(ptr, ordering)
   }
 
+  pub fn load_decoded_instructions(&self) -> u32 {
+    unsafe { std::ptr::read_unaligned(std::ptr::addr_of!((*self.raw).decoded_instructions)) }
+  }
+
   pub fn attach(path: &str) -> Result<Self, String> {
     let size = Self::size();
     let cpath = CString::new(path).map_err(|e| e.to_string())?;
