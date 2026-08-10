@@ -17,20 +17,20 @@ index 1ca16d692..3b506ce72 100644
  
 +static int target_owns_pc(uint16_t psp, unsigned int pc)
 +{
-+	dosaddr_t mcb;
-+	dosaddr_t first;
-+	dosaddr_t last;
-+	uint16_t paragraphs;
++        dosaddr_t mcb;
++        dosaddr_t first;
++        dosaddr_t last;
++        uint16_t paragraphs;
 +
-+	if (!psp)
-+		return 0;
-+	mcb = (dosaddr_t)(psp - 1) << 4;
-+	if (mcb + 5 > LOWMEM_SIZE + HMASIZE)
-+		return 0;
-+	paragraphs = LOWMEM_READ_WORD(mcb + 3);
-+	first = (dosaddr_t)psp << 4;
-+	last = first + ((dosaddr_t)paragraphs << 4);
-+	return pc >= first && pc < last && last <= LOWMEM_SIZE + HMASIZE;
++        if (!psp)
++                return 0;
++        mcb = (dosaddr_t)(psp - 1) << 4;
++        if (mcb + 5 > LOWMEM_SIZE + HMASIZE)
++                return 0;
++        paragraphs = LOWMEM_READ_WORD(mcb + 3);
++        first = (dosaddr_t)psp << 4;
++        last = first + ((dosaddr_t)paragraphs << 4);
++        return pc >= first && pc < last && last <= LOWMEM_SIZE + HMASIZE;
 +}
 +
  static void mark_target_finished(void)
@@ -40,13 +40,12 @@ index 1ca16d692..3b506ce72 100644
  			mark_target_finished();
  			return 0;
  		}
-+		/* DOS and BIOS handlers retain the caller's current PSP.  Only
-+		 * consume a request while executing inside the target's MCB. */
-+		if (!target_owns_pc(g_runtime_psp, *pc))
-+			return 0;
++                /* DOS and BIOS handlers retain the caller's current PSP.  Only
++                 * consume a request while executing inside the target's MCB. */
++                if (!target_owns_pc(g_runtime_psp, *pc))
++                        return 0;
  		req = __atomic_load_n(&g_shm->req, __ATOMIC_ACQUIRE);
  		ack = __atomic_load_n(&g_shm->ack, __ATOMIC_RELAXED);
  		if (req != ack)
 -- 
 2.43.0
-

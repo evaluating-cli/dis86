@@ -9,7 +9,7 @@ if [[ -z "$repo" ]]; then
   exit 2
 fi
 
-if [[ ! -d "$repo/.git" ]]; then
+if ! git -C "$repo" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
   echo "not a git checkout: $repo" >&2
   exit 2
 fi
