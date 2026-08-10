@@ -37,6 +37,25 @@ pub struct DosemuProcess {
 }
 
 impl DosemuProcess {
+  fn parent_pid(pid: u32) -> Option<u32> {
+    let status = std::fs::read_to_string(format!("/proc/{}/status", pid)).ok()?;
+    status.lines().find_map(|line| {
+      let value = line.strip_prefix("PPid:")?;
+      value.trim().parse().ok()
+    })
+  }
+
+  fn process_belongs_to_launcher(pid: u32, launcher_pid: u32) -> bool {
+    let mut current = pid;
+    for _ in 0..64 {
+      if current == launcher_pid { return true; }
+      let Some(parent) = Self::parent_pid(current) else { return false; };
+      if parent == 0 || parent == current { return false; }
+      current = parent;
+    }
+    false
+  }
+
   fn remove_stale_mapping(path: &str) -> Result<(), String> {
     match std::fs::remove_file(path) {
       Ok(()) => Ok(()),
@@ -227,8 +246,9 @@ impl DosemuProcess {
     }
 
     let shared_pid = shmdata_read!(self.data, pid);
-    if shared_pid != self.dosemu.id() {
-      return Err(format!("hydra_remote belongs to PID {}, expected {}", shared_pid, self.dosemu.id()));
+    if !Self::process_belongs_to_launcher(shared_pid, self.dosemu.id()) {
+      return Err(format!("hydra_remote belongs to PID {}, which is not launcher PID {} or its descendant",
+        shared_pid, self.dosemu.id()));
     }
 
     let abi_version = shmdata_read!(self.data, abi_version);
@@ -419,5 +439,22 @@ impl Emu for DosemuProcess {
   }
   fn report(&self) {
     panic!("Unimpl");
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::DosemuProcess;
+  use std::process::Command;
+
+  #[test]
+  fn shared_memory_owner_may_be_launcher_or_child() {
+    let launcher = std::process::id();
+    assert!(DosemuProcess::process_belongs_to_launcher(launcher, launcher));
+
+    let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+    assert!(DosemuProcess::process_belongs_to_launcher(child.id(), launcher));
+    let _ = child.kill();
+    let _ = child.wait();
   }
 }
