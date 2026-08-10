@@ -93,8 +93,12 @@ The exact target gate expects:
 DIIS_DOSEMU_VALIDATOR=1
 DIIS_DOSEMU_MZ_CS=<u16, decimal or 0x-prefixed>
 DIIS_DOSEMU_MZ_IP=<u16, decimal or 0x-prefixed>
-DIIS_DOSEMU_TARGET_DOS_PATH=<canonical DOS path, e.g. C:\\TEST.EXE>
+DIIS_DOSEMU_TARGET_DOS_PATH=<canonical DOS path, e.g. C:\\TEST.EXE or ?:\\TEST.EXE>
 ```
+
+`?` is accepted only as the first-character drive-letter wildcard. This is
+useful with dosemu2's `-K` mount, whose drive is selected from the redirects
+available in the active DOS boot stack.
 
 Activation occurs only when all of the following are true at a simx86 boundary:
 

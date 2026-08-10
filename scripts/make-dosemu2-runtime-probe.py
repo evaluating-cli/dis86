@@ -31,6 +31,7 @@ TERMINATING_CODE = bytes.fromhex(
     "01 d8 "          # add ax,bx
     "31 d2 "          # xor dx,dx
     "b8 00 4c "       # mov ax,4c00h
+    "eb 00 "          # force a translated-node boundary before termination
     "cd 21"           # int 21h (DOS terminate process)
 )
 

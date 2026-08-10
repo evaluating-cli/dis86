@@ -129,9 +129,10 @@ impl DosemuProcess {
       .map_err(|e| format!("Failed to decode target executable {}: {}", exe.display(), e))?;
     let mz_cs = mz.hdr.cs as u16;
     let mz_ip = mz.hdr.ip;
-    // -K mounts the containing directory as C:, so this is the canonical DOS
-    // identity placed in the PSP environment by the matching -E invocation.
-    let target_dos_path = format!("C:\\{}", exe.file_name().unwrap().to_string_lossy());
+    // -K assigns the containing directory the next available DOS drive, which
+    // depends on the boot image's existing redirects.  The hook accepts '?' as
+    // a drive-letter wildcard while still matching the complete absolute path.
+    let target_dos_path = format!("?:\\{}", exe.file_name().unwrap().to_string_lossy());
 
     Self::remove_stale_mapping(HYDRA_SHM_PATH)?;
     Self::remove_stale_mapping(DOSEMU_MEM_PATH)?;
