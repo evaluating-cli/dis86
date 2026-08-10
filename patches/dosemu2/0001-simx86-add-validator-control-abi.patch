@@ -91,30 +91,35 @@ new file mode 100644
 +#define DIIS_ENV_SCAN_MAX 32768
 +
 +struct diis_validator_shm {
-+	uint32_t abi_version;
-+	uint32_t struct_size;
++	/* Preserve the established 64-byte Hydra controller ABI prefix. */
 +	uint32_t init;
 +	uint32_t end;
 +	int32_t pid;
-+	uint16_t runtime_psp;
-+	uint16_t reserved0;
++	uint32_t reserved0;
 +	uint64_t req;
 +	uint64_t ack;
-+	uint32_t decoded_instructions;
-+	uint32_t step_flags;
 +	uint16_t ax, bx, cx, dx;
 +	uint16_t si, di, bp, sp;
 +	uint16_t ip, cs, ds, es, ss, flags;
-+	uint32_t reserved1;
++	uint32_t legacy_reserved1;
++	/* dosemu2 metadata is an append-only extension. */
++	uint32_t abi_version;
++	uint32_t struct_size;
++	uint16_t runtime_psp;
++	uint16_t reserved1;
++	uint32_t decoded_instructions;
++	uint32_t step_flags;
 +};
 +
-+_Static_assert(offsetof(struct diis_validator_shm, req) == 24,
++_Static_assert(offsetof(struct diis_validator_shm, pid) == 8,
++		"validator ABI pid offset");
++_Static_assert(offsetof(struct diis_validator_shm, req) == 16,
 +		"validator ABI req offset");
-+_Static_assert(offsetof(struct diis_validator_shm, ack) == 32,
-+		"validator ABI ack offset");
-+_Static_assert(offsetof(struct diis_validator_shm, decoded_instructions) == 40,
-+		"validator ABI metadata offset");
-+_Static_assert(sizeof(struct diis_validator_shm) == 80,
++_Static_assert(offsetof(struct diis_validator_shm, ax) == 32,
++		"validator ABI register offset");
++_Static_assert(offsetof(struct diis_validator_shm, abi_version) == 64,
++		"validator ABI extension offset");
++_Static_assert(sizeof(struct diis_validator_shm) == 88,
 +		"validator ABI size");
 +
 +static struct diis_validator_shm *g_shm;

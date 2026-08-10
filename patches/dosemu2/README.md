@@ -24,7 +24,7 @@ upstream revision should be explicit and reviewed as a separate change.
 1. `0001-simx86-add-validator-control-abi.patch`
    - page-sized `/hydra_remote` POSIX shared-memory object
      (`/dev/shm/hydra_remote` on Linux)
-   - ABI version and structure-size fields
+   - append-only ABI version and structure-size fields after the legacy 64-byte prefix
    - `init`, `end`, `pid`, `runtime_psp`, `req`, `ack`
    - register request/apply and publish/ack synchronization
    - exact MZ-entry activation gate using PSP/MCB/environment program identity
@@ -61,6 +61,11 @@ upstream revision should be explicit and reviewed as a separate change.
 The PSP ancestry walk is bounded and derives the parent field with
 `offsetof(struct PSP, parent_psp)` from dosemu's own PSP definition rather
 than embedding a numeric DOS offset.
+
+6. `0006-simx86-exclude-dos-handlers-from-validator.patch`
+   - consumes target requests only for PCs inside the target-owned MCB
+   - lets DOS and BIOS interrupt-handler nodes run without creating validator
+     boundaries even though DOS retains the caller's current PSP
 
 ## Validator launch contract
 
