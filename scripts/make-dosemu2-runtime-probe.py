@@ -65,7 +65,11 @@ def build_mz(code: bytes = CODE) -> bytes:
     header = struct.pack("<14H", *words)
     header += b"\x00" * (header_size - len(header))
     assert len(header) == 32
-    return header + code
+    # emu86's current MZ loader maps the complete page range declared by e_cp,
+    # so keep the compact fixture internally consistent with that loader as
+    # well as with DOS.  Retain e_cblp's logical image length while supplying
+    # harmless trailing bytes through the end of the declared page.
+    return (header + code).ljust(pages * 512, b"\x00")
 
 
 def main() -> int:

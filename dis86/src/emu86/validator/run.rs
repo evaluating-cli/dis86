@@ -69,6 +69,16 @@ fn compare_initial_states(reference: &Cpu, emu86: &Cpu) -> Result<(), String> {
     differing.join(", "), reference, emu86))
 }
 
+fn synchronize_initial_variance(reference: &dyn Emu, candidate: &mut dyn Emu) {
+  // These fields are unspecified at DOS EXEC entry.  Adopt the concrete
+  // values selected by dosemu2 so later instruction-by-instruction checks can
+  // become strict instead of repeatedly ignoring registers the program may
+  // subsequently initialize.
+  for reg in [AX, BX, CX, DX, SI, DI, BP, FLAGS] {
+    candidate.reg_write(reg, reference.reg_read(reg));
+  }
+}
+
 fn advance_candidate(reference: &mut dyn Emu, candidate: &mut dyn Emu) -> Result<StepOutcome, String> {
   let outcome = reference.step()?;
   let known = StepOutcome::MULTI_INSN | StepOutcome::SAME_PC | StepOutcome::FAULT |
@@ -126,8 +136,9 @@ impl Validator {
         if runtime_psp == 0 {
           return Err("dosemu2 validator published an invalid runtime PSP".to_string());
         }
-        let emu86 = Emulator::new_with_load_config(exe_path, LoadConfig { psp_segment: runtime_psp })?;
+        let mut emu86 = Emulator::new_with_load_config(exe_path, LoadConfig { psp_segment: runtime_psp })?;
         compare_initial_states(&dosemu.cpu_state(), &emu86.cpu_state())?;
+        synchronize_initial_variance(&dosemu, &mut emu86);
         (Box::new(dosemu), emu86)
       }
     };
@@ -362,5 +373,19 @@ mod tests {
     dosemu.reg_write_u16(CS, 1);
     let error = compare_initial_states(&dosemu, &emu86).unwrap_err();
     assert!(error.contains("initial state divergence in CS"));
+  }
+
+  #[test]
+  fn initial_variance_is_synchronized_for_strict_later_comparisons() {
+    let mut reference = FakeEmu::new(&[]);
+    let mut candidate = FakeEmu::new(&[]);
+    reference.cpu.reg_write_u16(BX, 0x1234);
+    reference.cpu.reg_write_u16(FLAGS, 0xf202);
+
+    synchronize_initial_variance(&reference, &mut candidate);
+
+    assert_eq!(candidate.cpu.reg_read_u16(BX), 0x1234);
+    assert_eq!(candidate.cpu.reg_read_u16(FLAGS), 0xf202);
+    assert_eq!(candidate.cpu.reg_read_u16(SP), 0);
   }
 }

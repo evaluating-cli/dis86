@@ -325,6 +325,7 @@ impl DosemuProcess {
     if let Some(status) = self.dosemu.try_wait()
       .map_err(|e| self.with_diagnostics(format!("Failed to query dosemu2 during shutdown: {}", e)))? {
       self.shut_down = true;
+      if self.finished && status.success() { return Ok(()); }
       return Err(self.with_diagnostics(format!(
         "dosemu2 exited before shutdown acknowledgement: {}", status)));
     }
@@ -336,6 +337,7 @@ impl DosemuProcess {
       if let Some(status) = self.dosemu.try_wait()
         .map_err(|e| self.with_diagnostics(format!("Failed to query dosemu2 during shutdown: {}", e)))? {
         self.shut_down = true;
+        if self.finished && status.success() { return Ok(()); }
         return Err(self.with_diagnostics(format!("dosemu2 exited before shutdown acknowledgement: {}", status)));
       }
       if Instant::now() >= ack_deadline {
