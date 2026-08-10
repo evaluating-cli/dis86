@@ -1,0 +1,29 @@
+From cb525df1b7c720dfcb748d17f34fccbce19abcbe Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Mon, 10 Aug 2026 14:05:26 +0000
+Subject: [PATCH] simx86: exclude validator single-step from faults
+
+Validator-controlled nodes set MSSTP, so their expected instruction boundary reports EXCP01_SSTP through TheCPU.err. Do not expose that control exception as a guest FAULT outcome.
+---
+ src/base/emu-i386/simx86/diis-validator.c | 5 ++++-
+ 1 file changed, 4 insertions(+), 1 deletion(-)
+
+diff --git a/src/base/emu-i386/simx86/diis-validator.c b/src/base/emu-i386/simx86/diis-validator.c
+index 11f3fb32a..5a677f81c 100644
+--- a/src/base/emu-i386/simx86/diis-validator.c
++++ b/src/base/emu-i386/simx86/diis-validator.c
+@@ -484,7 +484,10 @@ void diis_validator_after_node(unsigned int start_pc, unsigned int next_pc,
+ 		flags |= DIIS_STEP_MULTI_INSN;
+ 	if (next_pc == start_pc)
+ 		flags |= DIIS_STEP_SAME_PC;
+-	if (cpu_err)
++	/* MSSTP deliberately ends each validator-controlled instruction with the
++	 * interpreter's single-step exception.  It is the requested boundary, not
++	 * a guest fault; preserve FAULT for every other execution error. */
++	if (cpu_err && cpu_err != EXCP01_SSTP)
+ 		flags |= DIIS_STEP_FAULT;
+ 
+ 	publish_cpu(next_pc, decoded_instructions, flags);
+-- 
+2.43.0
+

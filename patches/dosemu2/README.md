@@ -172,6 +172,10 @@ opcode guesses:
 - `DIIS_STEP_END_ACK`: final publication after observing `end` and before stopping;
 - `DIIS_STEP_TARGET_EXIT`: DOS current-PSP ancestry has left the captured target.
 
+The interpreter's `EXCP01_SSTP` result is the expected boundary produced by
+the hook's `MSSTP` request and is therefore not classified as
+`DIIS_STEP_FAULT`; other nonzero interpreter errors remain faults.
+
 This gives the Rust side actual node consumption without assuming that
 `STI`, `MOV SS`, or `POP SS` necessarily consumed two instructions. More
 specific classifications (for example interrupt-shadow versus partial REP)
