@@ -1,4 +1,4 @@
-use super::super::emu::{Emu, Emulator};
+use super::super::emu::{Emu, Emulator, LoadConfig};
 use super::super::cpu::*;
 use super::hydra_process::HydraProcess;
 use super::dosemu_process::DosemuProcess;
@@ -44,10 +44,24 @@ impl Validator {
   }
 
   fn new_with_backend(exe_path: &str, backend: EmulatorBackend) -> Result<Self, String> {
-    let emu86_impl = Emulator::new(exe_path)?;
-    let hydra_impl: Box<dyn Emu> = match backend {
-      EmulatorBackend::DosboxX => Box::new(HydraProcess::spawn(exe_path)?),
-      EmulatorBackend::Dosemu2 => Box::new(DosemuProcess::spawn(exe_path)?),
+    let (hydra_impl, emu86_impl): (Box<dyn Emu>, Emulator) = match backend {
+      EmulatorBackend::DosboxX => (
+        Box::new(HydraProcess::spawn(exe_path)?),
+        Emulator::new(exe_path)?,
+      ),
+      EmulatorBackend::Dosemu2 => {
+        // dosemu chooses the PSP at runtime.  It must publish that choice before
+        // emu86 loads or every segment and relocation would use a different base.
+        let dosemu = DosemuProcess::spawn(exe_path)?;
+        let runtime_psp = dosemu.runtime_psp();
+        if runtime_psp == 0 {
+          return Err("dosemu2 validator published an invalid runtime PSP".to_string());
+        }
+        (
+          Box::new(dosemu),
+          Emulator::new_with_load_config(exe_path, LoadConfig { psp_segment: runtime_psp })?,
+        )
+      }
     };
 
     Ok(Self {
@@ -69,6 +83,9 @@ impl Validator {
       count += 1;
 
       self.hydra.step()?;
+      if self.hydra.finished() {
+        return Ok(());
+      }
       self.emu86.step()?;
 
       // detect interrupt handler firing

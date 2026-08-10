@@ -8,6 +8,7 @@ use super::shmdata::ShmData;
 use super::shmmem::ShmMem;
 use crate::segoff::SegOff;
 use crate::{shmdata_read, shmdata_write};
+use crate::binfmt::mz;
 use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -16,6 +17,8 @@ const HYDRA_SHM_PATH: &str = "/dev/shm/hydra_remote";
 const DOSEMU_MEM_PATH: &str = "/dev/shm/dosemu_mem";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const STEP_TIMEOUT: Duration = Duration::from_secs(5);
+const VALIDATOR_ABI_VERSION: u32 = 1;
+const DIIS_STEP_TARGET_EXIT: u32 = 1 << 4;
 
 pub struct DosemuProcess {
   dosemu: Child,
@@ -25,6 +28,7 @@ pub struct DosemuProcess {
 
   cpu_state: Cpu,
   last_cpu_state: Cpu,
+  finished: bool,
 }
 
 impl DosemuProcess {
@@ -71,9 +75,16 @@ impl DosemuProcess {
   }
 
   pub fn spawn(exe_path: &str) -> Result<DosemuProcess, String> {
-    let current_exe = std::env::current_exe().unwrap();
-    let dir = current_exe.parent().unwrap().parent().unwrap().parent().unwrap().parent().unwrap();
     let exe = Path::new(exe_path);
+    let image = std::fs::read(exe)
+      .map_err(|e| format!("Failed to read target executable {}: {}", exe.display(), e))?;
+    let mz = mz::Exe::decode(&image)
+      .map_err(|e| format!("Failed to decode target executable {}: {}", exe.display(), e))?;
+    let mz_cs = mz.hdr.cs as u16;
+    let mz_ip = mz.hdr.ip;
+    // -K mounts the containing directory as C:, so this is the canonical DOS
+    // identity placed in the PSP environment by the matching -E invocation.
+    let target_dos_path = format!("C:\\{}", exe.file_name().unwrap().to_string_lossy());
 
     Self::remove_stale_mapping(HYDRA_SHM_PATH)?;
     Self::remove_stale_mapping(DOSEMU_MEM_PATH)?;
@@ -86,9 +97,15 @@ impl DosemuProcess {
         "-quiet",
         "-K", &format!("{}", exe.parent().unwrap().to_string_lossy()),
         "-E", &format!("{}", exe.file_name().unwrap().to_string_lossy()),
-        "-hydra", &format!("{}/hydra/build/src/remote/libhydraremote.so", dir.display()),
-        "-hydra-conf", "normal",
+        "-I", "cpu_vm emulated",
+        "-I", "cpuemu 1",
+        "-I", "cpu_vm_dpmi emulated",
+        "-I", "mappingdriver mapshm",
       ])
+      .env("DIIS_DOSEMU_VALIDATOR", "1")
+      .env("DIIS_DOSEMU_MZ_CS", mz_cs.to_string())
+      .env("DIIS_DOSEMU_MZ_IP", mz_ip.to_string())
+      .env("DIIS_DOSEMU_TARGET_DOS_PATH", target_dos_path)
       .stdout(Stdio::null())
       .stderr(Stdio::null())
       .spawn()
@@ -110,6 +127,7 @@ impl DosemuProcess {
       mem,
       cpu_state: Cpu::default(),
       last_cpu_state: Cpu::default(),
+      finished: false,
     };
 
     this.wait_for_init()?;
@@ -133,6 +151,12 @@ impl DosemuProcess {
     let shared_pid = shmdata_read!(self.data, pid);
     if shared_pid != self.dosemu.id() {
       return Err(format!("hydra_remote belongs to PID {}, expected {}", shared_pid, self.dosemu.id()));
+    }
+
+    let abi_version = shmdata_read!(self.data, abi_version);
+    let struct_size = shmdata_read!(self.data, struct_size) as usize;
+    if abi_version != VALIDATOR_ABI_VERSION || struct_size < std::mem::size_of::<super::shmdata::ShmDataRaw>() {
+      return Err(format!("unsupported dosemu2 validator ABI version {} size {}", abi_version, struct_size));
     }
 
     Ok(())
@@ -201,7 +225,14 @@ impl DosemuProcess {
     }
 
     self.read_cpu_state();
+    if self.data.load_step_flags(Ordering::Acquire) & DIIS_STEP_TARGET_EXIT != 0 {
+      self.finished = true;
+    }
     Ok(())
+  }
+
+  pub fn runtime_psp(&self) -> u16 {
+    shmdata_read!(self.data, runtime_psp)
   }
 }
 
@@ -217,6 +248,7 @@ impl Emu for DosemuProcess {
     self.last_cpu_state = self.cpu_state();
     Self::step(self)
   }
+  fn finished(&self) -> bool { self.finished }
   fn cpu_state(&self) -> Cpu {
     self.cpu_state.clone()
   }

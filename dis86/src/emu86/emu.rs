@@ -98,6 +98,7 @@ impl Emulator {
 // different implementations
 pub trait Emu {
   fn step(&mut self) -> Result<(), String>;
+  fn finished(&self) -> bool { false }
   fn cpu_state(&self) -> Cpu;
   fn last_cpu_state(&self) -> Cpu;
   fn instr_addr(&self) -> SegOff;

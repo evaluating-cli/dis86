@@ -8,6 +8,8 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 #[repr(C)]
 #[derive(Debug)]
 pub struct ShmDataRaw {
+  // Legacy Hydra controls and register payload.  Never move these fields: old
+  // controllers use this prefix as their complete 64-byte ABI.
   pub init: u32,
   pub end: u32,
   pub pid: u32,
@@ -30,14 +32,28 @@ pub struct ShmDataRaw {
   pub es: u16,
   pub ss: u16,
   pub flags: u16,
+  pub legacy_reserved1: u32,
+
+  // dosemu2 validator extension.  New metadata is appended to preserve the
+  // established offsets above.
+  pub abi_version: u32,
+  pub struct_size: u32,
+  pub runtime_psp: u16,
+  pub reserved1: u16,
+  pub decoded_instructions: u32,
+  pub step_flags: u32,
 
   // memory
   // TODO...
 }
 
 // Keep the Rust side pinned to the C ABI in hydra/src/remote/shmdata.h.
-static_assertions::const_assert_eq!(std::mem::size_of::<ShmDataRaw>(), 64);
+static_assertions::const_assert_eq!(std::mem::size_of::<ShmDataRaw>(), 88);
 static_assertions::const_assert_eq!(std::mem::align_of::<ShmDataRaw>(), 8);
+static_assertions::const_assert_eq!(std::mem::offset_of!(ShmDataRaw, pid), 8);
+static_assertions::const_assert_eq!(std::mem::offset_of!(ShmDataRaw, req), 16);
+static_assertions::const_assert_eq!(std::mem::offset_of!(ShmDataRaw, ax), 32);
+static_assertions::const_assert_eq!(std::mem::offset_of!(ShmDataRaw, abi_version), 64);
 
 // These macros are for snapshot payload fields only. Synchronization/control
 // fields (init/end/req/ack) must use the atomic accessors on ShmData.
@@ -113,6 +129,11 @@ impl ShmData {
   pub fn load_ack(&self, ordering: Ordering) -> u64 {
     let ptr = unsafe { std::ptr::addr_of_mut!((*self.raw).ack) };
     self.load_u64(ptr, ordering)
+  }
+
+  pub fn load_step_flags(&self, ordering: Ordering) -> u32 {
+    let ptr = unsafe { std::ptr::addr_of_mut!((*self.raw).step_flags) };
+    self.load_u32(ptr, ordering)
   }
 
   pub fn attach(path: &str) -> Result<Self, String> {
