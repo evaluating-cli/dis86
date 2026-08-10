@@ -174,7 +174,8 @@ opcode guesses:
 
 The interpreter's `EXCP01_SSTP` result is the expected boundary produced by
 the hook's `MSSTP` request and is therefore not classified as
-`DIIS_STEP_FAULT`; other nonzero interpreter errors remain faults.
+`DIIS_STEP_FAULT`. The `EXCP_GOBACK` and higher values are simx86-internal
+return reasons rather than architectural CPU exceptions and are not faults.
 
 This gives the Rust side actual node consumption without assuming that
 `STI`, `MOV SS`, or `POP SS` necessarily consumed two instructions. More
