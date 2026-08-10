@@ -259,6 +259,43 @@ jobs:
           fi
           echo 'dosemu2 runtime hook proof passed'
 
+      - name: Validate a terminating MZ program through DosemuProcess
+        shell: bash
+        run: |
+          set -euo pipefail
+          fixture_dir=/tmp/diis-emu86-validator-fixture
+          validator_home=/tmp/diis-emu86-validator-home
+          validator_log=/tmp/diis-emu86-validator.log
+          rm -rf "$fixture_dir" "$validator_home"
+          mkdir -p "$fixture_dir" "$validator_home"
+
+          python3 scripts/make-dosemu2-runtime-probe.py \
+            --terminating "$fixture_dir/TEST.EXE"
+          cargo build --locked --manifest-path dis86/Cargo.toml \
+            --bin emu86_validator
+
+          set +e
+          HOME="$validator_home" \
+          DOSEMU_BIN=/tmp/dosemu2/bin/dosemu \
+            timeout --signal=TERM --kill-after=5s 45s \
+              dis86/target/debug/emu86_validator \
+                --backend dosemu2 --exe "$fixture_dir/TEST.EXE" \
+                >"$validator_log" 2>&1
+          status=$?
+          set -e
+          cat "$validator_log"
+          if [[ $status -ne 0 ]]; then
+            if [[ $status -eq 124 || $status -eq 137 ]]; then
+              echo "::error title=emu86 validator timed out::validator exceeded its 45 second deadline"
+            else
+              echo "::error title=emu86 validator failed::validator exited with status $status"
+            fi
+            echo '--- dosemu2 boot diagnostics ---'
+            cat "$validator_home/.dosemu/boot.log" 2>/dev/null || true
+            exit "$status"
+          fi
+          echo 'emu86 DosemuProcess validation passed'
+
       - name: Upload runtime diagnostics
         if: failure()
         uses: actions/upload-artifact@v4
@@ -269,4 +306,8 @@ jobs:
             /tmp/diis-dosemu2-runtime-probe.log
             /tmp/diis-dosemu2.log
             /tmp/diis-dosemu2-home/.dosemu/boot.log
+            /tmp/diis-emu86-validator.log
+            /tmp/diis-emu86-validator-home/.dosemu/boot.log
+            /tmp/diis-emu86-validator-fixture/TEST.EXE
+            /tmp/dis86-dosemu2-*.stderr
           if-no-files-found: warn

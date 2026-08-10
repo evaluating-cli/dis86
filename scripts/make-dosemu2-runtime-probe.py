@@ -20,14 +20,28 @@ CODE = bytes.fromhex(
     "11 11"
 )
 
+# Short, deterministic program used by the end-to-end validator check.  Keep
+# this instruction stream deliberately conservative: both emu86 and dosemu2's
+# interpreter execute the register moves, arithmetic, and DOS exit interrupt.
+# Unlike CODE, it reaches a normal target-exit boundary without relying on the
+# validator's shutdown barrier to escape a safety loop.
+TERMINATING_CODE = bytes.fromhex(
+    "b8 34 12 "       # mov ax,1234h
+    "bb ff 00 "       # mov bx,00ffh
+    "01 d8 "          # add ax,bx
+    "31 d2 "          # xor dx,dx
+    "b8 00 4c "       # mov ax,4c00h
+    "cd 21"           # int 21h (DOS terminate process)
+)
+
 assert len(CODE) == 18
 assert CODE[16:18] == b"\x11\x11"
 
 
-def build_mz() -> bytes:
+def build_mz(code: bytes = CODE) -> bytes:
     header_paragraphs = 2
     header_size = header_paragraphs * 16
-    total_size = header_size + len(CODE)
+    total_size = header_size + len(code)
     pages = (total_size + 511) // 512
     last_page = total_size % 512
 
@@ -51,18 +65,24 @@ def build_mz() -> bytes:
     header = struct.pack("<14H", *words)
     header += b"\x00" * (header_size - len(header))
     assert len(header) == 32
-    return header + CODE
+    return header + code
 
 
 def main() -> int:
-    if len(sys.argv) != 2:
-        print(f"usage: {sys.argv[0]} OUTPUT.EXE", file=sys.stderr)
+    args = sys.argv[1:]
+    terminating = False
+    if args[:1] == ["--terminating"]:
+        terminating = True
+        args = args[1:]
+    if len(args) != 1:
+        print(f"usage: {sys.argv[0]} [--terminating] OUTPUT.EXE", file=sys.stderr)
         return 2
-    out = pathlib.Path(sys.argv[1])
+    out = pathlib.Path(args[0])
     out.parent.mkdir(parents=True, exist_ok=True)
-    data = build_mz()
+    data = build_mz(TERMINATING_CODE if terminating else CODE)
     out.write_bytes(data)
-    print(f"wrote {out} ({len(data)} bytes, entry CS:IP=0000:0000, sentinel=0010h)")
+    kind = "terminating validator fixture" if terminating else "runtime probe, sentinel=0010h"
+    print(f"wrote {out} ({len(data)} bytes, entry CS:IP=0000:0000, {kind})")
     return 0
 
 
