@@ -131,8 +131,8 @@ diff --git a/src/base/emu-i386/simx86/diis-validator.c b/src/base/emu-i386/simx8
  			mark_target_finished();
  			return 0;
  		}
--		/* DOS and BIOS handlers retain the caller's current PSP.  Only
--		 * consume a request while executing inside the target's MCB. */
+-                /* DOS and BIOS handlers retain the caller's current PSP.  Only
+-                 * consume a request while executing inside the target's MCB. */
 +		if (g_request_deferred) {
 +			if (!target_owns_pc(g_runtime_psp, *pc))
 +				return 0;
