@@ -1,0 +1,36 @@
+name: debug dosemu2 carrier source
+
+on:
+  push:
+    branches:
+      - agent/defer-dosemu-handler-ack
+
+permissions:
+  contents: read
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch pinned dosemu2 source
+        run: |
+          git init /tmp/dosemu2
+          git -C /tmp/dosemu2 remote add origin https://github.com/dosemu2/dosemu2.git
+          git -C /tmp/dosemu2 fetch --depth=1 origin 604ce0cdd1a71f657e2a2df623d216d5ab289313
+          git -C /tmp/dosemu2 checkout --detach FETCH_HEAD
+          git -C /tmp/dosemu2 config user.name 'carrier debug'
+          git -C /tmp/dosemu2 config user.email 'noreply@example.invalid'
+          head -n 9 patches/dosemu2/series | while IFS= read -r patch; do
+            git -C /tmp/dosemu2 am "$GITHUB_WORKSPACE/patches/dosemu2/$patch"
+          done
+      - name: Capture exact post-0009 source
+        run: |
+          mkdir -p /tmp/carrier/src/base/emu-i386/simx86
+          cp /tmp/dosemu2/src/base/emu-i386/simx86/diis-validator.c /tmp/carrier/src/base/emu-i386/simx86/
+          cp /tmp/dosemu2/src/base/emu-i386/simx86/diis-validator.h /tmp/carrier/src/base/emu-i386/simx86/
+          cp /tmp/dosemu2/src/base/emu-i386/simx86/interp.c /tmp/carrier/src/base/emu-i386/simx86/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: post-0009-carrier-source
+          path: /tmp/carrier
