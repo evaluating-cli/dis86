@@ -1,0 +1,134 @@
+From 0000000000000000000000000000000000000010 Mon Sep 17 00:00:00 2001
+From: evaluating-cli <noreply@github.com>
+Date: Wed, 12 Aug 2026 22:03:00 +0200
+Subject: [PATCH 10/10] simx86: defer validator ack across DOS services
+
+A controlled software interrupt can leave the target-owned MCB while DOS or
+BIOS services the request.  The existing target-PC filter prevents handler
+nodes from consuming additional requests, but after_node() still publishes and
+acknowledges the controlled interrupt as soon as it reaches the handler entry.
+That state is not comparable with emu86's post-service interrupt boundary.
+
+Keep the current request outstanding when a non-faulting software interrupt
+transfers outside target-owned code.  Let non-target service nodes execute
+uncontrolled, then publish the accumulated target instruction count and the
+post-service CPU state when execution first returns to target-owned code.  Only
+then release-store the acknowledgement and wait for the next request.
+
+Target exit continues to terminate any pending request through the existing
+TARGET_EXIT path, and the global end barrier remains checked before all bypass
+paths.  Architectural faults are still published immediately rather than being
+mistaken for service execution.
+
+Base: patch 0009 on dosemu2/dosemu2@604ce0cdd1a71f657e2a2df623d216d5ab289313
+---
+ src/base/emu-i386/simx86/diis-validator.c | 53 +++++++++++++++++++++++--
+ 1 file changed, 49 insertions(+), 4 deletions(-)
+
+diff --git a/src/base/emu-i386/simx86/diis-validator.c b/src/base/emu-i386/simx86/diis-validator.c
+--- a/src/base/emu-i386/simx86/diis-validator.c
++++ b/src/base/emu-i386/simx86/diis-validator.c
+@@ -64,6 +64,10 @@
+ static int g_active;
+ static int g_target_finished;
+ static int g_node_controlled;
++static int g_request_deferred;
++static unsigned int g_deferred_start_pc;
++static uint32_t g_deferred_decoded;
++static uint32_t g_deferred_flags;
+ static uint16_t g_mz_cs;
+ static uint16_t g_mz_ip;
+ static uint16_t g_runtime_psp;
+@@ -306,6 +310,16 @@
+ 		(TheCPU.eax & 0xff00) == 0x4c00;
+ }
+ 
++static int target_is_software_interrupt(unsigned int pc)
++{
++	unsigned char opcode;
++
++	if (pc >= LOWMEM_SIZE + HMASIZE)
++		return 0;
++	opcode = LOWMEM_READ_BYTE(pc);
++	return opcode == 0xcc || opcode == 0xcd || opcode == 0xce;
++}
++
+ static void mark_target_finished(void)
+ {
+ 	uint64_t req;
+@@ -316,6 +330,10 @@
+ 	g_active = 0;
+ 	g_target_finished = 1;
+ 	g_node_controlled = 0;
++	g_request_deferred = 0;
++	g_deferred_start_pc = 0;
++	g_deferred_decoded = 0;
++	g_deferred_flags = 0;
+ 	g_runtime_psp = 0;
+ 	if (!g_shm)
+ 		return;
+@@ -350,6 +368,22 @@
+ 	__atomic_store_n(&g_shm->step_flags, flags, __ATOMIC_RELEASE);
+ }
+ 
++static void publish_deferred_return(unsigned int pc)
++{
++	uint32_t flags = g_deferred_flags;
++	uint64_t req;
++
++	if (pc == g_deferred_start_pc)
++		flags |= DIIS_STEP_SAME_PC;
++	publish_cpu(pc, g_deferred_decoded, flags);
++	g_request_deferred = 0;
++	g_deferred_start_pc = 0;
++	g_deferred_decoded = 0;
++	g_deferred_flags = 0;
++	req = __atomic_load_n(&g_shm->req, __ATOMIC_RELAXED);
++	__atomic_store_n(&g_shm->ack, req, __ATOMIC_RELEASE);
++}
++
+ static int apply_cpu(unsigned int *pc)
+ {
+ 	if (PROTMODE()) {
+@@ -438,6 +472,8 @@
+                  * consume a request while executing inside the target's MCB. */
+                 if (!target_owns_pc(g_runtime_psp, *pc))
+                         return 0;
++		if (g_request_deferred)
++			publish_deferred_return(*pc);
+ 		req = __atomic_load_n(&g_shm->req, __ATOMIC_ACQUIRE);
+ 		ack = __atomic_load_n(&g_shm->ack, __ATOMIC_RELAXED);
+ 		if (req != ack)
+@@ -481,8 +517,6 @@
+ 	g_node_controlled = 0;
+ 	if (decoded_instructions > 1)
+ 		flags |= DIIS_STEP_MULTI_INSN;
+-	if (next_pc == start_pc)
+-		flags |= DIIS_STEP_SAME_PC;
+ 	/* TheCPU.err also carries simx86-internal return reasons (EXCP_GOBACK and
+ 	 * above).  Publish only architectural exceptions, excluding the MSSTP
+ 	 * boundary deliberately requested for validator-controlled execution. */
+@@ -490,6 +524,21 @@
+ 			cpu_err != EXCP01_SSTP)
+ 		flags |= DIIS_STEP_FAULT;
+ 
++	/* A software interrupt may leave target-owned code while DOS or BIOS
++	 * services the request.  Keep the controller request outstanding until
++	 * execution returns to target-owned code, so the acknowledged CPU state
++	 * is the post-service boundary rather than the handler-entry boundary. */
++	if (!(flags & DIIS_STEP_FAULT) &&
++			target_is_software_interrupt(start_pc) &&
++			!target_owns_pc(g_runtime_psp, next_pc)) {
++		g_request_deferred = 1;
++		g_deferred_start_pc = start_pc;
++		g_deferred_decoded = decoded_instructions;
++		g_deferred_flags = flags;
++		return;
++	}
++	if (next_pc == start_pc)
++		flags |= DIIS_STEP_SAME_PC;
+ 	publish_cpu(next_pc, decoded_instructions, flags);
+ 	req = __atomic_load_n(&g_shm->req, __ATOMIC_RELAXED);
+ 	__atomic_store_n(&g_shm->ack, req, __ATOMIC_RELEASE);
+-- 
+2.43.0
