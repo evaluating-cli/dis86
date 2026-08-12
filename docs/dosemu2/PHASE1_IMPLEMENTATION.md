@@ -182,12 +182,19 @@ Activation requires MZ entry identity plus validated PSP/MCB/environment/current
 After activation:
 
 - target-owned PC + target PSP may consume requests;
-- DOS/BIOS code outside the target-owned MCB does not consume a target request;
+- DOS/BIOS code outside the target-owned MCB does not consume a new target request;
 - descendant/helper PSPs may run without consuming a target request;
 - global `end` remains effective before bypass;
 - leaving target ancestry permanently publishes `TARGET_EXIT`, clears `runtime_psp`, acknowledges pending work, and prevents stale-PSP reactivation.
 
-The source paths are implemented. Representative handler/helper execution and target lifecycle transitions remain runtime-proof items.
+The PC-range bypass is implemented, but the complete interrupt boundary is not. After
+a target interrupt node, the current post-node hook acknowledges at handler entry,
+before the out-of-range bypass can run. A nonterminating interrupt request must instead
+remain pending across handler execution and be published/acknowledged after return to
+target-owned code (or at an equivalent normalized boundary). The terminating
+`INT 21h/AH=4Ch` pre-execution path does not prove that behavior. Deferral is remaining
+implementation work; representative handler/helper execution and target lifecycle
+transitions remain runtime-proof items.
 
 ## 7. Low-memory export
 

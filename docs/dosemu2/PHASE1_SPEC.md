@@ -16,6 +16,7 @@ This is the normative behavior specification. The CPU hook, low-memory export, A
 | Implemented | Nine-patch dosemu2 carrier plus current dis86 adapter/outcome/shutdown path. |
 | Unit tested | Host-independent ABI/state/comparison/reference-CPU paths. |
 | Pinned-runtime tested | Build/link, ABI init, basic step, live low-memory alias, end barrier/clean exit, terminating MZ smoke fixture. |
+| Remaining implementation | Defer publication/acknowledgement across nonterminating DOS/BIOS handlers. |
 | Still-unverified E2E | REP, interrupt shadow, representative handler/helper exclusion, lifecycle transitions, full differential corpus. |
 
 ## 2. Execution-boundary contract
@@ -113,12 +114,25 @@ Activation requires real mode, a valid PSP/MCB/environment identity, matching co
 Once active:
 
 - target requests are consumed only for target-owned code;
-- code outside the target-owned MCB, including DOS/BIOS handler code, bypasses target request consumption;
+- when a target-owned interrupt node transfers control outside the target-owned MCB,
+  dosemu2 shall keep that request pending and shall not publish or acknowledge the
+  handler-entry state;
+- while that request remains pending, DOS/BIOS handler nodes outside the target-owned
+  MCB shall execute without consuming another request; publication and acknowledgement
+  occur only after control returns to target-owned code, at the normalized
+  post-service boundary (or at an explicitly equivalent normalized interrupt boundary);
 - descendant child/helper processes bypass target request consumption;
 - the global end barrier remains effective before all bypass paths;
 - leaving target ancestry publishes `TARGET_EXIT`, clears `runtime_psp`, acknowledges any pending request, and permanently prevents stale-PSP reactivation.
 
-These paths are implemented. Representative handler/helper execution and target lifecycle transitions remain unverified E2E.
+The current target-owned-PC filter prevents request consumption in handler code, but
+the carrier still publishes and acknowledges immediately after the interrupt node.
+It therefore does **not** yet implement the required nonterminating interrupt boundary:
+its handler-entry state is not comparable with emu86's post-service `Machine::step()`
+state. The terminating `INT 21h/AH=4Ch` pre-execution path is a special case and is not
+evidence for this requirement. Handler acknowledgement deferral is implementation work;
+representative handler/helper execution and target lifecycle transitions also remain
+unverified E2E.
 
 ## 7. Normalized comparison contract
 

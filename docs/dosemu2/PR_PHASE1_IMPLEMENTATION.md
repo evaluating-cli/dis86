@@ -7,7 +7,7 @@ PR #10 documents the implementation that has landed across #12, #14, #17, #18, #
 - **#12 merged:** CMPS/REP behavior, configurable runtime PSP loading, initial-state normalization.
 - **#14 merged:** SHL/SHR/SAR semantics aligned with the pinned simx86 interpreter.
 - **#17 merged:** initial five-patch dosemu2 carrier with hook/ABI, live low-memory export, target lifecycle, atomic lifecycle flags, and protected-mode rejection.
-- **Current carrier on main:** nine patches; adds DOS-handler exclusion, pre-execution termination publication, dynamic target-drive identity, and validator single-step fault classification.
+- **Current carrier on main:** nine patches; adds a DOS-handler PC filter, pre-execution termination publication, dynamic target-drive identity, and validator single-step fault classification. The PC filter alone does not provide the required post-service acknowledgement boundary.
 - **#18 merged:** Rust consumes node-boundary outcomes and advances/computes comparison state from published metadata.
 - **#19 merged:** cooperative shutdown, diagnostics, kill fallback, explicit reap.
 - **#20 merged:** pinned-runtime terminating MZ fixture through the dosemu2 backend/validator path.
@@ -24,7 +24,8 @@ PR #10 requires and now records:
 - forced `cpu_vm emulated`, `cpuemu 1`, `cpu_vm_dpmi emulated`, `mappingdriver mapshm` launch configuration;
 - executable-scoped target identity with explicit drive-letter wildcard support only where required by `-K`;
 - live `/dosemu_mem` export from the actual `MAPPING_LOWMEM` backing, with no exact backing-size equality assumption;
-- target-owned-PC filtering so DOS/BIOS handler code does not consume a target request;
+- target-owned-PC filtering that prevents handler code from consuming a new request,
+  while recording that post-interrupt acknowledgement deferral is still required;
 - PSP-ancestry descendant bypass and permanent target-exit latch;
 - release-published lifecycle flags;
 - Rust-side ABI/version/size and launcher-ownership validation, accepting a published emulator descendant PID when its ancestry leads back to the spawned launcher;
@@ -45,6 +46,11 @@ PR #10 requires and now records:
 - [x] clean/cooperative shutdown path
 - [x] terminating MZ fixture through dosemu2 backend
 
+### Remaining implementation
+
+- [ ] defer publication/acknowledgement across nonterminating DOS/BIOS handlers until
+  control returns to target-owned code, or implement an equivalent normalized boundary
+
 ### Implemented but still requiring expanded E2E proof
 
 - [ ] REP MOVS/STOS/CMPS/SCAS normalization
@@ -63,10 +69,11 @@ The supplied diff correctly reflects a newer repository state than the previous 
 
 Two wording constraints are retained here:
 
-1. **Implemented is not the same as integration-tested.** DOS-handler exclusion, descendant/lifecycle paths, REP, and interrupt-shadow handling have source implementations but still need representative expanded runtime fixtures.
+1. **The DOS-handler boundary is not yet implemented.** The PC filter stops request consumption in handler code, but the carrier still acknowledges a target interrupt at handler entry. It must keep the request pending until return to target-owned code (or an equivalent normalized boundary). Descendant/lifecycle paths, REP, and interrupt-shadow handling have source implementations but still need representative expanded runtime fixtures.
 2. **Smoke success is not performance evidence.** No validator-speedup claim follows from these correctness tests; normal Hydra hybrid performance remains a separate benchmark workload.
 
-The remaining E2E corpus is follow-up validation work and does not make the architecture/evidence consolidation itself incomplete for review.
+The expanded E2E corpus remains follow-up validation work. The handler-boundary deferral
+above, however, is an implementation gap rather than merely missing test evidence.
 
 ## Files
 

@@ -22,7 +22,7 @@ The series applies to dosemu2 commit `604ce0cdd1a71f657e2a2df623d216d5ab289313` 
 
 ### Specified and implemented
 
-The current carrier implements the executable-scoped `simx86` request/execute/ack hook, ABI-v1 register exchange, node metadata, live low-memory export, protected-mode rejection, target/child lifecycle policy, DOS-handler exclusion, pre-execution termination publication, dynamic target-drive identity, and validator single-step fault classification.
+The current carrier implements the executable-scoped `simx86` request/execute/ack hook, ABI-v1 register exchange, node metadata, live low-memory export, protected-mode rejection, target/child lifecycle policy, a DOS-handler PC filter, pre-execution termination publication, dynamic target-drive identity, and validator single-step fault classification. The filter does not yet defer acknowledgement across a nonterminating interrupt service, so complete DOS-handler exclusion remains implementation work.
 
 The Rust side consumes decoded-node outcomes, performs normalized initial-state comparison, handles terminal/fault categories, and shuts the dosemu2 child down cooperatively with explicit reaping.
 
@@ -44,6 +44,11 @@ The carrier workflow applies the complete patch series to the pinned dosemu2 com
 ### Still unverified end to end
 
 The current smoke coverage is not the expanded instruction corpus. In particular, **REP semantics, interrupt-shadow composition, representative DOS/BIOS and child/helper exclusion, target lifecycle transitions, and full differential state/memory comparison remain unverified E2E**.
+
+In addition, nonterminating DOS/BIOS interrupts have an implementation gap: the carrier
+currently acknowledges the target interrupt node at handler entry. It must defer
+publication/acknowledgement until the service returns to target-owned code, or expose an
+equivalent normalized boundary, before handler exclusion is complete.
 
 Performance and Hydra native-function interception are outside the current validator proof.
 

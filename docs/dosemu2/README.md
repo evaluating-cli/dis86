@@ -23,7 +23,7 @@ The carrier is a `git am` patch series because there is not yet a writable dosem
 
 ## Evidence summary
 
-**Specified and implemented:** ABI-v1 initialization; request/apply/publish/ack synchronization; validator-bounded `MSSTP` execution; decoded-instruction/outcome metadata; real-mode segment updates and protected-mode rejection; live low-memory export; executable/PSP ownership gating; DOS-handler and descendant-helper bypass; pre-execution termination publication; dynamic target-drive identity; target-exit/end-barrier publication; Rust-side launcher/descendant process-ownership validation; and Rust-side outcome handling/cooperative shutdown.
+**Specified and implemented:** ABI-v1 initialization; request/apply/publish/ack synchronization for ordinary target-owned nodes; validator-bounded `MSSTP` execution; decoded-instruction/outcome metadata; real-mode segment updates and protected-mode rejection; live low-memory export; executable/PSP ownership gating; descendant-helper bypass; pre-execution termination publication; dynamic target-drive identity; target-exit/end-barrier publication; Rust-side launcher/descendant process-ownership validation; and Rust-side outcome handling/cooperative shutdown. The DOS-handler PC filter exists, but acknowledgement deferral to a post-service target-owned boundary is not implemented.
 
 **Unit tested:** Rust-side ABI access, initial-state comparison, and handling of multi-instruction, same-PC, target-exit, end-acknowledgement, and fault outcomes, plus the reference CPU suite. Unit tests do not prove dosemu2 runtime semantics.
 

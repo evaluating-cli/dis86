@@ -13,7 +13,7 @@ PR #12 supplied configurable validator executable loading and `CMPS`; PR #17 est
 | Low memory | Share the live simulator low-memory backing, not a copied second buffer. | `mapshm`/`lowmem_base` backing exported as `/dosemu_mem`; external bidirectional alias proof passes. | Differential memory effects across the expanded corpus. |
 | REP | Compare at the same semantic boundary as emu86 without double-consuming an iteration. | `decoded_instructions`, `SAME_PC`, CMPS support, and Rust outcome plumbing exist. | **Not integration-tested** with REP MOVS/STOS/CMPS/SCAS fixtures. |
 | Shadow instructions | Account for nodes that legitimately consume multiple decoded instructions. | `TNode.seqnum`, `MULTI_INSN`, and Rust multi-instruction handling exist. | **Not integration-tested** with STI, MOV SS, and POP SS fixtures. |
-| DOS/BIOS exclusion | Do not consume target requests while executing outside the target's owned MCB. | Patch 0006 implements a target-owned PC range check. | **Not integration-tested** against representative DOS/BIOS handler execution. |
+| DOS/BIOS exclusion | Keep an interrupt request pending across out-of-target handler execution and publish/acknowledge only at a normalized post-service target boundary. | Patch 0006 implements only the target-owned PC range check; the carrier still acknowledges the interrupt node at handler entry. | Implement acknowledgement deferral, then test representative DOS/BIOS handler execution. |
 | Child/helper exclusion | Descendants may run without consuming target requests while global end remains effective. | PSP ancestry policy implemented. | **Not integration-tested** with actual child/helper execution. |
 | Lifecycle | Publish target exit once and prevent stale PSP reactivation. | Implemented; end barrier and terminating smoke path are runtime-tested. | Target -> child -> target and target -> parent transitions remain unverified. |
 | Target identity | Bind activation to executable path, MZ entry, PSP/MCB/environment/current PSP. | Implemented; patch 0008 allows an explicit wildcard only in the drive-letter position for `-K` drive variability. | More boot-stack/path coverage. |
@@ -46,9 +46,9 @@ ABI-v1 state import is a 16-bit real-mode contract. Protected mode is rejected b
 
 The plumbing is implemented, but the combined REP/shadow behavior is not proven until focused pinned-runtime fixtures pass.
 
-### Handler/child exclusion is implemented but not fully proven
+### Handler exclusion remains incomplete; child exclusion is not fully proven
 
-The current patch series contains explicit DOS-handler PC exclusion and PSP-ancestry child/helper handling. That resolves the earlier design ambiguity at source level. It does **not** justify claiming representative DOS/BIOS/child execution is integration-tested yet.
+The current patch series contains a DOS-handler PC filter and PSP-ancestry child/helper handling. The PC filter prevents a new request from being consumed in handler code, but the post-node hook has already published and acknowledged the target interrupt at handler entry. Because emu86 completes a nonterminating interrupt service within the corresponding `Machine::step()`, those states are not comparable. The carrier must defer publication/acknowledgement until control returns to target-owned code (or provide an equivalent normalized interrupt boundary). The terminating `INT 21h/AH=4Ch` path is special-case evidence only. Child handling also remains unverified with representative execution.
 
 ## Approval gate
 
