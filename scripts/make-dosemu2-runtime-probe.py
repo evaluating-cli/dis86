@@ -53,8 +53,22 @@ FAULT_CODE = bytes.fromhex(
     "f7 f3"           # div bx
 )
 
+# Returning DOS-service probe.  The controller seeds DS=CS and SI=1234h before
+# the first request.  AH=25h installs vector 60h at DS:DX, which is deterministic
+# and is also implemented by emu86.  The interrupt request must not acknowledge
+# at DOS handler entry: its publication point is IP=0008 after DOS returns, while
+# the following MOV SI,AX has not executed yet.
+HANDLER_RETURN_CODE = bytes.fromhex(
+    "ba 0a 00 "       # mov dx,000ah
+    "b8 60 25 "       # mov ax,2560h (set interrupt vector 60h)
+    "cd 21 "          # int 21h (returns)
+    "89 c6 "          # mov si,ax -- must execute only on the next request
+    "eb fe"            # safety loop
+)
+
 assert len(CODE) == 18
 assert CODE[16:18] == b"\x11\x11"
+assert len(HANDLER_RETURN_CODE) == 12
 
 
 def build_mz(code: bytes = CODE) -> bytes:
@@ -98,13 +112,14 @@ def main() -> int:
         "--terminating": "terminating",
         "--target-exit": "target-exit",
         "--fault": "fault",
+        "--handler-return": "handler-return",
     }
     if args[:1] and args[0] in modes:
         mode = modes[args[0]]
         args = args[1:]
     if len(args) != 1:
         print(
-            f"usage: {sys.argv[0]} [--terminating|--target-exit|--fault] OUTPUT.EXE",
+            f"usage: {sys.argv[0]} [--terminating|--target-exit|--fault|--handler-return] OUTPUT.EXE",
             file=sys.stderr,
         )
         return 2
@@ -115,6 +130,7 @@ def main() -> int:
         "terminating": TERMINATING_CODE,
         "target-exit": TARGET_EXIT_CODE,
         "fault": FAULT_CODE,
+        "handler-return": HANDLER_RETURN_CODE,
     }[mode]
     data = build_mz(code)
     out.write_bytes(data)
