@@ -42,7 +42,6 @@ pub struct ShmDataRaw {
   pub reserved1: u16,
   pub decoded_instructions: u32,
   pub step_flags: u32,
-
   // memory
   // TODO...
 }
@@ -82,7 +81,7 @@ pub struct ShmData {
 }
 
 impl ShmData {
-  fn size() -> usize {
+    pub(crate) fn size() -> usize {
     (std::mem::size_of::<ShmDataRaw>() + 4095) & !4095
   }
 
@@ -116,6 +115,7 @@ impl ShmData {
     self.store_u32(ptr, value, ordering);
   }
 
+  #[allow(dead_code)]
   pub fn load_req(&self, ordering: Ordering) -> u64 {
     let ptr = unsafe { std::ptr::addr_of_mut!((*self.raw).req) };
     self.load_u64(ptr, ordering)
@@ -152,12 +152,19 @@ impl ShmData {
     let mut stat: libc::stat = unsafe { std::mem::zeroed() };
     if unsafe { libc::fstat(fd, &mut stat) } < 0 {
       let err = last_os_error("fstat");
-      unsafe { libc::close(fd); }
+            unsafe {
+                libc::close(fd);
+            }
       return Err(err);
     }
     if stat.st_size < size as libc::off_t {
-      unsafe { libc::close(fd); }
-      return Err(format!("shared memory is not ready: {} bytes, need {}", stat.st_size, size));
+            unsafe {
+                libc::close(fd);
+            }
+            return Err(format!(
+                "shared memory is not ready: {} bytes, need {}",
+                stat.st_size, size
+            ));
     }
 
     let addr = unsafe {
@@ -171,11 +178,15 @@ impl ShmData {
       )
     };
     if addr == libc::MAP_FAILED {
-      unsafe { libc::close(fd); }
+            unsafe {
+                libc::close(fd);
+            }
       return Err(last_os_error("mmap"));
     }
 
-    unsafe { libc::close(fd); }
+        unsafe {
+            libc::close(fd);
+        }
 
     let raw = addr as *mut ShmDataRaw;
     Ok(Self { raw })
