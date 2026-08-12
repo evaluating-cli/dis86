@@ -35,6 +35,24 @@ TERMINATING_CODE = bytes.fromhex(
     "cd 21"           # int 21h (DOS terminate process)
 )
 
+# Runtime lifecycle probe: one ordinary instruction followed by the DOS
+# terminate-process service.  Keeping the interrupt at its own node boundary
+# lets the hook publish TARGET_EXIT before DOS takes control.
+TARGET_EXIT_CODE = bytes.fromhex(
+    "b8 00 4c "       # mov ax,4c00h
+    "cd 21"           # int 21h (DOS terminate process)
+)
+
+# Runtime fault probe: establish an unmistakable register snapshot and then
+# execute unsigned division by zero.  DIV raises architectural exception 0 in
+# simx86, which the validator hook must publish as DIIS_STEP_FAULT.
+FAULT_CODE = bytes.fromhex(
+    "b8 34 12 "       # mov ax,1234h
+    "31 d2 "          # xor dx,dx
+    "31 db "          # xor bx,bx
+    "f7 f3"           # div bx
+)
+
 assert len(CODE) == 18
 assert CODE[16:18] == b"\x11\x11"
 
@@ -75,18 +93,32 @@ def build_mz(code: bytes = CODE) -> bytes:
 
 def main() -> int:
     args = sys.argv[1:]
-    terminating = False
-    if args[:1] == ["--terminating"]:
-        terminating = True
+    mode = "end-barrier"
+    modes = {
+        "--terminating": "terminating",
+        "--target-exit": "target-exit",
+        "--fault": "fault",
+    }
+    if args[:1] and args[0] in modes:
+        mode = modes[args[0]]
         args = args[1:]
     if len(args) != 1:
-        print(f"usage: {sys.argv[0]} [--terminating] OUTPUT.EXE", file=sys.stderr)
+        print(
+            f"usage: {sys.argv[0]} [--terminating|--target-exit|--fault] OUTPUT.EXE",
+            file=sys.stderr,
+        )
         return 2
     out = pathlib.Path(args[0])
     out.parent.mkdir(parents=True, exist_ok=True)
-    data = build_mz(TERMINATING_CODE if terminating else CODE)
+    code = {
+        "end-barrier": CODE,
+        "terminating": TERMINATING_CODE,
+        "target-exit": TARGET_EXIT_CODE,
+        "fault": FAULT_CODE,
+    }[mode]
+    data = build_mz(code)
     out.write_bytes(data)
-    kind = "terminating validator fixture" if terminating else "runtime probe, sentinel=0010h"
+    kind = f"{mode} fixture"
     print(f"wrote {out} ({len(data)} bytes, entry CS:IP=0000:0000, {kind})")
     return 0
 

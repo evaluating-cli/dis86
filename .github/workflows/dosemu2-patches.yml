@@ -259,6 +259,71 @@ jobs:
           fi
           echo 'dosemu2 runtime hook proof passed'
 
+      - name: Prove target-exit and fault publications at runtime
+        working-directory: /tmp/dosemu2
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustc --edition=2021 -O \
+            "$GITHUB_WORKSPACE/scripts/dosemu2-runtime-probe.rs" \
+            -o /tmp/dosemu2-runtime-probe
+          config='cpu_vm emulated cpuemu 1 cpu_vm_dpmi emulated mappingdriver mapshm'
+
+          run_case() {
+            mode="$1"
+            probe_home="/tmp/diis-dosemu2-$mode-home"
+            drive_c="$probe_home/.dosemu/drive_c"
+            log="/tmp/diis-dosemu2-$mode.log"
+            probe_log="/tmp/diis-dosemu2-$mode-probe.log"
+            rm -rf "$probe_home"
+            mkdir -p "$drive_c"
+            rm -f /dev/shm/hydra_remote /dev/shm/dosemu_mem
+            python3 "$GITHUB_WORKSPACE/scripts/make-dosemu2-runtime-probe.py" \
+              "--$mode" "$drive_c/TEST.EXE"
+
+            HOME="$probe_home" \
+            DIIS_DOSEMU_VALIDATOR=1 \
+            DIIS_DOSEMU_MZ_CS=0 \
+            DIIS_DOSEMU_MZ_IP=0 \
+            DIIS_DOSEMU_TARGET_DOS_PATH='C:\TEST.EXE' \
+              ./bin/dosemu -dumb -q -n -I "$config" -E 'C:\TEST.EXE' \
+                >"$log" 2>&1 &
+            dosemu_pid=$!
+
+            set +e
+            timeout 25s /tmp/dosemu2-runtime-probe "$mode" >"$probe_log" 2>&1
+            probe_status=$?
+            set -e
+            if [[ $probe_status -ne 0 ]]; then
+              cat "$probe_log"
+              cat "$log"
+              kill "$dosemu_pid" 2>/dev/null || true
+              wait "$dosemu_pid" 2>/dev/null || true
+              return "$probe_status"
+            fi
+
+            # TARGET_EXIT continues into the DOS termination interrupt; FAULT
+            # is released by the probe's final END_ACK request.  Both paths
+            # must leave the surrounding emulator lifecycle without a hang.
+            set +e
+            timeout 10s tail --pid="$dosemu_pid" -f /dev/null
+            lifecycle_status=$?
+            set -e
+            if [[ $lifecycle_status -ne 0 ]]; then
+              echo "$mode dosemu2 lifecycle hung" >&2
+              cat "$probe_log"
+              cat "$log"
+              kill "$dosemu_pid" 2>/dev/null || true
+              wait "$dosemu_pid" 2>/dev/null || true
+              return 1
+            fi
+            wait "$dosemu_pid"
+            cat "$probe_log"
+          }
+
+          run_case target-exit
+          run_case fault
+
       - name: Validate a terminating MZ program through DosemuProcess
         shell: bash
         run: |
@@ -306,6 +371,10 @@ jobs:
             /tmp/comcom32.sha256
             /tmp/diis-dosemu2-runtime-probe.log
             /tmp/diis-dosemu2.log
+            /tmp/diis-dosemu2-target-exit-probe.log
+            /tmp/diis-dosemu2-target-exit.log
+            /tmp/diis-dosemu2-fault-probe.log
+            /tmp/diis-dosemu2-fault.log
             /tmp/diis-dosemu2-home/.dosemu/boot.log
             /tmp/diis-emu86-validator.log
             /tmp/diis-emu86-validator-home/.dosemu/boot.log
