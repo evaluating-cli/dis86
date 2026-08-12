@@ -1,119 +1,57 @@
-# Dosemu2 port: revised technical stance and Phase 0 gate
+# dosemu2 validator technical review
 
-The migration remains technically credible, but several source-level conclusions should be treated as explicit hypotheses until the simulator behavior is proven experimentally.
+## Evidence model
 
-## Revised technical hypotheses
+The original migration review correctly rejected a pure-plugin assumption, unsupported validator speedup claims, an unrelated second low-memory mapping, and unproven REP semantics. Those questions now have partial implementation evidence and should no longer be described uniformly as hypotheses.
 
-| Area | Current stance |
-| --- | --- |
-| Core integration | A pure out-of-band plugin is insufficient; the likely design is hybrid integration using a core callback, single-instruction block mode, generated instrumentation, or another `simx86` mechanism established in Phase 0. |
-| Workload performance | JIT block execution may substantially improve normal Hydra runs, but strict lockstep validation is a separate workload and must be benchmarked independently. |
-| Memory subsystem | Investigate reuse/export of dosemu2's existing `lowmem_base` backing before introducing a second shared-memory allocation; verify that its mirror semantics match validator requirements. |
-| REP contract | Phase 0 must define and verify whether a REP-prefixed instruction is one observable architectural step or whether sub-iterations must be externally visible. |
-| Control redirection | Hydra must escape stale translated execution and resynchronize CPU/segment-derived state after control-flow changes; the exact `simx86` mechanism remains a Phase 0 question. |
+PR #12 supplied configurable validator executable loading and `CMPS`; PR #17 established the dosemu2 carrier; PRs #18–#20 added Rust-side node-outcome handling, cooperative shutdown, and a terminating runtime fixture. The current dosemu2 implementation is carried in `patches/dosemu2/` against pinned upstream commit `604ce0cdd1a71f657e2a2df623d216d5ab289313`, using ABI version **1**.
 
-## 1. Integration model: likely hybrid integration
+| Area | Specified behavior | Implementation / evidence | Remaining E2E proof |
+| --- | --- | --- | --- |
+| CPU boundary | Consume a request, execute a validator-bounded translated node, publish state/metadata, acknowledge. | Implemented around `FindExecCode()` with `MSSTP`; pinned runtime performs a basic step. | Expanded instruction-by-instruction differential corpus. |
+| Register ABI | Exchange 14 x86-16 registers with acquire/release ordering and reject incompatible layouts. | ABI v1 implemented; protected-mode import fails closed. | Broad mutation coverage across the expanded corpus. |
+| Low memory | Share the live simulator low-memory backing, not a copied second buffer. | `mapshm`/`lowmem_base` backing exported as `/dosemu_mem`; external bidirectional alias proof passes. | Differential memory effects across the expanded corpus. |
+| REP | Compare at the same semantic boundary as emu86 without double-consuming an iteration. | `decoded_instructions`, `SAME_PC`, CMPS support, and Rust outcome plumbing exist. | **Not integration-tested** with REP MOVS/STOS/CMPS/SCAS fixtures. |
+| Shadow instructions | Account for nodes that legitimately consume multiple decoded instructions. | `TNode.seqnum`, `MULTI_INSN`, and Rust multi-instruction handling exist. | **Not integration-tested** with STI, MOV SS, and POP SS fixtures. |
+| DOS/BIOS exclusion | Do not consume target requests while executing outside the target's owned MCB. | Patch 0006 implements a target-owned PC range check. | **Not integration-tested** against representative DOS/BIOS handler execution. |
+| Child/helper exclusion | Descendants may run without consuming target requests while global end remains effective. | PSP ancestry policy implemented. | **Not integration-tested** with actual child/helper execution. |
+| Lifecycle | Publish target exit once and prevent stale PSP reactivation. | Implemented; end barrier and terminating smoke path are runtime-tested. | Target -> child -> target and target -> parent transitions remain unverified. |
+| Target identity | Bind activation to executable path, MZ entry, PSP/MCB/environment/current PSP. | Implemented; patch 0008 allows an explicit wildcard only in the drive-letter position for `-K` drive variability. | More boot-stack/path coverage. |
+| Differential comparison | Advance emu86 from reported node outcomes and compare normalized state. | PR #18 implements `StepOutcome` handling and initial-state comparison; PR #20 runs one terminating fixture. | **Full differential corpus remains unverified E2E.** |
+| Shutdown | End barrier, bounded cooperative exit, termination fallback, reap. | dosemu2 end barrier runtime proof plus PR #19 cooperative shutdown/reap path. | Stress/error-path runtime coverage. |
 
-A pure out-of-band plugin is insufficient because `simx86` translates and executes multi-instruction blocks. However, the minimal integration mechanism is not yet established.
+## Review conclusions
 
-Candidate approaches include:
+### Core hook and low-memory export are concrete
 
-- a direct core callback at an architectural instruction boundary;
-- forcing a single-instruction / one-block stepping mode;
-- generating Hydra instrumentation into translated blocks; or
-- another existing `simx86` facility discovered during prototype work.
+The `FindExecCode()` hook, `MSSTP` reassertion, pre-node state application, authoritative PC recomputation, post-node publication, and live low-memory export are implemented. They should no longer be described as proposed or merely likely.
 
-Phase 0 must determine the smallest patch surface that provides the required semantics. The project should not commit to a particular `interp.c` hook or instrumentation strategy before that experiment succeeds.
+This also confirms the original review's central architectural correction: the validator needs a small `simx86` core instrumentation surface. The plugin architecture alone is not the mechanism for arbitrary existing `CS:IP` instruction-boundary control.
 
-## 2. Workload separation and performance qualification
+### The low-memory design follows the existing backing
 
-Two workloads must be measured independently.
+The implementation exports the existing `MAPPING_LOWMEM` backing rather than allocating and copying a second DOS memory buffer. The real backing may be larger than the visible `LOWMEM_SIZE + HMASIZE` window; provenance/containment and address-zero aliasing are the relevant invariants, not exact-size equality.
 
-### Normal Hydra hybrid execution
+### Workloads remain separate
 
-`simx86` may retain translated block execution between native/decompiled and emulated boundaries, so it may provide substantial speedups over interpreted execution. This must be benchmarked on representative DOS binaries rather than inferred from raw simulator throughput.
+Strict validator lockstep pays synchronization cost after each observable node. Its correctness smoke tests establish no 10–50x speedup. Normal Hydra hybrid execution may have different performance characteristics and must be benchmarked separately.
 
-### `emu86_validator` differential testing
+### Real-mode scope remains deliberate
 
-Strict differential validation is effectively:
+ABI-v1 state import is a 16-bit real-mode contract. Protected mode is rejected before external register or segment mutation rather than applying `SetSegReal()` under unsupported conditions.
 
-1. execute one guest instruction;
-2. expose architectural state;
-3. synchronize with the peer emulator;
-4. compare state;
-5. repeat.
+### REP and shadow composition remain the semantic risk
 
-This pattern fragments normal JIT block execution and introduces synchronization overhead. The original 10–50x validator-speedup estimate is therefore not established and should not be used as a planning assumption.
+`MSSTP` does not imply every observable node corresponds to exactly one emu86 semantic step. Interrupt-shadow handling may produce multi-instruction nodes; REP may remain at the same PC across raw micro-iterations. The adapter therefore relies on published metadata rather than byte length or opcode guesses.
 
-## 3. Low-memory backing: investigate `lowmem_base` first
+The plumbing is implemented, but the combined REP/shadow behavior is not proven until focused pinned-runtime fixtures pass.
 
-Before introducing an independent `/dev/shm/dosemu_mem` allocation, investigate whether dosemu2's existing `lowmem_base` backing can be exported to the external validator.
+### Handler/child exclusion is implemented but not fully proven
 
-The memory investigation must determine whether the validator needs:
+The current patch series contains explicit DOS-handler PC exclusion and PSP-ancestry child/helper handling. That resolves the earlier design ambiguity at source level. It does **not** justify claiming representative DOS/BIOS/child execution is integration-tested yet.
 
-- the simulator's low-memory image exposed through `lowmem_base`;
-- logical DOS memory semantics through `MEM_BASE32(addr)` or related accessors; or
-- a deliberately defined combination of the two.
+## Approval gate
 
-Do not assume `MEM_BASE32(addr)` and `lowmem_base + addr` are interchangeable. Their semantics can differ around logical mappings, holes, video memory, and protection behavior.
+The patch/build/runtime smoke checks support continued development, but not a claim of complete validator integration. Approval of REP semantics, interrupt-shadow composition, helper exclusion, lifecycle transitions, or full differential comparison as integration-tested requires the expanded pinned-runtime corpus to pass.
 
-This memory validation follows the CPU-control architectural gate and should be treated as its own experiment rather than silently folded into Phase 0.
-
-## 4. REP stepping contract
-
-The primary issue is the validator's architectural stepping contract, not callback placement for string operations in isolation.
-
-Phase 0 must formally define and test whether a REP-prefixed instruction such as `REP MOVS` or `REP STOS` is observed as:
-
-- one guest instruction whose internal repetitions complete before the next architectural boundary; or
-- a sequence in which individual repetitions are externally observable.
-
-The intended contract must then be checked against both `emu86` and `simx86`. Until that source-level verification is recorded, REP atomicity should remain a tested hypothesis rather than a settled compatibility claim.
-
-## 5. coopth and HLT do not replace arbitrary `CS:IP` interception
-
-Dosemu2 cooperative threading and HLT handlers may be useful supporting facilities for control transfers, asynchronous services, or implementation structure. They do not by themselves provide a callback when existing guest execution reaches an arbitrary original function address.
-
-Hydra therefore still requires an execution-address interception mechanism at the CPU boundary.
-
-## 6. Control redirection and translated simulator state
-
-Assigning `_AX`, `_IP`, `_CS`, or other register macros is not by itself proof that execution can safely continue after Hydra redirects control flow with operations such as `RETURN_FAR` or `RETURN_JUMP`.
-
-The architectural requirement is to:
-
-- leave or terminate the currently active translated execution path when necessary;
-- avoid or invalidate translated state that is no longer valid;
-- resynchronize segment-derived and CPU state through the appropriate simulator path; and
-- resume execution at the redirected architectural state without stale execution artifacts.
-
-Phase 0 must establish the exact `simx86` mechanism and API. It should not assume that a specific helper such as `leave_block()` or global translation-cache invalidation is required until demonstrated.
-
-## Phase 0: architectural gate
-
-Before implementing the full Hydra ABI, validator transport, or memory-sharing design, prove the following with a minimal `simx86` experiment:
-
-1. Step exactly one guest instruction.
-2. Extract complete architectural state: general registers, segment registers, `CS:IP`, and FLAGS.
-3. Mutate `CS:IP` and register state externally.
-4. Escape any active translated execution state that is no longer valid and resynchronize CPU/segment state cleanly.
-5. Resume execution and compare the resulting architectural state against a known-good execution path, proving that state manipulation does not violate x86 architectural semantics.
-6. Verify deterministic behavior for CALL, RET, RETF, INT, instruction prefixes, and REP-prefixed string operations.
-
-Passing this gate establishes that Hydra-style interception is technically sound on `simx86` and reveals the minimal core patch surface. Failing it still produces a useful result: the simulator integration requirements become concrete before substantial validator or plugin code is written.
-
-## Follow-on sequence
-
-After Phase 0 succeeds:
-
-1. define the dosemu2-side register snapshot ABI;
-2. investigate/export the appropriate low-memory backing and validate its semantics;
-3. implement `/dev/shm/hydra_remote` synchronization;
-4. adapt `emu86_validator` to launch and drive dosemu2;
-5. validate a small differential corpus;
-6. implement Hydra address interception and native-function execution;
-7. validate overlays and other edge cases;
-8. benchmark normal Hydra execution and lockstep validation separately;
-9. decide the final boundary between the isolated `simx86` patch and the surrounding Hydra module.
-
-The migration should proceed from verified CPU semantics rather than early implementation assumptions.
+Hydra native-function interception, overlays, and performance remain follow-on work outside the current validator proof.
