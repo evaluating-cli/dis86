@@ -6,7 +6,7 @@ This directory records both the validator contract and the evidence for the dose
 
 - **Current dosemu2 implementation carrier:** `patches/dosemu2/`
 - **Pinned dosemu2 commit:** `604ce0cdd1a71f657e2a2df623d216d5ab289313`
-- **Shared-memory ABI:** version **1**
+- **Shared-memory ABI:** version **1**, 88-byte append-only structure preserving the legacy 64-byte Hydra prefix
 - **Current carrier size:** nine ordered patches
 
 The carrier is a `git am` patch series because there is not yet a writable dosemu2 fork. It contains the executable-scoped `simx86` hook and exports the live `mapshm` allocation backing `lowmem_base` as `/dosemu_mem`. These are implemented behavior, not hypothetical approaches.
@@ -23,7 +23,7 @@ The carrier is a `git am` patch series because there is not yet a writable dosem
 
 ## Evidence summary
 
-**Specified and implemented:** ABI-v1 initialization; request/apply/publish/ack synchronization; validator-bounded `MSSTP` execution; decoded-instruction/outcome metadata; real-mode segment updates and protected-mode rejection; live low-memory export; executable/PSP ownership gating; DOS-handler and descendant-helper bypass; pre-execution termination publication; dynamic target-drive identity; target-exit/end-barrier publication; and Rust-side outcome handling/cooperative shutdown.
+**Specified and implemented:** ABI-v1 initialization; request/apply/publish/ack synchronization; validator-bounded `MSSTP` execution; decoded-instruction/outcome metadata; real-mode segment updates and protected-mode rejection; live low-memory export; executable/PSP ownership gating; DOS-handler and descendant-helper bypass; pre-execution termination publication; dynamic target-drive identity; target-exit/end-barrier publication; Rust-side launcher/descendant process-ownership validation; and Rust-side outcome handling/cooperative shutdown.
 
 **Unit tested:** Rust-side ABI access, initial-state comparison, and handling of multi-instruction, same-PC, target-exit, end-acknowledgement, and fault outcomes, plus the reference CPU suite. Unit tests do not prove dosemu2 runtime semantics.
 
