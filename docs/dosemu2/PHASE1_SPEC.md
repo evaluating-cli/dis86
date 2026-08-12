@@ -36,23 +36,24 @@ The hook is around `FindExecCode()` node selection/execution. A changed `CS:IP` 
 
 ## 3. ABI-v1 contract
 
-The shared payload is an 80-byte structure in a page-sized `/hydra_remote` POSIX-SHM object:
+The shared structure is 88 bytes and preserves the established 64-byte Hydra controller/register prefix. The dosemu2 extension is append-only and begins at offset 64. The POSIX-SHM backing remains page-sized.
 
 ```text
-offset  0  u32 abi_version
-offset  4  u32 struct_size
-offset  8  u32 init
-offset 12  u32 end
-offset 16  i32 pid
-offset 20  u16 runtime_psp
-offset 22  u16 reserved0
-offset 24  u64 req
-offset 32  u64 ack
-offset 40  u32 decoded_instructions
-offset 44  u32 step_flags
-offset 48  u16 ax, bx, cx, dx, si, di, bp, sp, ip, cs, ds, es, ss, flags
-offset 76  u32 reserved1
-size       80
+offset  0  u32 init
+offset  4  u32 end
+offset  8  i32 pid
+offset 12  u32 reserved0
+offset 16  u64 req
+offset 24  u64 ack
+offset 32  u16 ax, bx, cx, dx, si, di, bp, sp, ip, cs, ds, es, ss, flags
+offset 60  u32 legacy_reserved1
+offset 64  u32 abi_version
+offset 68  u32 struct_size
+offset 72  u16 runtime_psp
+offset 74  u16 reserved1
+offset 76  u32 decoded_instructions
+offset 80  u32 step_flags
+size       88 bytes (8-byte aligned)
 ```
 
 Current raw flags:
@@ -65,7 +66,9 @@ DIIS_STEP_END_ACK      = 1 << 3
 DIIS_STEP_TARGET_EXIT  = 1 << 4
 ```
 
-Control fields use acquire/release ordering; non-atomic payload writes are ordered by those control operations. ABI version, structure size, mapping size, and process identity are validated before use.
+Control fields use acquire/release ordering; non-atomic payload writes are ordered by those control operations.
+
+`ShmData::attach()` rejects an undersized backing before mapping it. After `init`, the Rust adapter validates ABI version, structure size, and published process ownership before trusting the payload. The published PID may be the launcher returned by `Command::spawn()` or an emulator descendant whose parent ancestry leads back to that launcher; it need not equal `Child::id()`.
 
 General-register and FLAGS imports preserve their high 16 bits. Real-mode segment changes use dosemu2's segment-cache update path. Protected-mode import fails closed with `DIIS_STEP_FAULT` before mutation.
 
