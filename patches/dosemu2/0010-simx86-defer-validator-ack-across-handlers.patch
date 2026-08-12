@@ -139,10 +139,10 @@ diff --git a/src/base/emu-i386/simx86/diis-validator.c b/src/base/emu-i386/simx8
 +			publish_deferred_completion(*pc);
 +			continue;
 +		}
-+		/* DOS and BIOS handlers retain the caller's current PSP.  Only
-+		 * consume a request while executing inside the target's MCB. */
- 		if (!target_owns_pc(g_runtime_psp, *pc))
- 			return 0;
++                /* DOS and BIOS handlers retain the caller's current PSP.  Only
++                 * consume a request while executing inside the target's MCB. */
+                 if (!target_owns_pc(g_runtime_psp, *pc))
+                         return 0;
  		req = __atomic_load_n(&g_shm->req, __ATOMIC_ACQUIRE);
 @@ -439,9 +497,9 @@ int diis_validator_before_node(unsigned int *pc)
  		usleep(50);
