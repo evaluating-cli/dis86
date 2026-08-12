@@ -1,0 +1,224 @@
+From 9a7d8a58ef4ff6f41595cb3db2d8d504bbbdf010 Mon Sep 17 00:00:00 2001
+From: evaluating-cli <noreply@github.com>
+Date: Wed, 12 Aug 2026 22:10:00 +0200
+Subject: [PATCH] simx86: defer validator acknowledgement across DOS/BIOS handlers
+
+A validator request whose target-owned software INT transfers to DOS/BIOS
+handler code must remain outstanding until the service returns to the target.
+Otherwise the post-node hook publishes handler-entry state, while emu86
+completes the DOS service as part of the corresponding semantic step.
+
+Track the exact controlled request and defer publication only when the final
+decoded instruction is INT imm8 and execution leaves the target-owned MCB.
+Handler nodes then run without consuming requests.  At the first returned
+target pre-node boundary, publish the post-service register state with the
+original translated-node metadata, acknowledge the original request, and wait
+for a new request before executing the following target instruction.
+
+The lifecycle and end-barrier paths also release a deferred request so no
+controller request can be stranded during shutdown or target exit.
+---
+ src/base/emu-i386/simx86/diis-validator.c | 91 +++++++++++++++++++++++---
+ src/base/emu-i386/simx86/diis-validator.h |  2 +-
+ src/base/emu-i386/simx86/interp.c         |  5 +-
+ 3 files changed, 88 insertions(+), 10 deletions(-)
+
+diff --git a/src/base/emu-i386/simx86/diis-validator.h b/src/base/emu-i386/simx86/diis-validator.h
+--- a/src/base/emu-i386/simx86/diis-validator.h
++++ b/src/base/emu-i386/simx86/diis-validator.h
+@@ -15,7 +15,7 @@ enum {
+ int diis_validator_before_node(unsigned int *pc);
+ 
+-void diis_validator_after_node(unsigned int start_pc, unsigned int next_pc,
++void diis_validator_after_node(unsigned int start_pc, unsigned int last_pc, unsigned int next_pc,
+ 		unsigned int decoded_instructions, int cpu_err);
+ 
+ #endif
+diff --git a/src/base/emu-i386/simx86/diis-validator.c b/src/base/emu-i386/simx86/diis-validator.c
+--- a/src/base/emu-i386/simx86/diis-validator.c
++++ b/src/base/emu-i386/simx86/diis-validator.c
+@@ -64,6 +64,12 @@ static int g_created;
+ static int g_active;
+ static int g_target_finished;
+ static int g_node_controlled;
++static uint64_t g_controlled_req;
++static int g_request_deferred;
++static uint64_t g_deferred_req;
++static unsigned int g_deferred_start_pc;
++static unsigned int g_deferred_decoded_instructions;
++static uint32_t g_deferred_step_flags;
+ static uint16_t g_mz_cs;
+ static uint16_t g_mz_ip;
+ static uint16_t g_runtime_psp;
+@@ -289,6 +295,37 @@ static int target_owns_pc(uint16_t psp, unsigned int pc)
+         return pc >= first && pc < last && last <= LOWMEM_SIZE + HMASIZE;
+ }
+ 
++static int is_instruction_prefix(unsigned char op)
++{
++	switch (op) {
++	case 0x26: case 0x2e: case 0x36: case 0x3e:
++	case 0x64: case 0x65: case 0x66: case 0x67:
++	case 0xf0: case 0xf2: case 0xf3:
++		return 1;
++	default:
++		return 0;
++	}
++}
++
++static int target_instruction_is_software_int(unsigned int pc)
++{
++	const unsigned int lim = LOWMEM_SIZE + HMASIZE;
++	unsigned int i;
++
++	for (i = 0; i < 15 && pc + i < lim; i++) {
++		unsigned char op = LOWMEM_READ_BYTE(pc + i);
++
++		if (is_instruction_prefix(op))
++			continue;
++		return op == 0xcd && pc + i + 1 < lim;
++	}
++	return 0;
++}
++
+ static int target_is_dos_exit(unsigned int pc)
+ {
+ 	if (pc + 1 >= LOWMEM_SIZE + HMASIZE)
+@@ -310,6 +347,10 @@ static void mark_target_finished(void)
+ 	g_shm->runtime_psp = 0;
+ 	g_shm->decoded_instructions = 0;
+ 	__atomic_store_n(&g_shm->step_flags, DIIS_STEP_TARGET_EXIT, __ATOMIC_RELEASE);
+-	req = __atomic_load_n(&g_shm->req, __ATOMIC_RELAXED);
++	if (g_request_deferred)
++		req = g_deferred_req;
++	else
++		req = __atomic_load_n(&g_shm->req, __ATOMIC_RELAXED);
++	g_request_deferred = 0;
+ 	__atomic_store_n(&g_shm->ack, req, __ATOMIC_RELEASE);
+ }
+@@ -338,6 +379,18 @@ static void publish_cpu(unsigned int pc, uint32_t decoded, uint32_t flags)
+ 	__atomic_store_n(&g_shm->step_flags, flags, __ATOMIC_RELEASE);
+ }
+ 
++static void publish_deferred_completion(unsigned int pc)
++{
++	uint32_t flags = g_deferred_step_flags;
++
++	if (pc == g_deferred_start_pc)
++		flags |= DIIS_STEP_SAME_PC;
++	publish_cpu(pc, g_deferred_decoded_instructions, flags);
++	__atomic_store_n(&g_shm->ack, g_deferred_req, __ATOMIC_RELEASE);
++	g_request_deferred = 0;
++}
++
+ static int apply_cpu(unsigned int *pc)
+ {
+ 	if (PROTMODE()) {
+@@ -407,8 +460,12 @@ int diis_validator_before_node(unsigned int *pc)
+ 	for (;;) {
+ 		if (__atomic_load_n(&g_shm->end, __ATOMIC_ACQUIRE)) {
+ 			publish_cpu(*pc, 0, DIIS_STEP_END_ACK);
+-			req = __atomic_load_n(&g_shm->req, __ATOMIC_RELAXED);
++			if (g_request_deferred)
++				req = g_deferred_req;
++			else
++				req = __atomic_load_n(&g_shm->req, __ATOMIC_RELAXED);
++			g_request_deferred = 0;
+ 			__atomic_store_n(&g_shm->ack, req, __ATOMIC_RELEASE);
+ 			return -1;
+ 		}
+@@ -426,9 +483,15 @@ int diis_validator_before_node(unsigned int *pc)
+ 			mark_target_finished();
+ 			return 0;
+ 		}
+-		/* DOS and BIOS handlers retain the caller's current PSP.  Only
+-		 * consume a request while executing inside the target's MCB. */
++		if (g_request_deferred) {
++			if (!target_owns_pc(g_runtime_psp, *pc))
++				return 0;
++			publish_deferred_completion(*pc);
++			continue;
++		}
++		/* DOS and BIOS handlers retain the caller's current PSP.  Only
++		 * consume a request while executing inside the target's MCB. */
+ 		if (!target_owns_pc(g_runtime_psp, *pc))
+ 			return 0;
+ 		req = __atomic_load_n(&g_shm->req, __ATOMIC_ACQUIRE);
+@@ -439,15 +502,16 @@ int diis_validator_before_node(unsigned int *pc)
+ 		usleep(50);
+ 	}
+ 
++	g_controlled_req = req;
+ 	if (apply_cpu(pc)) {
+-		req = __atomic_load_n(&g_shm->req, __ATOMIC_RELAXED);
+-		__atomic_store_n(&g_shm->ack, req, __ATOMIC_RELEASE);
++		__atomic_store_n(&g_shm->ack, g_controlled_req, __ATOMIC_RELEASE);
+ 		return -1;
+ 	}
+ 
+@@ -463,8 +527,8 @@ int diis_validator_before_node(unsigned int *pc)
+ 	return 1;
+ }
+ 
+-void diis_validator_after_node(unsigned int start_pc, unsigned int next_pc,
++void diis_validator_after_node(unsigned int start_pc, unsigned int last_pc, unsigned int next_pc,
+ 		unsigned int decoded_instructions, int cpu_err)
+ {
+ 	uint32_t flags = 0;
+-	uint64_t req;
+ 
+ 	if (!g_active || !g_node_controlled)
+ 		return;
+@@ -472,15 +536,26 @@ void diis_validator_after_node(unsigned int start_pc, unsigned int next_pc,
+ 	g_node_controlled = 0;
+ 	if (decoded_instructions > 1)
+ 		flags |= DIIS_STEP_MULTI_INSN;
+-	if (next_pc == start_pc)
+-		flags |= DIIS_STEP_SAME_PC;
+ 	/* TheCPU.err also carries simx86-internal return reasons (EXCP_GOBACK and
+ 	 * above).  Publish only architectural exceptions, excluding the MSSTP
+ 	 * boundary deliberately requested for validator-controlled execution. */
+ 	if (cpu_err >= EXCP00_DIVZ && cpu_err <= EXCP12_MCHK &&
+ 			cpu_err != EXCP01_SSTP)
+ 		flags |= DIIS_STEP_FAULT;
++
++	if (!(flags & DIIS_STEP_FAULT) &&
++			target_instruction_is_software_int(last_pc) &&
++			!target_owns_pc(g_runtime_psp, next_pc)) {
++		g_request_deferred = 1;
++		g_deferred_req = g_controlled_req;
++		g_deferred_start_pc = start_pc;
++		g_deferred_decoded_instructions = decoded_instructions;
++		g_deferred_step_flags = flags;
++		return;
++	}
++	if (next_pc == start_pc)
++		flags |= DIIS_STEP_SAME_PC;
+ 
+ 	publish_cpu(next_pc, decoded_instructions, flags);
+-	req = __atomic_load_n(&g_shm->req, __ATOMIC_RELAXED);
+-	__atomic_store_n(&g_shm->ack, req, __ATOMIC_RELEASE);
++	__atomic_store_n(&g_shm->ack, g_controlled_req, __ATOMIC_RELEASE);
+ }
+diff --git a/src/base/emu-i386/simx86/interp.c b/src/base/emu-i386/simx86/interp.c
+--- a/src/base/emu-i386/simx86/interp.c
++++ b/src/base/emu-i386/simx86/interp.c
+@@ -487,6 +487,9 @@ static unsigned int FindExecCode(unsigned int PC)
+ 		/* ---- this is the MAIN EXECUTE point ---- */
+ 		unsigned int diis_start_pc = G->key;
+ 		unsigned int diis_decoded_instructions = G->seqnum;
++		unsigned int diis_last_pc = G->key;
++		if (G->seqnum)
++			diis_last_pc += G->meta[G->seqnum - 1].dnpc;
+ 
+ 		NodesExecd++;
+@@ -505,7 +508,7 @@ static unsigned int FindExecCode(unsigned int PC)
+ 		PC = DoExec(G);
+ 		// G is unreliable (maybe deleted) past this point!
+-		diis_validator_after_node(diis_start_pc, PC,
++		diis_validator_after_node(diis_start_pc, diis_last_pc, PC,
+ 				diis_decoded_instructions, TheCPU.err);
+ 
+ #if SPEC_PREJIT
+-- 
+2.47.0
