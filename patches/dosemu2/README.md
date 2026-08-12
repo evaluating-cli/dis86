@@ -93,8 +93,12 @@ The exact target gate expects:
 DIIS_DOSEMU_VALIDATOR=1
 DIIS_DOSEMU_MZ_CS=<u16, decimal or 0x-prefixed>
 DIIS_DOSEMU_MZ_IP=<u16, decimal or 0x-prefixed>
-DIIS_DOSEMU_TARGET_DOS_PATH=<canonical DOS path, e.g. C:\\TEST.EXE>
+DIIS_DOSEMU_TARGET_DOS_PATH=<canonical DOS path, e.g. C:\\TEST.EXE or ?:\\TEST.EXE>
 ```
+
+`?` is accepted only as the first-character drive-letter wildcard. This is
+useful with dosemu2's `-K` mount, whose drive is selected from the redirects
+available in the active DOS boot stack.
 
 Activation occurs only when all of the following are true at a simx86 boundary:
 
@@ -167,6 +171,11 @@ opcode guesses:
 - `DIIS_STEP_FAULT`: simx86 reported a CPU error/exception after the node;
 - `DIIS_STEP_END_ACK`: final publication after observing `end` and before stopping;
 - `DIIS_STEP_TARGET_EXIT`: DOS current-PSP ancestry has left the captured target.
+
+The interpreter's `EXCP01_SSTP` result is the expected boundary produced by
+the hook's `MSSTP` request and is therefore not classified as
+`DIIS_STEP_FAULT`. The `EXCP_GOBACK` and higher values are simx86-internal
+return reasons rather than architectural CPU exceptions and are not faults.
 
 This gives the Rust side actual node consumption without assuming that
 `STI`, `MOV SS`, or `POP SS` necessarily consumed two instructions. More

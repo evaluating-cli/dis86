@@ -1,0 +1,65 @@
+From b4a699d3e66d24acb1588882714879e7623b3ea8 Mon Sep 17 00:00:00 2001
+From: Codex <codex@openai.com>
+Date: Mon, 10 Aug 2026 13:30:26 +0000
+Subject: [PATCH] simx86: publish DOS termination before execution
+
+Recognize INT 21h/AH=4Ch at the controlled boundary so the validator observes target exit without asking emu86 to execute its standalone exit shim. Keep servicing the end request after target completion so process shutdown can receive END_ACK.
+---
+ src/base/emu-i386/simx86/diis-validator.c | 26 ++++++++++++++++++++++-
+ 1 file changed, 25 insertions(+), 1 deletion(-)
+
+diff --git a/src/base/emu-i386/simx86/diis-validator.c b/src/base/emu-i386/simx86/diis-validator.c
+index ad638693c..ad66a06d5 100644
+--- a/src/base/emu-i386/simx86/diis-validator.c
++++ b/src/base/emu-i386/simx86/diis-validator.c
+@@ -289,6 +289,15 @@ static int target_owns_pc(uint16_t psp, unsigned int pc)
+         return pc >= first && pc < last && last <= LOWMEM_SIZE + HMASIZE;
+ }
+ 
++static int target_is_dos_exit(unsigned int pc)
++{
++	if (pc + 1 >= LOWMEM_SIZE + HMASIZE)
++		return 0;
++	return LOWMEM_READ_BYTE(pc) == 0xcd &&
++		LOWMEM_READ_BYTE(pc + 1) == 0x21 &&
++		(TheCPU.eax & 0xff00) == 0x4c00;
++}
++
+ static void mark_target_finished(void)
+ {
+ 	uint64_t req;
+@@ -392,8 +401,15 @@ int diis_validator_before_node(unsigned int *pc)
+ 	if (!diis_validator_init())
+ 		return 0;
+ 	g_node_controlled = 0;
+-	if (g_target_finished)
++	if (g_target_finished) {
++		if (__atomic_load_n(&g_shm->end, __ATOMIC_ACQUIRE)) {
++			publish_cpu(*pc, 0, DIIS_STEP_END_ACK);
++			req = __atomic_load_n(&g_shm->req, __ATOMIC_RELAXED);
++			__atomic_store_n(&g_shm->ack, req, __ATOMIC_RELEASE);
++			return -1;
++		}
+ 		return 0;
++	}
+ 
+ 	if (!g_active) {
+ 		if (!target_entry_matches(*pc))
+@@ -439,6 +455,14 @@ int diis_validator_before_node(unsigned int *pc)
+ 		return -1;
+ 	}
+ 
++	/* The DOS terminate interrupt never returns to the target.  Publish its
++	 * terminal boundary before emu86 is asked to execute an interrupt whose
++	 * standalone DOS shim intentionally has no process-lifecycle host. */
++	if (target_is_dos_exit(*pc)) {
++		mark_target_finished();
++		return 0;
++	}
++
+ 	g_node_controlled = 1;
+ 	return 1;
+ }
+-- 
+2.43.0
+

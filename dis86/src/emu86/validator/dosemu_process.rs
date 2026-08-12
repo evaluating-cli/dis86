@@ -37,6 +37,25 @@ pub struct DosemuProcess {
 }
 
 impl DosemuProcess {
+  fn parent_pid(pid: u32) -> Option<u32> {
+    let status = std::fs::read_to_string(format!("/proc/{}/status", pid)).ok()?;
+    status.lines().find_map(|line| {
+      let value = line.strip_prefix("PPid:")?;
+      value.trim().parse().ok()
+    })
+  }
+
+  fn process_belongs_to_launcher(pid: u32, launcher_pid: u32) -> bool {
+    let mut current = pid;
+    for _ in 0..64 {
+      if current == launcher_pid { return true; }
+      let Some(parent) = Self::parent_pid(current) else { return false; };
+      if parent == 0 || parent == current { return false; }
+      current = parent;
+    }
+    false
+  }
+
   fn remove_stale_mapping(path: &str) -> Result<(), String> {
     match std::fs::remove_file(path) {
       Ok(()) => Ok(()),
@@ -129,9 +148,10 @@ impl DosemuProcess {
       .map_err(|e| format!("Failed to decode target executable {}: {}", exe.display(), e))?;
     let mz_cs = mz.hdr.cs as u16;
     let mz_ip = mz.hdr.ip;
-    // -K mounts the containing directory as C:, so this is the canonical DOS
-    // identity placed in the PSP environment by the matching -E invocation.
-    let target_dos_path = format!("C:\\{}", exe.file_name().unwrap().to_string_lossy());
+    // -K assigns the containing directory the next available DOS drive, which
+    // depends on the boot image's existing redirects.  The hook accepts '?' as
+    // a drive-letter wildcard while still matching the complete absolute path.
+    let target_dos_path = format!("?:\\{}", exe.file_name().unwrap().to_string_lossy());
 
     Self::remove_stale_mapping(HYDRA_SHM_PATH)?;
     Self::remove_stale_mapping(DOSEMU_MEM_PATH)?;
@@ -226,8 +246,9 @@ impl DosemuProcess {
     }
 
     let shared_pid = shmdata_read!(self.data, pid);
-    if shared_pid != self.dosemu.id() {
-      return Err(format!("hydra_remote belongs to PID {}, expected {}", shared_pid, self.dosemu.id()));
+    if !Self::process_belongs_to_launcher(shared_pid, self.dosemu.id()) {
+      return Err(format!("hydra_remote belongs to PID {}, which is not launcher PID {} or its descendant",
+        shared_pid, self.dosemu.id()));
     }
 
     let abi_version = shmdata_read!(self.data, abi_version);
@@ -325,6 +346,7 @@ impl DosemuProcess {
     if let Some(status) = self.dosemu.try_wait()
       .map_err(|e| self.with_diagnostics(format!("Failed to query dosemu2 during shutdown: {}", e)))? {
       self.shut_down = true;
+      if self.finished && status.success() { return Ok(()); }
       return Err(self.with_diagnostics(format!(
         "dosemu2 exited before shutdown acknowledgement: {}", status)));
     }
@@ -336,6 +358,7 @@ impl DosemuProcess {
       if let Some(status) = self.dosemu.try_wait()
         .map_err(|e| self.with_diagnostics(format!("Failed to query dosemu2 during shutdown: {}", e)))? {
         self.shut_down = true;
+        if self.finished && status.success() { return Ok(()); }
         return Err(self.with_diagnostics(format!("dosemu2 exited before shutdown acknowledgement: {}", status)));
       }
       if Instant::now() >= ack_deadline {
@@ -416,5 +439,22 @@ impl Emu for DosemuProcess {
   }
   fn report(&self) {
     panic!("Unimpl");
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::DosemuProcess;
+  use std::process::Command;
+
+  #[test]
+  fn shared_memory_owner_may_be_launcher_or_child() {
+    let launcher = std::process::id();
+    assert!(DosemuProcess::process_belongs_to_launcher(launcher, launcher));
+
+    let mut child = Command::new("sleep").arg("30").spawn().unwrap();
+    assert!(DosemuProcess::process_belongs_to_launcher(child.id(), launcher));
+    let _ = child.kill();
+    let _ = child.wait();
   }
 }

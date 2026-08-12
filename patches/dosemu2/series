@@ -4,3 +4,6 @@
 0004-simx86-publish-validator-step-flags-atomically.patch
 0005-simx86-reject-protected-mode-state-import.patch
 0006-simx86-exclude-dos-handlers-from-validator.patch
+0007-simx86-publish-dos-termination-before-execution.patch
+0008-simx86-allow-dynamic-target-drive-identity.patch
+0009-simx86-exclude-validator-single-step-from-faults.patch
