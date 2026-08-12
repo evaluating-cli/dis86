@@ -2,7 +2,7 @@
 
 **Pinned dosemu2 base:** `604ce0cdd1a71f657e2a2df623d216d5ab289313`  
 **Scope:** 16-bit real-mode MZ executables; one concurrent validator instance  
-**ABI:** version 1, 80-byte control structure in page-sized `/hydra_remote` backing  
+**ABI:** version 1, 88-byte structure preserving the legacy 64-byte Hydra prefix in page-sized `/hydra_remote` backing  
 **Status:** dosemu2 carrier and current Rust adapter path are implemented; expanded semantic runtime coverage remains incomplete.
 
 ## 1. Landed implementation map
@@ -18,7 +18,7 @@
 
 1. `0001-simx86-add-validator-control-abi.patch`
    - page-sized `/hydra_remote`;
-   - ABI version/size and 80-byte control layout;
+   - ABI version/size and 88-byte append-only layout preserving the established 64-byte Hydra controller prefix;
    - executable-scoped target activation;
    - request/apply + publish/ack around `FindExecCode()` / `DoExec(G)`;
    - validator `MSSTP` mode;
@@ -76,23 +76,24 @@ The `?` wildcard is accepted only for the drive-letter position by patch 0008.
 
 ## 2. Shared ABI and ordering
 
-Layout:
+The dosemu2 extension is append-only: the first 64 bytes retain the established Hydra controller/register ABI, and dosemu2 metadata begins at offset 64.
 
 ```text
-offset  0  u32 abi_version
-offset  4  u32 struct_size
-offset  8  u32 init
-offset 12  u32 end
-offset 16  i32 pid
-offset 20  u16 runtime_psp
-offset 22  u16 reserved0
-offset 24  u64 req
-offset 32  u64 ack
-offset 40  u32 decoded_instructions
-offset 44  u32 step_flags
-offset 48  u16 ax ... flags
-offset 76  u32 reserved1
-size       80 bytes
+offset  0  u32 init
+offset  4  u32 end
+offset  8  i32 pid
+offset 12  u32 reserved0
+offset 16  u64 req
+offset 24  u64 ack
+offset 32  u16 ax, bx, cx, dx, si, di, bp, sp, ip, cs, ds, es, ss, flags
+offset 60  u32 legacy_reserved1
+offset 64  u32 abi_version
+offset 68  u32 struct_size
+offset 72  u16 runtime_psp
+offset 74  u16 reserved1
+offset 76  u32 decoded_instructions
+offset 80  u32 step_flags
+size       88 bytes (8-byte aligned)
 ```
 
 Step flags:
@@ -134,11 +135,13 @@ The adapter:
 2. parses the target MZ header;
 3. launches the verified simx86/mapshm path;
 4. attaches `/hydra_remote` and `/dosemu_mem`;
-5. waits for `init` with child-exit/timeout handling;
-6. validates ABI/version/structure and launcher process ancestry;
+5. waits for `init` with process-exit/timeout handling;
+6. validates ABI version, structure size, and published process ownership before trusting the payload;
 7. captures the published initial CPU snapshot and `runtime_psp`;
 8. constructs/rebases emu86 using the configurable PSP load path;
 9. applies the shared initial-state normalization policy before comparison.
+
+`ShmData::attach()` rejects an undersized shared-memory backing before mapping it. After `init`, `DosemuProcess` accepts the published PID when it is either the launcher returned by `Command::spawn()` or an emulator descendant whose parent ancestry leads back to that launcher; equality with `Child::id()` is not required.
 
 The load segment is therefore discovered from runtime state rather than guessed from a fixed PSP.
 
