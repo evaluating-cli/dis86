@@ -1,122 +1,61 @@
-# Phase 1 Specification: `simx86` Validator Integration
+# Phase 1 specification: dosemu2 validator hook and lockstep transport
 
-**Target milestone:** Phase 1 — deterministic dosemu2/emu86 differential stepping  
-**Pinned dosemu2 source:** `dosemu2/dosemu2@604ce0cdd1a71f657e2a2df623d216d5ab289313`  
-**Scope:** 16-bit real-mode MZ executables; one concurrent validator instance  
-**Status:** emu86 prerequisites and the dosemu2 carrier (#17) are merged. The Rust dosemu2 adapter and the remaining semantic runtime coverage are incomplete.
+**Scope:** 16-bit real-mode `simx86` and `emu86_validator`  
+**Pinned dosemu2:** `604ce0cdd1a71f657e2a2df623d216d5ab289313`  
+**ABI:** version 1
 
-> PR #10 is the architecture contract. It describes the implementation that exists today and keeps unproven semantic behavior explicitly open.
+**Implementation:** dosemu2 carrier in `patches/dosemu2/`, with prerequisites from PR #12 and Rust integration from PRs #18–#20.
 
-## 1. Current implementation map
+## 1. Status and interpretation
 
-- **#12 — merged:** CMPS/REP semantics, configurable runtime PSP loading, and initial-state normalization for emu86.
-- **#14 — merged:** SHL/SHR/SAR behavior aligned with the pinned dosemu2 `simx86` interpreter.
-- **#17 — merged:** five-patch dosemu2 carrier implementing the validator control hook/ABI, verified live low-memory export, target lifecycle handling, atomic lifecycle flags, and fail-closed protected-mode import rejection.
-- **Rust `DosemuProcess` adapter — pending:** main still uses the inherited Phase-0/DOSBox-X launch path and old shared-memory contract.
+This is the normative behavior specification. The CPU hook, low-memory export, ABI, current Rust adapter path, and focused runtime smoke tests are implemented. “Implemented” does not mean every semantic edge has passed an end-to-end differential corpus.
 
-Merged #17 established green evidence for the complete five-patch `git am` / diff-check / compile / link gate, pinned FDPP + comcom32 runtime provisioning, external `/dosemu_mem` bidirectional aliasing, and the validator end barrier.
+| Evidence level | Current claim |
+| --- | --- |
+| Specified | All requirements below. |
+| Implemented | Nine-patch dosemu2 carrier plus current dis86 adapter/outcome/shutdown path. |
+| Unit tested | Host-independent ABI/state/comparison/reference-CPU paths. |
+| Pinned-runtime tested | Build/link, ABI init, basic step, live low-memory alias, end barrier/clean exit, terminating MZ smoke fixture. |
+| Still-unverified E2E | REP, interrupt shadow, representative handler/helper exclusion, lifecycle transitions, full differential corpus. |
 
-The following remain unproven end-to-end and are not completion claims: target -> child -> target, target -> parent / stale-PSP behavior, REP + interrupt-shadow normalization, and DOS/INT 21h boundary visibility.
+## 2. Execution-boundary contract
 
-## 2. Non-negotiable architecture
+When validator mode is enabled and the executable entry gate is reached, dosemu2 shall:
 
-### 2.1 Hook the persistent `FindExecCode()` boundary
+1. publish ABI version, structure size, PID, runtime PSP, and initial register state before release-storing `init`;
+2. acquire-load a new request before reading the non-atomic register payload;
+3. reject protected-mode state import before mutation;
+4. apply requested real-mode register/segment state before node lookup and recompute linear PC from `CS:IP`;
+5. reassert `MSSTP` after normal mode-bit reset;
+6. select/execute the translated node, publish state and node metadata, then release-store acknowledgement; and
+7. acquire-check `end` before selecting another target node or bypassing a helper, publish `END_ACK`, and execute no subsequent controlled node.
 
-`FindExecCode()` owns the authoritative local `PC`. Validator synchronization is split around `DoExec(G)`:
+The hook is around `FindExecCode()` node selection/execution. A changed `CS:IP` therefore selects from the recomputed PC instead of returning through a path that could overwrite the requested IP with a stale local PC.
 
-```text
-pre-node:
-  reject unsupported protected-mode import before mutation
-  observe end/target lifecycle
-  wait for request when the target owns the node
-  apply requested real-mode register state
-  recompute PC from imported CS:IP
-  reassert MSSTP
+`TNode.seqnum`, not byte-length `seqlen`, supplies `decoded_instructions`.
 
-execute:
-  lookup/generate node for the recomputed PC
-  next_PC = DoExec(G)
+## 3. ABI-v1 contract
 
-post-node:
-  publish CPU state using next_PC
-  publish decoded-node metadata
-  acknowledge the request
-```
-
-Consequences:
-
-- externally supplied `CS:IP` changes local `PC` before node lookup;
-- post-node `IP` is derived from authoritative `next_PC`;
-- `TNode::seqnum` is the decoded-instruction count; `seqlen` is byte length;
-- normal validator redirection does not use `EXCP_EMULEAVE`.
-
-`MSSTP` is required but does not guarantee one translated node equals one semantic emu86 step. REP micro-iterations and interrupt-shadow composition are normalized at the adapter boundary.
-
-### 2.2 Force the execution path containing the hook
-
-The verified #17 runtime forces the interpreter path and shared-memory mapping driver with direct dosemu2 config commands passed through `-I`:
+The shared payload is an 80-byte structure in a page-sized `/hydra_remote` POSIX-SHM object:
 
 ```text
-cpu_vm emulated
-cpuemu 1
-cpu_vm_dpmi emulated
-mappingdriver mapshm
+offset  0  u32 abi_version
+offset  4  u32 struct_size
+offset  8  u32 init
+offset 12  u32 end
+offset 16  i32 pid
+offset 20  u16 runtime_psp
+offset 22  u16 reserved0
+offset 24  u64 req
+offset 32  u64 ack
+offset 40  u32 decoded_instructions
+offset 44  u32 step_flags
+offset 48  u16 ax, bx, cx, dx, si, di, bp, sp, ip, cs, ds, es, ss, flags
+offset 76  u32 reserved1
+size       80
 ```
 
-The launcher also supplies:
-
-```text
-DIIS_DOSEMU_VALIDATOR=1
-DIIS_DOSEMU_MZ_CS=<relative MZ header CS>
-DIIS_DOSEMU_MZ_IP=<MZ header IP>
-DIIS_DOSEMU_TARGET_DOS_PATH=<canonical DOS path>
-```
-
-The inherited DOSBox-X `-hydra` / `-hydra-conf` arguments are not part of this contract.
-
-### 2.3 Real-mode import fails closed
-
-Phase 1 state import is real-mode only. Merged #17 patch 0005 checks `PROTMODE()` before applying any externally supplied state. In protected mode it publishes the unmodified current CPU state with `DIIS_STEP_FAULT`, acknowledges the pending request, executes no controlled node, and mutates no selectors, segment caches, GPRs, FLAGS, or PC.
-
-This is a runtime guard, not an assertion.
-
-## 3. Shared control ABI
-
-The contract is the versioned 80-byte ABI:
-
-```c
-struct diis_validator_shm {
-    uint32_t abi_version;
-    uint32_t struct_size;
-    uint32_t init;
-    uint32_t end;
-    int32_t  pid;
-    uint16_t runtime_psp;
-    uint16_t reserved0;
-    uint64_t req;
-    uint64_t ack;
-    uint32_t decoded_instructions;
-    uint32_t step_flags;
-    uint16_t ax, bx, cx, dx;
-    uint16_t si, di, bp, sp;
-    uint16_t ip, cs, ds, es, ss, flags;
-    uint32_t reserved1;
-};
-```
-
-Required layout checks include:
-
-```c
-_Static_assert(offsetof(struct diis_validator_shm, req) == 24, "req offset");
-_Static_assert(offsetof(struct diis_validator_shm, ack) == 32, "ack offset");
-_Static_assert(offsetof(struct diis_validator_shm, decoded_instructions) == 40,
-               "metadata offset");
-_Static_assert(sizeof(struct diis_validator_shm) == 80, "ABI size");
-```
-
-`abi_version` is currently `1`. `/hydra_remote` is page-sized even though the structure is 80 bytes.
-
-Current step flags:
+Current raw flags:
 
 ```text
 DIIS_STEP_MULTI_INSN   = 1 << 0
@@ -126,146 +65,86 @@ DIIS_STEP_END_ACK      = 1 << 3
 DIIS_STEP_TARGET_EXIT  = 1 << 4
 ```
 
-Ordering contract:
+Control fields use acquire/release ordering; non-atomic payload writes are ordered by those control operations. ABI version, structure size, mapping size, and process identity are validated before use.
 
-- controller writes request payload, then release-stores `req`;
-- dosemu2 acquire-loads `req` before reading payload;
-- ordinary publication writes CPU/metadata, release-publishes `step_flags`, then release-stores `ack`;
-- controller acquire-loads `ack` before reading an ordinary result;
-- asynchronous lifecycle events (`END_ACK`, `TARGET_EXIT`) are release-published through `step_flags`, which the controller acquire-loads even if `req`/`ack` do not change.
+General-register and FLAGS imports preserve their high 16 bits. Real-mode segment changes use dosemu2's segment-cache update path. Protected-mode import fails closed with `DIIS_STEP_FAULT` before mutation.
 
-Rust must validate ABI version, structure size, mapping size, and child PID before trusting the payload.
+Expected validator single-step/internal return reasons are not architectural faults.
 
-## 4. Target identity and lifecycle
+## 4. Launch contract
 
-Target activation is executable-scoped rather than inferred from a PSP signature or relative MZ entry alone. Merged #17 validates:
+The adapter shall force the path containing the hook and the shared-memory mapping driver:
 
-1. expected relative MZ `CS:IP`;
-2. PSP signature;
-3. owning MCB consistency;
-4. environment block program path against `DIIS_DOSEMU_TARGET_DOS_PATH`;
-5. current PSP through dosemu's version-adjusted `sda_cur_psp()`.
+```text
+-I "cpu_vm emulated"
+-I "cpuemu 1"
+-I "cpu_vm_dpmi emulated"
+-I "mappingdriver mapshm"
+```
 
-On activation, dosemu2 publishes `runtime_psp` and the initial CPU snapshot, then release-publishes `init`.
+with:
 
-After activation:
+```text
+DIIS_DOSEMU_VALIDATOR=1
+DIIS_DOSEMU_MZ_CS=<u16>
+DIIS_DOSEMU_MZ_IP=<u16>
+DIIS_DOSEMU_TARGET_DOS_PATH=?:\<exe>
+```
 
-- target PSP consumes validator requests;
-- descendants discovered through dosemu's PSP parent field may run without consuming target requests;
-- `end` is checked before descendant bypass;
-- leaving target ancestry permanently latches target exit;
-- `runtime_psp` is cleared and `DIIS_STEP_TARGET_EXIT` is published;
-- any pending request is acknowledged;
-- stale PSP reuse cannot reactivate the target gate.
+The `?` is permitted only in the configured path's drive-letter position because `-K` may receive a different redirected DOS drive depending on boot-stack state.
 
-The policy is implemented; target/child/exit runtime coverage is still required.
+DOSBox-X `-hydra` / `-hydra-conf` arguments are not part of this contract.
 
-## 5. Initialization handshake
+## 5. Low-memory contract
 
-The initial shared snapshot is setup, not a completed instruction.
+Validator mode shall require `mapshm` and expose as `/dosemu_mem` the same POSIX shared-memory backing that contains `lowmem_base`; it shall not allocate a second guest-memory buffer and copy into it.
 
-After `init`:
+Before publishing `init`, dosemu2 shall verify driver/backing provenance, that conventional address zero resolves through that backing, and bidirectional alias visibility. The backing may be larger than the visible `LOWMEM_SIZE + HMASIZE` window; exact-size equality is not required.
 
-1. validate ABI and child PID;
-2. read `runtime_psp`;
-3. construct/rebase emu86 using #12's configurable PSP load path;
-4. load the same MZ at `PSP + 0x10`, including relocations and entry/stack segments;
-5. apply #12's initial-state normalization policy;
-6. verify compared initial registers and load-dependent memory before request 1.
+The focused pinned-runtime probe proves external bidirectional alias visibility. It does not prove every logical DOS mapping or instruction memory effect matches emu86.
 
-No Phase 1 code assumes a permanently fixed PSP such as `0x0813`.
+## 6. Activation, exclusion, and lifecycle contract
 
-## 6. Normalized stepping contract
+Activation requires real mode, a valid PSP/MCB/environment identity, matching configured executable path and MZ entry `CS:IP`, and agreement with dosemu2's version-aware current-PSP accessor.
 
-A **raw step** is one request/ack exchange with the dosemu2 hook. A **normalized step** advances dosemu2 to the same comparison boundary as one or more emu86 decoded instructions.
+Once active:
 
-The hook reports actual translated-node consumption from `TNode.seqnum` as `decoded_instructions` and boundary facts through `step_flags`. The adapter uses those measurements and authoritative pre/post `CS:IP`; it does not guess from opcode class alone.
+- target requests are consumed only for target-owned code;
+- code outside the target-owned MCB, including DOS/BIOS handler code, bypasses target request consumption;
+- descendant child/helper processes bypass target request consumption;
+- the global end barrier remains effective before all bypass paths;
+- leaving target ancestry publishes `TARGET_EXIT`, clears `runtime_psp`, acknowledges any pending request, and permanently prevents stale-PSP reactivation.
 
-### 6.1 Direct REP
+These paths are implemented. Representative handler/helper execution and target lifecycle transitions remain unverified E2E.
 
-Under `MSSTP`, a REP string instruction may execute one raw micro-iteration while remaining at the same `CS:IP`.
+## 7. Normalized comparison contract
 
-For one normalized REP step, coalesce raw requests until the REP reaches its semantic exit boundary, using published `CS:IP` and `DIIS_STEP_SAME_PC`. emu86 then performs its single REP-aware semantic step and compares once.
+A raw step is one dosemu2 request/ack result. The result publishes `decoded_instructions` and `step_flags`. The Rust validator advances the emu86 candidate from reported node consumption rather than assuming one decoded instruction per node.
 
-CMPS/REP support is already merged in #12.
+Two composition rules remain critical:
 
-### 6.2 Interrupt shadow
+- **REP:** same-PC raw micro-iterations must reach the same final semantic comparison boundary as emu86 without double-consuming an iteration.
+- **Interrupt shadow:** STI/MOV SS/POP SS may compose with the following decoded instruction in one node; if that following instruction is REP, an already-consumed first REP iteration must not be executed or compared twice.
 
-`STI`, `MOV SS`, and `POP SS` may place the following decoded instruction in the same translated node. `decoded_instructions` determines the actual span.
-
-If a combined shadow node already executed the first iteration of a following REP instruction, that iteration is already consumed. The adapter must coalesce only the remaining raw REP iterations and compare at the final shared semantic boundary. It must never execute or compare the first REP iteration twice.
-
-This semantic normalization remains a runtime-proof item.
-
-## 7. Low-memory export
-
-`/dosemu_mem` aliases the **same backing object** used for dosemu2's `MAPPING_LOWMEM` allocation. It is not a copied snapshot or unrelated mapping.
-
-Merged #17 patch 0002:
-
-- requires the POSIX `mapshm` driver;
-- retains the same POSIX-SHM object/fd used for `MAPPING_LOWMEM`;
-- accepts the real backing allocation even when it is larger than the `LOWMEM_SIZE + HMASIZE` visible low-memory window;
-- verifies the export is the backing containing `lowmem_base` and conventional address zero resolves through that backing;
-- proves bidirectional visibility through a temporary second `MAP_SHARED` view before guest boot;
-- unlinks `/dosemu_mem` when the backing mapping is freed.
-
-The external bidirectional alias proof is green in #17. Rust should still treat a missing/invalid export as startup failure.
+The metadata/outcome plumbing is implemented. These semantics are not integration-tested until the expanded corpus passes.
 
 ## 8. Shutdown contract
 
-`end` is a **zero-more-controlled-guest-nodes barrier**.
+`end` is a zero-more-controlled-nodes barrier. When observed before a controlled node begins, dosemu2 publishes final state with `DIIS_STEP_END_ACK`, acknowledges the current request value, and starts no subsequent controlled node.
 
-Merged #17 proves the end-barrier runtime path: when dosemu2 observes `end` before a controlled node begins, it publishes final state with `DIIS_STEP_END_ACK`, acknowledges the current request value, and starts no subsequent controlled guest node.
+The parent performs cooperative bounded shutdown and explicitly reaps the child; kill is fallback only. Focused pinned-runtime coverage exists for this path.
 
-The parent remains responsible for process lifetime. `DosemuProcess::Drop` must:
+## 9. Required expanded corpus
 
-1. release-store `end`;
-2. observe final acknowledgement when practical;
-3. terminate the child if needed;
-4. explicitly reap it with `wait()` or equivalent.
+The remaining gate shall compare architectural state and relevant memory after each normalized boundary and include:
 
-A `kill()` without `wait()` is incomplete.
+- arithmetic/logic and flag-producing instructions;
+- stack, near/far call/return, branches, and interrupts;
+- REP MOVS/STOS/CMPS/SCAS, including termination conditions;
+- STI/MOV SS/POP SS multi-instruction nodes and shadow + REP composition;
+- external `CS:IP`, GPR, segment, and memory mutation;
+- DOS/BIOS handler and descendant child/helper execution;
+- target -> child -> target and target -> parent lifecycle transitions; and
+- normal termination, fault, target-exit, and controller end-barrier paths.
 
-## 9. Completion gates
-
-### Landed prerequisites
-
-- [x] CMPS and REP-aware CMPS behavior in emu86 (#12)
-- [x] configurable runtime PSP loading (#12)
-- [x] shared initial-state normalization helper (#12)
-- [x] shift semantics aligned with pinned simx86 (#14)
-
-### dosemu2 carrier (#17, merged)
-
-- [x] page-sized versioned control mapping
-- [x] request/apply and publish/ack hook
-- [x] `TNode.seqnum` metadata
-- [x] executable-scoped target identity and lifecycle policy
-- [x] live `MAPPING_LOWMEM` export and provenance checks
-- [x] release-ordered lifecycle flag publication
-- [x] protected-mode state import rejected before mutation
-- [x] complete five-patch apply/compile/link gate green
-- [x] pinned FDPP + comcom32 runtime provisioning green
-- [x] external `/dosemu_mem` bidirectional alias proof green
-- [x] validator end-barrier runtime proof green
-
-### Rust adapter
-
-- [ ] verified dosemu2 launch/config/env contract
-- [ ] old DOSBox-X Hydra CLI arguments removed
-- [ ] 80-byte ABI/version/size/PID validation
-- [ ] runtime PSP initialization handshake with #12 load configuration
-- [ ] raw-step primitive
-- [ ] metadata-driven normalized stepping
-- [ ] explicit `TARGET_EXIT`, `FAULT`, and `END_ACK` handling
-- [ ] child termination and explicit reap
-
-### Remaining semantic runtime proof
-
-- [ ] target -> child -> target pauses/resumes request consumption correctly
-- [ ] target -> parent publishes terminal exit and stale PSP reuse cannot reactivate
-- [ ] REP and interrupt-shadow boundaries match emu86, including shadow + REP composition
-- [ ] DOS/INT 21h handler execution is characterized for unwanted validator-visible boundaries
-
-PR #10 should remain draft until the Rust adapter and remaining semantic runtime-proof items are linked and reviewable.
+Until this corpus passes, REP, shadow composition, representative helper exclusion, lifecycle transitions, and full differential comparison are **specified/implemented where noted, but not integration-tested**.
