@@ -1,63 +1,57 @@
-# Pull Request: Architecture, Review Findings, and Phase 0 Gate Specification for `dosemu2` Migration
+# dosemu2 validator migration: implementation and verification status
 
-## Overview
+## Relationship to landed work
 
-This pull request introduces the architectural design, source review findings, and implementation plan for replacing the patched DosBox-X execution backend used by [Hydra](https://github.com/xorvoid/hydra) and the `emu86` differential validator with [dosemu2](https://github.com/dosemu2/dosemu2).
+PR #12 added configurable executable loading and `CMPS` support. PR #17 added the pinned dosemu2 validator implementation carrier. PR #18 taught the Rust validator to consume dosemu2 node-boundary outcomes, PR #19 added cooperative shutdown/diagnostics/reaping, and PR #20 added a terminating dosemu2-backed validator fixture.
 
----
+Until the dosemu2-side changes are replayed onto a writable dosemu2 fork, **`patches/dosemu2/` is the implementation carrier**. It is an ordered patch series, not merely an architectural proposal.
 
-## Motivation
+The series applies to dosemu2 commit `604ce0cdd1a71f657e2a2df623d216d5ab289313` and exposes validator ABI version **1**. The current series contains nine patches.
 
-Hydra currently uses a custom-patched fork of DosBox-X (`xorvoid/dosbox-x`) for running hybrid x86-16 / native C applications and powering lockstep differential validation in `dis86`.
+## Evidence vocabulary
 
-Migrating to `dosemu2` offers significant long-term benefits:
-1. **Higher CPU Throughput**: `simx86` JIT / dynarec execution for hybrid runtime workloads.
-2. **Modular Architecture**: Leveraging `dosemu2`'s native plugin framework (`src/plugin/`) to avoid maintaining an intrusive emulator fork.
-3. **Headless Continuous Integration**: Support for batch, headless execution (`dosemu -dumb -quiet -K <dir> -E <exe>`) without SDL/X11 dependencies.
-4. **Authentic DOS Environment**: Support for real DOS kernels, FreeDOS, 64-bit FDPP, and standard DPMI extenders.
+| Status | Meaning |
+| --- | --- |
+| Specified | Required contract is documented; this alone is not implementation evidence. |
+| Implemented | Code is present in the dosemu2 patch carrier and/or dis86 adapter. |
+| Unit tested | Host-independent tests exercise local data layout, comparison, or state-handling logic without booting dosemu2. |
+| Pinned-runtime tested | CI applies the series to the exact pinned commit, builds/boots the pinned runtime stack, and exercises the stated focused path. |
+| Still-unverified E2E | Behavior has not passed the expanded pinned-runtime differential corpus and must not be described as integration-tested. |
 
----
+## Current status
 
-## Key Architectural Hypotheses & Design Discipline
+### Specified and implemented
 
-Following technical review, several initial assumptions have been refined into testable hypotheses for the migration:
+The current carrier implements the executable-scoped `simx86` request/execute/ack hook, ABI-v1 register exchange, node metadata, live low-memory export, protected-mode rejection, target/child lifecycle policy, a DOS-handler PC filter, pre-execution termination publication, dynamic target-drive identity, and validator single-step fault classification. The filter does not yet defer acknowledgement across a nonterminating interrupt service, so complete DOS-handler exclusion remains implementation work.
 
-1. **Integration Model (Likely Hybrid Integration)**: A pure out-of-band plugin is unlikely to suffice because `simx86` translates multi-instruction blocks. Hydra requires instruction-boundary control and arbitrary `CS:IP` interception. Phase 0 will determine whether the minimal mechanism is a core callback, single-instruction block mode, or translated instrumentation.
-2. **Workload Separation in Benchmarking**: JIT block execution may provide substantial performance gains for *normal Hydra hybrid execution*, but strict *1-instruction lockstep validation* is dominated by IPC and synchronization. Performance metrics for these two workloads must be measured independently.
-3. **Low-Memory Model**: The migration will investigate exporting `dosemu2`'s existing `lowmem_base` shared memory backing to the validator before considering redundant independent allocations, taking into account semantic differences between `lowmem_base` and `MEM_BASE32`.
-4. **REP Instruction Stepping Contract**: Phase 0 will explicitly define and test whether `REP MOVS`/`STOS` instructions should be observed as single atomic steps or individual iterations by the validator.
-5. **JIT State Invalidation on Control Redirection**: When Hydra alters `CS:IP` or registers (`RETURN_FAR`, `RETURN_JUMP`), `simx86` must safely escape the current translated block, invalidate stale cached translations, and resynchronize segment state before resuming execution.
+The Rust side consumes decoded-node outcomes, performs normalized initial-state comparison, handles terminal/fault categories, and shuts the dosemu2 child down cooperatively with explicit reaping.
 
----
+### Unit tested
 
-## Phase 0: Minimal Simulator Gate
+Host-independent tests cover validator outcome interpretation (including multi-instruction nodes, same-PC nodes, target exit, end acknowledgement, and faults), initial-state comparison, ABI access/layout logic, and the reference CPU behavior. These prove local code paths, not dosemu2 execution semantics.
 
-Before building the full shared-memory transport or Hydra ABI, the migration is gated on a minimal standalone experiment verifying:
+### Pinned-runtime tested
 
-- [x] Execution halts after exactly **one** guest instruction.
-- [x] Complete architectural state (`AX..FLAGS`, `CS:IP`, segments) is readable without side effects.
-- [x] `CS:IP` and register state can be modified externally.
-- [x] Execution resumes at the new target without executing stale translated blocks.
-- [x] State manipulation is validated against a known-good execution path in `emu86` without violating x86 semantics.
-- [x] Deterministic behavior for `CALL`, `RET`, `RETF`, `INT`, prefixes, and `REP`.
+The carrier workflow applies the complete patch series to the pinned dosemu2 commit, checks the resulting diff, builds and links the touched runtime, and provisions pinned FDPP/comcom32. Focused runtime tests prove:
 
----
+- ABI-v1 initialization;
+- a basic request/step acknowledgement;
+- external `/dosemu_mem` bidirectional alias visibility;
+- the zero-more-controlled-nodes end barrier;
+- clean/cooperative shutdown; and
+- one small terminating MZ fixture through the dosemu2 backend/validator path.
 
-## Phased Implementation Roadmap
+### Still unverified end to end
 
-- **Phase 0:** Minimal `simx86` instruction-control gate and semantic validation.
-- **Phase 1:** Register snapshot ABI and `/dev/shm/hydra_remote` validator transport.
-- **Phase 2:** Low-memory backing export (`lowmem_base`) to the validator.
-- **Phase 3:** Native `dosemu2` Hydra plugin (`src/plugin/hydra`) and hybrid function execution.
-- **Phase 4:** `INT 3Fh` overlay resolution, flags calibration, and dynamic load segment support.
-- **Phase 5:** Benchmark validation workloads and configure headless CI workflows.
+The current smoke coverage is not the expanded instruction corpus. In particular, **REP semantics, interrupt-shadow composition, representative DOS/BIOS and child/helper exclusion, target lifecycle transitions, and full differential state/memory comparison remain unverified E2E**.
 
----
+In addition, nonterminating DOS/BIOS interrupts have an implementation gap: the carrier
+currently acknowledges the target interrupt node at handler entry. It must defer
+publication/acknowledgement until the service returns to target-owned code, or expose an
+equivalent normalized boundary, before handler exclusion is complete.
 
-## Changes in this Pull Request
+Performance and Hydra native-function interception are outside the current validator proof.
 
-* `docs/dosemu2/README.md`: Updated with disciplined architectural hypotheses and the 6-phase implementation roadmap.
-* `docs/dosemu2/REVIEW.md`: Detailed review findings addressing plugin boundaries, workload separation, memory semantics, and JIT cache invalidation.
-* `docs/dosemu2/SOURCES.md`: Source references and touchpoints across `dis86`, `hydra`, `dosbox-x`, and `dosemu2`.
-* `docs/dosemu2/PHASE0_GATE.md`: Technical specification, test vectors, and success criteria for the Phase 0 simulator gate.
-* `docs/dosemu2/PR_DESCRIPTION.md`: Pull request proposal and migration overview.
+## Next gate
+
+Add the expanded pinned-runtime corpus with focused fixtures for REP string operations, shadow instructions, DOS/BIOS and child/helper execution, target-to-child-to-target and target-to-parent transitions, external register/segment/memory mutation, and complete per-boundary state/memory comparison against emu86.
