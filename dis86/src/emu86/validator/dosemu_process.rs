@@ -19,6 +19,8 @@ const HYDRA_SHM_PATH: &str = "/dev/shm/hydra_remote";
 const DOSEMU_MEM_PATH: &str = "/dev/shm/dosemu_mem";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const STEP_TIMEOUT: Duration = Duration::from_secs(5);
+// Keep the request/ack path hot while amortizing process and clock syscalls.
+const STEP_STATUS_POLL_SPINS: u32 = 1024;
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const DIAGNOSTIC_LIMIT: u64 = 64 * 1024;
 const VALIDATOR_ABI_VERSION: u32 = 1;
@@ -486,8 +488,14 @@ impl DosemuProcess {
     self.data.store_req(next_ack, Ordering::Release);
 
         let deadline = self.clock.now() + STEP_TIMEOUT;
+        let mut spins_until_status_poll = STEP_STATUS_POLL_SPINS;
     while next_ack != self.data.load_ack(Ordering::Acquire) {
       std::hint::spin_loop();
+            spins_until_status_poll -= 1;
+            if spins_until_status_poll != 0 {
+                continue;
+            }
+            spins_until_status_poll = STEP_STATUS_POLL_SPINS;
             if let Some(status) = self.dosemu.try_wait().map_err(|e| {
                 self.with_diagnostics(format!("Failed to query dosemu2 status: {}", e))
             })? {
@@ -502,7 +510,6 @@ impl DosemuProcess {
                     next_ack
                 )));
       }
-            self.clock.sleep(Duration::from_millis(1));
     }
 
     // The acquire-load of flags is the publication barrier for both the CPU
