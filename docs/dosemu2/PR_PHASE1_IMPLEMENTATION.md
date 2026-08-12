@@ -1,6 +1,6 @@
-# Draft Pull Request: Phase 1 `simx86` Validator Architecture
+# Pull Request: Phase 1 `simx86` Validator Architecture
 
-> **Draft — architecture/evidence consolidation.** PR #10 now documents the implementation that has landed across #12, #14, #17, #18, #19, and #20, and separates implemented/smoke-tested behavior from semantic E2E work that is still open.
+PR #10 documents the implementation that has landed across #12, #14, #17, #18, #19, and #20, and separates implemented/smoke-tested behavior from semantic E2E work that remains open.
 
 ## Current status
 
@@ -19,7 +19,7 @@ PR #10 requires and now records:
 - request/apply and publish/ack synchronization around the persistent `FindExecCode()` node boundary;
 - authoritative post-node PC and fresh node lookup after imported `CS:IP`;
 - real-mode segment-cache updates and fail-closed protected-mode import;
-- ABI-v1 80-byte control structure in page-sized `/hydra_remote`;
+- ABI-v1 88-byte append-only structure preserving the 64-byte Hydra prefix in page-sized `/hydra_remote` backing;
 - `TNode.seqnum` as decoded-instruction count;
 - forced `cpu_vm emulated`, `cpuemu 1`, `cpu_vm_dpmi emulated`, `mappingdriver mapshm` launch configuration;
 - executable-scoped target identity with explicit drive-letter wildcard support only where required by `-K`;
@@ -27,6 +27,7 @@ PR #10 requires and now records:
 - target-owned-PC filtering so DOS/BIOS handler code does not consume a target request;
 - PSP-ancestry descendant bypass and permanent target-exit latch;
 - release-published lifecycle flags;
+- Rust-side ABI/version/size and launcher-ownership validation, accepting a published emulator descendant PID when its ancestry leads back to the spawned launcher;
 - metadata-driven Rust outcome handling;
 - zero-more-controlled-nodes end barrier and parent-owned cooperative shutdown/reaping.
 
@@ -65,11 +66,11 @@ Two wording constraints are retained here:
 1. **Implemented is not the same as integration-tested.** DOS-handler exclusion, descendant/lifecycle paths, REP, and interrupt-shadow handling have source implementations but still need representative expanded runtime fixtures.
 2. **Smoke success is not performance evidence.** No validator-speedup claim follows from these correctness tests; normal Hydra hybrid performance remains a separate benchmark workload.
 
+The remaining E2E corpus is follow-up validation work and does not make the architecture/evidence consolidation itself incomplete for review.
+
 ## Files
 
 - `PHASE1_SPEC.md` — normative architecture/ABI contract.
 - `PHASE1_IMPLEMENTATION.md` — concrete implementation map and remaining semantic proof.
 - `PR_PHASE1_IMPLEMENTATION.md` — this PR consolidation note.
 - `README.md`, `REVIEW.md`, `TESTING.md`, `PR_DESCRIPTION.md` — reconciled status/evidence vocabulary across the wider dosemu2 docs.
-
-Keep PR #10 as draft until the expanded semantic runtime corpus is either landed or explicitly split into the next reviewable milestone.
