@@ -169,7 +169,7 @@ diff --git a/src/base/emu-i386/simx86/diis-validator.c b/src/base/emu-i386/simx8
  
  	if (!g_active || !g_node_controlled)
  		return;
-@@ -472,15 +529,25 @@ void diis_validator_after_node(unsigned int start_pc, unsigned int next_pc,
+@@ -472,16 +529,26 @@ void diis_validator_after_node(unsigned int start_pc, unsigned int next_pc,
  	g_node_controlled = 0;
  	if (decoded_instructions > 1)
  		flags |= DIIS_STEP_MULTI_INSN;
