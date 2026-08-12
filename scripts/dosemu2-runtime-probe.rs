@@ -22,10 +22,13 @@ const OFF_ACK: usize = 24;
 const OFF_DECODED: usize = 76;
 const OFF_STEP_FLAGS: usize = 80;
 const OFF_AX: usize = 32;
+const OFF_BX: usize = 34;
+const OFF_DX: usize = 38;
 const OFF_IP: usize = 48;
 const OFF_CS: usize = 50;
 
 const DIIS_STEP_END_ACK: u32 = 1 << 3;
+const DIIS_STEP_FAULT: u32 = 1 << 2;
 const DIIS_STEP_TARGET_EXIT: u32 = 1 << 4;
 
 const PROT_READ: i32 = 0x1;
@@ -218,7 +221,7 @@ fn step(
     Ok(())
 }
 
-fn run() -> Result<(), String> {
+fn run_end_barrier() -> Result<(), String> {
     let deadline = Instant::now() + Duration::from_secs(20);
 
     stage("open_control");
@@ -332,8 +335,92 @@ fn run() -> Result<(), String> {
     Ok(())
 }
 
+fn initialized_control(deadline: Instant) -> Result<Mapping, String> {
+    stage("open_control");
+    let control = Mapping::open(CONTROL_PATH, ABI_SIZE, deadline)
+        .map_err(|e| format!("map control: {e}"))?;
+    let init = unsafe { control.atomic_u32(OFF_INIT) };
+    stage("wait_init");
+    wait_until(deadline, || init.load(Ordering::Acquire) == 1, "validator init")
+        .map_err(|e| format!("{e}; {}", control_snapshot(&control)))?;
+    let abi = unsafe { control.read_u32(OFF_ABI_VERSION) };
+    let size = unsafe { control.read_u32(OFF_STRUCT_SIZE) } as usize;
+    if abi != ABI_VERSION || size != ABI_SIZE {
+        return Err(format!("unexpected control ABI: version={abi}, size={size}"));
+    }
+    Ok(control)
+}
+
+fn request(control: &Mapping, value: u64, deadline: Instant) -> Result<(), String> {
+    unsafe { control.atomic_u64(OFF_REQ) }.store(value, Ordering::Release);
+    wait_until(
+        deadline,
+        || unsafe { control.atomic_u64(OFF_ACK) }.load(Ordering::Acquire) == value,
+        &format!("ack {value}"),
+    ).map_err(|e| format!("{e}; {}", control_snapshot(control)))
+}
+
+fn run_target_exit() -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let control = initialized_control(deadline)?;
+    step(&control, 1, 0x0003, 0x4c00, deadline)?;
+    stage("request_terminal_publication");
+    request(&control, 2, deadline)?;
+    let flags = unsafe { control.atomic_u32(OFF_STEP_FLAGS) }.load(Ordering::Acquire);
+    let decoded = unsafe { control.read_u32(OFF_DECODED) };
+    let runtime_psp = unsafe { control.read_u16(OFF_RUNTIME_PSP) };
+    if flags != DIIS_STEP_TARGET_EXIT || decoded != 0 || runtime_psp != 0 {
+        return Err(format!("inconsistent TARGET_EXIT publication; {}", control_snapshot(&control)));
+    }
+    stage("validate_target_stays_inactive");
+    thread::sleep(Duration::from_millis(100));
+    if unsafe { control.read_u16(OFF_RUNTIME_PSP) } != 0
+        || unsafe { control.atomic_u32(OFF_STEP_FLAGS) }.load(Ordering::Acquire) != DIIS_STEP_TARGET_EXIT
+        || unsafe { control.atomic_u64(OFF_ACK) }.load(Ordering::Acquire) != 2
+    {
+        return Err(format!("target gate reactivated after exit; {}", control_snapshot(&control)));
+    }
+    println!("target-exit runtime probe passed");
+    Ok(())
+}
+
+fn run_fault() -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let control = initialized_control(deadline)?;
+    step(&control, 1, 0x0003, 0x1234, deadline)?;
+    step(&control, 2, 0x0005, 0x1234, deadline)?;
+    step(&control, 3, 0x0007, 0x1234, deadline)?;
+    stage("request_faulting_divide");
+    request(&control, 4, deadline)?;
+    let flags = unsafe { control.atomic_u32(OFF_STEP_FLAGS) }.load(Ordering::Acquire);
+    let decoded = unsafe { control.read_u32(OFF_DECODED) };
+    let ax = unsafe { control.read_u16(OFF_AX) };
+    let bx = unsafe { control.read_u16(OFF_BX) };
+    let dx = unsafe { control.read_u16(OFF_DX) };
+    let ip = unsafe { control.read_u16(OFF_IP) };
+    if flags & DIIS_STEP_FAULT == 0 || decoded != 1 || (ax, bx, dx, ip) != (0x1234, 0, 0, 0x0007) {
+        return Err(format!("inconsistent post-fault publication; {}", control_snapshot(&control)));
+    }
+    stage("release_after_fault");
+    unsafe { control.atomic_u32(OFF_END) }.store(1, Ordering::Release);
+    wait_until(
+        deadline,
+        || unsafe { control.atomic_u32(OFF_STEP_FLAGS) }.load(Ordering::Acquire) & DIIS_STEP_END_ACK != 0,
+        "END_ACK after fault",
+    ).map_err(|e| format!("{e}; {}", control_snapshot(&control)))?;
+    println!("fault runtime probe passed: decoded={decoded}, AX={ax:04x}, DX={dx:04x}, IP={ip:04x}");
+    Ok(())
+}
+
 fn main() {
-    if let Err(e) = run() {
+    let mode = std::env::args().nth(1).unwrap_or_else(|| "end-barrier".into());
+    let result = match mode.as_str() {
+        "end-barrier" => run_end_barrier(),
+        "target-exit" => run_target_exit(),
+        "fault" => run_fault(),
+        _ => Err(format!("unknown probe mode {mode:?}; expected end-barrier, target-exit, or fault")),
+    };
+    if let Err(e) = result {
         eprintln!("dosemu2 runtime probe failed: {e}");
         std::process::exit(1);
     }
