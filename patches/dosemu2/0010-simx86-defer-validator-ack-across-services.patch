@@ -29,8 +29,8 @@ mistaken for service execution.
 
 Base: patch 0009 on dosemu2/dosemu2@604ce0cdd1a71f657e2a2df623d216d5ab289313
 ---
- src/base/emu-i386/simx86/diis-validator.c | 176 ++++++++++++++++++++++-
- 1 file changed, 170 insertions(+), 6 deletions(-)
+ src/base/emu-i386/simx86/diis-validator.c | 173 ++++++++++++++++++++++-
+ 1 file changed, 167 insertions(+), 6 deletions(-)
 
 diff --git a/src/base/emu-i386/simx86/diis-validator.c b/src/base/emu-i386/simx86/diis-validator.c
 index f916c84..12ea356 100644
@@ -190,7 +190,7 @@ index f916c84..12ea356 100644
  		g_active = 1;
  		publish_cpu(*pc, 0, 0);
  		__atomic_store_n(&g_shm->init, 1, __ATOMIC_RELEASE);
-@@ -443,10 +562,30 @@ int diis_validator_before_node(unsigned int *pc)
+@@ -443,10 +562,27 @@ int diis_validator_before_node(unsigned int *pc)
  			mark_target_finished();
  			return 0;
  		}
