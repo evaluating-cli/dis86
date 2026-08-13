@@ -9,13 +9,18 @@ nodes from consuming additional requests, but after_node() still publishes and
 acknowledges the controlled interrupt as soon as it reaches the handler entry.
 That state is not comparable with emu86's post-service interrupt boundary.
 
-Keep the current request outstanding when a non-faulting software interrupt
-transfers outside target-owned code.  Let non-target service nodes execute
-uncontrolled and record the return CS:IP from the interrupt stack.  Ignore
-intermediate re-entry through target-owned callbacks, then publish the accumulated
-target instruction count and post-service CPU state only at the recorded return
-boundary.  Only then release-store the acknowledgement and wait for the next
-request.
+Keep the current request outstanding only for host-normalized DOS/BIOS service
+interrupts.  Recognize INT imm8 after the segment-override prefixes accepted by
+emu86, and snapshot the activation-time IVT entries for emu86's inline service
+vectors (10h, 1Ah, 21h, and 33h).  If the application changes one of those
+vectors, preserve handler-entry semantics instead of swallowing the configured
+handler as a host service.
+
+For a deferred host service, record the return CS:IP from the interrupt stack.
+Ignore intermediate re-entry through target-owned callbacks, then publish the
+original target instruction count and post-service CPU state only at that exact
+return boundary.  Only then release-store the acknowledgement and wait for the
+next request.
 
 Target exit continues to terminate any pending request through the existing
 TARGET_EXIT path, and the global end barrier remains checked before all bypass
@@ -24,14 +29,14 @@ mistaken for service execution.
 
 Base: patch 0009 on dosemu2/dosemu2@604ce0cdd1a71f657e2a2df623d216d5ab289313
 ---
- src/base/emu-i386/simx86/diis-validator.c | 75 ++++++++++++++++++++++-
- 1 file changed, 73 insertions(+), 2 deletions(-)
+ src/base/emu-i386/simx86/diis-validator.c | 115 ++++++++++++++++++++++-
+ 1 file changed, 113 insertions(+), 2 deletions(-)
 
 diff --git a/src/base/emu-i386/simx86/diis-validator.c b/src/base/emu-i386/simx86/diis-validator.c
 index f916c84..12ea356 100644
 --- a/src/base/emu-i386/simx86/diis-validator.c
 +++ b/src/base/emu-i386/simx86/diis-validator.c
-@@ -62,6 +62,11 @@ static int g_created;
+@@ -62,6 +62,18 @@ static int g_created;
  static int g_active;
  static int g_target_finished;
  static int g_node_controlled;
@@ -40,27 +45,67 @@ index f916c84..12ea356 100644
 +static unsigned int g_deferred_return_pc;
 +static uint32_t g_deferred_decoded;
 +static uint32_t g_deferred_flags;
++struct diis_ivt_entry {
++	uint16_t off;
++	uint16_t seg;
++};
++static const uint8_t g_host_service_vectors[] = { 0x10, 0x1a, 0x21, 0x33 };
++static struct diis_ivt_entry g_host_service_ivt[
++		sizeof(g_host_service_vectors)];
  static uint16_t g_mz_cs;
  static uint16_t g_mz_ip;
  static uint16_t g_runtime_psp;
-@@ -302,6 +307,16 @@ static int target_is_dos_exit(unsigned int pc)
+@@ -302,6 +314,49 @@ static int target_is_dos_exit(unsigned int pc)
  		(TheCPU.eax & 0xff00) == 0x4c00;
  }
  
-+static int target_is_software_interrupt(unsigned int pc)
++static void snapshot_host_service_vectors(void)
 +{
-+	unsigned char opcode;
++	size_t i;
 +
-+	if (pc >= LOWMEM_SIZE + HMASIZE)
++	for (i = 0; i < sizeof(g_host_service_vectors); i++) {
++		dosaddr_t ivt = (dosaddr_t)g_host_service_vectors[i] << 2;
++
++		g_host_service_ivt[i].off = LOWMEM_READ_WORD(ivt);
++		g_host_service_ivt[i].seg = LOWMEM_READ_WORD(ivt + 2);
++	}
++}
++
++static int target_classify_host_service_interrupt(unsigned int pc)
++{
++	const dosaddr_t lim = LOWMEM_SIZE + HMASIZE;
++	unsigned int opcode_pc = pc;
++	unsigned char opcode;
++	unsigned char vector;
++	size_t i;
++
++	while (opcode_pc < lim) {
++		opcode = LOWMEM_READ_BYTE(opcode_pc);
++		if (opcode != 0x26 && opcode != 0x2e &&
++				opcode != 0x36 && opcode != 0x3e)
++			break;
++		opcode_pc++;
++	}
++	if (opcode_pc + 1 >= lim || LOWMEM_READ_BYTE(opcode_pc) != 0xcd)
 +		return 0;
-+	opcode = LOWMEM_READ_BYTE(pc);
-+	return opcode == 0xcc || opcode == 0xcd || opcode == 0xce;
++	vector = LOWMEM_READ_BYTE(opcode_pc + 1);
++
++	for (i = 0; i < sizeof(g_host_service_vectors); i++) {
++		dosaddr_t ivt;
++
++		if (g_host_service_vectors[i] != vector)
++			continue;
++		ivt = (dosaddr_t)vector << 2;
++		return LOWMEM_READ_WORD(ivt) == g_host_service_ivt[i].off &&
++			LOWMEM_READ_WORD(ivt + 2) == g_host_service_ivt[i].seg;
++	}
++	return 0;
 +}
 +
  static void mark_target_finished(void)
  {
  	uint64_t req;
-@@ -311,6 +326,11 @@ static void mark_target_finished(void)
+@@ -311,6 +366,11 @@ static void mark_target_finished(void)
  	g_active = 0;
  	g_target_finished = 1;
  	g_node_controlled = 0;
@@ -72,7 +117,7 @@ index f916c84..12ea356 100644
  	g_runtime_psp = 0;
  	if (!g_shm)
  		return;
-@@ -363,6 +383,23 @@ static void publish_cpu(unsigned int pc, uint32_t decoded, uint32_t flags)
+@@ -363,6 +423,23 @@ static void publish_cpu(unsigned int pc, uint32_t decoded, uint32_t flags)
  	__atomic_store_n(&g_shm->step_flags, flags, __ATOMIC_RELEASE);
  }
  
@@ -96,7 +141,15 @@ index f916c84..12ea356 100644
  static int apply_cpu(unsigned int *pc)
  {
  	if (PROTMODE()) {
-@@ -446,6 +483,14 @@ int diis_validator_before_node(unsigned int *pc)
+@@ -415,6 +492,7 @@ int diis_validator_before_node(unsigned int *pc)
+ 		if (!target_entry_matches(*pc))
+ 			return 0;
+ 		g_runtime_psp = TheCPU.ds;
++		snapshot_host_service_vectors();
+ 		g_active = 1;
+ 		publish_cpu(*pc, 0, 0);
+ 		__atomic_store_n(&g_shm->init, 1, __ATOMIC_RELEASE);
+@@ -446,6 +524,14 @@ int diis_validator_before_node(unsigned int *pc)
                   * consume a request while executing inside the target's MCB. */
                  if (!target_owns_pc(g_runtime_psp, *pc))
                          return 0;
@@ -111,7 +164,7 @@ index f916c84..12ea356 100644
  		req = __atomic_load_n(&g_shm->req, __ATOMIC_ACQUIRE);
  		ack = __atomic_load_n(&g_shm->ack, __ATOMIC_RELAXED);
  		if (req != ack)
-@@ -482,8 +527,6 @@ void diis_validator_after_node(unsigned int start_pc, unsigned int next_pc,
+@@ -482,8 +568,6 @@ void diis_validator_after_node(unsigned int start_pc, unsigned int next_pc,
  	g_node_controlled = 0;
  	if (decoded_instructions > 1)
  		flags |= DIIS_STEP_MULTI_INSN;
@@ -120,16 +173,15 @@ index f916c84..12ea356 100644
  	/* TheCPU.err also carries simx86-internal return reasons (EXCP_GOBACK and
  	 * above).  Publish only architectural exceptions, excluding the MSSTP
  	 * boundary deliberately requested for validator-controlled execution. */
-@@ -491,6 +534,34 @@ void diis_validator_after_node(unsigned int start_pc, unsigned int next_pc,
+@@ -491,6 +575,33 @@ void diis_validator_after_node(unsigned int start_pc, unsigned int next_pc,
  			cpu_err != EXCP01_SSTP)
  		flags |= DIIS_STEP_FAULT;
  
-+	/* A software interrupt may leave target-owned code while DOS or BIOS
-+	 * services the request.  Keep the controller request outstanding until
-+	 * execution returns to target-owned code, so the acknowledged CPU state
-+	 * is the post-service boundary rather than the handler-entry boundary. */
++	/* Only host-normalized DOS/BIOS services should retain the controller
++	 * request.  Application-installed vectors keep emu86's handler-entry
++	 * boundary and are therefore published immediately. */
 +	if (!(flags & DIIS_STEP_FAULT) &&
-+			target_is_software_interrupt(start_pc) &&
++			target_classify_host_service_interrupt(start_pc) &&
 +			!target_owns_pc(g_runtime_psp, next_pc)) {
 +		dosaddr_t stack = ((dosaddr_t)TheCPU.ss << 4) +
 +				(uint16_t)TheCPU.esp;
