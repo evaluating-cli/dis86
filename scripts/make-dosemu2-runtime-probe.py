@@ -5,18 +5,26 @@ import sys
 
 # Probe image, loaded at MZ CS:IP 0000:0000.
 #
-#   mov ax, cs:[0010]       ; external -> guest visibility
+#   mov ax, cs:[0020]       ; external -> guest visibility
 #   inc ax
-#   mov cs:[0010], ax       ; guest -> external visibility
-#   inc word cs:[0010]      ; must NOT execute after END_ACK request
+#   mov cs:[0020], ax       ; guest -> external visibility
+#   mov ax, 3000h           ; DOS get-version request
+#   int 21h                 ; must ACK only after DOS returns to target code
+#   mov bx, ax              ; consume the post-service register result
+#   inc word cs:[0020]      ; must NOT execute after END_ACK request
 #   jmp $                   ; safety loop if the barrier is broken later
-#   dw 1111h                ; shared sentinel at image offset 0010h
+#   <padding>
+#   dw 1111h                ; shared sentinel at image offset 0020h
 CODE = bytes.fromhex(
-    "2e a1 10 00 "
+    "2e a1 20 00 "
     "40 "
-    "2e a3 10 00 "
-    "2e ff 06 10 00 "
+    "2e a3 20 00 "
+    "b8 00 30 "
+    "cd 21 "
+    "89 c3 "
+    "2e ff 06 20 00 "
     "eb fe "
+    "00 00 00 00 00 00 00 00 00 "
     "11 11"
 )
 
@@ -53,8 +61,8 @@ FAULT_CODE = bytes.fromhex(
     "f7 f3"           # div bx
 )
 
-assert len(CODE) == 18
-assert CODE[16:18] == b"\x11\x11"
+assert len(CODE) == 34
+assert CODE[32:34] == b"\x11\x11"
 
 
 def build_mz(code: bytes = CODE) -> bytes:

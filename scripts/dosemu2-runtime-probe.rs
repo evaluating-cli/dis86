@@ -265,7 +265,7 @@ fn run_end_barrier() -> Result<(), String> {
     stage("open_lowmem");
     let lowmem = Mapping::open(LOWMEM_PATH, 2, deadline)
         .map_err(|e| format!("map low memory: {e}; {}", control_snapshot(&control)))?;
-    let sentinel = ((image_seg as usize) << 4) + 0x10;
+    let sentinel = ((image_seg as usize) << 4) + 0x20;
     if sentinel + 2 > lowmem.len {
         return Err(format!(
             "sentinel linear address {sentinel:#x} exceeds /dosemu_mem size {:#x}",
@@ -300,7 +300,45 @@ fn run_end_barrier() -> Result<(), String> {
         ));
     }
 
-    // The instruction at IP=0009 would increment the sentinel to 1236. End is
+    // Prepare AH=30h/AL=00h (get DOS version) at a controlled boundary.
+    stage("prepare_dos_service");
+    step(&control, 4, 0x000c, 0x3000, deadline)?;
+
+    // The interrupt leaves target-owned code while DOS services it.  The ACK
+    // must remain outstanding until control has returned to the instruction at
+    // IP=000eh in the target image.  The previous implementation ACKed at the
+    // handler entry and therefore published a non-target CS:IP here.
+    stage("dos_service_return");
+    request(&control, 5, deadline)?;
+    let service_flags = step_flags.load(Ordering::Acquire);
+    let service_decoded = unsafe { control.read_u32(OFF_DECODED) };
+    let service_ax = unsafe { control.read_u16(OFF_AX) };
+    let service_cs = unsafe { control.read_u16(OFF_CS) };
+    let service_ip = unsafe { control.read_u16(OFF_IP) };
+    if service_flags != 0
+        || service_decoded != 1
+        || service_cs != image_seg
+        || service_ip != 0x000e
+        || service_ax == 0x3000
+    {
+        return Err(format!(
+            "DOS service was not acknowledged at the normalized post-service boundary; {}",
+            control_snapshot(&control)
+        ));
+    }
+
+    // Prove the target can consume the register result returned by DOS.
+    stage("consume_dos_service_result");
+    step(&control, 6, 0x0010, service_ax, deadline)?;
+    let service_bx = unsafe { control.read_u16(OFF_BX) };
+    if service_bx != service_ax {
+        return Err(format!(
+            "post-service AX was not consumable by target code: AX={service_ax:04x}, BX={service_bx:04x}; {}",
+            control_snapshot(&control)
+        ));
+    }
+
+    // The instruction at IP=0010h would increment the sentinel to 1236. End is
     // release-stored while dosemu is stopped at the pre-node barrier; END_ACK
     // must be acquire-visible without that instruction ever beginning.
     stage("end_request");
@@ -330,7 +368,7 @@ fn run_end_barrier() -> Result<(), String> {
 
     stage("complete");
     println!(
-        "runtime probe passed: PSP={runtime_psp:04x}, image={image_seg:04x}, sentinel={sentinel:#x}"
+        "runtime probe passed: PSP={runtime_psp:04x}, image={image_seg:04x}, sentinel={sentinel:#x}, service_AX={service_ax:04x}"
     );
     Ok(())
 }

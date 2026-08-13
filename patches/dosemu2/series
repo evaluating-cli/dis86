@@ -7,3 +7,4 @@
 0007-simx86-publish-dos-termination-before-execution.patch
 0008-simx86-allow-dynamic-target-drive-identity.patch
 0009-simx86-exclude-validator-single-step-from-faults.patch
+0010-simx86-defer-validator-ack-across-services.patch

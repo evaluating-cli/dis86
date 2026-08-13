@@ -4,7 +4,7 @@
 **Pinned dosemu2:** `604ce0cdd1a71f657e2a2df623d216d5ab289313`  
 **ABI:** version 1
 
-**Implementation:** dosemu2 carrier in `patches/dosemu2/`, with prerequisites from PR #12 and Rust integration from PRs #18–#20.
+**Implementation:** dosemu2 carrier in `patches/dosemu2/`, with prerequisites from PR #12 and Rust integration from PRs #18–#23.
 
 ## 1. Status and interpretation
 
@@ -13,11 +13,11 @@ This is the normative behavior specification. The CPU hook, low-memory export, A
 | Evidence level | Current claim |
 | --- | --- |
 | Specified | All requirements below. |
-| Implemented | Nine-patch dosemu2 carrier plus current dis86 adapter/outcome/shutdown path. |
+| Implemented | Ten-patch dosemu2 carrier plus current dis86 adapter/outcome/shutdown path. |
 | Unit tested | Host-independent ABI/state/comparison/reference-CPU paths. |
-| Pinned-runtime tested | Build/link, ABI init, basic step, live low-memory alias, end barrier/clean exit, terminating MZ smoke fixture. |
-| Remaining implementation | Defer publication/acknowledgement across nonterminating DOS/BIOS handlers. |
-| Still-unverified E2E | REP, interrupt shadow, representative handler/helper exclusion, lifecycle transitions, full differential corpus. |
+| Pinned-runtime tested | Build/link, ABI init, basic step, live low-memory alias, end barrier/clean exit, nonterminating `INT 21h/AH=30h` post-service acknowledgement, target-exit/fault publication, terminating MZ smoke fixture. |
+| Remaining implementation | No known gap in the tested standalone `INT 21h` host-service acknowledgement path; expanded corpus may still expose REP/shadow/helper/lifecycle or interrupt-classification fixes. |
+| Still-unverified E2E | Prefixed service calls, application-installed interrupt handlers outside the target MCB, REP, interrupt shadow, broader handler/helper exclusion, lifecycle transitions, full differential corpus. |
 
 ## 2. Execution-boundary contract
 
@@ -113,26 +113,21 @@ Activation requires real mode, a valid PSP/MCB/environment identity, matching co
 
 Once active:
 
-- target requests are consumed only for target-owned code;
-- when a target-owned interrupt node transfers control outside the target-owned MCB,
-  dosemu2 shall keep that request pending and shall not publish or acknowledge the
-  handler-entry state;
-- while that request remains pending, DOS/BIOS handler nodes outside the target-owned
-  MCB shall execute without consuming another request; publication and acknowledgement
-  occur only after control returns to target-owned code, at the normalized
-  post-service boundary (or at an explicitly equivalent normalized interrupt boundary);
+- target requests are consumed only for target-owned code, except while executing an application-installed interrupt handler that emu86 exposes as part of the controlled instruction stream;
+- when a target-owned host-normalized DOS/BIOS service interrupt transfers control outside the target-owned MCB, dosemu2 shall keep that request pending and shall not publish or acknowledge the handler-entry state;
+- while a host-service request remains pending, intervening DOS/BIOS handler nodes and callbacks shall execute without consuming another request; publication and acknowledgement occur only at the exact interrupt return `CS:IP` recorded from the handler-entry stack;
+- software-interrupt recognition skips the segment-override prefixes accepted by emu86 (`26h`, `2Eh`, `36h`, `3Eh`) before decoding `INT3`, `INT imm8`, or `INTO`;
+- unchanged activation-time vectors `10h`, `1Ah`, `21h`, and `33h` are eligible for host-service normalization; if the target changes a vector, the interrupt retains emu86's application-handler boundary instead of being normalized as a host service;
+- an application-installed handler is published at handler entry and remains controller-stepped even when its code resides outside the target MCB, until its recorded interrupt return boundary is reached;
 - descendant child/helper processes bypass target request consumption;
 - the global end barrier remains effective before all bypass paths;
 - leaving target ancestry publishes `TARGET_EXIT`, clears `runtime_psp`, acknowledges any pending request, and permanently prevents stale-PSP reactivation.
 
-The current target-owned-PC filter prevents request consumption in handler code, but
-the carrier still publishes and acknowledges immediately after the interrupt node.
-It therefore does **not** yet implement the required nonterminating interrupt boundary:
-its handler-entry state is not comparable with emu86's post-service `Machine::step()`
-state. The terminating `INT 21h/AH=4Ch` pre-execution path is a special case and is not
-evidence for this requirement. Handler acknowledgement deferral is implementation work;
-representative handler/helper execution and target lifecycle transitions also remain
-unverified E2E.
+Patch 0010 implements this classification and acknowledgement behavior for standalone controlled software-interrupt nodes. At activation it snapshots the IVT, then uses the current vector value plus the decoded interrupt number to distinguish host-normalized services from application-installed handlers. Host-service requests remain outstanding until the exact saved return `CS:IP`; intermediate target callbacks are not mistaken for service completion. Application-installed handlers instead expose their handler-entry boundary and remain in lockstep through their interrupt return. Architectural faults remain immediate, and target exit or the global end barrier terminates pending work through the existing lifecycle paths.
+
+The pinned runtime probe exercises a nonterminating unprefixed `INT 21h/AH=30h` service and requires the acknowledgement snapshot to be back at the target instruction after the interrupt with the DOS-returned register state. The subsequent target instruction consumes that returned state. The terminating `INT 21h/AH=4Ch` pre-execution path remains a separate terminal special case.
+
+The current pinned runtime proof does not separately exercise a prefixed service encoding or an application-installed interrupt handler outside the target MCB. It also does not cover a software interrupt composed as the following instruction of an interrupt-shadow multi-instruction node, REP/shadow composition, a broader DOS/BIOS handler set, descendant helpers, or target lifecycle transitions. Those remain part of the expanded corpus rather than being inferred from the standalone service proof.
 
 ## 7. Normalized comparison contract
 
@@ -157,6 +152,7 @@ The remaining gate shall compare architectural state and relevant memory after e
 
 - arithmetic/logic and flag-producing instructions;
 - stack, near/far call/return, branches, and interrupts;
+- prefixed DOS/BIOS service calls and application-installed interrupt handlers, including handlers outside the target MCB;
 - REP MOVS/STOS/CMPS/SCAS, including termination conditions;
 - STI/MOV SS/POP SS multi-instruction nodes and shadow + REP composition;
 - external `CS:IP`, GPR, segment, and memory mutation;
@@ -164,4 +160,4 @@ The remaining gate shall compare architectural state and relevant memory after e
 - target -> child -> target and target -> parent lifecycle transitions; and
 - normal termination, fault, target-exit, and controller end-barrier paths.
 
-Until this corpus passes, REP, shadow composition, representative helper exclusion, lifecycle transitions, and full differential comparison are **specified/implemented where noted, but not integration-tested**.
+Until this corpus passes, prefixed/application-handler interrupt cases, REP, shadow composition, representative helper exclusion, lifecycle transitions, and full differential comparison are **specified/implemented where noted, but not integration-tested**.
