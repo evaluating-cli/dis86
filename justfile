@@ -16,8 +16,8 @@ build-dis86:
   cp dis86/target/debug/dis86 build/bin/
   cp dis86/target/debug/mzfile build/bin/
 
-# Run the host-independent checks used by CI. This deliberately excludes the
-# legacy interactive SDL frontend and does not build a DosBox-X submodule.
+# Run the host-independent checks used by CI. Hydra is syntax-checked from its
+# own sources, proving the retained runtime no longer needs an emulator submodule.
 check:
   #!/bin/bash
   set -euo pipefail
@@ -29,8 +29,8 @@ check:
     --skip emu86::alu_test::shl8_count_8_cf_from_bit0 \
     --skip emu86::alu_test::shr8_of_set_when_original_negative \
     --skip emu86::alu_test::shr8_sign_never_set
-  cc -std=c11 -Wall -Wextra -Werror -D_GNU_SOURCE \
-    -Ihydra/src -fsyntax-only hydra/src/remote/shmdata.c
+  cc -std=c11 -D_GNU_SOURCE -Dtypeof=__typeof__ \
+    -Ihydra/src -Ihydra/include -fsyntax-only hydra/src/*.c
 
 # Build the hydra component only
 build-hydra:

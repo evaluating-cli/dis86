@@ -1,5 +1,5 @@
 #pragma once
-#include "dosbox-x/include/export/dosbox-x/hydra_machine.h"
+#include "hydra_machine.h"
 #include <errno.h>
 #include <pthread.h>
 #include "header.h"

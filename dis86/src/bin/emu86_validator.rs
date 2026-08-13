@@ -1,4 +1,4 @@
-use dis86::emu86::validator::{self, EmulatorBackend};
+use dis86::emu86::validator;
 
 fn print_help() {
   let appname = std::env::args().next().unwrap();
@@ -8,7 +8,7 @@ fn print_help() {
   println!("  --exe             path to MZ format exe on the filesystem (required)");
   println!("");
   println!("OPTIONAL OPTIONS:");
-  println!("  --backend         emulator backend: 'dosbox-x' (default) or 'dosemu2'");
+  println!("  --backend         emulator backend (currently only 'dosemu2')");
 }
 
 #[derive(Debug)]
@@ -31,8 +31,7 @@ fn parse_args() -> Result<Args, pico_args::Error> {
   };
 
   let remaining = pargs.finish();
-
-  if remaining.len() != 0 {
+  if !remaining.is_empty() {
     eprintln!("Error: unused arguments left: {:?}.", remaining);
     std::process::exit(1);
   }
@@ -50,32 +49,22 @@ pub fn run() -> i32 {
   };
 
   if let Some(backend_name) = &args.backend {
-    let backend = match backend_name.to_lowercase().as_str() {
-      "dosemu2" | "dosemu" => EmulatorBackend::Dosemu2,
-      "dosbox-x" | "dosbox" => EmulatorBackend::DosboxX,
+    match backend_name.to_lowercase().as_str() {
+      "dosemu2" | "dosemu" => (),
       other => {
-        eprintln!("Error: unknown emulator backend '{}'. Expected 'dosbox-x' or 'dosemu2'.", other);
-        return 1;
-      }
-    };
-    match validator::run_with_backend(&args.exe, backend) {
-      Ok(_) => (),
-      Err(err) => {
-        eprintln!("Error: {}", err);
-        return 1;
-      }
-    }
-  } else {
-    match validator::run(&args.exe) {
-      Ok(_) => (),
-      Err(err) => {
-        eprintln!("Error: {}", err);
+        eprintln!("Error: unknown emulator backend '{}'. Expected 'dosemu2'.", other);
         return 1;
       }
     }
   }
 
-  0
+  match validator::run(&args.exe) {
+    Ok(_) => 0,
+    Err(err) => {
+      eprintln!("Error: {}", err);
+      1
+    }
+  }
 }
 
 fn main() {
