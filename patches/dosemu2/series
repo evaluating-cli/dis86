@@ -1,10 +1,2 @@
-0001-simx86-add-validator-control-abi.patch
-0002-mapping-export-validator-lowmem.patch
-0003-simx86-harden-validator-target-lifecycle.patch
-0004-simx86-publish-validator-step-flags-atomically.patch
-0005-simx86-reject-protected-mode-state-import.patch
-0006-simx86-exclude-dos-handlers-from-validator.patch
-0007-simx86-publish-dos-termination-before-execution.patch
-0008-simx86-allow-dynamic-target-drive-identity.patch
-0009-simx86-exclude-validator-single-step-from-faults.patch
-0010-simx86-defer-validator-ack-across-services.patch
+0001-simx86-add-executable-scoped-validator-control.patch
+0002-mapping-expose-live-low-memory-backing.patch

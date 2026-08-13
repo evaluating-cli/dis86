@@ -19,72 +19,36 @@ be treated as an upstream PR by themselves.
 The base commit is intentionally pinned. Rebase/regeneration onto a newer
 upstream revision should be explicit and reviewed as a separate change.
 
-## Series
+## Frozen feature series
 
-1. `0001-simx86-add-validator-control-abi.patch`
-   - page-sized `/hydra_remote` POSIX shared-memory object
-     (`/dev/shm/hydra_remote` on Linux)
-   - append-only ABI version and structure-size fields after the legacy 64-byte prefix
-   - `init`, `end`, `pid`, `runtime_psp`, `req`, `ack`
-   - register request/apply and publish/ack synchronization
-   - exact MZ-entry activation gate using PSP/MCB/environment program identity
-   - validator-only `MSSTP` mode
-   - translated-node `decoded_instructions` from `TNode.seqnum`
-   - raw node-boundary `step_flags`
-   - final end acknowledgement before execution stops
+The active carrier is regenerated from the final tree as exactly two feature
+commits. Patch boundaries follow subsystem ownership rather than the historical
+development sequence:
 
-2. `0002-mapping-export-validator-lowmem.patch`
-   - requires the POSIX `mapshm` mapping driver in validator mode
-   - keeps the actual `MAPPING_LOWMEM` POSIX SHM object named `/dosemu_mem`
-   - uses the same fd that backs `lowmem_base`; no second DOS-memory copy
-   - creates a temporary second `MAP_SHARED` view before guest boot and proves
-     writes are visible in both directions, restoring the original bytes
-   - verifies before validator `init` publication that the selected driver is
-     `mapshm`, the exported object is the live `lowmem_base` allocation, and
-     conventional address zero resolves through that backing
-   - unlinks `/dosemu_mem` when the backing mapping is freed
+1. `0001-simx86-add-executable-scoped-validator-control.patch`
+   (`simx86: add executable-scoped validator control`)
+   - owns the simx86 build integration, interpreter hook, ABI, activation gate,
+     state exchange, and executable-scoped stepping implementation;
+   - preserves ABI version 1 and the 88-byte shared control layout;
+   - includes all lifecycle hardening, atomic flag publication, protected-mode
+     rejection, DOS-handler exclusion, termination publication, dynamic drive
+     identity, architectural-fault classification, and interrupt-service
+     acknowledgement deferral from the former patches 0001 and 0003-0010.
 
-3. `0003-simx86-harden-validator-target-lifecycle.patch`
-   - requires the exact entry-gate PSP to equal dosemu's current PSP
-   - uses dosemu's version-adjusted `sda_cur_psp()` accessor rather than a
-     literal SDA offset
-   - treats PSPs descending from the captured target PSP as child/helper
-     processes and lets those nodes run without consuming validator requests
-   - checks `end` before child/helper bypass, preserving the global stop barrier
-   - permanently marks the target finished once the current PSP leaves the
-     target ancestry
-   - clears `runtime_psp`, publishes `DIIS_STEP_TARGET_EXIT`, and release-stores
-     `ack` for any pending request
-   - never allows the exact target gate to reactivate after target exit, which
-     prevents stale PSP reuse from resuming validation
+2. `0002-mapping-expose-live-low-memory-backing.patch`
+   (`mapping: expose live low-memory backing for external validation`)
+   - adds a generic mapping-backing query describing backing kind, fd, POSIX
+     name, size, and base-address provenance;
+   - uses the generic named-backing path to retain the live `mapshm`
+     low-memory allocation at `/dosemu_mem`, without DIIS-specific policy in
+     `mapfile.c`;
+   - includes the validator-side provenance call so `init` is not published
+     until the selected mapping is proven to be that live backing.
 
-The PSP ancestry walk is bounded and derives the parent field with
-`offsetof(struct PSP, parent_psp)` from dosemu's own PSP definition rather
-than embedding a numeric DOS offset.
-
-4. `0004-simx86-publish-validator-step-flags-atomically.patch`
-   - release-publishes asynchronous lifecycle flags
-
-5. `0005-simx86-reject-protected-mode-state-import.patch`
-   - fails closed before applying unsupported protected-mode state
-
-6. `0006-simx86-exclude-dos-handlers-from-validator.patch`
-   - consumes target requests only for PCs inside the target-owned MCB
-   - lets DOS and BIOS interrupt-handler nodes run without creating validator
-     boundaries even though DOS retains the caller's current PSP
-
-7. `0007-simx86-publish-dos-termination-before-execution.patch`
-   - publishes target termination before another controlled node executes
-
-8. `0008-simx86-allow-dynamic-target-drive-identity.patch`
-   - permits a wildcard only in the canonical DOS drive-letter position
-
-9. `0009-simx86-exclude-validator-single-step-from-faults.patch`
-   - separates expected simx86 single-step/internal returns from CPU faults
-
-10. `0010-simx86-defer-validator-ack-across-services.patch`
-   - defers eligible standalone host services to their exact saved return `CS:IP`
-   - preserves controller lockstep for application-installed handlers
+These patches are frozen against the pinned base and preserve the same observable
+validator behavior as the former ten-patch carrier. The original ten commits remain
+available in this repository's Git history; they are intentionally no longer
+kept as active patch files or listed in `series`.
 
 ## Validator launch contract
 
@@ -102,8 +66,8 @@ interpreter **if CPU emulation is used**, but does not itself prevent KVM or
 vm86 from being selected. The validator hook lives in simx86, so
 `$_cpu_vm = "emulated"` is part of the mandatory launch contract.
 
-Patch 0001 fails closed if it is reached without the simx86 interpreter selected.
-Patch 0002 fails closed unless the live low-memory backing is the verified
+The simx86 feature patch fails closed if it is reached without the simx86 interpreter selected.
+The mapping feature patch fails closed unless the live low-memory backing is the verified
 `mapshm` export at `/dosemu_mem`.
 
 The exact target gate expects:
@@ -137,7 +101,7 @@ hook merely because they execute under simx86.
 
 ## Lifecycle provenance
 
-The pinned source establishes the lifecycle abstraction used by patch 0003:
+The pinned source establishes the lifecycle abstraction used by the simx86 feature patch:
 
 1. dosemu's redirector initialization selects SDA offsets by supported DOS /
    redirector version (`REDVER_PC30`, `REDVER_PC31`, `REDVER_PC40`, and the
@@ -147,7 +111,7 @@ The pinned source establishes the lifecycle abstraction used by patch 0003:
 3. `dos2linux.h` exposes `sda_cur_psp(sda_t)` and dosemu itself uses that
    accessor when tracking the current DOS program;
 4. the same header defines `struct PSP`, including its `parent_psp` field;
-5. patch 0003 therefore reads the current PSP through dosemu's abstraction and
+5. the simx86 feature patch therefore reads the current PSP through dosemu's abstraction and
    uses dosemu's PSP layout only to walk the process ancestry.
 
 This lets a child EXEC temporarily replace the current PSP without being
@@ -157,7 +121,7 @@ ancestry, the target is latched finished and cannot reactivate.
 
 ## Low-memory provenance
 
-The pinned source establishes the chain used by patch 0002:
+The pinned source establishes the chain used by the mapping feature patch:
 
 1. `mapping.c::do_alloc_mapping()` assigns `lowmem_base` from an allocation
    only when the allocation capability contains `MAPPING_LOWMEM`.
@@ -165,20 +129,21 @@ The pinned source establishes the chain used by patch 0002:
 3. `alloc_mapping_file()` `ftruncate`s one fd and maps it with `MAP_SHARED`.
 4. `alias_mapping_file()` creates aliases from the fd stored for that same
    allocation.
-5. In validator mode, patch 0002 names that low-memory fd `/dosemu_mem`, proves
-   a second shared view has bidirectional visibility, and records that exact
-   allocation as the export.
-6. At the first simx86 validator boundary, `mapping.c` confirms the selected
-   driver is `mapshm`, the recorded export equals `lowmem_base` with the full
-   `LOWMEM_SIZE + HMASIZE` size, and address zero resolves through that backing.
-7. Only after this proof can patch 0001 publish validator `init`.
+5. The feature patch adds a generic query for that allocation's backing kind,
+   fd, optional POSIX name, mapped size, and base address.
+6. In validator mode, `mapping.c` requests `/dosemu_mem` through the generic
+   named-backing path; `mapfile.c` contains no DIIS-specific name or policy.
+7. At the first simx86 validator boundary, the generic query proves that the
+   export is POSIX SHM, is named `/dosemu_mem`, equals `lowmem_base`, covers
+   `LOWMEM_SIZE + HMASIZE`, and resolves conventional address zero.
+8. Only after this proof can the simx86 feature publish validator `init`.
 
 This is deliberately different from allocating another shared-memory buffer
 and copying low memory into it.
 
 ## Node-boundary metadata
 
-`TNode.seqlen` is byte length and is **not** an instruction count. Patch 0001
+`TNode.seqlen` is byte length and is **not** an instruction count. The simx86 feature patch
 publishes `TNode.seqnum`, which is populated from the number of decoded
 `IMeta` entries used to construct the translated node.
 
@@ -227,8 +192,8 @@ The carrier workflow fetches exactly the pinned dosemu2 commit and applies
 every entry in `patches/dosemu2/series` with `git am`, then runs
 `git diff --check`.
 
-All ten current patches pass that gate together against the exact pinned
-upstream revision.
+Both frozen feature patches pass that gate together against the exact pinned
+upstream revision, and CI asserts their count and commit subjects.
 
 The workflow then configures an interpreter-only build, generates the standard
 `version.hh` and `plugin_config.hh` prerequisites, and directly builds the two
@@ -255,7 +220,7 @@ pinned-runtime proofs.
 
 ## Upstreaming later
 
-Once a writable dosemu2 fork exists, replay this exact series with `git am`
+Once a writable dosemu2 fork exists, replay these two frozen feature commits with `git am`
 onto the pinned base, push those commits to the fork, and make the fork PR the
 authoritative implementation. At that point this local carrier can either be
 regenerated from the fork commits or removed once the integration fetches the

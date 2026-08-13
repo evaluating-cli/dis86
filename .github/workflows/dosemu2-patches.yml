@@ -1,4 +1,4 @@
-name: dosemu2 patch series
+name: dosemu2 frozen feature patches
 
 on:
   push:
@@ -20,7 +20,7 @@ permissions:
   contents: read
 
 jobs:
-  apply-series:
+  apply-feature-patches:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -41,7 +41,7 @@ jobs:
           git -C /tmp/dosemu2 checkout --detach FETCH_HEAD
           test "$(git -C /tmp/dosemu2 rev-parse HEAD)" = "$DOSEMU2_BASE"
 
-      - name: Apply patch series with git am
+      - name: Apply two frozen feature patches with git am
         env:
           DOSEMU2_BASE: 604ce0cdd1a71f657e2a2df623d216d5ab289313
         run: |
@@ -51,6 +51,15 @@ jobs:
             [[ -z "$patch" || "$patch" == \#* ]] && continue
             git -C /tmp/dosemu2 am "$GITHUB_WORKSPACE/patches/dosemu2/$patch"
           done < patches/dosemu2/series
+          test "$(git -C /tmp/dosemu2 rev-list --count "$DOSEMU2_BASE"..HEAD)" = 2
+          test "$(git -C /tmp/dosemu2 log -1 --format=%s HEAD~1)" = \
+            'simx86: add executable-scoped validator control'
+          test "$(git -C /tmp/dosemu2 log -1 --format=%s HEAD)" = \
+            'mapping: expose live low-memory backing for external validation'
+          git -C /tmp/dosemu2 grep -q 'struct mapping_backing' HEAD -- \
+            src/base/lib/mapping/mapping.h
+          git -C /tmp/dosemu2 grep -q 'mapping_get_lowmem_backing' HEAD -- \
+            src/base/lib/mapping/mapping.c
           git -C /tmp/dosemu2 diff --check "$DOSEMU2_BASE"..HEAD
           git -C /tmp/dosemu2 log --oneline --decorate "$DOSEMU2_BASE"..HEAD
 
