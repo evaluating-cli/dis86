@@ -1,44 +1,35 @@
-# Porting dis86 / Hydra to dosemu2
+# dosemu2 validator migration
 
-This directory records both the validator contract and the evidence for the dosemu2 migration. PR #12 added configurable executable loading and `CMPS` support; PR #17 established the pinned dosemu2 patch carrier; PRs #18–#20 completed the current Rust-side node-outcome/shutdown path and added a terminating runtime fixture.
+This directory documents the 16-bit real-mode `simx86` backend used by the dis86 differential validator.
 
-## Authoritative implementation coordinates
+## Current coordinates
 
-- **Current dosemu2 implementation carrier:** `patches/dosemu2/`
-- **Pinned dosemu2 commit:** `604ce0cdd1a71f657e2a2df623d216d5ab289313`
-- **Shared-memory ABI:** version **1**, 88-byte append-only structure preserving the legacy 64-byte Hydra prefix
-- **Current carrier size:** nine ordered patches
+- **Implementation carrier:** `patches/dosemu2/series` (ten ordered `git am` patches)
+- **Pinned dosemu2 base:** `604ce0cdd1a71f657e2a2df623d216d5ab289313`
+- **Shared-memory ABI:** version 1; 88-byte append-only structure preserving the 64-byte Hydra prefix
+- **Scope:** one validator instance controlling a 16-bit real-mode MZ executable
 
-The carrier is a `git am` patch series because there is not yet a writable dosemu2 fork. It contains the executable-scoped `simx86` hook and exports the live `mapshm` allocation backing `lowmem_base` as `/dosemu_mem`. These are implemented behavior, not hypothetical approaches.
+PR #17 established the carrier; PRs #18–#20 completed the Rust outcome and shutdown path and added a terminating runtime fixture. PR #21 added pinned-runtime target-exit and fault evidence. PR #22 pinned and digest-verifies the comcom32 artifact. PR #23 added host-only coverage for the exact command, MZ identity, canonical path, mapping size, and launcher/descendant PID ownership. PR #25 added patch 0010.
 
-## Status vocabulary
+Patch 0010 implements deferred acknowledgement for standalone nonterminating host services. Eligible unchanged DOS/BIOS vectors are normalized at the exact saved return `CS:IP`. Application-installed handlers are a different contract: they remain visible and controller-stepped in lockstep.
 
-| Label | Scope |
+## Evidence snapshot
+
+**Pinned-runtime proven:** the ten-patch series applies/builds/links; pinned FDPP and comcom32 provisioning; ABI initialization; basic request/step acknowledgement; live `/dosemu_mem` bidirectional aliasing; end barrier and clean shutdown; terminating MZ execution; target-exit and fault publication; and an unprefixed `INT 21h/AH=30h` acknowledgement at the post-service target boundary with DOS-returned state.
+
+**Not integration-tested:** prefixed service calls; application-installed handlers outside the target MCB; broader BIOS coverage; REP; interrupt shadow and shadow composition; child/helper exclusion; helper/lifecycle transitions; broad state/control redirection; and the full per-boundary differential corpus.
+
+“Implemented,” “host-only tested,” and “pinned-runtime tested” are distinct claims. Focused runtime proofs must not be reported as completion of the expanded corpus. Correctness smoke tests also establish no performance claim.
+
+## Document map
+
+| Document | Authority |
 | --- | --- |
-| **Specified** | Required behavior documented in `PHASE1_SPEC.md`. |
-| **Implemented** | Code exists in the dosemu2 patch carrier and/or dis86 adapter. |
-| **Unit tested** | Host-independent tests cover local ABI, state, and comparison logic. |
-| **Pinned-runtime tested** | CI applies the patches to the pinned commit and boots that runtime for focused proofs. |
-| **Still-unverified E2E** | No passing expanded pinned-runtime differential corpus yet. |
+| [`PHASE1_SPEC.md`](PHASE1_SPEC.md) | Normative execution, ABI, ownership, interrupt, and shutdown contract. |
+| [`PHASE1_IMPLEMENTATION.md`](PHASE1_IMPLEMENTATION.md) | Current implementation map and design details. |
+| [`TESTING.md`](TESTING.md) | Evidence levels, commands, proven paths, and remaining integration gate. |
+| [`REVIEW.md`](REVIEW.md) | Design decisions and review cautions not repeated by the spec. |
+| [`SOURCES.md`](SOURCES.md) | Code and upstream source coordinates. |
+| [`patches/dosemu2/README.md`](../../patches/dosemu2/README.md) | Patch application, provenance, and carrier mechanics. |
 
-## Evidence summary
-
-**Specified and implemented:** ABI-v1 initialization; request/apply/publish/ack synchronization for ordinary target-owned nodes; validator-bounded `MSSTP` execution; decoded-instruction/outcome metadata; real-mode segment updates and protected-mode rejection; live low-memory export; executable/PSP ownership gating; descendant-helper bypass; pre-execution termination publication; dynamic target-drive identity; target-exit/end-barrier publication; Rust-side launcher/descendant process-ownership validation; and Rust-side outcome handling/cooperative shutdown. The DOS-handler PC filter exists, but acknowledgement deferral to a post-service target-owned boundary is not implemented.
-
-**Unit tested:** Rust-side ABI access, initial-state comparison, and handling of multi-instruction, same-PC, target-exit, end-acknowledgement, and fault outcomes, plus the reference CPU suite. Unit tests do not prove dosemu2 runtime semantics.
-
-**Pinned-runtime tested:** complete patch-series application/build/link, pinned FDPP/comcom32 provisioning, ABI initialization, a basic request/step acknowledgement, bidirectional `/dosemu_mem` alias visibility, the end barrier/clean shutdown, and one small terminating MZ fixture driven through the dosemu2 backend.
-
-**Still unverified E2E:** REP behavior, interrupt-shadow composition, DOS/BIOS and child/helper exclusion under realistic execution, target lifecycle transitions, and the full instruction-by-instruction differential comparison. Do not describe these as integration-tested until the expanded pinned-runtime corpus passes.
-
-Performance claims and Hydra native-function interception remain separate work and must be evaluated independently from validator lockstep correctness.
-
-## Documents
-
-- `PHASE1_SPEC.md` — normative execution/ABI contract and evidence status.
-- `PHASE1_IMPLEMENTATION.md` — implementation map, adapter behavior, and remaining work.
-- `PR_PHASE1_IMPLEMENTATION.md` — PR #10 consolidation/status notes.
-- `REVIEW.md` — technical review and evidence boundaries.
-- `TESTING.md` — unit, pinned-runtime smoke, and expanded E2E gates.
-- `PR_DESCRIPTION.md` — concise migration/status summary.
-- `patches/dosemu2/README.md` — patch application and provenance.
+`PHASE0_GATE.md`, `PR_PHASE0_HARNESS.md`, `PR_PHASE1_IMPLEMENTATION.md`, and `PR_DESCRIPTION.md` are historical records. They are retained for provenance, not as current status or implementation guidance.

@@ -1,9 +1,11 @@
 # Phase 0 Gate: Minimal Simulator Control Specification
 
-**Status:** Proposed Architectural Gate  
+**Status:** Historical design gate; superseded by `PHASE1_SPEC.md` and the ten-patch carrier
 **Target:** `dosemu2` `simx86` simulator integration  
 
 ---
+
+> This document preserves the original investigation criteria. It is not a current checklist: focused Phase 1 paths are implemented, while the expanded corpus is tracked only in `TESTING.md`.
 
 ## 1. Objective
 

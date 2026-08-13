@@ -14,7 +14,7 @@
 
 ### dosemu2 carrier
 
-`patches/dosemu2/series` currently contains nine ordered patches:
+`patches/dosemu2/series` currently contains ten ordered patches:
 
 1. `0001-simx86-add-validator-control-abi.patch`
    - page-sized `/hydra_remote`;
@@ -46,12 +46,20 @@
    - supports an explicit wildcard only in the DOS drive-letter position for `-K` mount variability.
 9. `0009-simx86-exclude-validator-single-step-from-faults.patch`
    - distinguishes expected validator single-step/internal return reasons from architectural faults.
+10. `0010-simx86-defer-validator-ack-across-services.patch`
+   - snapshots eligible host vectors at activation and classifies controlled software interrupts;
+   - defers standalone host-service acknowledgement to the exact saved return `CS:IP`;
+   - keeps application-installed handlers controller-stepped in lockstep through interrupt return.
 
 ### Rust validator path
 
 - **#18 merged:** `StepOutcome`, decoded-node metadata consumption, initial-state comparison, terminal/fault outcome handling, and emu86 advancement from reported decoded counts.
 - **#19 merged:** dosemu2 stderr diagnostics, cooperative `END_ACK` shutdown, bounded fallback termination, and explicit reap.
 - **#20 merged:** pinned-runtime terminating MZ fixture driven through the dosemu2 backend/validator path.
+- **#21 merged:** pinned-runtime target-exit and architectural-fault publication evidence.
+- **#22 merged:** digest-pinned comcom32 artifact provisioning for reproducibility.
+- **#23 merged:** host-only exact-command, MZ-identity, canonical-path, mapping-size, and launcher/descendant PID-ownership coverage.
+- **#25 merged:** patch 0010 deferred acknowledgement across standalone nonterminating host services.
 
 The adapter now launches dosemu2 with:
 
@@ -187,14 +195,9 @@ After activation:
 - global `end` remains effective before bypass;
 - leaving target ancestry permanently publishes `TARGET_EXIT`, clears `runtime_psp`, acknowledges pending work, and prevents stale-PSP reactivation.
 
-The PC-range bypass is implemented, but the complete interrupt boundary is not. After
-a target interrupt node, the current post-node hook acknowledges at handler entry,
-before the out-of-range bypass can run. A nonterminating interrupt request must instead
-remain pending across handler execution and be published/acknowledged after return to
-target-owned code (or at an equivalent normalized boundary). The terminating
-`INT 21h/AH=4Ch` pre-execution path does not prove that behavior. Deferral is remaining
-implementation work; representative handler/helper execution and target lifecycle
-transitions remain runtime-proof items.
+Patch 0010 distinguishes host-service normalization from application-handler lockstep. For a standalone software interrupt through an eligible unchanged activation-time vector, it records the exact saved return `CS:IP`, leaves the request pending across the host service and callbacks, and publishes only on that return. If the application changes the vector, handler entry remains an emu86-visible boundary and the handler stays controller-stepped through interrupt return, even outside the target MCB.
+
+The pinned nonterminating `INT 21h/AH=30h` probe passes: acknowledgement occurs back at the post-interrupt target instruction with DOS-returned register state, and the following target instruction consumes it. This does not integration-test prefixed calls, application-installed handlers, broader BIOS coverage, shadow-composed interrupts, helpers, or lifecycle transitions.
 
 ## 7. Low-memory export
 
@@ -208,30 +211,8 @@ The dosemu2 side implements a pre-node zero-more-controlled-nodes end barrier an
 
 This path has focused pinned-runtime coverage.
 
-## 9. Verification matrix
+## 9. Verification ownership
 
-### Implemented and pinned-runtime proven where stated
-
-- [x] nine-patch series applies to the pinned dosemu2 revision
-- [x] patched runtime compiles/links
-- [x] pinned FDPP + comcom32 provisioning
-- [x] ABI initialization
-- [x] basic request/step acknowledgement
-- [x] external `/dosemu_mem` bidirectional alias proof
-- [x] end barrier
-- [x] cooperative/clean shutdown path
-- [x] terminating MZ fixture through dosemu2 backend
-
-### Implemented, but expanded E2E proof still required
-
-- [ ] REP MOVS/STOS/CMPS/SCAS comparison semantics
-- [ ] STI/MOV SS/POP SS multi-instruction nodes
-- [ ] shadow + REP composition
-- [ ] representative DOS/BIOS handler exclusion
-- [ ] representative descendant child/helper exclusion
-- [ ] target -> child -> target lifecycle
-- [ ] target -> parent / stale-PSP lifecycle
-- [ ] broad external register/segment/control redirection coverage
-- [ ] full per-boundary architectural-state and relevant-memory differential corpus
+The evidence matrix is maintained in [`TESTING.md`](TESTING.md) rather than duplicated here. In summary, the standalone unprefixed `INT 21h/AH=30h` host-service path, target-exit/fault publication, transport, low-memory alias, and shutdown have focused pinned-runtime proofs. Prefixed/application-handler interrupt cases, broader BIOS coverage, REP, interrupt shadow, helper/lifecycle transitions, broad mutation, and the full differential corpus do not.
 
 Hydra native-function interception, overlays, and performance benchmarking remain separate follow-on work.

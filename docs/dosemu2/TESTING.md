@@ -1,5 +1,7 @@
 # dosemu2 migration testing
 
+This is the authoritative evidence ledger for the migration; other documents link here rather than maintaining parallel checklists.
+
 ## Test levels
 
 Testing claims use these levels; passing a lower level must not be reported as passing a higher one.
@@ -16,7 +18,7 @@ Testing claims use these levels; passing a lower level must not be reported as p
 just check
 ```
 
-This covers Rust/reference CPU tests and local ABI/state/comparison logic without making normal repository checks depend on a dosemu2 checkout or graphical stack. Passing it is unit-test evidence, not dosemu2 integration evidence.
+This covers Rust/reference CPU tests and local ABI/state/comparison logic. PR #23 specifically covers the exact host command, MZ-derived identity, canonical target path, page-sized mapping with its 88-byte ABI prefix, and launcher/descendant PID ownership without making normal repository checks depend on a dosemu2 checkout or graphical stack. Passing it is unit-test evidence, not dosemu2 integration evidence.
 
 The optional SDL frontend remains separate:
 
@@ -26,7 +28,7 @@ cargo build --manifest-path dis86/Cargo.toml --features sdl --bin emu86
 
 ## Pinned-runtime coverage
 
-The `dosemu2 patch series` workflow uses `patches/dosemu2/` as the implementation carrier. It applies the complete nine-patch series to the exact pinned commit, checks the resulting diff, builds/links the runtime, and provisions pinned FDPP/comcom32 components.
+The `dosemu2 patch series` workflow uses `patches/dosemu2/` as the implementation carrier. It applies the complete ten-patch series to the exact pinned commit, checks the resulting diff, builds/links the runtime, and provisions pinned FDPP plus the exact digest-verified comcom32 artifact from PR #22.
 
 Current focused runtime evidence includes:
 
@@ -35,10 +37,12 @@ Current focused runtime evidence includes:
 - a basic request/step acknowledgement;
 - external bidirectional visibility of the live `/dosemu_mem` backing;
 - the zero-more-controlled-nodes end barrier;
-- cooperative/clean shutdown behavior; and
-- one small terminating MZ fixture driven through the dosemu2 backend/validator path.
+- cooperative/clean shutdown behavior;
+- one small terminating MZ fixture driven through the dosemu2 backend/validator path;
+- PR #21 target-exit and architectural-fault publication; and
+- PR #25/patch 0010 nonterminating unprefixed `INT 21h/AH=30h`, acknowledged at the post-service target PC with DOS-returned state that the next target instruction consumes.
 
-These prove that the hook, transport, live low-memory alias, and basic adapter path execute on the pinned runtime. They are not a substitute for a representative differential corpus.
+These prove that the hook, transport, live low-memory alias, basic adapter path, terminal/fault outcomes, and the standalone unprefixed host-service normalization path execute on the pinned runtime. Host-service normalization is distinct from application-handler lockstep: unchanged eligible vectors are deferred to their saved return, whereas application-installed handlers must remain controller-stepped. They are not a substitute for a representative differential corpus.
 
 ## Expanded pinned-runtime corpus still required
 
@@ -46,9 +50,9 @@ Do **not** mark the following integration-tested until checked-in fixtures exerc
 
 - REP MOVS/STOS/CMPS/SCAS stepping, termination, state, and memory effects;
 - interrupt-shadow behavior for STI, MOV SS, and POP SS, including shadow + REP composition;
-- DOS/BIOS handler exclusion;
+- prefixed host-service encodings, application-installed handler lockstep (including outside the target MCB), and broader BIOS coverage;
 - descendant child/helper exclusion;
-- target -> child -> target and target -> parent / stale-PSP lifecycle transitions;
+- helper/lifecycle transitions, including target -> child -> target and target -> parent / stale-PSP;
 - external register/segment/control-flow mutation across a broad instruction corpus; and
 - full per-boundary architectural-state and relevant-memory comparison against emu86.
 
