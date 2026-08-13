@@ -4,7 +4,7 @@
 **Pinned dosemu2:** `604ce0cdd1a71f657e2a2df623d216d5ab289313`  
 **ABI:** version 1
 
-**Implementation:** dosemu2 carrier in `patches/dosemu2/`, with prerequisites from PR #12 and Rust integration from PRs #18–#23.
+**Implementation:** dosemu2 carrier in `patches/dosemu2/`, with prerequisites from PR #12, Rust integration from PRs #18–#23, and service-boundary patch 0010 from PR #25.
 
 ## 1. Status and interpretation
 

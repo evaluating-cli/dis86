@@ -1,29 +1,29 @@
-# Source references
+# Implementation source coordinates
 
-The porting investigation and review are based on these upstream projects and source areas.
+The implementation is pinned to dosemu2 commit `604ce0cdd1a71f657e2a2df623d216d5ab289313`. Line numbers in upstream sources may change; the carrier patches are the reviewable record of the exact changes.
 
-## Projects
+## Authoritative repository paths
 
-- `xorvoid/dis86` — x86-16 disassembler/decompiler and differential validator
-- `xorvoid/hydra` — hybrid native/x86-16 runtime
-- `xorvoid/dosbox-x` — patched baseline emulator used by Hydra
-- `dosemu2/dosemu2` — target DOS execution environment
+- `patches/dosemu2/series` — ordered ten-patch carrier.
+- `patches/dosemu2/*.patch` — exact dosemu2 changes and commit messages.
+- `.github/workflows/dosemu2-patches.yml` — pinned apply/build/link and runtime probes, including FDPP/comcom32 provenance.
+- `scripts/dosemu2-runtime-probe.rs` — shared-memory and runtime behavior probe.
+- `scripts/make-dosemu2-runtime-probe.py` — MZ fixtures used by the runtime job.
+- `dis86/src/emu86/validator/dosemu_process.rs` — dosemu2 launch, ownership, stepping, diagnostics, and shutdown.
+- `dis86/src/emu86/validator/shmdata.rs` — ABI-v1 shared-memory mapping and accessors.
 
-## dosemu2 areas requiring direct verification
+## Pinned dosemu2 areas modified or relied upon
 
-- `src/base/emu-i386/simx86/interp.c` — translated execution loop and block behavior
-- `src/include/memory.h` — `mem_base`, `lowmem_base`, `MEM_BASE32`, segment/linear helpers
-- `src/include/coopth.h` — cooperative threading facilities
-- `src/include/hlt.h` — HLT handler API
-- `src/plugin/` — plugin integration model
+- `src/base/emu-i386/simx86/interp.c` — translated-node boundary and validator hook.
+- `src/base/lib/mapping/` and mapping headers — live `mapshm` low-memory export.
+- PSP, MCB, SDA/current-PSP, and DOS redirector definitions — target identity and ancestry.
+- simx86 decode metadata — `TNode.seqnum`, interrupt decoding, and step classification.
 
-## dis86 / Hydra areas expected to change
+## Related projects
 
-- `src/emu86/validator/` — lockstep validator and emulator-process control
-- Hydra machine/register ABI
-- Hydra hook dispatch and control-flow result handling
-- shared-memory IPC and memory-view integration
+- `xorvoid/dis86` — reference x86-16 interpreter and differential validator.
+- `xorvoid/hydra` — consumer of the legacy shared-memory ABI prefix.
+- `xorvoid/dosbox-x` — historical patched backend; its CLI is not the dosemu2 launch contract.
+- `dosemu2/dosemu2` — target DOS runtime.
 
-## Validation policy
-
-Performance estimates and exact hook locations should remain provisional until demonstrated against the concrete dosemu2 revision used by the port. In particular, normal Hydra execution and strict one-instruction lockstep validation must be benchmarked separately.
+Performance for normal Hydra hybrid execution and strict validator lockstep must be measured separately. Neither the source review nor focused correctness probes establish a speedup.

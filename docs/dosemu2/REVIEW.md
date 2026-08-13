@@ -1,57 +1,35 @@
-# dosemu2 validator technical review
+# dosemu2 validator design review
 
-## Evidence model
+This document records the non-obvious design conclusions. Current status and test coverage live in [`README.md`](README.md) and [`TESTING.md`](TESTING.md); the normative requirements live in [`PHASE1_SPEC.md`](PHASE1_SPEC.md).
 
-The original migration review correctly rejected a pure-plugin assumption, unsupported validator speedup claims, an unrelated second low-memory mapping, and unproven REP semantics. Those questions now have partial implementation evidence and should no longer be described uniformly as hypotheses.
+## Core instrumentation, not a pure plugin
 
-PR #12 supplied configurable validator executable loading and `CMPS`; PR #17 established the dosemu2 carrier; PRs #18–#20 added Rust-side node-outcome handling, cooperative shutdown, and a terminating runtime fixture. The current dosemu2 implementation is carried in `patches/dosemu2/` against pinned upstream commit `604ce0cdd1a71f657e2a2df623d216d5ab289313`, using ABI version **1**.
+Arbitrary imported `CS:IP` and validator-bounded execution require a small `simx86` core hook around `FindExecCode()`/`DoExec(G)`. Patch 0001 applies state before node lookup, recomputes the authoritative PC, reasserts `MSSTP`, and publishes the returned node boundary. A plugin alone does not provide this control point.
 
-| Area | Specified behavior | Implementation / evidence | Remaining E2E proof |
-| --- | --- | --- | --- |
-| CPU boundary | Consume a request, execute a validator-bounded translated node, publish state/metadata, acknowledge. | Implemented around `FindExecCode()` with `MSSTP`; pinned runtime performs a basic step. | Expanded instruction-by-instruction differential corpus. |
-| Register ABI | Exchange 14 x86-16 registers with acquire/release ordering and reject incompatible layouts. | ABI v1 implemented; protected-mode import fails closed. | Broad mutation coverage across the expanded corpus. |
-| Low memory | Share the live simulator low-memory backing, not a copied second buffer. | `mapshm`/`lowmem_base` backing exported as `/dosemu_mem`; external bidirectional alias proof passes. | Differential memory effects across the expanded corpus. |
-| REP | Compare at the same semantic boundary as emu86 without double-consuming an iteration. | `decoded_instructions`, `SAME_PC`, CMPS support, and Rust outcome plumbing exist. | **Not integration-tested** with REP MOVS/STOS/CMPS/SCAS fixtures. |
-| Shadow instructions | Account for nodes that legitimately consume multiple decoded instructions. | `TNode.seqnum`, `MULTI_INSN`, and Rust multi-instruction handling exist. | **Not integration-tested** with STI, MOV SS, and POP SS fixtures. |
-| DOS/BIOS exclusion | Keep an interrupt request pending across out-of-target handler execution and publish/acknowledge only at a normalized post-service target boundary. | Patch 0006 implements only the target-owned PC range check; the carrier still acknowledges the interrupt node at handler entry. | Implement acknowledgement deferral, then test representative DOS/BIOS handler execution. |
-| Child/helper exclusion | Descendants may run without consuming target requests while global end remains effective. | PSP ancestry policy implemented. | **Not integration-tested** with actual child/helper execution. |
-| Lifecycle | Publish target exit once and prevent stale PSP reactivation. | Implemented; end barrier and terminating smoke path are runtime-tested. | Target -> child -> target and target -> parent transitions remain unverified. |
-| Target identity | Bind activation to executable path, MZ entry, PSP/MCB/environment/current PSP. | Implemented; patch 0008 allows an explicit wildcard only in the drive-letter position for `-K` drive variability. | More boot-stack/path coverage. |
-| Differential comparison | Advance emu86 from reported node outcomes and compare normalized state. | PR #18 implements `StepOutcome` handling and initial-state comparison; PR #20 runs one terminating fixture. | **Full differential corpus remains unverified E2E.** |
-| Shutdown | End barrier, bounded cooperative exit, termination fallback, reap. | dosemu2 end barrier runtime proof plus PR #19 cooperative shutdown/reap path. | Stress/error-path runtime coverage. |
+## Low memory follows the live backing
 
-## Review conclusions
+Patch 0002 exports the existing `MAPPING_LOWMEM` `mapshm` allocation as `/dosemu_mem`; it does not allocate a second DOS-memory buffer. The backing can be larger than the visible `LOWMEM_SIZE + HMASIZE` window, so provenance, containment, address-zero resolution, and bidirectional aliasing are the invariants—not exact-size equality.
 
-### Core hook and low-memory export are concrete
+## ABI-v1 is deliberately real mode
 
-The `FindExecCode()` hook, `MSSTP` reassertion, pre-node state application, authoritative PC recomputation, post-node publication, and live low-memory export are implemented. They should no longer be described as proposed or merely likely.
+Imported state is a 16-bit real-mode contract. General registers and FLAGS preserve their high halves, segment changes use the normal real-mode cache path, and protected-mode import fails before mutation. The 88-byte ABI remains append-only after the legacy 64-byte Hydra prefix.
 
-This also confirms the original review's central architectural correction: the validator needs a small `simx86` core instrumentation surface. The plugin architecture alone is not the mechanism for arbitrary existing `CS:IP` instruction-boundary control.
+## Node boundaries require metadata
 
-### The low-memory design follows the existing backing
+`TNode.seqlen` is byte length, not instruction count. The carrier publishes `TNode.seqnum` and raw flags so the Rust adapter does not infer consumption from opcode length. This plumbing is implemented, but REP, interrupt-shadow behavior, and their composition remain not integration-tested.
 
-The implementation exports the existing `MAPPING_LOWMEM` backing rather than allocating and copying a second DOS memory buffer. The real backing may be larger than the visible `LOWMEM_SIZE + HMASIZE` window; provenance/containment and address-zero aliasing are the relevant invariants, not exact-size equality.
+## Host services and application handlers are different contracts
 
-### Workloads remain separate
+Patch 0010 normalizes a standalone software interrupt only when its eligible vector still matches the activation-time host vector. It keeps the request outstanding across the host service and publishes at the exact saved return `CS:IP`. The unprefixed `INT 21h/AH=30h` pinned-runtime proof validates this path and its DOS-returned state.
 
-Strict validator lockstep pays synchronization cost after each observable node. Its correctness smoke tests establish no 10–50x speedup. Normal Hydra hybrid execution may have different performance characteristics and must be benchmarked separately.
+If the application changes the vector, emu86 exposes handler entry as a controlled boundary. dosemu2 therefore keeps that application-installed handler in controller lockstep, including code outside the target MCB, rather than normalizing it away. Prefixed calls, application-installed handlers, broader BIOS services, and shadow-composed interrupts still require runtime fixtures.
 
-### Real-mode scope remains deliberate
+## Ownership and lifecycle fail closed
 
-ABI-v1 state import is a 16-bit real-mode contract. Protected mode is rejected before external register or segment mutation rather than applying `SetSegReal()` under unsupported conditions.
+Activation combines executable path, MZ entry, PSP/MCB/environment identity, and dosemu2’s current-PSP accessor. Descendant PSPs bypass request consumption; leaving the captured ancestry latches target exit and prevents stale-PSP reactivation. The launcher accepts its own PID or a verified descendant PID. Representative helper execution and helper/lifecycle transitions remain not integration-tested even though target-exit and fault publication have focused runtime proofs.
 
-### REP and shadow composition remain the semantic risk
+## Approval boundary
 
-`MSSTP` does not imply every observable node corresponds to exactly one emu86 semantic step. Interrupt-shadow handling may produce multi-instruction nodes; REP may remain at the same PC across raw micro-iterations. The adapter therefore relies on published metadata rather than byte length or opcode guesses.
+The focused carrier build/runtime job supports the implemented claims listed in [`TESTING.md`](TESTING.md). It does not approve prefixed/application-handler cases, broader BIOS coverage, REP, interrupt shadow, helper exclusion, lifecycle transitions, broad mutation, or full differential state/memory comparison.
 
-The plumbing is implemented, but the combined REP/shadow behavior is not proven until focused pinned-runtime fixtures pass.
-
-### Handler exclusion remains incomplete; child exclusion is not fully proven
-
-The current patch series contains a DOS-handler PC filter and PSP-ancestry child/helper handling. The PC filter prevents a new request from being consumed in handler code, but the post-node hook has already published and acknowledged the target interrupt at handler entry. Because emu86 completes a nonterminating interrupt service within the corresponding `Machine::step()`, those states are not comparable. The carrier must defer publication/acknowledgement until control returns to target-owned code (or provide an equivalent normalized interrupt boundary). The terminating `INT 21h/AH=4Ch` path is special-case evidence only. Child handling also remains unverified with representative execution.
-
-## Approval gate
-
-The patch/build/runtime smoke checks support continued development, but not a claim of complete validator integration. Approval of REP semantics, interrupt-shadow composition, helper exclusion, lifecycle transitions, or full differential comparison as integration-tested requires the expanded pinned-runtime corpus to pass.
-
-Hydra native-function interception, overlays, and performance remain follow-on work outside the current validator proof.
+Strict lockstep correctness also makes no performance claim. Hydra native-function interception, overlays, and hybrid-performance benchmarking remain separate work.

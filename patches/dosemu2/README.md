@@ -62,10 +62,29 @@ The PSP ancestry walk is bounded and derives the parent field with
 `offsetof(struct PSP, parent_psp)` from dosemu's own PSP definition rather
 than embedding a numeric DOS offset.
 
+4. `0004-simx86-publish-validator-step-flags-atomically.patch`
+   - release-publishes asynchronous lifecycle flags
+
+5. `0005-simx86-reject-protected-mode-state-import.patch`
+   - fails closed before applying unsupported protected-mode state
+
 6. `0006-simx86-exclude-dos-handlers-from-validator.patch`
    - consumes target requests only for PCs inside the target-owned MCB
    - lets DOS and BIOS interrupt-handler nodes run without creating validator
      boundaries even though DOS retains the caller's current PSP
+
+7. `0007-simx86-publish-dos-termination-before-execution.patch`
+   - publishes target termination before another controlled node executes
+
+8. `0008-simx86-allow-dynamic-target-drive-identity.patch`
+   - permits a wildcard only in the canonical DOS drive-letter position
+
+9. `0009-simx86-exclude-validator-single-step-from-faults.patch`
+   - separates expected simx86 single-step/internal returns from CPU faults
+
+10. `0010-simx86-defer-validator-ack-across-services.patch`
+   - defers eligible standalone host services to their exact saved return `CS:IP`
+   - preserves controller lockstep for application-installed handlers
 
 ## Validator launch contract
 
@@ -189,8 +208,7 @@ node is selected or before child/helper bypass is allowed. If set, the hook
 publishes the current CPU state with `DIIS_STEP_END_ACK`, release-stores `ack`,
 and asks the simx86 loop to leave dosemu without beginning another guest node.
 
-A dedicated runtime proof test is still required before the series is
-considered ready for an upstream/fork PR.
+The pinned runtime job proves this barrier and cooperative clean shutdown.
 
 ## Applying
 
@@ -209,8 +227,8 @@ The carrier workflow fetches exactly the pinned dosemu2 commit and applies
 every entry in `patches/dosemu2/series` with `git am`, then runs
 `git diff --check`.
 
-All three current patches have passed that gate together against the exact
-pinned upstream revision.
+All ten current patches pass that gate together against the exact pinned
+upstream revision.
 
 The workflow then configures an interpreter-only build, generates the standard
 `version.hh` and `plugin_config.hh` prerequisites, and directly builds the two
@@ -224,13 +242,16 @@ minimal whole-runtime link with the `charsets`, `msdos`, and `term` plugins,
 which supply the core charset, DOS, and headless-terminal hooks without pulling
 in SDL/audio/network plugins.
 
-Still required:
+Still required for expanded integration coverage:
 
-- prove the `end` barrier at runtime;
-- exercise target -> child -> target and target -> parent lifecycle transitions;
-- exercise `/dosemu_mem` bidirectional visibility from the external controller side;
-- verify whether DOS/INT 21h handler guest nodes become validator-visible while
-  the current PSP remains the target, and define normalization/filtering if so.
+- prefixed host services, application-installed handlers, and broader BIOS services;
+- REP and interrupt-shadow composition;
+- target -> child -> target and target -> parent lifecycle transitions;
+- representative helper execution and broad state/memory differential comparison.
+
+The external `/dosemu_mem` alias, end barrier, target-exit/fault paths, and
+unprefixed `INT 21h/AH=30h` post-service acknowledgement already have focused
+pinned-runtime proofs.
 
 ## Upstreaming later
 
