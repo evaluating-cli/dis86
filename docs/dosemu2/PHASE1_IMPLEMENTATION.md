@@ -14,42 +14,10 @@
 
 ### dosemu2 carrier
 
-`patches/dosemu2/series` currently contains ten ordered patches:
+`patches/dosemu2/series` contains two squashed frozen feature patches. The former development patches 0001–0010 are closed historical development; see the authoritative [`FREEZE_ABI_V1.md`](FREEZE_ABI_V1.md).
 
-1. `0001-simx86-add-validator-control-abi.patch`
-   - page-sized `/hydra_remote`;
-   - ABI version/size and 88-byte append-only layout preserving the established 64-byte Hydra controller prefix;
-   - executable-scoped target activation;
-   - request/apply + publish/ack around `FindExecCode()` / `DoExec(G)`;
-   - validator `MSSTP` mode;
-   - real-mode state import, segment-cache update, PC recomputation;
-   - `TNode.seqnum` decoded count and raw step flags;
-   - pre-node end barrier.
-2. `0002-mapping-export-validator-lowmem.patch`
-   - requires `mapshm`;
-   - exports the actual `MAPPING_LOWMEM` backing as `/dosemu_mem`;
-   - accepts a backing larger than the visible low-memory window;
-   - validates containment/address-zero provenance and bidirectional aliasing.
-3. `0003-simx86-harden-validator-target-lifecycle.patch`
-   - current-PSP and PSP-parent ancestry handling;
-   - descendant bypass;
-   - permanent target-exit latch and stale-PSP protection.
-4. `0004-simx86-publish-validator-step-flags-atomically.patch`
-   - release publication for asynchronous lifecycle flags.
-5. `0005-simx86-reject-protected-mode-state-import.patch`
-   - fail-closed protected-mode import with `DIIS_STEP_FAULT` before mutation.
-6. `0006-simx86-exclude-dos-handlers-from-validator.patch`
-   - consumes target requests only while PC lies inside the target-owned MCB range.
-7. `0007-simx86-publish-dos-termination-before-execution.patch`
-   - publishes termination before another target node executes.
-8. `0008-simx86-allow-dynamic-target-drive-identity.patch`
-   - supports an explicit wildcard only in the DOS drive-letter position for `-K` mount variability.
-9. `0009-simx86-exclude-validator-single-step-from-faults.patch`
-   - distinguishes expected validator single-step/internal return reasons from architectural faults.
-10. `0010-simx86-defer-validator-ack-across-services.patch`
-   - snapshots eligible host vectors at activation and classifies controlled software interrupts;
-   - defers standalone host-service acknowledgement to the exact saved return `CS:IP`;
-   - keeps application-installed handlers controller-stepped in lockstep through interrupt return.
+1. `0001-simx86-add-executable-scoped-validator-control.patch` carries the simx86 ABI, activation, execution, lifecycle, atomic publication, protected-mode rejection, handler boundary, termination, fault, and interrupt-service behavior developed in historical patches 0001 and 0003–0010.
+2. `0002-mapping-expose-live-low-memory-backing.patch` carries the generic mapping-backing query and live `/dosemu_mem` alias work developed in historical patch 0002.
 
 ### Rust validator path
 

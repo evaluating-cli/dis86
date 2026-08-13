@@ -28,7 +28,7 @@ cargo build --manifest-path dis86/Cargo.toml --features sdl --bin emu86
 
 ## Pinned-runtime coverage
 
-The `dosemu2 patch series` workflow uses `patches/dosemu2/` as the implementation carrier. It applies the complete ten-patch series to the exact pinned commit, checks the resulting diff, builds/links the runtime, and provisions pinned FDPP plus the exact digest-verified comcom32 artifact from PR #22.
+The `dosemu2 frozen feature patches` workflow uses `patches/dosemu2/` as the implementation carrier. It applies the two-patch squashed frozen carrier to the exact pinned commit, checks the resulting diff, builds/links the runtime, and provisions pinned FDPP plus the exact digest-verified comcom32 artifact from PR #22.
 
 Current focused runtime evidence includes:
 
