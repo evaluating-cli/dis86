@@ -1,7 +1,7 @@
-From 0000000000000000000000000000000000000010 Mon Sep 17 00:00:00 2001
+From af64c8ceba3bad02c39bb79e9d66176f6826486e Mon Sep 17 00:00:00 2001
 From: evaluating-cli <noreply@github.com>
 Date: Wed, 12 Aug 2026 22:03:00 +0200
-Subject: [PATCH 10/10] simx86: defer validator ack across DOS services
+Subject: [PATCH] simx86: defer validator ack across DOS services
 
 A controlled software interrupt can leave the target-owned MCB while DOS or
 BIOS services the request.  The existing target-PC filter prevents handler
@@ -11,9 +11,11 @@ That state is not comparable with emu86's post-service interrupt boundary.
 
 Keep the current request outstanding when a non-faulting software interrupt
 transfers outside target-owned code.  Let non-target service nodes execute
-uncontrolled, then publish the accumulated target instruction count and the
-post-service CPU state when execution first returns to target-owned code.  Only
-then release-store the acknowledgement and wait for the next request.
+uncontrolled and record the return CS:IP from the interrupt stack.  Ignore
+intermediate re-entry through target-owned callbacks, then publish the accumulated
+target instruction count and post-service CPU state only at the recorded return
+boundary.  Only then release-store the acknowledgement and wait for the next
+request.
 
 Target exit continues to terminate any pending request through the existing
 TARGET_EXIT path, and the global end barrier remains checked before all bypass
@@ -22,24 +24,26 @@ mistaken for service execution.
 
 Base: patch 0009 on dosemu2/dosemu2@604ce0cdd1a71f657e2a2df623d216d5ab289313
 ---
- src/base/emu-i386/simx86/diis-validator.c | 53 +++++++++++++++++++++++--
- 1 file changed, 49 insertions(+), 4 deletions(-)
+ src/base/emu-i386/simx86/diis-validator.c | 75 ++++++++++++++++++++++-
+ 1 file changed, 73 insertions(+), 2 deletions(-)
 
 diff --git a/src/base/emu-i386/simx86/diis-validator.c b/src/base/emu-i386/simx86/diis-validator.c
+index f916c84..12ea356 100644
 --- a/src/base/emu-i386/simx86/diis-validator.c
 +++ b/src/base/emu-i386/simx86/diis-validator.c
-@@ -64,6 +64,10 @@
+@@ -62,6 +62,11 @@ static int g_created;
  static int g_active;
  static int g_target_finished;
  static int g_node_controlled;
 +static int g_request_deferred;
 +static unsigned int g_deferred_start_pc;
++static unsigned int g_deferred_return_pc;
 +static uint32_t g_deferred_decoded;
 +static uint32_t g_deferred_flags;
  static uint16_t g_mz_cs;
  static uint16_t g_mz_ip;
  static uint16_t g_runtime_psp;
-@@ -306,6 +310,16 @@
+@@ -302,6 +307,16 @@ static int target_is_dos_exit(unsigned int pc)
  		(TheCPU.eax & 0xff00) == 0x4c00;
  }
  
@@ -56,18 +60,19 @@ diff --git a/src/base/emu-i386/simx86/diis-validator.c b/src/base/emu-i386/simx8
  static void mark_target_finished(void)
  {
  	uint64_t req;
-@@ -316,6 +330,10 @@
+@@ -311,6 +326,11 @@ static void mark_target_finished(void)
  	g_active = 0;
  	g_target_finished = 1;
  	g_node_controlled = 0;
 +	g_request_deferred = 0;
 +	g_deferred_start_pc = 0;
++	g_deferred_return_pc = 0;
 +	g_deferred_decoded = 0;
 +	g_deferred_flags = 0;
  	g_runtime_psp = 0;
  	if (!g_shm)
  		return;
-@@ -350,6 +368,22 @@
+@@ -363,6 +383,23 @@ static void publish_cpu(unsigned int pc, uint32_t decoded, uint32_t flags)
  	__atomic_store_n(&g_shm->step_flags, flags, __ATOMIC_RELEASE);
  }
  
@@ -81,6 +86,7 @@ diff --git a/src/base/emu-i386/simx86/diis-validator.c b/src/base/emu-i386/simx8
 +	publish_cpu(pc, g_deferred_decoded, flags);
 +	g_request_deferred = 0;
 +	g_deferred_start_pc = 0;
++	g_deferred_return_pc = 0;
 +	g_deferred_decoded = 0;
 +	g_deferred_flags = 0;
 +	req = __atomic_load_n(&g_shm->req, __ATOMIC_RELAXED);
@@ -90,16 +96,22 @@ diff --git a/src/base/emu-i386/simx86/diis-validator.c b/src/base/emu-i386/simx8
  static int apply_cpu(unsigned int *pc)
  {
  	if (PROTMODE()) {
-@@ -438,6 +472,8 @@
+@@ -446,6 +483,14 @@ int diis_validator_before_node(unsigned int *pc)
                   * consume a request while executing inside the target's MCB. */
                  if (!target_owns_pc(g_runtime_psp, *pc))
                          return 0;
-+		if (g_request_deferred)
++		/* Target callbacks can run while DOS/BIOS still owns the interrupted
++		 * service.  They are not its return boundary, so let them execute
++		 * uncontrolled until the saved interrupt return CS:IP is reached. */
++		if (g_request_deferred) {
++			if (*pc != g_deferred_return_pc)
++				return 0;
 +			publish_deferred_return(*pc);
++		}
  		req = __atomic_load_n(&g_shm->req, __ATOMIC_ACQUIRE);
  		ack = __atomic_load_n(&g_shm->ack, __ATOMIC_RELAXED);
  		if (req != ack)
-@@ -481,8 +517,6 @@
+@@ -482,8 +527,6 @@ void diis_validator_after_node(unsigned int start_pc, unsigned int next_pc,
  	g_node_controlled = 0;
  	if (decoded_instructions > 1)
  		flags |= DIIS_STEP_MULTI_INSN;
@@ -108,7 +120,7 @@ diff --git a/src/base/emu-i386/simx86/diis-validator.c b/src/base/emu-i386/simx8
  	/* TheCPU.err also carries simx86-internal return reasons (EXCP_GOBACK and
  	 * above).  Publish only architectural exceptions, excluding the MSSTP
  	 * boundary deliberately requested for validator-controlled execution. */
-@@ -490,6 +524,21 @@
+@@ -491,6 +534,34 @@ void diis_validator_after_node(unsigned int start_pc, unsigned int next_pc,
  			cpu_err != EXCP01_SSTP)
  		flags |= DIIS_STEP_FAULT;
  
@@ -119,12 +131,25 @@ diff --git a/src/base/emu-i386/simx86/diis-validator.c b/src/base/emu-i386/simx8
 +	if (!(flags & DIIS_STEP_FAULT) &&
 +			target_is_software_interrupt(start_pc) &&
 +			!target_owns_pc(g_runtime_psp, next_pc)) {
++		dosaddr_t stack = ((dosaddr_t)TheCPU.ss << 4) +
++				(uint16_t)TheCPU.esp;
++
++		/* At interrupt-handler entry SS:SP addresses the return IP followed
++		 * by return CS.  Remember that exact boundary: merely re-entering the
++		 * target may instead be a target-owned callback invoked by the service. */
++		if (stack + 3 >= LOWMEM_SIZE + HMASIZE)
++			goto publish_immediately;
 +		g_request_deferred = 1;
 +		g_deferred_start_pc = start_pc;
++		g_deferred_return_pc =
++				((unsigned int)LOWMEM_READ_WORD(stack + 2) << 4) +
++				LOWMEM_READ_WORD(stack);
 +		g_deferred_decoded = decoded_instructions;
 +		g_deferred_flags = flags;
 +		return;
 +	}
++
++publish_immediately:
 +	if (next_pc == start_pc)
 +		flags |= DIIS_STEP_SAME_PC;
  	publish_cpu(next_pc, decoded_instructions, flags);

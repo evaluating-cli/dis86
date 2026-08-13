@@ -128,8 +128,10 @@ Once active:
 Patch 0010 implements the post-service acknowledgement rule for a standalone
 controlled software-interrupt node (`INT3`, `INT imm8`, or `INTO`) that transfers
 outside the target-owned MCB. The request remains outstanding while service code
-runs; the first boundary back in target-owned code publishes the original target
-node's decoded-instruction count with the post-service CPU state and only then
+runs. At handler entry, the validator records the return `CS:IP` saved on the
+interrupt stack. Target-owned callbacks entered before the service returns remain
+uncontrolled; only arrival at that recorded boundary publishes the original
+target node's decoded-instruction count with the post-service CPU state and then
 release-stores the acknowledgement. Architectural faults remain immediate, and
 target exit or the global end barrier terminates the pending operation through
 the existing lifecycle paths.
