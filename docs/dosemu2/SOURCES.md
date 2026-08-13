@@ -4,7 +4,8 @@ The implementation is pinned to dosemu2 commit `604ce0cdd1a71f657e2a2df623d216d5
 
 ## Authoritative repository paths
 
-- `patches/dosemu2/series` — ordered ten-patch carrier.
+- `patches/dosemu2/series` — two-patch squashed frozen carrier.
+- `docs/dosemu2/FREEZE_ABI_V1.md` — ABI-v1 freeze and dosemu2-side change gate.
 - `patches/dosemu2/*.patch` — exact dosemu2 changes and commit messages.
 - `.github/workflows/dosemu2-patches.yml` — pinned apply/build/link and runtime probes, including FDPP/comcom32 provenance.
 - `scripts/dosemu2-runtime-probe.rs` — shared-memory and runtime behavior probe.
