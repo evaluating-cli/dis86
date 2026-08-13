@@ -1,0 +1,766 @@
+From 9a9b6431b6c25ff61687d287c6ed1629937a43d3 Mon Sep 17 00:00:00 2001
+From: dis86 patch maintainer <noreply@example.invalid>
+Date: Thu, 13 Aug 2026 15:25:32 +0000
+Subject: [PATCH 1/2] simx86: add executable-scoped validator control
+
+---
+ src/base/emu-i386/simx86/Makefile         |   2 +-
+ src/base/emu-i386/simx86/diis-validator.c | 652 ++++++++++++++++++++++
+ src/base/emu-i386/simx86/diis-validator.h |  20 +
+ src/base/emu-i386/simx86/interp.c         |  17 +
+ 4 files changed, 690 insertions(+), 1 deletion(-)
+ create mode 100644 src/base/emu-i386/simx86/diis-validator.c
+ create mode 100644 src/base/emu-i386/simx86/diis-validator.h
+
+diff --git a/src/base/emu-i386/simx86/Makefile b/src/base/emu-i386/simx86/Makefile
+index d61425d..db010eb 100644
+--- a/src/base/emu-i386/simx86/Makefile
++++ b/src/base/emu-i386/simx86/Makefile
+@@ -14,7 +14,7 @@ ifeq ($(X86_JIT),1)
+ JITFILES = codegen-x86.c fp87-x86.c sigsegv.c cpatch.c
+ endif
+ CFILES = interp.c cpu-emu.c modrm-gen.c $(JITFILES) \
+-	codegen-sim.c fp87-sim.c protmode.c tables.c \
++	codegen-sim.c fp87-sim.c protmode.c tables.c diis-validator.c \
+ 	codegen.c trees.c memory.c codebuf.c
+ ALL_CPPFLAGS +=-I$(EM86DIR) $(EM86FLG)
+ 
+diff --git a/src/base/emu-i386/simx86/diis-validator.c b/src/base/emu-i386/simx86/diis-validator.c
+new file mode 100644
+index 0000000..eaff089
+--- /dev/null
++++ b/src/base/emu-i386/simx86/diis-validator.c
+@@ -0,0 +1,652 @@
++#include <ctype.h>
++#include <errno.h>
++#include <fcntl.h>
++#include <stddef.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/mman.h>
++#include <sys/stat.h>
++#include <unistd.h>
++
++#include "dos2linux.h"
++#include "emu86.h"
++#include "codegen.h"
++#include "diis-validator.h"
++#include "memory.h"
++#include "protmode.h"
++#include "utilities.h"
++
++#define DIIS_SHM_NAME "/hydra_remote"
++#define DIIS_PATH_MAX 260
++#define DIIS_ENV_SCAN_MAX 32768
++
++struct diis_validator_shm {
++	/* Preserve the established 64-byte Hydra controller ABI prefix. */
++	uint32_t init;
++	uint32_t end;
++	int32_t pid;
++	uint32_t reserved0;
++	uint64_t req;
++	uint64_t ack;
++	uint16_t ax, bx, cx, dx;
++	uint16_t si, di, bp, sp;
++	uint16_t ip, cs, ds, es, ss, flags;
++	uint32_t legacy_reserved1;
++	/* dosemu2 metadata is an append-only extension. */
++	uint32_t abi_version;
++	uint32_t struct_size;
++	uint16_t runtime_psp;
++	uint16_t reserved1;
++	uint32_t decoded_instructions;
++	uint32_t step_flags;
++};
++
++_Static_assert(offsetof(struct diis_validator_shm, pid) == 8,
++		"validator ABI pid offset");
++_Static_assert(offsetof(struct diis_validator_shm, req) == 16,
++		"validator ABI req offset");
++_Static_assert(offsetof(struct diis_validator_shm, ax) == 32,
++		"validator ABI register offset");
++_Static_assert(offsetof(struct diis_validator_shm, abi_version) == 64,
++		"validator ABI extension offset");
++_Static_assert(sizeof(struct diis_validator_shm) == 88,
++		"validator ABI size");
++
++static struct diis_validator_shm *g_shm;
++static size_t g_map_size;
++static int g_config_checked;
++static int g_enabled;
++static int g_created;
++static int g_active;
++static int g_target_finished;
++static int g_node_controlled;
++static int g_request_deferred;
++static unsigned int g_deferred_start_pc;
++static unsigned int g_deferred_return_pc;
++static uint32_t g_deferred_decoded;
++static uint32_t g_deferred_flags;
++struct diis_ivt_entry {
++	uint16_t off;
++	uint16_t seg;
++};
++static struct diis_ivt_entry g_activation_ivt[256];
++#define DIIS_USER_INT_MAX_DEPTH 16
++static unsigned int g_user_int_return_pc[DIIS_USER_INT_MAX_DEPTH];
++static unsigned int g_user_int_depth;
++static uint16_t g_mz_cs;
++static uint16_t g_mz_ip;
++static uint16_t g_runtime_psp;
++static char *g_target_dos_path;
++
++static void diis_validator_cleanup(void)
++{
++	if (g_shm && g_shm != MAP_FAILED)
++		munmap(g_shm, g_map_size);
++	g_shm = NULL;
++	if (g_created)
++		shm_unlink(DIIS_SHM_NAME);
++	g_created = 0;
++	free(g_target_dos_path);
++	g_target_dos_path = NULL;
++}
++
++static int parse_u16_env(const char *name, uint16_t *out)
++{
++	const char *s = getenv(name);
++	char *end;
++	unsigned long v;
++
++	if (!s || !*s)
++		return -1;
++	errno = 0;
++	v = strtoul(s, &end, 0);
++	if (errno || *end || v > 0xffff)
++		return -1;
++	*out = (uint16_t)v;
++	return 0;
++}
++
++static int diis_validator_init(void)
++{
++	const char *enabled;
++	const char *target;
++	long page_size;
++	int fd;
++
++	if (g_config_checked)
++		return g_enabled;
++	g_config_checked = 1;
++
++	enabled = getenv("DIIS_DOSEMU_VALIDATOR");
++	if (!enabled || strcmp(enabled, "1") != 0)
++		return 0;
++
++	if (!CONFIG_CPUSIM) {
++		error("DIIS validator requires $_cpuemu = (1)\n");
++		return 0;
++	}
++
++	target = getenv("DIIS_DOSEMU_TARGET_DOS_PATH");
++	if (!target || !*target ||
++			parse_u16_env("DIIS_DOSEMU_MZ_CS", &g_mz_cs) ||
++			parse_u16_env("DIIS_DOSEMU_MZ_IP", &g_mz_ip)) {
++		error("DIIS validator target identity is incomplete\n");
++		return 0;
++	}
++	g_target_dos_path = strdup(target);
++	if (!g_target_dos_path)
++		return 0;
++
++	page_size = sysconf(_SC_PAGESIZE);
++	if (page_size <= 0 ||
++			sizeof(struct diis_validator_shm) > (size_t)page_size) {
++		error("DIIS validator cannot determine a usable page size\n");
++		goto fail;
++	}
++	g_map_size = (size_t)page_size;
++
++	fd = shm_open(DIIS_SHM_NAME, O_RDWR | O_CREAT | O_EXCL, 0600);
++	if (fd == -1) {
++		error("DIIS validator shm_open(%s): %s\n",
++				DIIS_SHM_NAME, strerror(errno));
++		goto fail;
++	}
++	g_created = 1;
++	if (ftruncate(fd, (off_t)g_map_size) == -1) {
++		error("DIIS validator ftruncate: %s\n", strerror(errno));
++		close(fd);
++		goto fail;
++	}
++	g_shm = mmap(NULL, g_map_size, PROT_READ | PROT_WRITE,
++			MAP_SHARED, fd, 0);
++	close(fd);
++	if (g_shm == MAP_FAILED) {
++		g_shm = NULL;
++		error("DIIS validator mmap: %s\n", strerror(errno));
++		goto fail;
++	}
++
++	memset(g_shm, 0, g_map_size);
++	g_shm->abi_version = DIIS_VALIDATOR_ABI_VERSION;
++	g_shm->struct_size = sizeof(*g_shm);
++	g_shm->pid = getpid();
++	atexit(diis_validator_cleanup);
++	g_enabled = 1;
++	return 1;
++
++fail:
++	diis_validator_cleanup();
++	return 0;
++}
++
++static unsigned char norm_path_char(unsigned char c)
++{
++	if (c == '/')
++		c = '\\';
++	return (unsigned char)toupper(c);
++}
++
++static int guest_path_matches(dosaddr_t addr)
++{
++	size_t i;
++	const dosaddr_t lim = LOWMEM_SIZE + HMASIZE;
++
++	for (i = 0; i < DIIS_PATH_MAX && addr + i < lim; i++) {
++		unsigned char guest = LOWMEM_READ_BYTE(addr + i);
++		unsigned char expected = (unsigned char)g_target_dos_path[i];
++
++		/* -K uses the next free redirected drive, which depends on the
++		 * selected DOS boot stack.  Permit an explicit drive wildcard while
++		 * retaining an exact match for the rest of the canonical path. */
++		if (!(i == 0 && expected == '?' && isalpha(guest)) &&
++				norm_path_char(guest) != norm_path_char(expected))
++			return 0;
++		if (!guest)
++			return expected == 0;
++		if (!expected)
++			return 0;
++	}
++	return 0;
++}
++
++static int psp_program_identity_matches(uint16_t psp)
++{
++	dosaddr_t base = (dosaddr_t)psp << 4;
++	dosaddr_t p;
++	const dosaddr_t lim = LOWMEM_SIZE + HMASIZE;
++	uint16_t env_seg;
++	unsigned int scanned;
++
++	if (base + 0x2d >= lim)
++		return 0;
++	if (LOWMEM_READ_BYTE(base) != 0xcd ||
++			LOWMEM_READ_BYTE(base + 1) != 0x20)
++		return 0;
++
++	if (psp == 0)
++		return 0;
++	p = (dosaddr_t)(psp - 1) << 4;
++	if (p + 2 >= lim || LOWMEM_READ_WORD(p + 1) != psp)
++		return 0;
++
++	env_seg = LOWMEM_READ_WORD(base + 0x2c);
++	if (!env_seg)
++		return 0;
++	p = (dosaddr_t)env_seg << 4;
++
++	for (scanned = 0;
++			scanned < DIIS_ENV_SCAN_MAX && p + 1 < lim;
++			scanned++, p++) {
++		if (LOWMEM_READ_BYTE(p) == 0 &&
++				LOWMEM_READ_BYTE(p + 1) == 0) {
++			p += 2;
++			if (p + 2 >= lim || LOWMEM_READ_WORD(p) < 1)
++				return 0;
++			p += 2;
++			return guest_path_matches(p);
++		}
++	}
++	return 0;
++}
++
++static uint16_t current_psp(void)
++{
++	if (!sda)
++		return 0;
++	return sda_cur_psp(sda);
++}
++
++static int psp_is_descendant_of(uint16_t psp, uint16_t ancestor)
++{
++	unsigned int depth;
++
++	for (depth = 0; depth < 64; depth++) {
++		dosaddr_t parent_addr;
++		uint16_t parent;
++
++		if (!psp)
++			return 0;
++		if (psp == ancestor)
++			return 1;
++		parent_addr = ((dosaddr_t)psp << 4) +
++			offsetof(struct PSP, parent_psp);
++		if (parent_addr + sizeof(uint16_t) > LOWMEM_SIZE + HMASIZE)
++			return 0;
++		parent = LOWMEM_READ_WORD(parent_addr);
++		if (!parent || parent == psp)
++			return 0;
++		psp = parent;
++	}
++	return 0;
++}
++
++static int target_owns_pc(uint16_t psp, unsigned int pc)
++{
++        dosaddr_t mcb;
++        dosaddr_t first;
++        dosaddr_t last;
++        uint16_t paragraphs;
++
++        if (!psp)
++                return 0;
++        mcb = (dosaddr_t)(psp - 1) << 4;
++        if (mcb + 5 > LOWMEM_SIZE + HMASIZE)
++                return 0;
++        paragraphs = LOWMEM_READ_WORD(mcb + 3);
++        first = (dosaddr_t)psp << 4;
++        last = first + ((dosaddr_t)paragraphs << 4);
++        return pc >= first && pc < last && last <= LOWMEM_SIZE + HMASIZE;
++}
++
++static int target_is_dos_exit(unsigned int pc)
++{
++	if (pc + 1 >= LOWMEM_SIZE + HMASIZE)
++		return 0;
++	return LOWMEM_READ_BYTE(pc) == 0xcd &&
++		LOWMEM_READ_BYTE(pc + 1) == 0x21 &&
++		(TheCPU.eax & 0xff00) == 0x4c00;
++}
++
++enum diis_interrupt_kind {
++	DIIS_INT_NONE,
++	DIIS_INT_HOST_SERVICE,
++	DIIS_INT_USER_HANDLER,
++};
++
++static void snapshot_activation_ivt(void)
++{
++	unsigned int vector;
++
++	for (vector = 0; vector < 256; vector++) {
++		dosaddr_t ivt = (dosaddr_t)vector << 2;
++
++		g_activation_ivt[vector].off = LOWMEM_READ_WORD(ivt);
++		g_activation_ivt[vector].seg = LOWMEM_READ_WORD(ivt + 2);
++	}
++}
++
++static enum diis_interrupt_kind
++target_classify_software_interrupt(unsigned int pc)
++{
++	const dosaddr_t lim = LOWMEM_SIZE + HMASIZE;
++	unsigned int opcode_pc = pc;
++	unsigned char opcode;
++	unsigned char vector;
++	dosaddr_t ivt;
++	int changed;
++
++	while (opcode_pc < lim) {
++		opcode = LOWMEM_READ_BYTE(opcode_pc);
++		if (opcode != 0x26 && opcode != 0x2e &&
++				opcode != 0x36 && opcode != 0x3e)
++			break;
++		opcode_pc++;
++	}
++	if (opcode_pc >= lim)
++		return DIIS_INT_NONE;
++
++	opcode = LOWMEM_READ_BYTE(opcode_pc);
++	if (opcode == 0xcc) {
++		vector = 3;
++	} else if (opcode == 0xce) {
++		vector = 4;
++	} else if (opcode == 0xcd) {
++		if (opcode_pc + 1 >= lim)
++			return DIIS_INT_NONE;
++		vector = LOWMEM_READ_BYTE(opcode_pc + 1);
++	} else {
++		return DIIS_INT_NONE;
++	}
++
++	ivt = (dosaddr_t)vector << 2;
++	changed = LOWMEM_READ_WORD(ivt) != g_activation_ivt[vector].off ||
++		LOWMEM_READ_WORD(ivt + 2) != g_activation_ivt[vector].seg;
++	if (changed)
++		return DIIS_INT_USER_HANDLER;
++
++	switch (vector) {
++	case 0x10:
++	case 0x1a:
++	case 0x21:
++	case 0x33:
++		return DIIS_INT_HOST_SERVICE;
++	default:
++		return DIIS_INT_NONE;
++	}
++}
++
++static int interrupt_return_pc(unsigned int *return_pc)
++{
++	dosaddr_t stack = ((dosaddr_t)TheCPU.ss << 4) +
++			(uint16_t)TheCPU.esp;
++
++	if (stack + 3 >= LOWMEM_SIZE + HMASIZE)
++		return 0;
++	*return_pc =
++		((unsigned int)LOWMEM_READ_WORD(stack + 2) << 4) +
++		LOWMEM_READ_WORD(stack);
++	return 1;
++}
++
++static void mark_target_finished(void)
++{
++	uint64_t req;
++
++	if (g_target_finished)
++		return;
++	g_active = 0;
++	g_target_finished = 1;
++	g_node_controlled = 0;
++	g_request_deferred = 0;
++	g_deferred_start_pc = 0;
++	g_deferred_return_pc = 0;
++	g_deferred_decoded = 0;
++	g_deferred_flags = 0;
++	g_user_int_depth = 0;
++	memset(g_user_int_return_pc, 0, sizeof(g_user_int_return_pc));
++	g_runtime_psp = 0;
++	if (!g_shm)
++		return;
++	g_shm->runtime_psp = 0;
++	g_shm->decoded_instructions = 0;
++	__atomic_store_n(&g_shm->step_flags, DIIS_STEP_TARGET_EXIT, __ATOMIC_RELEASE);
++	req = __atomic_load_n(&g_shm->req, __ATOMIC_RELAXED);
++	__atomic_store_n(&g_shm->ack, req, __ATOMIC_RELEASE);
++}
++
++static int target_entry_matches(unsigned int pc)
++{
++	uint16_t psp;
++	uint16_t expected_cs;
++	uint16_t ip;
++
++	if (PROTMODE())
++		return 0;
++	if (TheCPU.ds != TheCPU.es)
++		return 0;
++
++	psp = TheCPU.ds;
++	if (current_psp() != psp)
++		return 0;
++	ip = (uint16_t)(pc - LONG_CS);
++	expected_cs = (uint16_t)(psp + 0x10 + g_mz_cs);
++	if (TheCPU.cs != expected_cs || ip != g_mz_ip)
++		return 0;
++	return psp_program_identity_matches(psp);
++}
++
++static void publish_cpu(unsigned int pc, uint32_t decoded, uint32_t flags)
++{
++	g_shm->ax = (uint16_t)TheCPU.eax;
++	g_shm->bx = (uint16_t)TheCPU.ebx;
++	g_shm->cx = (uint16_t)TheCPU.ecx;
++	g_shm->dx = (uint16_t)TheCPU.edx;
++	g_shm->si = (uint16_t)TheCPU.esi;
++	g_shm->di = (uint16_t)TheCPU.edi;
++	g_shm->bp = (uint16_t)TheCPU.ebp;
++	g_shm->sp = (uint16_t)TheCPU.esp;
++	g_shm->ip = (uint16_t)(pc - LONG_CS);
++	g_shm->cs = TheCPU.cs;
++	g_shm->ds = TheCPU.ds;
++	g_shm->es = TheCPU.es;
++	g_shm->ss = TheCPU.ss;
++	g_shm->flags = (uint16_t)TheCPU.eflags;
++	g_shm->runtime_psp = g_runtime_psp;
++	g_shm->decoded_instructions = decoded;
++	__atomic_store_n(&g_shm->step_flags, flags, __ATOMIC_RELEASE);
++}
++
++static void publish_deferred_return(unsigned int pc)
++{
++	uint32_t flags = g_deferred_flags;
++	uint64_t req;
++
++	if (pc == g_deferred_start_pc)
++		flags |= DIIS_STEP_SAME_PC;
++	publish_cpu(pc, g_deferred_decoded, flags);
++	g_request_deferred = 0;
++	g_deferred_start_pc = 0;
++	g_deferred_return_pc = 0;
++	g_deferred_decoded = 0;
++	g_deferred_flags = 0;
++	req = __atomic_load_n(&g_shm->req, __ATOMIC_RELAXED);
++	__atomic_store_n(&g_shm->ack, req, __ATOMIC_RELEASE);
++}
++
++static int apply_cpu(unsigned int *pc)
++{
++	if (PROTMODE()) {
++		error("DIIS validator refuses external CPU state import in protected mode\n");
++		publish_cpu(*pc, 0, DIIS_STEP_FAULT);
++		return -1;
++	}
++
++	TheCPU.eax = (TheCPU.eax & 0xffff0000u) | g_shm->ax;
++	TheCPU.ebx = (TheCPU.ebx & 0xffff0000u) | g_shm->bx;
++	TheCPU.ecx = (TheCPU.ecx & 0xffff0000u) | g_shm->cx;
++	TheCPU.edx = (TheCPU.edx & 0xffff0000u) | g_shm->dx;
++	TheCPU.esi = (TheCPU.esi & 0xffff0000u) | g_shm->si;
++	TheCPU.edi = (TheCPU.edi & 0xffff0000u) | g_shm->di;
++	TheCPU.ebp = (TheCPU.ebp & 0xffff0000u) | g_shm->bp;
++	TheCPU.esp = (TheCPU.esp & 0xffff0000u) | g_shm->sp;
++	TheCPU.eflags = (TheCPU.eflags & 0xffff0000u) | g_shm->flags;
++
++	if (TheCPU.cs != g_shm->cs)
++		SetSegReal(g_shm->cs, Ofs_CS);
++	if (TheCPU.ds != g_shm->ds)
++		SetSegReal(g_shm->ds, Ofs_DS);
++	if (TheCPU.es != g_shm->es)
++		SetSegReal(g_shm->es, Ofs_ES);
++	if (TheCPU.ss != g_shm->ss)
++		SetSegReal(g_shm->ss, Ofs_SS);
++
++	TheCPU.eip = g_shm->ip;
++	*pc = LONG_CS + TheCPU.eip;
++	TheCPU.key = *pc;
++	return 0;
++}
++
++int diis_validator_before_node(unsigned int *pc)
++{
++	uint64_t req;
++	uint64_t ack;
++	uint16_t psp;
++
++	if (!diis_validator_init())
++		return 0;
++	g_node_controlled = 0;
++	if (g_target_finished) {
++		if (__atomic_load_n(&g_shm->end, __ATOMIC_ACQUIRE)) {
++			publish_cpu(*pc, 0, DIIS_STEP_END_ACK);
++			req = __atomic_load_n(&g_shm->req, __ATOMIC_RELAXED);
++			__atomic_store_n(&g_shm->ack, req, __ATOMIC_RELEASE);
++			return -1;
++		}
++		return 0;
++	}
++
++	if (!g_active) {
++		if (!target_entry_matches(*pc))
++			return 0;
++		g_runtime_psp = TheCPU.ds;
++		snapshot_activation_ivt();
++		g_active = 1;
++		publish_cpu(*pc, 0, 0);
++		__atomic_store_n(&g_shm->init, 1, __ATOMIC_RELEASE);
++	}
++
++	for (;;) {
++		if (__atomic_load_n(&g_shm->end, __ATOMIC_ACQUIRE)) {
++			publish_cpu(*pc, 0, DIIS_STEP_END_ACK);
++			req = __atomic_load_n(&g_shm->req, __ATOMIC_RELAXED);
++			__atomic_store_n(&g_shm->ack, req, __ATOMIC_RELEASE);
++			return -1;
++		}
++		psp = current_psp();
++		if (!psp) {
++			mark_target_finished();
++			return 0;
++		}
++		if (psp != g_runtime_psp) {
++			if (psp_is_descendant_of(psp, g_runtime_psp))
++				return 0;
++			mark_target_finished();
++			return 0;
++		}
++                /* A deferred host service owns every intermediate boundary,
++                 * including callbacks into target code and returns to an
++                 * external user handler. Resume lockstep only at the exact
++                 * interrupt return CS:IP. */
++                if (g_request_deferred) {
++                        if (*pc != g_deferred_return_pc)
++                                return 0;
++                        publish_deferred_return(*pc);
++                }
++
++                /* Application-installed interrupt handlers remain part of
++                 * emu86's instruction stream even outside the target MCB. */
++                if (g_user_int_depth &&
++                                *pc == g_user_int_return_pc[g_user_int_depth - 1]) {
++                        g_user_int_depth--;
++                        g_user_int_return_pc[g_user_int_depth] = 0;
++                }
++                /* DOS and BIOS handlers retain the caller's current PSP.  Only
++                 * consume a request while executing inside the target's MCB. */
++                if (!g_user_int_depth &&
++                                !target_owns_pc(g_runtime_psp, *pc))
++                        return 0;
++		req = __atomic_load_n(&g_shm->req, __ATOMIC_ACQUIRE);
++		ack = __atomic_load_n(&g_shm->ack, __ATOMIC_RELAXED);
++		if (req != ack)
++			break;
++		usleep(50);
++	}
++
++	if (apply_cpu(pc)) {
++		req = __atomic_load_n(&g_shm->req, __ATOMIC_RELAXED);
++		__atomic_store_n(&g_shm->ack, req, __ATOMIC_RELEASE);
++		return -1;
++	}
++
++	/* The DOS terminate interrupt never returns to the target.  Publish its
++	 * terminal boundary before emu86 is asked to execute an interrupt whose
++	 * standalone DOS shim intentionally has no process-lifecycle host. */
++	if (target_is_dos_exit(*pc)) {
++		mark_target_finished();
++		return 0;
++	}
++
++	g_node_controlled = 1;
++	return 1;
++}
++
++void diis_validator_after_node(unsigned int start_pc, unsigned int next_pc,
++		unsigned int decoded_instructions, int cpu_err)
++{
++	uint32_t flags = 0;
++	uint64_t req;
++
++	if (!g_active || !g_node_controlled)
++		return;
++	g_node_controlled = 0;
++	if (decoded_instructions > 1)
++		flags |= DIIS_STEP_MULTI_INSN;
++	/* TheCPU.err also carries simx86-internal return reasons (EXCP_GOBACK and
++	 * above).  Publish only architectural exceptions, excluding the MSSTP
++	 * boundary deliberately requested for validator-controlled execution. */
++	if (cpu_err >= EXCP00_DIVZ && cpu_err <= EXCP12_MCHK &&
++			cpu_err != EXCP01_SSTP)
++		flags |= DIIS_STEP_FAULT;
++
++	if (!(flags & DIIS_STEP_FAULT) &&
++			!target_owns_pc(g_runtime_psp, next_pc)) {
++		enum diis_interrupt_kind kind =
++			target_classify_software_interrupt(start_pc);
++		unsigned int return_pc;
++
++		if (kind == DIIS_INT_HOST_SERVICE &&
++				interrupt_return_pc(&return_pc)) {
++			g_request_deferred = 1;
++			g_deferred_start_pc = start_pc;
++			g_deferred_return_pc = return_pc;
++			g_deferred_decoded = decoded_instructions;
++			g_deferred_flags = flags;
++			return;
++		}
++
++		if (kind == DIIS_INT_USER_HANDLER &&
++				interrupt_return_pc(&return_pc) &&
++				g_user_int_depth < DIIS_USER_INT_MAX_DEPTH) {
++			/* emu86 exposes application handler entry as the completed
++			 * interrupt step, then controls the handler itself. */
++			g_user_int_return_pc[g_user_int_depth++] = return_pc;
++		}
++	}
++
++	if (next_pc == start_pc)
++		flags |= DIIS_STEP_SAME_PC;
++	publish_cpu(next_pc, decoded_instructions, flags);
++	req = __atomic_load_n(&g_shm->req, __ATOMIC_RELAXED);
++	__atomic_store_n(&g_shm->ack, req, __ATOMIC_RELEASE);
++}
+diff --git a/src/base/emu-i386/simx86/diis-validator.h b/src/base/emu-i386/simx86/diis-validator.h
+new file mode 100644
+index 0000000..6777690
+--- /dev/null
++++ b/src/base/emu-i386/simx86/diis-validator.h
+@@ -0,0 +1,20 @@
++#ifndef _EMU86_DIIS_VALIDATOR_H
++#define _EMU86_DIIS_VALIDATOR_H
++
++#define DIIS_VALIDATOR_ABI_VERSION 1u
++
++enum {
++	DIIS_STEP_MULTI_INSN = 1u << 0,
++	DIIS_STEP_SAME_PC = 1u << 1,
++	DIIS_STEP_FAULT = 1u << 2,
++	DIIS_STEP_END_ACK = 1u << 3,
++	DIIS_STEP_TARGET_EXIT = 1u << 4,
++};
++
++/* 0 = disabled/not active, 1 = active, -1 = stop before next node. */
++int diis_validator_before_node(unsigned int *pc);
++
++void diis_validator_after_node(unsigned int start_pc, unsigned int next_pc,
++		unsigned int decoded_instructions, int cpu_err);
++
++#endif
+diff --git a/src/base/emu-i386/simx86/interp.c b/src/base/emu-i386/simx86/interp.c
+index 798d8ff..641e5e4 100644
+--- a/src/base/emu-i386/simx86/interp.c
++++ b/src/base/emu-i386/simx86/interp.c
+@@ -43,6 +43,7 @@
+ #include "mhpdbg.h"
+ #include "video.h"
+ #include "utilities.h"
++#include "diis-validator.h"
+ 
+ #if PROFILE
+ int EmuSignals = 0;
+@@ -443,9 +444,19 @@ static unsigned int FindExecCode(unsigned int PC)
+ 	 * a 'descheduling point' for checking signals.
+ 	 */
+ 	while (1) {
++		int diis_state;
++
+ 		TheCPU.mode &= ~(MSSTP|MTRAP);
+ 		if (EFLAGS & TF)
+ 			TheCPU.mode |= MSSTP|MTRAP;
++		diis_state = diis_validator_before_node(&PC);
++		if (diis_state < 0) {
++			TheCPU.err = EXCP_GOBACK;
++			leavedos_main(0);
++			return PC;
++		}
++		if (diis_state > 0)
++			TheCPU.mode |= MSSTP;
+ 		G = NULL;
+ 		if (e_querynode(PC)) {
+ 			G = FindTree(PC);
+@@ -489,6 +500,9 @@ static unsigned int FindExecCode(unsigned int PC)
+ 				error("@corrupted at %x\n", G->key + j);
+ 		}
+ 		/* ---- this is the MAIN EXECUTE point ---- */
++		unsigned int diis_start_pc = G->key;
++		unsigned int diis_decoded_instructions = G->seqnum;
++
+ 		NodesExecd++;
+ #if PROFILE
+ 		TotalNodesExecd++;
+@@ -502,6 +516,9 @@ static unsigned int FindExecCode(unsigned int PC)
+ #endif
+ 		PC = DoExec(G);
+ 		// G is unreliable (maybe deleted) past this point!
++		diis_validator_after_node(diis_start_pc, PC,
++				diis_decoded_instructions, TheCPU.err);
++
+ #if SPEC_PREJIT
+ 		if (speculate) {
+ 			prejit_sync();
+-- 
+2.43.0
+

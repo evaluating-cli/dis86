@@ -29,9 +29,20 @@ fi
 
 root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 series_dir="$root/patches/dosemu2"
+series_file="$series_dir/series"
+expected_series=(
+  0001-simx86-add-executable-scoped-validator-control.patch
+  0002-mapping-expose-live-low-memory-backing.patch
+)
+mapfile -t active_series < <(sed -e '/^[[:space:]]*$/d' -e '/^[[:space:]]*#/d' "$series_file")
+if [[ "${active_series[*]}" != "${expected_series[*]}" ]]; then
+  echo "dosemu2 series must contain the two frozen feature patches" >&2
+  exit 1
+fi
 
+echo "Applying two frozen dosemu2 feature patches"
 while IFS= read -r patch; do
   [[ -z "$patch" || "$patch" == \#* ]] && continue
   echo "Applying $patch"
   git -C "$repo" am "$series_dir/$patch"
-done < "$series_dir/series"
+done < "$series_file"
