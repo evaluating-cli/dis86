@@ -650,6 +650,9 @@ impl Emu for DosemuProcess {
   fn mem_slice(&self, addr: SegOff, len: u32) -> &[u8] {
     &self.mem.slice_starting_at(addr)[..len as usize]
   }
+  fn mem_len(&self) -> usize {
+    self.mem.len
+  }
   fn interrupt_handler(&self, _vector: u8) -> Option<SegOff> {
     panic!("interrupt_handler unimpl for dosemu process");
   }

@@ -132,6 +132,14 @@ pub trait Emu {
 
   fn mem_slice(&self, addr: SegOff, len: u32) -> &[u8];
 
+  /// Length of the linear memory the backend exposes through `mem_slice`.
+  /// Used by the validator to bound a differential memory comparison window.
+  /// The default assumes a full 16-bit real-mode address space; backends backed
+  /// by a smaller mapping (e.g. dosemu2's shared low-memory alias) override it.
+  fn mem_len(&self) -> usize {
+    crate::emu86::mem::MEM_SIZE
+  }
+
   fn interrupt_handler(&self, vector: u8) -> Option<SegOff>;
 
   fn machine(&mut self) -> Option<&mut Machine>;

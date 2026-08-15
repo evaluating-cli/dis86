@@ -4,16 +4,16 @@ fn print_help() {
   let appname = std::env::args().next().unwrap();
   println!("usage: {} OPTIONS", appname);
   println!("");
-  println!("REQUIRED OPTIONS:");
-  println!("  --exe             path to MZ format exe on the filesystem (required)");
-  println!("");
-  println!("OPTIONAL OPTIONS:");
+  println!("OPTIONS:");
+  println!("  --exe             path to MZ format exe on the filesystem");
+  println!("  --corpus <dir>    run the declarative differential corpus (overrides --exe)");
   println!("  --backend         emulator backend (currently only 'dosemu2')");
 }
 
 #[derive(Debug)]
 struct Args {
-  exe: String,
+  exe: Option<String>,
+  corpus: Option<String>,
   backend: Option<String>,
 }
 
@@ -26,7 +26,8 @@ fn parse_args() -> Result<Args, pico_args::Error> {
   }
 
   let args = Args {
-    exe: pargs.value_from_str("--exe")?,
+    exe: pargs.opt_value_from_str("--exe")?,
+    corpus: pargs.opt_value_from_str("--corpus")?,
     backend: pargs.opt_value_from_str("--backend")?,
   };
 
@@ -58,7 +59,24 @@ pub fn run() -> i32 {
     }
   }
 
-  match validator::run(&args.exe) {
+  let result = if let Some(corpus) = &args.corpus {
+    if args.exe.is_some() {
+      eprintln!("Error: --corpus and --exe are mutually exclusive.");
+      return 1;
+    }
+    validator::run_corpus(std::path::Path::new(corpus))
+  } else {
+    let exe = match &args.exe {
+      Some(exe) => exe,
+      None => {
+        eprintln!("Error: one of --exe or --corpus is required.");
+        return 1;
+      }
+    };
+    validator::run(exe)
+  };
+
+  match result {
     Ok(_) => 0,
     Err(err) => {
       eprintln!("Error: {}", err);
