@@ -125,6 +125,7 @@ Some specific known limitations:
 - Control-flow synthesis is limited to while-loops, if-stmts, and switch-stmts. If-else is unimplemented.
 - Block scheduling and placement is very unoptimal for more complicated control-flow.
 - emu86 implements only the instruction/device subset exercised by the project's target binaries; the dosemu2 differential validator is used to bring behavior into alignment incrementally.
+- emu86's real-mode instruction behavior is hardware-anchored against the SingleStepTests 80286 corpus (V1 conservative family: ~1.01M hardware executions, 81.6% PASS; 11 classified emu86-bug clusters documented in [`docs/emu86/sst.md`](docs/emu86/sst.md)); a hermetic checked-in micro-corpus guards the `just check` harness lane.
 - ... and many more ...
 
 ## Future Plans / Wishlist

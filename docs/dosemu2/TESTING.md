@@ -20,6 +20,15 @@ just check
 
 This covers Rust/reference CPU tests and local ABI/state/comparison logic. PR #23 specifically covers the exact host command, MZ-derived identity, canonical target path, page-sized mapping with its 88-byte ABI prefix, and launcher/descendant PID ownership without making normal repository checks depend on a dosemu2 checkout or graphical stack. Passing it is unit-test evidence, not dosemu2 integration evidence.
 
+### Hardware-anchored emu86 coverage (separate evidence axis)
+
+`just check` also runs a hermetic checked-in micro-corpus of real SingleStepTests
+80286 hardware captures through the emu86 SST harness (V1 conservative family:
+~1.01M hardware executions, 81.6% PASS; 11 classified emu86-bug clusters, see
+`docs/emu86/sst.md`). This is a *hardware*-anchoring axis (emu86 vs a real
+Harris 80C286), distinct from — and neither implied by nor implying — the
+twin-equivalence claims above about emu86 vs dosemu2 simx86.
+
 The optional SDL frontend remains separate:
 
 ```sh
