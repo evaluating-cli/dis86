@@ -1,0 +1,60 @@
+# Hermetic micro-corpus extraction spec (dis86/data/sst/micro/spec.txt).
+#
+# Each line selects ONE real hardware-captured test from the pinned full data
+# (dis86/data/sst/full, hashes pinned in dis86/data/sst/manifest.txt) by source
+# form stem + 0-based index, and names the checked-in micro MOO file it is
+# extracted into (one file per family, named after its source form).
+#
+#   <out>.MOO <kind> <src> <idx>
+#     out   target file under dis86/data/sst/micro/
+#     kind  "pass"      -> the cargo-test lane (src/emu86/sst/micro.rs) asserts
+#                          this entry PASSes 100%.
+#           "failrepro" -> the lane asserts it diverges EXACTLY as recorded in
+#                          FAILREPRO.txt + the expectations table in micro.rs.
+#     src   source form stem (policy.rs key), e.g. "04" -> dis86/data/sst/full/04.MOO
+#     idx   0-based index of the test within the source file
+#
+# Regenerate after a full re-fetch (and re-verify) with:
+#   ./dis86/target/release/emu86_sst micro-extract dis86/data/sst/micro/spec.txt \
+#       --verify
+#   ./dis86/target/release/emu86_sst micro-extract dis86/data/sst/micro/spec.txt
+#
+# ---- PASS-representative entries (one per family) ----
+04.MOO      pass      04   0
+0C.MOO      pass      0C   0
+14.MOO      pass      14   0
+1C.MOO      pass      1C   0
+24.MOO      pass      24   2
+2D.MOO      pass      2D   0
+35.MOO      pass      35   1
+3D.MOO      pass      3D   0
+40.MOO      pass      40   0
+4F.MOO      pass      4F   0
+50.MOO      pass      50   0
+58.MOO      pass      58   0
+89.MOO      pass      89   0
+8B.MOO      pass      8B   0
+B8.MOO      pass      B8   0
+91.MOO      pass      91   0
+98.MOO      pass      98   0
+99.MOO      pass      99   0
+74.MOO      pass      74   0
+EB.MOO      pass      EB   1
+C3.MOO      pass      C3   0
+E2.MOO      pass      E2   0
+E3.MOO      pass      E3   0
+A2.MOO      pass      A2   0
+D1.4.MOO    pass      D1.4 0
+F6.0.MOO    pass      F6.0 0
+F6.2.MOO      pass      F6.2 0
+F7.3.MOO      pass      F7.3 1
+F8.MOO      pass      F8   0
+FC.MOO      pass      FC   0
+9C.MOO      pass      9C   0
+# ---- Known-FAILREPRO entries (one per pinned P3 divergence cluster) ----
+D1.0.MOO    failrepro D1.0 0
+F7.5.MOO    failrepro F7.5 13
+F7.7.MOO    failrepro F7.7 7
+C1.4.MOO    failrepro C1.4 2
+87.MOO      failrepro 87   0
+FF.5.MOO    failrepro FF.5 2914

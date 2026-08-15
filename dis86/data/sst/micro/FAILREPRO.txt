@@ -1,0 +1,25 @@
+# Known-FAILREPRO registry for the hermetic micro corpus (dis86/data/sst/micro/)
+#
+# Each line pins ONE expected DIVERGENCE of emu86 from the 80C286 hardware for a
+# real, hand-picked test. These entries are regression fixtures, NOT bugs to be
+# hidden: the cargo-test lane (dis86/src/emu86/sst/micro.rs) runs each one
+# through the real runner and asserts it diverges EXACTLY as recorded here
+# (bucket + detail, keyed by SHA1). See docs/emu86/sst.md for the full P3
+# divergence ledger; `cluster` links to its classification (SST-D-XXX).
+#
+# Contract: when a future emu86 fix flips one of these entries to PASS, the
+# lane FAILS. That failure is the signal to (a) drop the entry from spec.txt,
+# (b) regenerate the corpus, and (c) move the entry from this file + the
+# expectations table in micro.rs into the PASS list. Do not weaken the
+# assertion instead.
+#
+# File naming: <form>.MOO, one per family, mirroring the source form stem so the
+# lane applies the same per-form policy flag umask as the CLI.
+#
+# Columns: file | src | idx | cluster | bucket | sha1 | recorded sample detail
+D1.0.MOO | D1.0 | 0   | SST-D-003 | FAIL  | f6b69bc8bdfed7bd1dd7235ea5e694f9811b418f | flags exp=0x0842 act=0x0843 umask=0x0FD7
+F7.5.MOO | F7.5 | 13  | SST-D-004 | FAIL  | 6b0be02aa172b5cd3b83950cb610e327ccf097c4 | flags exp=0x0096 act=0x0883 umask=0x0801
+F7.7.MOO | F7.7 | 7   | SST-D-005 | FAIL  | b08f0b9dd03d3b7d264647f32c24a7c6b451044c | AX exp=0xE5AA act=0x133E; DX exp=0x5DB7 act=0x2FB3
+C1.4.MOO | C1.4 | 2   | SST-D-009 | PANIC | aa19e33e8c0c96929dba01a5cbb85545701b2610 | panic: assertion failed: val as u8 as u16 == val
+87.MOO   | 87   | 0   | SST-D-006 | FAIL  | eb65e3ae7e2c04e115929edc43a7b3c83cd1be46 | [0xB4356] exp=0xA6 act=0x1E; [0xB4357] exp=0x8A act=0xA9
+FF.5.MOO | FF.5 | 2914| SST-D-007 | FAIL  | 0921a4aa520839742a7c3a73a91a927d9e877be2 | CS exp=0x848F act=0x0000
