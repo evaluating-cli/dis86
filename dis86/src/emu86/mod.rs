@@ -31,6 +31,8 @@ mod opl;
 
 mod mzhdr;
 
+pub mod sst;
+
 #[cfg(feature = "sdl")]
 mod sdl;
 pub mod emu;
