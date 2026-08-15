@@ -7,6 +7,8 @@ on:
       - 'scripts/apply-dosemu2-patches.sh'
       - 'scripts/make-dosemu2-runtime-probe.py'
       - 'scripts/dosemu2-runtime-probe.rs'
+      - 'dis86/src/emu86/**'
+      - 'dis86/src/bin/emu86_validator.rs'
       - '.github/workflows/dosemu2-patches.yml'
   pull_request:
     paths:
@@ -14,6 +16,8 @@ on:
       - 'scripts/apply-dosemu2-patches.sh'
       - 'scripts/make-dosemu2-runtime-probe.py'
       - 'scripts/dosemu2-runtime-probe.rs'
+      - 'dis86/src/emu86/**'
+      - 'dis86/src/bin/emu86_validator.rs'
       - '.github/workflows/dosemu2-patches.yml'
 
 permissions:
@@ -374,6 +378,39 @@ jobs:
           fi
           echo 'emu86 DosemuProcess validation passed'
 
+      - name: Run the differential corpus through DosemuProcess
+        shell: bash
+        run: |
+          set -euo pipefail
+          corpus_dir=/tmp/diis-emu86-corpus
+          validator_home=/tmp/diis-emu86-corpus-home
+          corpus_log=/tmp/diis-emu86-corpus.log
+          rm -rf "$corpus_dir" "$validator_home"
+          mkdir -p "$corpus_dir" "$validator_home"
+          rm -f /dev/shm/hydra_remote /dev/shm/dosemu_mem
+
+          set +e
+          HOME="$validator_home" \
+          DOSEMU_BIN=/tmp/dosemu2/bin/dosemu \
+            timeout --signal=TERM --kill-after=5s 90s \
+              dis86/target/debug/emu86_validator \
+                --backend dosemu2 --corpus "$corpus_dir" \
+                >"$corpus_log" 2>&1
+          status=$?
+          set -e
+          cat "$corpus_log"
+          if [[ $status -ne 0 ]]; then
+            if [[ $status -eq 124 || $status -eq 137 ]]; then
+              echo "::error title=emu86 corpus timed out::corpus exceeded its 90 second deadline"
+            else
+              echo "::error title=emu86 corpus diverged::corpus exited with status $status"
+            fi
+            echo '--- dosemu2 boot diagnostics ---'
+            cat "$validator_home/.dosemu/boot.log" 2>/dev/null || true
+            exit "$status"
+          fi
+          echo 'emu86 differential corpus passed'
+
       - name: Upload runtime diagnostics
         if: failure()
         uses: actions/upload-artifact@v4
@@ -391,5 +428,8 @@ jobs:
             /tmp/diis-emu86-validator.log
             /tmp/diis-emu86-validator-home/.dosemu/boot.log
             /tmp/diis-emu86-validator-fixture/TEST.EXE
+            /tmp/diis-emu86-corpus.log
+            /tmp/diis-emu86-corpus-home/.dosemu/boot.log
+            /tmp/diis-emu86-corpus
             /tmp/dis86-dosemu2-*.stderr
           if-no-files-found: warn
