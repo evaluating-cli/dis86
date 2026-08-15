@@ -16,6 +16,7 @@ pico-args = "0.5.0"
 itertools = "0.12.1"
 static_assertions = "1.1.0"
 libc = "0.2"
+moo-rs = { path = "third_party/moo" }
 sdl2 = { version = "0.38", features = ["use-pkgconfig", "unsafe_textures"], optional = true } ## Used for the interactive emu86 frontend only
 
 [build-dependencies]
