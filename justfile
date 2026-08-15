@@ -22,13 +22,7 @@ check:
   #!/bin/bash
   set -euo pipefail
   cd {{justfile_directory()}}
-  # These four pre-existing shift-flag cases currently fail independently of
-  # the dosemu2 migration.
-  cargo test --manifest-path dis86/Cargo.toml --locked --all-targets -- \
-    --skip emu86::alu_test::shl16_count_16_cf_from_bit0 \
-    --skip emu86::alu_test::shl8_count_8_cf_from_bit0 \
-    --skip emu86::alu_test::shr8_of_set_when_original_negative \
-    --skip emu86::alu_test::shr8_sign_never_set
+  cargo test --manifest-path dis86/Cargo.toml --locked --all-targets
   cc -std=c11 -D_GNU_SOURCE -Dtypeof=__typeof__ \
     -Ihydra/src -Ihydra/include -fsyntax-only hydra/src/*.c
 
