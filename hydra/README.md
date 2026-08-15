@@ -20,10 +20,13 @@ audio, execution notification, and step hooks. An emulator integration supplies
 those callbacks and calls Hydra's exported `hydra_machine_*` entrypoints.
 
 The repository no longer carries or builds the historical patched DOSBox-X
-fork. The dosemu2-backed differential validator is a separate transport and is
-not, by itself, a Hydra native-function host. Porting Hydra's arbitrary-address
-function interception and native/guest control transfer onto dosemu2 remains a
-separate integration step.
+fork; dosemu2 has replaced it as the project's DOS runtime of choice. The
+dosemu2-backed differential validator (see `../docs/dosemu2/`) is the first
+delivered piece of that port, and is not, by itself, a Hydra native-function
+host. Hydra-on-dosemu2 is the intended end state: porting Hydra's
+arbitrary-address function interception and native/guest control transfer onto
+the pinned, validated dosemu2 base is the remaining integration step on the
+roadmap.
 
 ## Function hooks
 

@@ -1,6 +1,15 @@
-# dosemu2 validator migration
+# dosemu2 port
 
-This directory documents the 16-bit real-mode `simx86` backend used by the dis86 differential validator.
+This directory documents the dosemu2 port: the 16-bit real-mode `simx86` backend used by the dis86 differential validator. The validator transport documented here is the first delivered piece of the port off the historical patched DOSBox-X fork; porting Hydra's native-function hosting onto dosemu2 is the roadmap (see [`hydra/README.md`](../../hydra/README.md)).
+
+## Roles and glossary
+
+- **emu86** — the upstream-authored Rust 8086/286 interpreter in `dis86/src/emu86/`. It is the project's semantic **reference CPU model**: the readable, authoritative statement of expected instruction, flag, and DOS behavior that this project maintains.
+- **dosemu2 simx86** — the lockstep execution host, patched by the frozen carrier below. It steps one translated node per request and publishes state; its observable behavior must be brought into alignment with emu86's documented semantics across the validation corpus.
+- **`reference`/`candidate` (validator code)** — internal naming on the *stepping* axis only: `reference` is the stepped host (dosemu2) whose decoded-node counts drive the loop, `candidate` is emu86 replaying them. It says nothing about semantic priority; semantic authority remains with emu86 as the reference CPU model.
+- **differential validator (`emu86_validator`)** — the harness that runs both engines in lockstep and halts on the first state divergence.
+- **ABI v1** — the frozen 88-byte shared-memory control contract between the Rust validator and patched dosemu2 (see [`FREEZE_ABI_V1.md`](FREEZE_ABI_V1.md)).
+- **carrier** — the two squash-frozen `git am` patches in `patches/dosemu2/` that implement the dosemu2 side of the contract.
 
 ## Current coordinates
 
@@ -33,4 +42,4 @@ Historical patch 0010 implemented deferred acknowledgement for standalone nonter
 | [`SOURCES.md`](SOURCES.md) | Code and upstream source coordinates. |
 | [`patches/dosemu2/README.md`](../../patches/dosemu2/README.md) | Patch application, provenance, and carrier mechanics. |
 
-`PHASE0_GATE.md`, `PR_PHASE0_HARNESS.md`, `PR_PHASE1_IMPLEMENTATION.md`, and `PR_DESCRIPTION.md` are historical records. They are retained for provenance, not as current status or implementation guidance.
+Earlier phase-gate and PR-description records were removed from this directory; they remain available in git history for provenance and are not current status or implementation guidance.

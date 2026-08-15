@@ -15,7 +15,7 @@ This is the normative behavior specification. The CPU hook, low-memory export, A
 | Evidence level | Current claim |
 | --- | --- |
 | Specified | All requirements below. |
-| Implemented | Ten-patch dosemu2 carrier plus current dis86 adapter/outcome/shutdown path. |
+| Implemented | Two-patch frozen dosemu2 carrier plus current dis86 adapter/outcome/shutdown path. |
 | Unit tested | Host-independent ABI/state/comparison/reference-CPU paths. |
 | Pinned-runtime tested | Build/link, ABI init, basic step, live low-memory alias, end barrier/clean exit, nonterminating `INT 21h/AH=30h` post-service acknowledgement, target-exit/fault publication, terminating MZ smoke fixture. |
 | Remaining implementation | No known gap in the tested standalone `INT 21h` host-service acknowledgement path; expanded corpus may still expose REP/shadow/helper/lifecycle or interrupt-classification fixes. |

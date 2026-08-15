@@ -2,7 +2,8 @@ use std::ffi::CString;
 use std::ptr;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
-//// IMPORTANT!! THIS MUST MATCH THE STRUCT DEFINED IN hydra/src/remote/shmdata.h
+//// IMPORTANT!! THE AUTHORITATIVE LAYOUT IS THE FROZEN ABI V1 IN docs/dosemu2/FREEZE_ABI_V1.md
+//// (offsets 0-63 are the unchanged Hydra prefix; the dosemu2 extension is append-only from offset 64).
 // Keep the control fields naturally aligned: req/ack are accessed atomically on
 // both sides of the shared-memory ABI and AtomicU64 requires 8-byte alignment.
 #[repr(C)]
@@ -46,7 +47,8 @@ pub struct ShmDataRaw {
   // TODO...
 }
 
-// Keep the Rust side pinned to the C ABI in hydra/src/remote/shmdata.h.
+// Keep the Rust side pinned to the frozen ABI-v1 layout documented in
+// docs/dosemu2/FREEZE_ABI_V1.md.
 static_assertions::const_assert_eq!(std::mem::size_of::<ShmDataRaw>(), 88);
 static_assertions::const_assert_eq!(std::mem::align_of::<ShmDataRaw>(), 8);
 static_assertions::const_assert_eq!(std::mem::offset_of!(ShmDataRaw, pid), 8);

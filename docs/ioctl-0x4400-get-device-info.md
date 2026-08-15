@@ -1,5 +1,10 @@
 # INT 21h AH=44h AL=00h — IOCTL Get Device Information
 
+> **Note:** The source paths cited below (`include/dos_inc.h`,
+> `src/dos/dos_ioctl.cpp`, `EXT_DEVICE_BIT`) refer to the historical DOSBox-X
+> backend, which has been removed from this tree. The document is retained as
+> DOS-behavior reference background.
+
 **Input:** BX = file handle
 **Output:** CF clear → DX = AX = device info word; CF set → AX = error code
 

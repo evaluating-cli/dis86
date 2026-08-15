@@ -48,7 +48,7 @@ DIIS_DOSEMU_MZ_IP=<u16>
 DIIS_DOSEMU_TARGET_DOS_PATH=?:\<exe>
 ```
 
-The `?` wildcard is accepted only for the drive-letter position by patch 0008.
+The `?` wildcard is accepted only for the drive-letter position by the frozen carrier (developed in historical patch 0008).
 
 ## 2. Shared ABI and ordering
 

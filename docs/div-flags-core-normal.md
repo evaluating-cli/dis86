@@ -1,6 +1,10 @@
 # DIV Instruction Flag Behavior in core_normal
 
-Source: `src/cpu/instructions.h` lines 635–782
+Source: `src/cpu/instructions.h` lines 635–782 (DOSBox-X, `core_normal` path)
+
+> **Note:** The file/line coordinates in this document refer to the historical
+> DOSBox-X backend, which has been removed from this tree. The behavioral
+> analysis is retained as reference background.
 
 ## Execution Flow
 

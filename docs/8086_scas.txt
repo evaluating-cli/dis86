@@ -9,7 +9,7 @@ DI to the next element. It does not store the result of the comparison.
 
 There are two forms:
   SCASB   -- scan byte:  compares AL  with ES:[DI], adjusts DI by 1
-  SCASW   -- scan word:  compares AX  with ES:[DW], adjusts DI by 2
+  SCASW   -- scan word:  compares AX  with ES:[DI], adjusts DI by 2
 
 The segment is always ES and cannot be overridden with a segment prefix.
 This is unlike MOVS/LODS where the source segment can be overridden.

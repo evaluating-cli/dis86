@@ -24,7 +24,7 @@ The implementation is pinned to dosemu2 commit `604ce0cdd1a71f657e2a2df623d216d5
 
 - `xorvoid/dis86` — reference x86-16 interpreter and differential validator.
 - `xorvoid/hydra` — consumer of the legacy shared-memory ABI prefix.
-- `xorvoid/dosbox-x` — historical patched backend; its CLI is not the dosemu2 launch contract.
+- `xorvoid/dosbox-x` — historical patched DOSBox-X backend, removed from this tree; its CLI is not the dosemu2 launch contract. Retained here for provenance only.
 - `dosemu2/dosemu2` — target DOS runtime.
 
 Performance for normal Hydra hybrid execution and strict validator lockstep must be measured separately. Neither the source review nor focused correctness probes establish a speedup.
