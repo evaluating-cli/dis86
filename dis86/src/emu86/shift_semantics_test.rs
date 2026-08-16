@@ -224,3 +224,58 @@ fn c1x_sign_extended_count_masks_to_low_byte() {
   assert_eq!(result, Value::U16(0x0000));
   assert_eq!(m.exec_count, 1);
 }
+
+// --- ROL flags (SST-D-003): CF = rotated-out bit; OF only when count mod
+// width == 1; ZF/SF/PF/AF unchanged (pinned D1.0 sample `rol word [..],1`). ---
+
+#[test]
+fn rol_count_1_defines_cf_and_of() {
+  // Pinned D1.0: rol word,1 on 0x6B2D -> 0xD65A. CF = old MSB (0), OF =
+  // CF XOR new MSB (0 XOR 1) = 1. ZF/SF/PF/AF are undefined and preserved.
+  let input = flags_with(false, true);
+  let (result, flags) = alu::shift(ShiftOp::Rol, Value::U16(0x6b2d), 1, input);
+  assert_eq!(result, Value::U16(0xd65a));
+  assert_flags(flags, false, false, false, true, false, true);
+}
+
+#[test]
+fn rol_count_1_cf_eq_msb_of_original() {
+  // 0x80 rol-by-1 (byte): CF = MSB = 1, result = 0x01, OF = CF XOR new MSB
+  // (new MSB = 0) = 1. ZF/SF/PF/AF untouched.
+  let input = flags_with(false, false);
+  let (result, flags) = alu::shift(ShiftOp::Rol, Value::U8(0x80), 1, input);
+  assert_eq!(result, Value::U8(0x01));
+  assert_flags(flags, true, false, false, true, false, false);
+}
+
+#[test]
+fn rol_count_gt_1_sets_cf_and_preserves_of() {
+  // rol byte,2 on 0x01: CF = original bit 6 = 0, result = 0x04. OF is
+  // undefined for count != 1 and left unchanged on the 80C286.
+  for incoming_of in [false, true] {
+    let input = flags_with(incoming_of, true);
+    let (result, flags) = alu::shift(ShiftOp::Rol, Value::U8(0x01), 2, input);
+    assert_eq!(result, Value::U8(0x04));
+    assert_flags(flags, false, false, false, incoming_of, false, true);
+  }
+}
+
+#[test]
+fn rol_full_circle_sets_cf_to_original_lsb() {
+  // rol byte,8 (count mod width == 0, count != 0): value unchanged, CF = old
+  // LSB = 1, OF untouched. Derived from C0.0 sample `rol byte [..],8` (exp CF=1).
+  let input = flags_with(true, true);
+  let (result, flags) = alu::shift(ShiftOp::Rol, Value::U8(0x0d), 8, input);
+  assert_eq!(result, Value::U8(0x0d));
+  assert_flags(flags, true, false, false, true, false, true);
+}
+
+#[test]
+fn rol_count_0_is_a_noop() {
+  // count == 0: nothing rotates and no flag changes at all (C0.0 sample
+  // `rol byte [ds:bx],0` leaves flags identical).
+  let input = flags_with(true, true);
+  let (result, flags) = alu::shift(ShiftOp::Rol, Value::U8(0xa5), 0, input);
+  assert_eq!(result, Value::U8(0xa5));
+  assert_eq!(flags.0, input.0);
+}

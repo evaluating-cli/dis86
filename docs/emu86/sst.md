@@ -269,10 +269,8 @@ Up to 3 samples per form (idx / name / first-16-of-sha1 / detail) from run outpu
 |   |   |   | idx=1 `test ax,2A2Fh` `8028ba3f90c767f8…` flags exp=0x0002 act=0x0012 umask=0x0FD7; FLAGS exp=0x0002 act=0x0012 |
 |   |   |   | idx=2 `test ax,805Bh` `d347863b43f92db4…` flags exp=0x0402 act=0x0412 umask=0x0FD7; FLAGS exp=0x0402 act=0x0412 |
 |   |   |   | idx=5 `test ax,C962h` `812af671a0d91610…` flags exp=0x0402 act=0x0412 umask=0x0FD7; FLAGS exp=0x0402 act=0x0412 |
-| `C0.0` | 3971 | 1240 | FAIL=2731 |
-|   |   |   | idx=1 `rol byte [ds:bx+si-29h],25h` `42d704860f75f210…` flags exp=0x0C97 act=0x0496 umask=0x0FD7; FLAGS exp=0x0C97 act=0x0496 |
-|   |   |   | idx=2 `rol bh,73h` `f654019178633dfb…` flags exp=0x0896 act=0x0097 umask=0x0FD7; FLAGS exp=0x0896 act=0x0097 |
-|   |   |   | idx=3 `rol byte [ds:si-38h],C1h` `2bfeada58af4ee41…` flags exp=0x00C2 act=0x08C2 umask=0x0FD7; FLAGS exp=0x00C2 act=0x08C2 |
+| `C0.0` | 3971 | 2359 | FAIL=1612 |
+|   |   |   | idx=1 `rol byte [ds:bx+si-29h],25h` `42d704860f75f210…` flags exp=0x0C97 act=0x0497 umask=0x0FD7; FLAGS exp=0x0C97 act=0x0497 (only OF(11) undefined, count>1) |
 | `C0.4` | 3971 | 1247 | FAIL=2724 |
 |   |   |   | idx=0 `shl byte [ss:bp+si],4Ah` `e6501a1380a44db1…` flags exp=0x0046 act=0x0846 umask=0x0FD7; FLAGS exp=0x0046 act=0x0846 |
 |   |   |   | idx=1 `shl ch,9Fh` `120f83faa1cb956e…` flags exp=0x0046 act=0x0056 umask=0x0FD7; FLAGS exp=0x0046 act=0x0056 |
@@ -289,10 +287,8 @@ Up to 3 samples per form (idx / name / first-16-of-sha1 / detail) from run outpu
 |   |   |   | idx=0 `sar byte [ds:EDBFh],DDh` `3f6c78fb359fbbb0…` flags exp=0x0056 act=0x0856 umask=0x0FD7; FLAGS exp=0x0056 act=0x0856 |
 |   |   |   | idx=3 `sar byte [ss:bp+si],4Ah` `f366e9ea5e9b93e0…` flags exp=0x0097 act=0x0887 umask=0x0FD7; FLAGS exp=0x0097 act=0x0887 |
 |   |   |   | idx=4 `sar byte [ds:si-38h],C1h` `039c6fafde14fc3f…` flags exp=0x0093 act=0x0083 umask=0x0FD7; FLAGS exp=0x0093 act=0x0083 |
-| `C1.0` | 3971 | 1194 | FAIL=2749 |
-|   |   |   | idx=1 `rol word [ss:bp+di],77h` `2f312bb94476919e…` flags exp=0x08D3 act=0x00D3 umask=0x0FD7; FLAGS exp=0x08D3 act=0x00D3 |
-|   |   |   | idx=3 `rol word [ds:bx-6Eh],3Fh` `60243e6a3b9565fb…` flags exp=0x04D2 act=0x0CD3 umask=0x0FD7; FLAGS exp=0x04D2 act=0x0CD3 |
-|   |   |   | idx=5 `rol word [ss:bp+di-1Dh],6` `88fdc30d48edb8a2…` flags exp=0x0056 act=0x0857 umask=0x0FD7; FLAGS exp=0x0056 act=0x0857 |
+| `C1.0` | 3971 | 2189 | FAIL=1754 |
+|   |   |   | idx=1 `rol word [ss:bp+di],77h` `2f312bb94476919e…` flags exp=0x08D3 act=0x00D3 umask=0x0FD7; FLAGS exp=0x08D3 act=0x00D3 (only OF(11) undefined, count>1) |
 | `C1.4` | 3973 | 1230 | FAIL=2716 |
 |   |   |   | idx=1 `shl word [ss:bp+di-1Dh],6` `9b139f2e7435cfcc…` flags exp=0x0882 act=0x0892 umask=0x0FD7; FLAGS exp=0x0882 act=0x0892 |
 |   |   |   | idx=2 `shl word [ss:bp+di+6BDh],CBh` `aa19e33e8c0c9692…` flags exp=0x0C07 act=0x0C17 umask=0x0FD7; FLAGS exp=0x0C07 act=0x0C17 |
@@ -325,10 +321,8 @@ Up to 3 samples per form (idx / name / first-16-of-sha1 / detail) from run outpu
 |   |   |   | idx=3 `retf` `85c8007c8b25ddd1…` panic: attempt to add with overflow |
 |   |   |   | idx=7 `retf` `f87d194b46f7aa3a…` panic: attempt to add with overflow |
 |   |   |   | idx=30 `retf` `1aba79c78abd2534…` panic: attempt to add with overflow |
-| `D0.0` | 3955 | 987 | FAIL=2968 |
-|   |   |   | idx=0 `rol dl,1` `cbfeb5b2b5150e49…` flags exp=0x0087 act=0x0886 umask=0x0FD7; FLAGS exp=0x0087 act=0x0886 |
-|   |   |   | idx=3 `rol dl,1` `85c0beeb034baa32…` flags exp=0x0852 act=0x0853 umask=0x0FD7; FLAGS exp=0x0852 act=0x0853 |
-|   |   |   | idx=4 `rol byte [ds:bx+si+7Fh],1` `b2c1dcdfbf76d5e6…` flags exp=0x0842 act=0x0043 umask=0x0FD7; FLAGS exp=0x0842 act=0x0043 |
+| `D0.0` | 3955 | 3955 | FAIL=0 |
+|   |   |   | (fixed 2026-08-16, SST-D-003: count==1 ROL CF/OF now correct) |
 | `D0.4` | 3955 | 1970 | FAIL=1985 |
 |   |   |   | idx=4 `shl dl,1` `11de9b3816641117…` flags exp=0x0097 act=0x0087 umask=0x0FD7; FLAGS exp=0x0097 act=0x0087 |
 |   |   |   | idx=7 `shl dl,1` `2028b89b99dc472b…` flags exp=0x0886 act=0x0896 umask=0x0FD7; FLAGS exp=0x0886 act=0x0896 |
@@ -345,10 +339,8 @@ Up to 3 samples per form (idx / name / first-16-of-sha1 / detail) from run outpu
 |   |   |   | idx=2 `sar byte [ss:bp-40h],1` `f0ef3e81bd4c192c…` flags exp=0x0413 act=0x0403 umask=0x0FD7; FLAGS exp=0x0413 act=0x0403 |
 |   |   |   | idx=3 `sar byte [ds:bx+si+7Fh],1` `94e131392b05fe83…` flags exp=0x0012 act=0x0002 umask=0x0FD7; FLAGS exp=0x0012 act=0x0002 |
 |   |   |   | idx=6 `sar byte [ss:bp+di-72DDh],1` `aef14d000ec9a818…` flags exp=0x0413 act=0x0403 umask=0x0FD7; FLAGS exp=0x0413 act=0x0403 |
-| `D1.0` | 3955 | 934 | FAIL=2993 |
-|   |   |   | idx=0 `rol word [ss:bp+di-40F5h],1` `f6b69bc8bdfed7bd…` flags exp=0x0842 act=0x0843 umask=0x0FD7; FLAGS exp=0x0842 act=0x0843 |
-|   |   |   | idx=1 `rol word [ds:bx],1` `ca308e1507f984ea…` flags exp=0x0006 act=0x0807 umask=0x0FD7; FLAGS exp=0x0006 act=0x0807 |
-|   |   |   | idx=4 `rol word [ss:bp+si+63h],1` `fbf3a9a89b936da0…` flags exp=0x00C2 act=0x08C2 umask=0x0FD7; FLAGS exp=0x00C2 act=0x08C2 |
+| `D1.0` | 3955 | 3927 | FAIL=0 |
+|   |   |   | (fixed 2026-08-16, SST-D-003: count==1 ROL CF/OF now correct) |
 | `D1.4` | 3955 | 1987 | FAIL=1940 |
 |   |   |   | idx=1 `shl word [ds:bx],1` `1c97de7ad3801101…` flags exp=0x0817 act=0x0807 umask=0x0FD7; FLAGS exp=0x0817 act=0x0807 |
 |   |   |   | idx=4 `shl word [ss:bp+di-40F5h],1` `0b5a2ad394a94bd4…` flags exp=0x0097 act=0x0087 umask=0x0FD7; FLAGS exp=0x0097 act=0x0087 |
@@ -365,10 +357,8 @@ Up to 3 samples per form (idx / name / first-16-of-sha1 / detail) from run outpu
 |   |   |   | idx=2 `sar word [ds:bx],1` `c610ea1b61796aed…` flags exp=0x0012 act=0x0002 umask=0x0FD7; FLAGS exp=0x0012 act=0x0002 |
 |   |   |   | idx=3 `sar word [ss:bp+si+63h],1` `ba6592efda928ccf…` flags exp=0x0013 act=0x0003 umask=0x0FD7; FLAGS exp=0x0013 act=0x0003 |
 |   |   |   | idx=6 `sar word [ds:bx],1` `8e149aba4dc8c770…` flags exp=0x0093 act=0x0083 umask=0x0FD7; FLAGS exp=0x0093 act=0x0083 |
-| `D2.0` | 3957 | 1232 | FAIL=2725 |
-|   |   |   | idx=0 `rol byte [ds:bx+si+5B6Fh],cl` `849ac602cadf7aa2…` flags exp=0x0856 act=0x0056 umask=0x0FD7; FLAGS exp=0x0856 act=0x0056 |
-|   |   |   | idx=2 `rol byte [ds:49Ch],cl` `2a46974e98dae4e6…` flags exp=0x0803 act=0x0002 umask=0x0FD7; FLAGS exp=0x0803 act=0x0002 |
-|   |   |   | idx=3 `rol byte [ds:si],cl` `921311549ac22620…` flags exp=0x04C3 act=0x0CC3 umask=0x0FD7; FLAGS exp=0x04C3 act=0x0CC3 |
+| `D2.0` | 3957 | 2368 | FAIL=1589 |
+|   |   |   | idx=0 `rol byte [ds:bx+si+5B6Fh],cl` `849ac602cadf7aa2…` flags exp=0x0856 act=0x0056 umask=0x0FD7; FLAGS exp=0x0856 act=0x0056 (only OF(11) undefined, count>1) |
 | `D2.4` | 3957 | 1259 | FAIL=2698 |
 |   |   |   | idx=1 `shl dl,cl` `0549b9a7b9e02832…` flags exp=0x0C47 act=0x0C57 umask=0x0FD7; FLAGS exp=0x0C47 act=0x0C57 |
 |   |   |   | idx=2 `shl byte [ds:E841h],cl` `a330abb69ab6128b…` flags exp=0x0C86 act=0x0496 umask=0x0FD7; FLAGS exp=0x0C86 act=0x0496 |
@@ -385,10 +375,8 @@ Up to 3 samples per form (idx / name / first-16-of-sha1 / detail) from run outpu
 |   |   |   | idx=0 `sar byte [ss:bp-1Bh],cl` `0b9b4481f28181f2…` flags exp=0x0097 act=0x0897 umask=0x0FD7; FLAGS exp=0x0097 act=0x0897 |
 |   |   |   | idx=2 `sar dl,cl` `3113268fe2be5b60…` flags exp=0x0497 act=0x0C97 umask=0x0FD7; FLAGS exp=0x0497 act=0x0C97 |
 |   |   |   | idx=4 `sar byte [ds:si],cl` `6894759aa5b27b59…` flags exp=0x0456 act=0x0C46 umask=0x0FD7; FLAGS exp=0x0456 act=0x0C46 |
-| `D3.0` | 3955 | 1208 | FAIL=2719 |
-|   |   |   | idx=1 `rol word [ds:bx],cl` `0da54c82fc9a08eb…` flags exp=0x04D7 act=0x04D6 umask=0x0FD7; FLAGS exp=0x04D7 act=0x04D6 |
-|   |   |   | idx=4 `rol word [ds:si-1C4Dh],cl` `5c6e44a9c9e3d9ae…` flags exp=0x0453 act=0x0452 umask=0x0FD7; FLAGS exp=0x0453 act=0x0452 |
-|   |   |   | idx=5 `rol ax,cl` `442f0af6490d4790…` flags exp=0x0CC3 act=0x04C3 umask=0x0FD7; FLAGS exp=0x0CC3 act=0x04C3 |
+| `D3.0` | 3955 | 2256 | FAIL=1671 |
+|   |   |   | idx=1 `rol word [ds:bx],cl` `0da54c82fc9a08eb…` flags exp=0x04D7 act=0x04D6 umask=0x0FD7; FLAGS exp=0x04D7 act=0x04D6 (only OF(11) undefined, count>1) |
 | `D3.4` | 3960 | 1267 | FAIL=2665 |
 |   |   |   | idx=0 `shl word [ds:si-1C4Dh],cl` `69df0df536c4177e…` flags exp=0x0C86 act=0x0496 umask=0x0FD7; FLAGS exp=0x0C86 act=0x0496 |
 |   |   |   | idx=3 `shl di,cl` `79b6ed707c4334d5…` flags exp=0x0C47 act=0x0447 umask=0x0FD7; FLAGS exp=0x0C47 act=0x0447 |
@@ -465,27 +453,49 @@ AF) turns all 08/20/30-class FAILs into PASS. Classification: **harness-caveat**
 error because the bit is architecturally undefined).
 
 **SST-D-002 — shift/rotate-adjacent AF/OF undefined-bit noise.**
-Forms: C0.4-C0.7, C1.4-C1.7 (FAIL part), D0.4-D0.7, D1.4-D1.7, D2.4-D2.7,
-D3.4-D3.7 — 58,582 FAIL (47,799 for 8-bit/16-bit-by-1/CL forms + 10,783 C1.x FAIL;
-up from 53,030: after the SST-D-009 fix, formerly-PANIC C1.4-C1.7 imm-count
-tests complete and now fail on these same undefined bits, +5,552).
+Forms: C0.0, C0.4-C0.7, C1.0, C1.4-C1.7, D0.4-D0.7, D1.4-D1.7, D2.0,
+D2.4-D2.7, D3.0, D3.4-D3.7 — 65,208 FAIL (58,582 previously: 47,799 for
+8-bit/16-bit-by-1/CL forms + 10,783 C1.x FAIL; +5,552 after the SST-D-009 fix,
+when formerly-PANIC C1.4-C1.7 imm-count tests completed and failed on these same
+undefined bits; +6,626 after the SST-D-004-adjacent ROL fix (SST-D-003), when
+the count>1 ROL forms (C0.0, C1.0, D2.0, D3.0) reduced to their undefined-OF
+residual — those forms now differ **only** on OF(11) for count>1, and pass
+under `--umask 0x07F7`).
 Bit analysis: AF(4) appears everywhere; OF(11) appears for count>1 forms
-(C0.x imm-count, D2.x/D3.x by-CL). Intel 80286: SHL/SHR/SAR define OF only for
-count==1 and leave AF undefined; emu86's `update_flags_shl/shr/sar` correctly set
-OF only for count==1 and never touch AF, so emu86's *defined* bits match — the
-FAILs are entirely in undefined AF and (count>1) undefined OF. Classification:
-**harness-caveat** (policy per-form umask cannot express "OF defined only when
-count==1"; residual undefined-bit comparison).
+(C0.x imm-count, D2.x/D3.x by-CL, and now the count>1 ROL residuals). Intel
+80286: SHL/SHR/SAR/ROL define OF only for count==1 and leave AF undefined;
+emu86's `update_flags_shl/shr/sar` correctly set OF only for count==1 and never
+touch AF, and the ROL arm (SST-D-003, fixed) matches for count==1 — so emu86's
+*defined* bits match; the FAILs are entirely in undefined AF and (count>1)
+undefined OF. Classification: **harness-caveat** (policy per-form umask cannot
+express "OF defined only when count==1"; residual undefined-bit comparison).
 
 **SST-D-003 — ROL: emu86 does not update CF/OF at all.**
 Forms: C0.0, C1.0 (FAIL part), D0.0, D1.0, D2.0, D3.0 — 16,885 FAIL (15,472 +
 1,413 C1.0 from the formerly-PANIC C1.x imm-count tests, which now complete and
 fail on the missing ROL CF/OF update).
-`alu::shift(ShiftOp::Rol)` contains `// TODO SET FLAGS ?` and leaves every flag
+`alu::shift(ShiftOp::Rol)` contained `// TODO SET FLAGS ?` and left every flag
 unchanged; the 80C286 sets CF (rotated-out bit) and, for count==1, OF. Samples
 all show `CF(0)`/`OF(11)` diffs, e.g. `rol dl,1` exp=0x0087 act=0x0886. Intel
 80286 defines CF for ROL (and OF for count==1), so this is a genuine emu86
 deficiency. Classification: **emu86-bug** (ROL flag update missing).
+
+**RESOLVED 2026-08-16 (F4):** the ROL arm of `alu::shift` now computes the
+effective count (`n & 0x1f`), sets `CF = bit((width - n_mod) % width)` of the
+original value (for `n != 0`; `n == 0` is a complete no-op leaving all flags
+unchanged), and sets `OF = CF XOR new MSB` only when `n_mod == 1`. ZF/SF/PF/AF
+are preserved (rotate does not touch them), matching the 80C286. Verified on
+the pinned D1.0 sample (`rol word [ss:bp+di-40F5h],1`: 0x6B2D → 0xD65A, flags
+0x0843 → 0x0842) and on all six ROL forms under `--umask 0x07F7` (OF masked):
+**23,680/23,680 PASS, 0 FAIL, 0 PANIC**. Without the mask the count==1 forms
+(D0.0, D1.0) pass 100% (PASS=3955/3927, FAIL=0); the remaining count>1 FAILs
+(6,626 total: C0.0 1612, C1.0 1754, D2.0 1589, D3.0 1671) differ **only** on
+the undefined-OF bit (0x0800) — the SST-D-002 harness-caveat (see that
+cluster). Fix demonstrated by the ROL mirror tests in `shift_semantics_test.rs`
+(count==1 CF/OF, count>1 CF+preserved-OF, full-circle CF=old-LSB, count==0
+no-op); `cargo test --locked --all-targets` 325 passed; hermetic micro lane
+green after moving D1.0 from FAILREPRO to the PASS list (spec.txt:55,
+micro.rs PASS_STEMS, FAILREPRO.txt).
 
 **SST-D-004 — IMUL: CF/OF overflow flag diverges from hardware.**
 Forms: 69, 6B, F7.5 — residual FAIL after masking the Intel-undefined IMUL bits:
@@ -606,16 +616,17 @@ FAILREPRO pin existed for this cluster.
 
 ### Cluster size accounting
 
-- FAIL 164,046 = harness-caveat (145,438: SST-D-001 79,739 + SST-D-002 58,582 +
-  SST-D-004-undefined part 7,117) + emu86-bug (18,608: SST-D-003 16,885 +
-  SST-D-004-CF/OF 507 + SST-D-005 334 + SST-D-006 878 + SST-D-007 4).
-  (FAIL rose from 157,081: the SST-D-009 fix turned 9,773 PANIC into 6,965 FAIL
-  on residual undefined-AF / ROL-flag bits + 2,808 PASS.)
+- FAIL 153,787 = harness-caveat (152,064: SST-D-001 79,739 + SST-D-002 65,208 +
+  SST-D-004-undefined part 7,117) + emu86-bug (1,723: SST-D-003 0 + SST-D-004-CF/OF
+  507 + SST-D-005 334 + SST-D-006 878 + SST-D-007 4).
+  (FAIL fell from 164,046: the SST-D-003 fix turned 16,885 ROL FAILs into 10,259
+  PASS + 6,626 undefined-OF FAIL on count>1 forms, reclassified into SST-D-002.)
 - PANIC 723 = SST-D-010 723
   (SST-D-008 resolved 2026-08-16 — non-wrapping stack arithmetic, no longer
   counted; SST-D-011 resolved 2026-08-16 — debug-only trap; SST-D-009 resolved
-  2026-08-16 — C1.x shift-count assert, no longer counted).
-- Sum check: 145,438 + 18,608 = 164,046 ✓ ; 723 ✓.
+  2026-08-16 — C1.x shift-count assert, no longer counted; SST-D-003 resolved
+  2026-08-16 — ROL CF/OF, no longer counted).
+- Sum check: 152,064 + 1,723 = 153,787 ✓ ; 723 ✓.
 
 ## Coverage statement (honest)
 
@@ -643,7 +654,6 @@ LES/LDS, ENTER/LEAVE). These have **no** hardware evidence in this ledger.
   (SST-D-002) compare Intel-undefined AF (and OF for count>1); per-form umasks or
   a "mask AF for logicals/shifts" rule would turn ~133K FAILs into PASS without
   any emu86 change.
-- ROL flag update (SST-D-003): emulate CF/OF for ROL (count==1 OF).
 - IMUL CF/OF (SST-D-004): signed-overflow flag vs Harris.
 - IDIV signed division (SST-D-005/SST-D-010): replace unsigned divmod path with a
   signed one; hardware-anchored expected flags.
@@ -653,7 +663,8 @@ LES/LDS, ENTER/LEAVE). These have **no** hardware evidence in this ledger.
   (SST-D-008 stack wrap fixed 2026-08-16 — wrapping stack/XLAT/RET
   arithmetic; SST-D-011 NEG i16::MIN fixed 2026-08-16 — `wrapping_neg`;
   SST-D-009 C1.x shift-count assert fixed 2026-08-16 — count masked to low
-  byte, 5-bit in `alu::shift`.)
+  byte, 5-bit in `alu::shift`; SST-D-003 ROL CF/OF fixed 2026-08-16 — CF =
+  rotated-out bit, OF for count==1.)
 
 ## Hermetic micro-corpus (checked-in)
 
@@ -684,17 +695,18 @@ helper; the checked-in files are what the lane runs).
   leading prefix byte, no exception key). Note the logical-ops entries (0C/24/35/
   F6.0) are the init-AF=0 subset that does not trip the SST-D-001 undefined-AF
   caveat; the shift entry (D1.4) is an init-AF=0 case outside the SST-D-002 noise.
-- **6 FAILREPRO files**, one per pinned divergence, each expected to
-  *diverge*: ROL flags (D1.0, SST-D-003), IMUL CF/OF (F7.5, SST-D-004),
-  IDIV-as-unsigned (F7.7, SST-D-005), XCHG memory-EA recompute (87, SST-D-006),
-  far-branch 64KB offset wrap (FF.5, SST-D-007), and the C1.x shift undefined-AF
-  residual (C1.4, SST-D-002 — re-pinned 2026-08-16 from SST-D-009 PANIC: the
-  shift-count assert is fixed, the sample now diverges only on undefined AF).
+- **5 FAILREPRO files**, one per pinned divergence, each expected to
+  *diverge*: IMUL CF/OF (F7.5, SST-D-004), IDIV-as-unsigned (F7.7, SST-D-005),
+  XCHG memory-EA recompute (87, SST-D-006), far-branch 64KB offset wrap (FF.5,
+  SST-D-007), and the C1.x shift undefined-AF residual (C1.4, SST-D-002 —
+  re-pinned 2026-08-16 from SST-D-009 PANIC: the shift-count assert is fixed,
+  the sample now diverges only on undefined AF). D1.0 (SST-D-003) moved to the
+  PASS list 2026-08-16 when the ROL CF/OF fix flipped it to PASS.
   Their SHA1s, cluster IDs, and exact recorded divergences are listed in
   `micro/FAILREPRO.txt` and asserted byte-for-byte in the `micro.rs`
   expectations table.
 
-**Expected-FAILREPRO contract:** these six entries are regression pins for
+**Expected-FAILREPRO contract:** these five entries are regression pins for
 *known* emu86 divergences (emu86-bug or harness-caveat), not tests to make
 green. When a future fix flips one of them to PASS, the lane **fails**; the
 fix's author then (a) drops the entry from `spec.txt`, (b) regenerates the

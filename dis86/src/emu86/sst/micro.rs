@@ -35,8 +35,8 @@ use super::runner::{run_file, FileSummary, RunOpts, DEFAULT_FLAGS_UMASK};
 /// Stems of the PASS micro files (one per family), mirroring `spec.txt`.
 const PASS_STEMS: &[&str] = &[
   "04", "0C", "14", "1C", "24", "2D", "35", "3D", "40", "4F", "50", "58", "74",
-  "89", "8B", "91", "98", "99", "9C", "A2", "B8", "C3", "D1.4", "E2", "E3",
-  "EB", "F6.0", "F6.2", "F7.3", "F8", "FC",
+  "89", "8B", "91", "98", "99", "9C", "A2", "B8", "C3", "D1.0", "D1.4", "E2",
+  "E3", "EB", "F6.0", "F6.2", "F7.3", "F8", "FC",
 ];
 
 /// Expected divergence of one FAILREPRO entry, keyed by filename and SHA1.
@@ -54,13 +54,6 @@ struct FailExpect {
 }
 
 const FAILREPRO_EXPECT: &[FailExpect] = &[
-  FailExpect {
-    file: "D1.0",
-    cluster: "SST-D-003",
-    hash_prefix: "f6b69bc8bdfed7bd1dd7",
-    bucket: "FAIL",
-    detail: "flags exp=0x0842 act=0x0843 umask=0x0FD7",
-  },
   FailExpect {
     file: "F7.5",
     cluster: "SST-D-004",

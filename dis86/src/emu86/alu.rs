@@ -331,12 +331,32 @@ pub fn shift(op: ShiftOp, a: Value, n: u8, mut f: Flags) -> (Value, Flags) {
       }
     }
     ShiftOp::Rol => {
+      let n = n & 0x1f;
+      let width = match size {
+        1 => 8,
+        2 => 16,
+        _ => unreachable!(),
+      };
+      let n_mod = n % width;
       result = match size {
         1 => (a as u8).rotate_left(n as u32) as u16,
         2 => a.rotate_left(n as u32),
         _ => unreachable!(),
       };
-      // TODO SET FLAGS ?
+      if n != 0 {
+        // CF = the last bit rotated out: the original bit at position
+        // (width - n_mod) mod width. A full-circle rotate (n_mod == 0, n != 0)
+        // therefore sets CF = original LSB; the 80C286 leaves CF unchanged for
+        // count == 0 (no-op). OF is defined only when n_mod == 1: OF = CF XOR
+        // new MSB (i.e. MSB changed). ZF/SF/PF/AF are undefined for ROL and
+        // left unchanged, matching the 80C286 captures.
+        let cf = ((a >> ((width - n_mod) % width)) & 1) != 0;
+        f.set(FLAG_CF, cf);
+        if n_mod == 1 {
+          let new_msb = ((result >> (width - 1)) & 1) != 0;
+          f.set(FLAG_OF, cf ^ new_msb);
+        }
+      }
     }
   };
 
