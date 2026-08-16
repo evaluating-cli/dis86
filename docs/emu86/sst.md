@@ -45,8 +45,8 @@ no REP/prefix semantics, no I/O, no far-segment decode path, or no step arm.
 | files run | 258 |
 | tests visited (total in files) | 1,162,000 |
 | tests executed (visited − filtered − revoked) | 1,014,157 |
-| **PASS** | **849,877** (83.81% of executed) |
-| **FAIL** | **152,640** (15.05%) |
+| **PASS** | **850,133** (83.83% of executed) |
+| **FAIL** | **152,384** (15.03%) |
 | **DECODE_ERR** | **0** |
 | **PANIC** | **0** |
 | SKIP_EXCEPTION | 11,640 |
@@ -57,16 +57,17 @@ no REP/prefix semantics, no I/O, no far-segment decode path, or no step arm.
 Bucket-sum check: `PASS+FAIL+DECODE_ERR+PANIC+SKIP_EXCEPTION+SKIP_32BIT == executed`
 holds; `executed+filtered+revoked == visited` holds.
 
-Files with any FAIL/DECODE_ERR/PANIC: **90** (out of 258).
+Files with any FAIL/DECODE_ERR/PANIC: **68** (out of 258).
 DECODE_ERR count: **0** across the whole run.
 
 ## Per-form breakdown (only forms with non-pass, non-filtered, non-skip-exception outcomes)
 
-90 forms have FAIL and/or PANIC (recounted from the F7 run: 26 forms resolved to
-zero FAIL/PANIC by fixes F1-F8, and the 20 short-branch forms 70-7F (minus 77),
-E0-E3, EB marked SST-D-012 below are now explicitly listed — the original count
-of 95 omitted them). Table columns: form | executed | PASS | outcomes.
-Up to 3 samples per form (idx / name / first-16-of-sha1 / detail) from run output.
+68 forms have FAIL and/or PANIC (recounted from the D-012 full run: F8 resolved
+F7.7 and D-012 resolved the 20 short-branch forms 70-7F (minus 77), E0-E3, EB,
+down from the F7 recount of 90; the table retains stale rows for already-resolved
+clusters — 07, D7, F7.3, F7.5, FF.3, FF.5, F7.7 — kept as historical record).
+Table columns: form | executed | PASS | outcomes. Up to 3 samples per form
+(idx / name / first-16-of-sha1 / detail) from run output.
 
 | `07` | 4854 | 4645 | PANIC=188 |
 |   |   |   | idx=31 `pop es` `51c521c028f008be…` panic: attempt to add with overflow |
@@ -187,21 +188,21 @@ Up to 3 samples per form (idx / name / first-16-of-sha1 / detail) from run outpu
 | `69` | 3986 | 224 | FAIL=3726 |
 | `6B` | 3982 | 235 | FAIL=3711 |
 |   |   |   | idx=2 `imul si,[ds:bx+si-51h],FFF4h` `ab64f9df2ab273e8…` flags exp=0x0C17 act=0x0C53 umask=0x0FD7; FLAGS exp=0x0C17 act=0x0C53 |
-| `70` | 5000 | 4988 | FAIL=12 (SST-D-012) |
-| `71` | 5000 | 4987 | FAIL=13 (SST-D-012) |
-| `72` | 5000 | 4983 | FAIL=17 (SST-D-012) |
-| `73` | 5000 | 4992 | FAIL=8 (SST-D-012) |
-| `74` | 5000 | 4981 | FAIL=19 (SST-D-012) |
-| `75` | 5000 | 4994 | FAIL=6 (SST-D-012) |
-| `76` | 5000 | 4975 | FAIL=25 (SST-D-012) |
-| `78` | 5000 | 4987 | FAIL=13 (SST-D-012) |
-| `79` | 5000 | 4988 | FAIL=12 (SST-D-012) |
-| `7A` | 5000 | 4989 | FAIL=11 (SST-D-012) |
-| `7B` | 5000 | 4986 | FAIL=14 (SST-D-012) |
-| `7C` | 5000 | 4989 | FAIL=11 (SST-D-012) |
-| `7D` | 5000 | 4986 | FAIL=14 (SST-D-012) |
-| `7E` | 5000 | 4977 | FAIL=23 (SST-D-012) |
-| `7F` | 5000 | 4997 | FAIL=3 (SST-D-012) |
+| `70` | 5000 | 5000 | FAIL=0 (SST-D-012 RESOLVED) |
+| `71` | 5000 | 5000 | FAIL=0 (SST-D-012 RESOLVED) |
+| `72` | 5000 | 5000 | FAIL=0 (SST-D-012 RESOLVED) |
+| `73` | 5000 | 5000 | FAIL=0 (SST-D-012 RESOLVED) |
+| `74` | 5000 | 5000 | FAIL=0 (SST-D-012 RESOLVED) |
+| `75` | 5000 | 5000 | FAIL=0 (SST-D-012 RESOLVED) |
+| `76` | 5000 | 5000 | FAIL=0 (SST-D-012 RESOLVED) |
+| `78` | 5000 | 5000 | FAIL=0 (SST-D-012 RESOLVED) |
+| `79` | 5000 | 5000 | FAIL=0 (SST-D-012 RESOLVED) |
+| `7A` | 5000 | 5000 | FAIL=0 (SST-D-012 RESOLVED) |
+| `7B` | 5000 | 5000 | FAIL=0 (SST-D-012 RESOLVED) |
+| `7C` | 5000 | 5000 | FAIL=0 (SST-D-012 RESOLVED) |
+| `7D` | 5000 | 5000 | FAIL=0 (SST-D-012 RESOLVED) |
+| `7E` | 5000 | 5000 | FAIL=0 (SST-D-012 RESOLVED) |
+| `7F` | 5000 | 5000 | FAIL=0 (SST-D-012 RESOLVED) |
 | `80.1` | 3972 | 1988 | FAIL=1984 |
 |   |   |   | idx=1 `or byte [ds:bx+124Eh],B3h` `baf6d20652456c60…` flags exp=0x0482 act=0x0492 umask=0x0FD7; FLAGS exp=0x0482 act=0x0492 |
 |   |   |   | idx=3 `or dh,51h` `d81bd93ffafb22c3…` flags exp=0x0482 act=0x0492 umask=0x0FD7; FLAGS exp=0x0482 act=0x0492 |
@@ -406,11 +407,11 @@ Up to 3 samples per form (idx / name / first-16-of-sha1 / detail) from run outpu
 |   |   |   | idx=38 `xlatb` `fcaa2b4557093807…` panic: attempt to add with overflow |
 |   |   |   | idx=39 `xlatb` `d59bb504647cb61e…` panic: attempt to add with overflow |
 |   |   |   | idx=52 `xlatb` `c6a11aab7147d87b…` panic: attempt to add with overflow |
-| `E0` | 4849 | 4844 | FAIL=5 (SST-D-012) |
-| `E1` | 4846 | 4832 | FAIL=14 (SST-D-012) |
-| `E2` | 4848 | 4829 | FAIL=19 (SST-D-012) |
-| `E3` | 4847 | 4846 | FAIL=1 (SST-D-012) |
-| `EB` | 3964 | 3948 | FAIL=16 (SST-D-012) |
+| `E0` | 4849 | 4849 | FAIL=0 (SST-D-012 RESOLVED) |
+| `E1` | 4846 | 4846 | FAIL=0 (SST-D-012 RESOLVED) |
+| `E2` | 4848 | 4848 | FAIL=0 (SST-D-012 RESOLVED) |
+| `E3` | 4847 | 4847 | FAIL=0 (SST-D-012 RESOLVED) |
+| `EB` | 3964 | 3964 | FAIL=0 (SST-D-012 RESOLVED) |
 | `F6.0` | 3968 | 1967 | FAIL=2001 |
 |   |   |   | idx=2 `test byte [ss:bp+30h],75h` `b7529a4b5f3d43bf…` flags exp=0x0002 act=0x0012 umask=0x0FD7; FLAGS exp=0x0002 act=0x0012 |
 |   |   |   | idx=4 `test byte [ds:bx+di],6Ah` `91ec7868d388ba88…` flags exp=0x0046 act=0x0056 umask=0x0FD7; FLAGS exp=0x0046 act=0x0056 |
@@ -618,9 +619,19 @@ to `init` and is recorded "unchanged/absent"; emu86 (one step, landing at
 `target = init − 1`) is then compared to `expected = init` → off by one. EB
 (unconditional) is affected → not a flag caveat. Classification:
 **harness/runner bug (false-FAIL)** — emu86 is correct; the runner's absent-IP
-comparison is wrong. OPEN: fix is a one-liner at `runner.rs:230`
-(`init[IP_IDX].wrapping_sub(1)`), flipping all 256 false FAILs to PASS with zero
-emu86 changes; deferred as a future task (out of the F7 scope).
+comparison is wrong.
+
+**RESOLVED 2026-08-16 (D-012):** the absent-IP arm of `compare_state` now applies
+the same `−1` convention (`init[IP_IDX].wrapping_sub(1)` at `runner.rs:230`):
+emu86 stops one step before the terminating HALT, so whether the reference's
+final IP is listed or absent, the expected emu86 IP is the recorded value minus
+one. Zero emu86 changes. Full-corpus stride-1 recount confirms exactly 256
+false FAILs flipped to PASS with zero regressions: PASS 849,877 → 850,133,
+FAIL 152,640 → 152,384, PANIC 0; all 20 short-branch forms now 100% PASS
+(70-7F, E0-E3, EB). The fix is demonstrated by the runner unit test
+`absent_final_ip_short_branch_onto_halt_passes_d012` (JMP rel8 = -3 onto a HALT
+byte at init−1, absent final IP → PASS); `cargo test --locked --all-targets`
+339 passed.
 
 ### PANIC clusters (all `catch_unwind`-captured; reported, never aborts)
 
@@ -698,16 +709,15 @@ FAILREPRO pin existed for this cluster.
 
 ### Cluster size accounting
 
-- FAIL 152,640 = harness-caveat (152,384: SST-D-001 79,739 + SST-D-002 65,208 +
-  SST-D-004-undefined part 7,437) + SST-D-012 256
-  (short-branch IP off-by-one — runner terminating-HALT convention, harness bug,
-  open; identified below).
+- FAIL 152,384 = harness-caveat only (SST-D-001 79,739 + SST-D-002 65,208 +
+  SST-D-004-undefined part 7,437). All emu86-bug FAIL clusters are now resolved.
   (The prior total 152,402 under-counted the clean-F6 actual 152,978 by 576:
   320 from the D-004-undefined miscount (7,117 → 7,437 — the 69/6B undefined-
   flag part recomputed from the F7 sweep: 69 3,726 + 6B 3,711) and 256 from the
   SST-D-012 short-branch FAILs absent from the ledger. The F7 fix then turned
   the 4 SST-D-007 FAILs into PASS: 152,978 → 152,974. The F8 fix then turned
-  the 334 SST-D-005 FAILs into PASS: 152,974 → 152,640.)
+  the 334 SST-D-005 FAILs into PASS: 152,974 → 152,640. The D-012 runner fix
+  then turned the 256 SST-D-012 false FAILs into PASS: 152,640 → 152,384.)
 - PANIC 0 = no remaining PANIC clusters
   (SST-D-010 resolved 2026-08-16 — signed IDIV, no longer counted; SST-D-008
   resolved 2026-08-16 — non-wrapping stack arithmetic, no longer counted;
@@ -716,7 +726,7 @@ FAILREPRO pin existed for this cluster.
   2026-08-16 — ROL CF/OF, no longer counted; SST-D-006 resolved 2026-08-16 —
   XCHG memory EA, no longer counted; SST-D-007 resolved 2026-08-16 — multi-byte
   reads wrap the EA offset at 0x10000, no longer counted).
-- Sum check: 152,384 + 256 = 152,640 ✓ ; PANIC 0 ✓.
+- Sum check: 79,739 + 65,208 + 7,437 = 152,384 ✓ ; PANIC 0 ✓.
 
 ## Coverage statement (honest)
 
@@ -727,9 +737,9 @@ PUSH/POP (all forms), PUSHF/POPF, XCHG, MOV (all forms), TEST, LEA, NOP, CBW/CWD
 far/near CALL/JMP/RET, Jcc/LOOP/JCXZ, flag ops (CLC/STC/CLD/STD/CLI/STI),
 XLAT, shifts/rotates (SHL/SHR/SAR/ROL), grp3 TEST, MUL/IMUL/DIV/IDIV. For all of
 these, the *defined* flag bits and register/memory results match hardware except
-for the clusters above; 81.56% of executed tests pass outright and the FAIL
-surface decomposes into (a) architecturally-undefined bits (harness-caveat),
-(b) the listed emu86-bug clusters.
+for the clusters above; 83.83% of executed tests pass outright and the FAIL
+surface is now **entirely harness-caveat** (architecturally-undefined AF/OF bits);
+all emu86-bug clusters are resolved.
 
 **Planned-but-not-validated (deferred, per policy):** REP/string family
 (MOVS/CMPS/STOS/LODS/SCAS/INS/OUTS), segment/operand/address/LOCK prefixes, IN/OUT
@@ -743,11 +753,7 @@ LES/LDS, ENTER/LEAVE). These have **no** hardware evidence in this ledger.
 - Policy `flags_umask` gap: logical-op forms (SST-D-001) and shift forms
   (SST-D-002) compare Intel-undefined AF (and OF for count>1); per-form umasks or
   a "mask AF for logicals/shifts" rule would turn ~133K FAILs into PASS without
-  any emu86 change.
-- Short-branch IP off-by-one (SST-D-012): runner `compare_state` absent-IP case
-  does not apply the terminating-HALT −1; one-liner at `runner.rs:230`
-  (`init[IP_IDX].wrapping_sub(1)`); flips 256 false FAILs to PASS, zero emu86
-  changes.
+  any emu86 change. This is the entire remaining FAIL surface (Track 2).
   (SST-D-008 stack wrap fixed 2026-08-16 — wrapping stack/XLAT/RET
   arithmetic; SST-D-011 NEG i16::MIN fixed 2026-08-16 — `wrapping_neg`;
   SST-D-009 C1.x shift-count assert fixed 2026-08-16 — count masked to low
@@ -756,7 +762,9 @@ LES/LDS, ENTER/LEAVE). These have **no** hardware evidence in this ledger.
   — EA computed pre-swap; SST-D-004 IMUL CF/OF fixed 2026-08-16 — sign-
   extension overflow check; SST-D-007 far-branch 64KB wrap fixed 2026-08-16 —
   multi-byte reads wrap the EA offset at 0x10000; SST-D-005/SST-D-010 IDIV
-  signed division fixed 2026-08-16 — `DivideOp` signed arm, `OP_IDIV`.)
+  signed division fixed 2026-08-16 — `DivideOp` signed arm, `OP_IDIV`;
+  SST-D-012 short-branch IP off-by-one fixed 2026-08-16 — runner absent-IP
+  `−1` convention, 256 false FAILs → PASS.)
 
 ## Hermetic micro-corpus (checked-in)
 

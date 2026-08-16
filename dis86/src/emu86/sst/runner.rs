@@ -222,11 +222,16 @@ fn compare_state(
   for i in 0..14 {
     let fin_reg = reg16(fin, i);
     // An absent final register means "unchanged" (expected == initial), except
-    // for IP where the suite's convention still applies: if listed, subtract 1
-    // for the terminating HALT; if absent, IP is also "unchanged".
+    // for IP where the suite's terminating-HALT convention still applies: the
+    // reference records IP one past the HALT byte it executed, while emu86
+    // stops one step before it, so a listed final IP is compared with -1. An
+    // absent final IP means the reference's post-HALT IP wrapped back to the
+    // initial IP (short branch onto a HALT byte at init-1), so emu86's one
+    // step lands at init-1 and the same -1 applies.
     let expected = match (fin_reg, i == IP_IDX) {
       (Some(v), true) => v.wrapping_sub(1),
       (Some(v), false) => v,
+      (None, true) => init[i].wrapping_sub(1),
       (None, _) => init[i],
     };
     let actual_val = actual[i];
@@ -840,6 +845,27 @@ mod tests {
     let test = div_test(0x0002, 0xFFFF);
     let opts = RunOpts { flags_umask: policy_umask, ..RunOpts::default() };
     assert_eq!(run_test(&test, &opts), Outcome::Pass, "undefined DIV flags must not fail");
+  }
+
+  #[test]
+  fn absent_final_ip_short_branch_onto_halt_passes_d012() {
+    // SST-D-012 reproduction: a short branch whose target = init IP - 1 (JMP
+    // rel8 = -3 onto a 0xF4 HALT byte at 0x00001). The suite's terminating-HALT
+    // convention: the reference executed the HALT, so its recorded post-HALT IP
+    // wrapped back to the initial IP and is recorded "unchanged/absent"; emu86
+    // stops one step before the HALT at init-1. The runner must apply the same
+    // -1 to the absent final IP (was: expected = init, off by one -> false FAIL).
+    let mut init = base_init();
+    init.ip = 2; // JMP rel8 at 0x00002
+    let fin = init.clone(); // IP absent: unchanged
+    let init_ram = ram(&[
+      (0x00001, 0xF4), // HALT at target = init-1
+      (0x00002, 0xEB), // JMP rel8
+      (0x00003, 0xFD), // rel8 = -3 -> target 0x00001
+    ]);
+    let test = make_test("jmp short onto halt", &[0xEB, 0xFD, 0xF4], init, fin, init_ram, vec![]);
+    let outcome = run_test(&test, &RunOpts::default());
+    assert_eq!(outcome, Outcome::Pass, "outcome: {:?}", outcome);
   }
 
   #[test]
