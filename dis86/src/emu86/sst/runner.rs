@@ -117,9 +117,25 @@ impl Outcome {
   }
 }
 
-/// Return true if the test's first byte is a segment/operand/address prefix or
-/// REP/LOCK prefix byte. Such tests are skipped by the conservative filter.
+/// Return true if the test should be skipped by the conservative prefix filter.
+///
+/// The filter skips tests whose first byte is a segment/operand/address prefix
+/// or REP/LOCK prefix byte — EXCEPT when the opcode (after stripping prefixes)
+/// is a string op (A4-AF), where the prefix is semantically meaningful (REP,
+/// segment-override, or LOCK on MOVS/CMPS/STOS/LODS/SCAS) and emu86 implements
+/// it. This scoped exception lets the string family run under the conservative
+/// filter without un-filtering prefix tests for non-string forms.
 pub fn is_prefix_filtered(bytes: &[u8]) -> bool {
+  // Strip leading prefix bytes to find the opcode.
+  let mut i = 0;
+  while i < bytes.len() && matches!(bytes[i], 0x26 | 0x2E | 0x36 | 0x3E | 0x66 | 0x67 | 0xF0 | 0xF2 | 0xF3) {
+    i += 1;
+  }
+  // String ops (A4-A7, AA-AF) with a prefix are valid and implemented — keep them.
+  if i < bytes.len() && matches!(bytes[i], 0xA4..=0xA7 | 0xAA..=0xAF) {
+    return false;
+  }
+  // Otherwise, filter iff the first byte is a prefix (original conservative rule).
   matches!(bytes.first(), Some(b) if matches!(b, 0x26 | 0x2E | 0x36 | 0x3E | 0x66 | 0x67 | 0xF0 | 0xF2 | 0xF3))
 }
 
@@ -748,6 +764,14 @@ mod tests {
     assert!(is_prefix_filtered(&[0xF3, 0x27, 0xF4]));
     assert!(!is_prefix_filtered(&[0x04, 0x05, 0xF4]));
     assert!(!is_prefix_filtered(&[0x90, 0xF4]));
+    // String ops with a prefix are NOT filtered (REP/seg/LOCK + A4-AF is valid).
+    assert!(!is_prefix_filtered(&[0xF3, 0xA4, 0xF4])); // rep movsb
+    assert!(!is_prefix_filtered(&[0xF2, 0xAE, 0xF4])); // repne scasb
+    assert!(!is_prefix_filtered(&[0x3E, 0xA5, 0xF4])); // ds: movsw
+    assert!(!is_prefix_filtered(&[0xF0, 0xAA, 0xF4])); // lock stosb
+    assert!(!is_prefix_filtered(&[0xA4, 0xF4]));        // bare movsb (no prefix anyway)
+    // A non-string op with a prefix is still filtered.
+    assert!(is_prefix_filtered(&[0xF3, 0xA3, 0xF4])); // rep mov moffs (not a string op)
   }
 
   #[test]

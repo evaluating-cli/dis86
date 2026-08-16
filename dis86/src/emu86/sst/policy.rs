@@ -269,18 +269,18 @@ pub const FORM_POLICIES: &[FormPolicy] = &[
   FormPolicy { file: "A1", opcode_bytes: &[0xA1, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], cap: Capability::Implemented, scope: Scope::V1, flags_umask: None, note: "MOV AX,moffs16 (step.rs:253)" },
   FormPolicy { file: "A2", opcode_bytes: &[0xA2, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], cap: Capability::Implemented, scope: Scope::V1, flags_umask: None, note: "MOV moffs8,AL (step.rs:253)" },
   FormPolicy { file: "A3", opcode_bytes: &[0xA3, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], cap: Capability::Implemented, scope: Scope::V1, flags_umask: None, note: "MOV moffs16,AX (step.rs:253)" },
-  FormPolicy { file: "A4", opcode_bytes: &[0xA4, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], cap: Capability::Implemented, scope: Scope::Deferred(DeferReason::RepString), flags_umask: None, note: "MOVS m8 implemented (step.rs:244) but REP/string family deferred per plan" },
-  FormPolicy { file: "A5", opcode_bytes: &[0xA5, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], cap: Capability::Implemented, scope: Scope::Deferred(DeferReason::RepString), flags_umask: None, note: "MOVS m16 implemented (step.rs:244) but REP/string family deferred per plan" },
-  FormPolicy { file: "A6", opcode_bytes: &[0xA6, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], cap: Capability::Implemented, scope: Scope::Deferred(DeferReason::RepString), flags_umask: None, note: "CMPS m8 implemented (step.rs:245) but REP/string family deferred per plan" },
-  FormPolicy { file: "A7", opcode_bytes: &[0xA7, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], cap: Capability::Implemented, scope: Scope::Deferred(DeferReason::RepString), flags_umask: None, note: "CMPS m16 implemented (step.rs:245) but REP/string family deferred per plan" },
+  FormPolicy { file: "A4", opcode_bytes: &[0xA4, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], cap: Capability::Implemented, scope: Scope::V1, flags_umask: None, note: "MOVS m8 implemented (step.rs:244) string family (Track 3 R1: lifted to V1; REP/seg/LOCK prefixes implemented)" },
+  FormPolicy { file: "A5", opcode_bytes: &[0xA5, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], cap: Capability::Implemented, scope: Scope::V1, flags_umask: None, note: "MOVS m16 implemented (step.rs:244) string family (Track 3 R1: lifted to V1; REP/seg/LOCK prefixes implemented)" },
+  FormPolicy { file: "A6", opcode_bytes: &[0xA6, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], cap: Capability::Implemented, scope: Scope::V1, flags_umask: None, note: "CMPS m8 implemented (step.rs:245) string family (Track 3 R1: lifted to V1; REP/seg/LOCK prefixes implemented)" },
+  FormPolicy { file: "A7", opcode_bytes: &[0xA7, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], cap: Capability::Implemented, scope: Scope::V1, flags_umask: None, note: "CMPS m16 implemented (step.rs:245) string family (Track 3 R1: lifted to V1; REP/seg/LOCK prefixes implemented)" },
   FormPolicy { file: "A8", opcode_bytes: &[0xA8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], cap: Capability::Implemented, scope: Scope::V1, flags_umask: Some(0x0FC7), note: "TEST AL,imm8 (step.rs:448)" },
   FormPolicy { file: "A9", opcode_bytes: &[0xA9, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], cap: Capability::Implemented, scope: Scope::V1, flags_umask: Some(0x0FC7), note: "TEST AX,imm16 (step.rs:448)" },
-  FormPolicy { file: "AA", opcode_bytes: &[0xAA, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], cap: Capability::Implemented, scope: Scope::Deferred(DeferReason::RepString), flags_umask: None, note: "STOS m8 implemented (step.rs:243) but REP/string family deferred per plan" },
-  FormPolicy { file: "AB", opcode_bytes: &[0xAB, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], cap: Capability::Implemented, scope: Scope::Deferred(DeferReason::RepString), flags_umask: None, note: "STOS m16 implemented (step.rs:243) but REP/string family deferred per plan" },
-  FormPolicy { file: "AC", opcode_bytes: &[0xAC, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], cap: Capability::Implemented, scope: Scope::Deferred(DeferReason::RepString), flags_umask: None, note: "LODS m8 implemented (step.rs:368) but REP/string family deferred per plan" },
-  FormPolicy { file: "AD", opcode_bytes: &[0xAD, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], cap: Capability::Implemented, scope: Scope::Deferred(DeferReason::RepString), flags_umask: None, note: "LODS m16 implemented (step.rs:368) but REP/string family deferred per plan" },
-  FormPolicy { file: "AE", opcode_bytes: &[0xAE, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], cap: Capability::Implemented, scope: Scope::Deferred(DeferReason::RepString), flags_umask: None, note: "SCAS m8 implemented (step.rs:242) but REP/string family deferred per plan" },
-  FormPolicy { file: "AF", opcode_bytes: &[0xAF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], cap: Capability::Implemented, scope: Scope::Deferred(DeferReason::RepString), flags_umask: None, note: "SCAS m16 implemented (step.rs:242) but REP/string family deferred per plan" },
+  FormPolicy { file: "AA", opcode_bytes: &[0xAA, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], cap: Capability::Implemented, scope: Scope::V1, flags_umask: None, note: "STOS m8 implemented (step.rs:243) string family (Track 3 R1: lifted to V1; REP/seg/LOCK prefixes implemented)" },
+  FormPolicy { file: "AB", opcode_bytes: &[0xAB, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], cap: Capability::Implemented, scope: Scope::V1, flags_umask: None, note: "STOS m16 implemented (step.rs:243) string family (Track 3 R1: lifted to V1; REP/seg/LOCK prefixes implemented)" },
+  FormPolicy { file: "AC", opcode_bytes: &[0xAC, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], cap: Capability::Implemented, scope: Scope::V1, flags_umask: None, note: "LODS m8 implemented (step.rs:368) string family (Track 3 R1: lifted to V1; REP/seg/LOCK prefixes implemented)" },
+  FormPolicy { file: "AD", opcode_bytes: &[0xAD, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], cap: Capability::Implemented, scope: Scope::V1, flags_umask: None, note: "LODS m16 implemented (step.rs:368) string family (Track 3 R1: lifted to V1; REP/seg/LOCK prefixes implemented)" },
+  FormPolicy { file: "AE", opcode_bytes: &[0xAE, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], cap: Capability::Implemented, scope: Scope::V1, flags_umask: None, note: "SCAS m8 implemented (step.rs:242) string family (Track 3 R1: lifted to V1; REP/seg/LOCK prefixes implemented)" },
+  FormPolicy { file: "AF", opcode_bytes: &[0xAF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], cap: Capability::Implemented, scope: Scope::V1, flags_umask: None, note: "SCAS m16 implemented (step.rs:242) string family (Track 3 R1: lifted to V1; REP/seg/LOCK prefixes implemented)" },
   FormPolicy { file: "B0", opcode_bytes: &[0xB0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], cap: Capability::Implemented, scope: Scope::V1, flags_umask: None, note: "MOV r8,imm8 (step.rs:253)" },
   FormPolicy { file: "B1", opcode_bytes: &[0xB1, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], cap: Capability::Implemented, scope: Scope::V1, flags_umask: None, note: "MOV r8,imm8 (step.rs:253)" },
   FormPolicy { file: "B2", opcode_bytes: &[0xB2, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], cap: Capability::Implemented, scope: Scope::V1, flags_umask: None, note: "MOV r8,imm8 (step.rs:253)" },
@@ -826,7 +826,7 @@ mod tests {
       assert_eq!(p.cap, Capability::Implemented);
       assert!(seen.insert(*f), "dup in v1 list: {}", f);
     }
-    assert_eq!(list.len(), 258, "expected 258 conservative-v1 forms");
+    assert_eq!(list.len(), 268, "expected 268 conservative-v1 forms (258 + 10 string A4-AF lifted in Track 3 R1)");
   }
 
   #[test]

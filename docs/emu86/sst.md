@@ -38,18 +38,18 @@ BOUND, WAIT, LAHF/SAHF, ROR/RCL/RCR, 8-bit MUL/DIV/IMUL, ENTER/LEAVE, CMC, AAM/A
 ESC, LES/LDS, etc.). These are excluded because emu86 has no exception machinery,
 no REP/prefix semantics, no I/O, no far-segment decode path, or no step arm.
 
-## Totals — full V1 run (258 files, every test)
+## Totals — full V1 run (268 files, every test)
 
 | metric | count |
 |---|---|
-| files run | 258 |
-| tests visited (total in files) | 1,162,000 |
-| tests executed (visited − filtered − revoked) | 1,014,157 |
-| **PASS** | **1,002,517** (98.85% of executed) |
+| files run | 268 |
+| tests visited (total in files) | 1,212,000 |
+| tests executed (visited − filtered − revoked) | 1,064,157 |
+| **PASS** | **1,050,652** (98.73% of executed) |
 | **FAIL** | **0** |
 | **DECODE_ERR** | **0** |
 | **PANIC** | **0** |
-| SKIP_EXCEPTION | 11,640 |
+| SKIP_EXCEPTION | 13,505 |
 | SKIP_32BIT | 0 |
 | FILTERED (prefix-collateral) | 147,841 |
 | REVOKED (upstream revocation_list) | 2 |
@@ -57,16 +57,17 @@ no REP/prefix semantics, no I/O, no far-segment decode path, or no step arm.
 Bucket-sum check: `PASS+FAIL+DECODE_ERR+PANIC+SKIP_EXCEPTION+SKIP_32BIT == executed`
 holds; `executed+filtered+revoked == visited` holds.
 
-Files with any FAIL/DECODE_ERR/PANIC: **0** (out of 258).
+Files with any FAIL/DECODE_ERR/PANIC: **0** (out of 268).
 DECODE_ERR count: **0** across the whole run.
 
 ## Per-form breakdown (only forms with non-pass, non-filtered, non-skip-exception outcomes)
 
-0 forms have FAIL and/or PANIC (Track 2 applied per-form `flags_umask` to every
-harness-caveat form — D-001 logical-AF, D-002 shift-AF/OF, D-004-undefined
-IMUL bits — masking the architecturally-undefined bits per Intel 80286 docs;
-all 258 V1 forms now pass 100% on the defined bits). The historical per-form
-table below is retained as the audit trail of every divergence cluster and its
+0 forms have FAIL and/or PANIC. Track 1 (F1-F8 + D-012) resolved all emu86-bug
+clusters; Track 2 masked the harness-caveat undefined-flag residuals; Track 3 R1
+lifted the string family (A4-AF) to V1 and resolved SST-D-013/D-014/D-015
+(segment-override dest, REP LODS, LOCK prefix). The conservative V1 sweep is at
+0 FAIL / 0 DECODE_ERR / 0 PANIC across 268 forms. The historical per-form table
+below is retained as the audit trail of every divergence cluster and its
 resolution; rows that previously carried FAIL/PANIC are marked RESOLVED.
 Table columns: form | executed | PASS | outcomes. Up to 3 samples per form
 (idx / name / first-16-of-sha1 / detail) from run output.
@@ -682,12 +683,14 @@ form, ~100-108 per word-string form. Classification: **emu86-bug** (decoder).
 locking). Demonstrated by `lock_prefix_movsb_decodes_and_executes` in
 `cpu_movs.rs`; all 10 string forms now 0 DECODE_ERR with `--all`.
 
-**R1 status:** string forms fetched and pinned; bare + REP + segment-override +
-LOCK-prefixed string ops now 100% PASS/PANIC/DECODE_ERR-free with `--all`. Scope
-lift (Deferred → V1) + scoped un-filtering of the string family remains
-(see R1 step 3-5 in `.opencode/plan.md`); `cargo test --locked --all-targets`
-348 passed (incl. 9 new string-op unit tests); V1 sweep totals unchanged
-(string forms remain Deferred scope).
+**R1 status — complete:** string forms fetched, pinned, and lifted to V1 scope.
+Bare + REP + segment-override + LOCK-prefixed string ops all 100%
+PASS/PANIC/DECODE_ERR-free. `is_prefix_filtered` now scopes its prefix filter to
+skip string-op tests (A4-AF after prefix-stripping is not filtered), so the
+conservative filter still blocks prefix tests for non-string forms. Full V1
+sweep with 268 forms: PASS=1,050,652 FAIL=0 DECODE_ERR=0 PANIC=0. `cargo test
+--locked --all-targets` 348 passed (incl. 9 new string-op unit tests); `audit
+--probe` 0 PROBE-MISMATCH (V1=268, Deferred=59).
 
 ### PANIC clusters (all `catch_unwind`-captured; reported, never aborts)
 
@@ -793,12 +796,14 @@ PUSH/POP (all forms), PUSHF/POPF, XCHG, MOV (all forms), TEST, LEA, NOP, CBW/CWD
 far/near CALL/JMP/RET, Jcc/LOOP/JCXZ, flag ops (CLC/STC/CLD/STD/CLI/STI),
 XLAT, shifts/rotates (SHL/SHR/SAR/ROL), grp3 TEST, MUL/IMUL/DIV/IDIV. For all of
 these, the *defined* flag bits and register/memory results match hardware except
-for the clusters above; **98.85% of executed tests pass outright and the entire
-remaining surface (SKIP_EXCEPTION 11,640) is exception-expected tests the suite
-itself skips** — all FAIL and PANIC clusters are resolved. Per-form `flags_umask`
-now masks the architecturally-undefined bits (logical-op AF, shift AF/OF,
-IMUL undefined bits) per Intel 80286 docs, so the conservative V1 subset
-compares only defined bits. **The conservative V1 sweep is at 0 FAIL / 0 PANIC.**
+for the clusters above; **98.73% of executed tests pass outright and the entire
+remaining surface (SKIP_EXCEPTION 13,505) is exception-expected tests the suite
+itself skips** — all FAIL, DECODE_ERR, and PANIC clusters are resolved across
+268 V1 forms (including the string family A4-AF lifted in Track 3 R1).
+Per-form `flags_umask` masks the architecturally-undefined bits (logical-op AF,
+shift AF/OF, IMUL undefined bits) per Intel 80286 docs, so the conservative V1
+subset compares only defined bits. **The conservative V1 sweep is at 0 FAIL /
+0 DECODE_ERR / 0 PANIC.**
 
 **Planned-but-not-validated (deferred, per policy):** REP/string family
 (MOVS/CMPS/STOS/LODS/SCAS/INS/OUTS), segment/operand/address/LOCK prefixes, IN/OUT
