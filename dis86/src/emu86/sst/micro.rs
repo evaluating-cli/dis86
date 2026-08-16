@@ -36,7 +36,7 @@ use super::runner::{run_file, FileSummary, RunOpts, DEFAULT_FLAGS_UMASK};
 const PASS_STEMS: &[&str] = &[
   "04", "0C", "14", "1C", "24", "2D", "35", "3D", "40", "4F", "50", "58", "74",
   "87", "89", "8B", "91", "98", "99", "9C", "A2", "B8", "C3", "D1.0", "D1.4",
-  "E2", "E3", "EB", "F6.0", "F6.2", "F7.3", "F7.5", "F8", "FC",
+  "E2", "E3", "EB", "F6.0", "F6.2", "F7.3", "F7.5", "FF.5", "F8", "FC",
 ];
 
 /// Expected divergence of one FAILREPRO entry, keyed by filename and SHA1.
@@ -67,13 +67,6 @@ const FAILREPRO_EXPECT: &[FailExpect] = &[
     hash_prefix: "aa19e33e8c0c96929dba",
     bucket: "FAIL",
     detail: "flags exp=0x0C07 act=0x0C17 umask=0x0FD7",
-  },
-  FailExpect {
-    file: "FF.5",
-    cluster: "SST-D-007",
-    hash_prefix: "0921a4aa520839742a7c",
-    bucket: "FAIL",
-    detail: "CS exp=0x848F act=0x0000",
   },
 ];
 

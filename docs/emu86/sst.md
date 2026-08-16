@@ -411,12 +411,8 @@ Up to 3 samples per form (idx / name / first-16-of-sha1 / detail) from run outpu
 |   |   |   | idx=7 `idiv word [ss:bp+di]` `b08f0b9dd03d3b7d…` AX exp=0xE5AA act=0x133E; DX exp=0x5DB7 act=0x2FB3 |
 |   |   |   | idx=9 `idiv word [ds:si+3D3Bh]` `2bcb8be3ab9e9cb6…` panic: Divide Error |
 |   |   |   | idx=10 `idiv word [ds:bx+di+59h]` `5e8c66d6508cec66…` panic: Divide Error |
-| `FF.3` | 3968 | 2946 | FAIL=2 |
-|   |   |   | idx=2916 `call far [ds:bx+di]` `0fa97fc1b8e6aceb…` CS exp=0x653A act=0x0000 |
-|   |   |   | idx=3650 `call far [ss:bp+di]` `c52ea1ee7585a084…` CS exp=0x2EF7 act=0x0000 |
-| `FF.5` | 3968 | 2943 | FAIL=2 |
-|   |   |   | idx=2914 `jmp far [ds:bx+di]` `0921a4aa52083974…` CS exp=0x848F act=0x0000 |
-|   |   |   | idx=3652 `jmp far [ss:bp+di]` `5d6cea81c9b44d85…` CS exp=0x5E79 act=0x0000 |
+| `FF.3` | 3968 | 2948 | FAIL=0 |
+| `FF.5` | 3968 | 2945 | FAIL=0 |
 
 ## Divergence clusters — classification
 
@@ -561,6 +557,19 @@ Samples: `call far [ds:bx+di]` CS exp=0x653A act=0x0000. Only 2 per form (0.05%)
 **emu86-bug** (memory reads do not wrap the EA offset at the 64KB segment
 boundary for multi-byte operands).
 
+**RESOLVED 2026-08-16 (F7):** `read_u16`/`read_u32`/`write_u16`/`write_u32`
+now wrap each byte's offset at the 64KB segment boundary (`base + ((off + i) &
+0xffff)`) instead of reading the linear continuation. Verified on the pinned
+FF.5 sample `jmp far [ds:bx+di]` (bytes FF 29 F4, ds=0x0FBA, bx=di=0xFFFF →
+EA ds:0xFFFE; IP=0x74CD from ds:0xFFFE/0xFFFF, CS=0x848F from the wrapped
+ds:0x0000/0x0001; the old code read the linear continuation at 0x1FBA:0 → CS=
+0x0000). Both affected forms now pass 100% (FF.3: PASS=2948 FAIL=0; FF.5:
+PASS=2945 FAIL=0, 0 PANIC). Fix demonstrated by the step-level mirror test
+`jmp_far_mem_wraps_far_pointer_at_64kb_boundary` in `shift_semantics_test.rs`;
+`cargo test --locked --all-targets` 333 passed; hermetic micro lane green after
+moving FF.5 from FAILREPRO to the PASS list (spec.txt, micro.rs PASS_STEMS,
+FAILREPRO.txt).
+
 ### PANIC clusters (all `catch_unwind`-captured; reported, never aborts)
 
 **SST-D-008 — stack-pointer wrap panics ("attempt to add with overflow").**
@@ -633,19 +642,23 @@ FAILREPRO pin existed for this cluster.
 
 ### Cluster size accounting
 
-- FAIL 152,402 = harness-caveat (152,064: SST-D-001 79,739 + SST-D-002 65,208 +
-  SST-D-004-undefined part 7,117) + emu86-bug (338: SST-D-003 0 + SST-D-004-CF/OF
-  0 + SST-D-005 334 + SST-D-006 0 + SST-D-007 4).
-  (FAIL fell from 152,909: the SST-D-006 fix earlier turned all 878 XCHG FAILs
-  into PASS; the SST-D-004 fix turned all 507 IMUL CF/OF FAILs into PASS, leaving
-  only the undefined-flag harness-caveat for 69/6B.)
+- FAIL 152,974 = harness-caveat (152,384: SST-D-001 79,739 + SST-D-002 65,208 +
+  SST-D-004-undefined part 7,437) + emu86-bug (334: SST-D-005) + SST-D-012 256
+  (short-branch IP off-by-one — runner terminating-HALT convention, harness bug,
+  open; identified below).
+  (The prior total 152,402 under-counted the clean-F6 actual 152,978 by 576:
+  320 from the D-004-undefined miscount (7,117 → 7,437 — the 69/6B undefined-
+  flag part recomputed from the F7 sweep: 69 3,726 + 6B 3,711) and 256 from the
+  SST-D-012 short-branch FAILs absent from the ledger. The F7 fix then turned
+  the 4 SST-D-007 FAILs into PASS: 152,978 → 152,974.)
 - PANIC 723 = SST-D-010 723
   (SST-D-008 resolved 2026-08-16 — non-wrapping stack arithmetic, no longer
   counted; SST-D-011 resolved 2026-08-16 — debug-only trap; SST-D-009 resolved
   2026-08-16 — C1.x shift-count assert, no longer counted; SST-D-003 resolved
   2026-08-16 — ROL CF/OF, no longer counted; SST-D-006 resolved 2026-08-16 —
-  XCHG memory EA, no longer counted).
-- Sum check: 152,064 + 338 = 152,402 ✓ ; 723 ✓.
+  XCHG memory EA, no longer counted; SST-D-007 resolved 2026-08-16 — multi-byte
+  reads wrap the EA offset at 0x10000, no longer counted).
+- Sum check: 152,384 + 334 + 256 = 152,974 ✓ ; 723 ✓.
 
 ## Coverage statement (honest)
 
@@ -675,15 +688,14 @@ LES/LDS, ENTER/LEAVE). These have **no** hardware evidence in this ledger.
   any emu86 change.
 - IDIV signed division (SST-D-005/SST-D-010): replace unsigned divmod path with a
   signed one; hardware-anchored expected flags.
-- Far indirect CALL/JMP CS load (SST-D-007): wrap the EA offset at 0x10000 for
-  multi-byte reads (fixes the far-pointer boundary case).
   (SST-D-008 stack wrap fixed 2026-08-16 — wrapping stack/XLAT/RET
   arithmetic; SST-D-011 NEG i16::MIN fixed 2026-08-16 — `wrapping_neg`;
   SST-D-009 C1.x shift-count assert fixed 2026-08-16 — count masked to low
   byte, 5-bit in `alu::shift`; SST-D-003 ROL CF/OF fixed 2026-08-16 — CF =
   rotated-out bit, OF for count==1; SST-D-006 XCHG memory-EA fixed 2026-08-16
   — EA computed pre-swap; SST-D-004 IMUL CF/OF fixed 2026-08-16 — sign-
-  extension overflow check.)
+  extension overflow check; SST-D-007 far-branch 64KB wrap fixed 2026-08-16 —
+  multi-byte reads wrap the EA offset at 0x10000.)
 
 ## Hermetic micro-corpus (checked-in)
 
@@ -703,7 +715,7 @@ helper; the checked-in files are what the lane runs).
 
 **Counts (37 entries, ~22KB total):**
 
-- **31 PASS-representative files** spanning the conservative breadth — ADD (04),
+- **35 PASS-representative files** spanning the conservative breadth — ADD (04),
   OR (0C), ADC (14), SBB (1C), AND (24), SUB (2D), XOR (35), CMP (3D),
   INC (40), DEC (4F), PUSH r16 (50), POP r16 (58), MOV (89/8B/B8), XCHG (91),
   CBW/CWD (98/99), Jcc (74), JMP rel8 (EB), RET (C3), LOOP (E2), JCXZ (E3),
@@ -714,20 +726,20 @@ helper; the checked-in files are what the lane runs).
   leading prefix byte, no exception key). Note the logical-ops entries (0C/24/35/
   F6.0) are the init-AF=0 subset that does not trip the SST-D-001 undefined-AF
   caveat; the shift entry (D1.4) is an init-AF=0 case outside the SST-D-002 noise.
-- **3 FAILREPRO files**, one per pinned divergence, each expected to
-  *diverge*: IDIV-as-unsigned (F7.7, SST-D-005), far-branch 64KB offset wrap
-  (FF.5, SST-D-007), and the C1.x shift undefined-AF residual (C1.4, SST-D-002
-  — re-pinned 2026-08-16 from SST-D-009 PANIC: the shift-count assert is fixed,
-  the sample now diverges only on undefined AF). D1.0 (SST-D-003) moved to the
-  PASS list 2026-08-16 when the ROL CF/OF fix flipped it to PASS; 87
-  (SST-D-006) moved to the PASS list 2026-08-16 when the XCHG memory-EA fix
-  flipped it to PASS; F7.5 (SST-D-004) moved to the PASS list 2026-08-16 when
-  the IMUL CF/OF fix flipped it to PASS.
+- **2 FAILREPRO files**, one per pinned divergence, each expected to
+  *diverge*: IDIV-as-unsigned (F7.7, SST-D-005) and the C1.x shift undefined-AF
+  residual (C1.4, SST-D-002 — re-pinned 2026-08-16 from SST-D-009 PANIC: the
+  shift-count assert is fixed, the sample now diverges only on undefined AF).
+  D1.0 (SST-D-003) moved to the PASS list 2026-08-16 when the ROL CF/OF fix
+  flipped it to PASS; 87 (SST-D-006) moved to the PASS list 2026-08-16 when the
+  XCHG memory-EA fix flipped it to PASS; F7.5 (SST-D-004) moved to the PASS list
+  2026-08-16 when the IMUL CF/OF fix flipped it to PASS; FF.5 (SST-D-007) moved
+  to the PASS list 2026-08-16 when the 64KB offset wrap fix flipped it to PASS.
   Their SHA1s, cluster IDs, and exact recorded divergences are listed in
   `micro/FAILREPRO.txt` and asserted byte-for-byte in the `micro.rs`
   expectations table.
 
-**Expected-FAILREPRO contract:** these three entries are regression pins for
+**Expected-FAILREPRO contract:** these two entries are regression pins for
 *known* emu86 divergences (emu86-bug or harness-caveat), not tests to make
 green. When a future fix flips one of them to PASS, the lane **fails**; the
 fix's author then (a) drops the entry from `spec.txt`, (b) regenerates the

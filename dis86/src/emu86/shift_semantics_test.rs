@@ -1,5 +1,5 @@
 use super::alu::{self, ShiftOp};
-use super::cpu::{BP, CS, DI, DS, IP, SS};
+use super::cpu::{BP, BX, CS, DI, DS, IP, SS};
 use super::cpu_flags::*;
 use super::machine::Machine;
 use super::value::Value;
@@ -305,5 +305,45 @@ fn xchg_mem_ea_uses_pre_swap_register() {
 
   assert_eq!(m.reg(DI), 0xa91e);
   assert_eq!(m.mem.read_u16(mem_addr), 0x8aa6);
+  assert_eq!(m.exec_count, 1);
+}
+
+// --- step-level: far-pointer memory reads wrap the EA offset at the 64KB
+// segment boundary (SST-D-007). Pinned FF.5 sample `jmp far [ds:bx+di]` (bytes
+// FF 29 F4, ds=0x0FBA, bx=di=0xFFFF): the 4-byte far pointer at EA ds:0xFFFE
+// straddles the boundary, so its CS word must come from the wrapped
+// ds:0x0000/0x0001 rather than the linear continuation. ---
+
+#[test]
+fn jmp_far_mem_wraps_far_pointer_at_64kb_boundary() {
+  // ds:bx+di = 0x0FBA:(0xFFFF+0xFFFF) -> EA ds:0xFFFE. IP bytes at
+  // ds:0xFFFE/0xFFFF = CD 74 -> 0x74CD; CS bytes at the *wrapped*
+  // ds:0x0000/0x0001 = 8F 84 -> 0x848F. The linear continuation
+  // (0x1FBA:0x0000/0x0001) holds 00 00, so a non-wrapping read would load
+  // CS=0x0000 and jump to the wrong segment.
+  let mut m = Machine::new(None);
+  m.reg_write_u16(CS, 0x0000);
+  m.reg_write_u16(IP, 0x0100);
+  m.reg_write_u16(DS, 0x0fba);
+  m.reg_write_u16(BX, 0xffff);
+  m.reg_write_u16(DI, 0xffff);
+  // `jmp far [ds:bx+di]` = FF 29 (modrm 0x29: mod=00 reg=5/JMPf rm=001/[bx+di])
+  for (i, &b) in [0xFFu8, 0x29].iter().enumerate() {
+    m.mem.write_u8(SegOff::new(0x0000, 0x0100 + i as u16), b);
+  }
+  // Far pointer at ds:0xFFFE: IP=0x74CD (CD 74), CS=0x848F (8F 84 at the
+  // wrapped ds:0x0000/0x0001). Linear-continuation bytes differ so a
+  // non-wrapping read would load the wrong CS.
+  m.mem.write_u8(SegOff::new(0x0fba, 0xfffe), 0xCD);
+  m.mem.write_u8(SegOff::new(0x0fba, 0xffff), 0x74);
+  m.mem.write_u8(SegOff::new(0x0fba, 0x0000), 0x8F);
+  m.mem.write_u8(SegOff::new(0x0fba, 0x0001), 0x84);
+  m.mem.write_u8(SegOff::new(0x1fba, 0x0000), 0x00);
+  m.mem.write_u8(SegOff::new(0x1fba, 0x0001), 0x00);
+
+  m.step().unwrap();
+
+  assert_eq!(m.reg(CS), 0x848f);
+  assert_eq!(m.reg(IP), 0x74cd);
   assert_eq!(m.exec_count, 1);
 }
