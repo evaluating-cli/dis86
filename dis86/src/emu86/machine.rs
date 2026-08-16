@@ -61,7 +61,7 @@ impl Machine {
 
   pub fn stack_push_u16(&mut self, val: u16) {
     let mut addr = self.reg_read_addr(SS, SP);
-    addr.off.0 -= 2;
+    addr.off.0 = addr.off.0.wrapping_sub(2);
 
     self.reg_write_u16(SP, addr.off.0);
 
@@ -72,8 +72,60 @@ impl Machine {
     let addr = self.reg_read_addr(SS, SP);
     let val = self.mem.read_u16(addr);
 
-    self.reg_write_u16(SP, addr.off.0 + 2);
+    self.reg_write_u16(SP, addr.off.0.wrapping_add(2));
 
     val
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn machine_with_sp(sp: u16) -> Machine {
+    let mut m = Machine::new(None);
+    m.reg_write_u16(SS, 0x2000);
+    m.reg_write_u16(SP, sp);
+    m
+  }
+
+  fn seg_off(seg: u16, off: u16) -> SegOff {
+    SegOff::new(seg, off)
+  }
+
+  #[test]
+  fn stack_push_wraps_sp_at_zero() {
+    // SP = 0: the 80C286 wraps to 0xFFFE instead of trapping; the value lands
+    // at SS:0xFFFE.
+    let mut m = machine_with_sp(0x0000);
+    m.stack_push_u16(0x1234);
+    assert_eq!(m.reg_read_u16(SP), 0xFFFE);
+    assert_eq!(m.mem.read_u16(seg_off(0x2000, 0xFFFE)), 0x1234);
+  }
+
+  #[test]
+  fn stack_pop_wraps_sp_at_max() {
+    // SP = 0xFFFE: the 80C286 wraps to 0x0000 instead of trapping; the value
+    // read comes from SS:0xFFFE.
+    let mut m = machine_with_sp(0xFFFE);
+    m.mem.write_u16(seg_off(0x2000, 0xFFFE), 0x5678);
+    assert_eq!(m.stack_pop_u16(), 0x5678);
+    assert_eq!(m.reg_read_u16(SP), 0x0000);
+  }
+
+  #[test]
+  fn stack_push_under_sp_gt_zero() {
+    let mut m = machine_with_sp(0x0100);
+    m.stack_push_u16(0x1234);
+    assert_eq!(m.reg_read_u16(SP), 0x00FE);
+    assert_eq!(m.mem.read_u16(seg_off(0x2000, 0x00FE)), 0x1234);
+  }
+
+  #[test]
+  fn stack_pop_over_sp_lt_max() {
+    let mut m = machine_with_sp(0x0100);
+    m.mem.write_u16(seg_off(0x2000, 0x0100), 0x5678);
+    assert_eq!(m.stack_pop_u16(), 0x5678);
+    assert_eq!(m.reg_read_u16(SP), 0x0102);
   }
 }

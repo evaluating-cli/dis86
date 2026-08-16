@@ -276,7 +276,7 @@ impl Machine {
         let idx = self.operand_read_u8(&instr, 0);
         let addr_seg = self.operand_read_u16(&instr, 1);
         let addr_off = self.operand_read_u16(&instr, 2);
-        let addr = SegOff::new(addr_seg, addr_off + idx as u16);
+        let addr = SegOff::new(addr_seg, addr_off.wrapping_add(idx as u16));
         let val = self.mem.read_u8(addr);
         self.operand_write(&instr, 0, Value::U8(val));
       }
@@ -326,7 +326,7 @@ impl Machine {
         if instr.operands.len() == 1 {
           // handle stack args removal
           let adj = self.operand_read(&instr, 0).unwrap_u16();
-          self.reg_write_u16(SP, self.reg_read_u16(SP) + adj);
+          self.reg_write_u16(SP, self.reg_read_u16(SP).wrapping_add(adj));
         }
         self.reg_write(IP, off);
       }
@@ -337,7 +337,7 @@ impl Machine {
         if instr.operands.len() == 1 {
           // handle stack args removal
           let adj = self.operand_read(&instr, 0).unwrap_u16();
-          self.reg_write_u16(SP, self.reg_read_u16(SP) + adj);
+          self.reg_write_u16(SP, self.reg_read_u16(SP).wrapping_add(adj));
         }
         self.reg_write(CS, seg);
         self.reg_write(IP, off);

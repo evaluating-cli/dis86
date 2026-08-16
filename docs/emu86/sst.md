@@ -540,6 +540,25 @@ this is the debug-mode arithmetic trap (release would wrap silently). Samples al
 `pop`/`ret`/`popf`/`xlat` with near-top-of-stack SP. Classification:
 **emu86-bug** (non-wrapping stack arithmetic; manifests as PANIC in debug builds).
 
+**RESOLVED 2026-08-16 (F2):** stack arithmetic now wraps: `stack_push_u16`
+`addr.off.0.wrapping_sub(2)` (machine.rs:64), `stack_pop_u16`
+`addr.off.0.wrapping_add(2)` (machine.rs:75), XLAT offset
+`addr_off.wrapping_add(idx)` (step.rs:279), RET/RETF immediate adjust
+`SP.wrapping_add(adj)` (step.rs:329,340).
+
+Note on verification: this defect only traps in **debug** builds (u16 overflow
+panics); release already wraps silently, so a release-mode run exercises the
+same values but cannot distinguish old vs new code. The fix is demonstrated by
+the 4 new unit tests in `machine.rs` (run under `cargo test`, debug profile):
+`stack_push_wraps_sp_at_zero` and `stack_pop_wraps_sp_at_max` trap with
+"attempt to subtract/add with overflow" on the old code and pass now, with
+round-trip memory-value assertions. These are synthetic primitive tests, not
+data-file runs, so they are consistent with the speed policy (which forbids
+running the *debug binary against the corpus*). Release-mode runs on all 18
+affected forms (07 17 1F 58-5F 8F 9D C2 C3 CA CB D7) — 86,115 PASS aggregate,
+0 FAIL, 0 PANIC (381 pre-existing exception-expected tests); `cargo test
+--locked --all-targets` 319 passed. No FAILREPRO pin existed for this cluster.
+
 **SST-D-009 — C1.x 16-bit shift count assertion.**
 Forms: C1.0-C1.7 — 9,773 PANIC ("assertion failed: val as u8 as u16 == val",
 step.rs:146). C1.x operands are `OPER_IMM8_EXT` (sign-extended imm8); for counts
@@ -556,21 +575,25 @@ assert on sign-extended imm8; counts ≥ 0x80 not masked to 5 bits).
 Classification: **emu86-bug**.
 
 **RESOLVED 2026-08-16 (F1):** `alu.rs:262` NEG now uses `(a as i16).wrapping_neg()`
-(i16::MIN wraps to itself, matching the 80C286 result 0x8000). Verification:
-release-mode runs on the affected NEG forms — `F6.3` 3968/3968 PASS, `F7.3`
-3939/3939 PASS, 0 FAIL, 0 PANIC (28 pre-existing exception-expected tests, all
-#GP #13, unchanged from baseline); hermetic micro lane `F7.3.MOO` PASS;
-`cargo test --locked --all-targets` 315 passed. No FAILREPRO pin existed for
-this cluster.
+(i16::MIN wraps to itself, matching the 80C286 result 0x8000). This defect only
+traps in **debug** builds (release already wraps silently); the fix is
+demonstrated by the `neg16_min_i16` / `neg8_min_i8` unit tests in `alu_test.rs`
+(debug profile, synthetic — consistent with the speed policy), which trap on the
+old code and pass now. Release-mode runs on the affected NEG forms also pass
+(`F6.3` 3968/3968, `F7.3` 3939/3939, 0 FAIL, 0 PANIC; 28 pre-existing
+exception-expected tests, all #GP #13, unchanged from baseline); hermetic micro
+lane `F7.3.MOO` PASS; `cargo test --locked --all-targets` 315 passed. No
+FAILREPRO pin existed for this cluster.
 
 ### Cluster size accounting
 
 - FAIL 157,081 = harness-caveat (139,886: SST-D-001 79,739 + SST-D-002 53,030 +
   SST-D-004-undefined part 7,117) + emu86-bug (17,195: SST-D-003 15,472 +
   SST-D-004-CF/OF 507 + SST-D-005 334 + SST-D-006 878 + SST-D-007 4).
-- PANIC 18,258 = SST-D-008 7,762 + SST-D-009 9,773 + SST-D-010 723
-  (SST-D-011 resolved 2026-08-16 — debug-only trap, no longer counted).
-- Sum check: 139,886 + 17,195 = 157,081 ✓ ; 18,258 ✓.
+- PANIC 10,496 = SST-D-009 9,773 + SST-D-010 723
+  (SST-D-008 resolved 2026-08-16 — non-wrapping stack arithmetic, no longer
+  counted; SST-D-011 resolved 2026-08-16 — debug-only trap).
+- Sum check: 139,886 + 17,195 = 157,081 ✓ ; 10,496 ✓.
 
 ## Coverage statement (honest)
 
@@ -605,9 +628,9 @@ LES/LDS, ENTER/LEAVE). These have **no** hardware evidence in this ledger.
 - XCHG memory EA (SST-D-006): compute EA once before writing the register operand.
 - Far indirect CALL/JMP CS load (SST-D-007): wrap the EA offset at 0x10000 for
   multi-byte reads (fixes the far-pointer boundary case).
-- Stack-pointer wrap arithmetic (SST-D-008) and shift-count masking for C1.x
-  (SST-D-009) so debug builds do not trap. (SST-D-011 NEG i16::MIN fixed
-  2026-08-16 — `wrapping_neg`.)
+- Shift-count masking for C1.x (SST-D-009) so debug builds do not trap.
+  (SST-D-008 stack wrap fixed 2026-08-16 — wrapping stack/XLAT/RET
+  arithmetic; SST-D-011 NEG i16::MIN fixed 2026-08-16 — `wrapping_neg`.)
 
 ## Hermetic micro-corpus (checked-in)
 
