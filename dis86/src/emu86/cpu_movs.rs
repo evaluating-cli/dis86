@@ -93,4 +93,24 @@ mod test {
     assert_eq!(m.reg_read_u16(SI), 0x0001);
     assert_eq!(m.reg_read_u16(DI), 0x0001);
   }
+
+  /// SST-D-015: a LOCK prefix (0xF0) must be parsed-and-discarded by the
+  /// decoder so `lock movsb` (F0 A4) decodes and executes instead of DECODE_ERR.
+  /// The 80C286 executes `lock movsb` (LOCK ignored on string ops; exception:
+  /// none); emu86's single-step model treats LOCK as a no-op.
+  #[test]
+  fn lock_prefix_movsb_decodes_and_executes() {
+    let mut m = Machine::new(None);
+    mem_write_slice(&mut m, SegOff::new(0x0000, 0x0000), &[0xf0, 0xa4, 0xf4]);
+    m.reg_write_u16(DS, 0x1000);
+    m.reg_write_u16(SI, 0x0000);
+    m.mem.write_u8(SegOff::new(0x1000, 0x0000), 0x5A);
+    m.reg_write_u16(ES, 0x2000);
+    m.reg_write_u16(DI, 0x0000);
+    m.flag_write(FLAG_DF, false);
+    m.step().unwrap();
+    assert_eq!(m.mem.read_u8(SegOff::new(0x2000, 0x0000)), 0x5A);
+    assert_eq!(m.reg_read_u16(SI), 0x0001);
+    assert_eq!(m.reg_read_u16(DI), 0x0001);
+  }
 }

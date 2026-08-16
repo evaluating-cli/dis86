@@ -175,6 +175,7 @@ pub fn decode_one_impl<'a>(bin: &mut RegionIter<'a>) -> Result<Option<(Instr, &'
       0x2e => sreg = Some(Reg::CS),
       0x36 => sreg = Some(Reg::SS),
       0x3e => sreg = Some(Reg::DS),
+      0xf0 => (), // LOCK prefix: parse-and-discard (no-op in the single-step model)
       0xf2 => rep = Some(Rep::NE),
       0xf3 => rep = Some(Rep::EQ),
       _ => break,

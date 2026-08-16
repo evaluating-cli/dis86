@@ -671,22 +671,23 @@ mirroring the MOVS/SCAS pattern (CX-counted while-loop, no ZF break since LODS
 sets no flags), and added to the rep-aware dispatch list. Demonstrated by the
 `rep_lodsb_*` / `rep_lodsw_*` tests in `cpu_lods.rs`; all REP LODS tests 0 PANIC.
 
-**SST-D-015 — LOCK prefix (0xF0) not parsed by the decoder (open).**
+**SST-D-015 — LOCK prefix (0xF0) not parsed by the decoder.**
 Forms: any with an F0 prefix (e.g. `cs lock movsb` = 2E F0 A4). The decoder's
-prefix loop (decode.rs:170-181) handles 26/2E/36/3E/F2/F3 but not F0, so a LOCK
-prefix is treated as the opcode → DECODE_ERR. The 80C286 executes `lock movsb`
+prefix loop (decode.rs:170-181) handled 26/2E/36/3E/F2/F3 but not F0, so a LOCK
+prefix was treated as the opcode → DECODE_ERR. The 80C286 executes `lock movsb`
 (LOCK ignored on string ops; exception: none). ~115 DECODE_ERR per byte-string
-form, ~100-108 per word-string form. OPEN: add 0xF0 to the prefix loop
-(parse-and-ignore for the single-step model, where LOCK is a no-op). This is a
-general prefix issue (affects all forms, not just string) and is a prerequisite
-for lifting the string scope without introducing DECODE_ERR into the V1 sweep.
+form, ~100-108 per word-string form. Classification: **emu86-bug** (decoder).
+**RESOLVED 2026-08-16 (R1):** 0xF0 added to the prefix loop as parse-and-discard
+(LOCK is a no-op in emu86's single-step model — no concurrency, so no bus
+locking). Demonstrated by `lock_prefix_movsb_decodes_and_executes` in
+`cpu_movs.rs`; all 10 string forms now 0 DECODE_ERR with `--all`.
 
-**R1 status:** string forms fetched and pinned; bare + REP + segment-override
-string ops now 100% PASS/PANIC-free with `--all`. Scope lift (Deferred → V1) +
-scoped un-filtering of the string family is deferred until SST-D-015 (LOCK) is
-resolved, to keep the V1 sweep at 0 FAIL / 0 DECODE_ERR / 0 PANIC. `cargo test
---locked --all-targets` 347 passed (incl. 8 new string-op unit tests); V1 sweep
-totals unchanged (string forms remain Deferred scope).
+**R1 status:** string forms fetched and pinned; bare + REP + segment-override +
+LOCK-prefixed string ops now 100% PASS/PANIC/DECODE_ERR-free with `--all`. Scope
+lift (Deferred → V1) + scoped un-filtering of the string family remains
+(see R1 step 3-5 in `.opencode/plan.md`); `cargo test --locked --all-targets`
+348 passed (incl. 9 new string-op unit tests); V1 sweep totals unchanged
+(string forms remain Deferred scope).
 
 ### PANIC clusters (all `catch_unwind`-captured; reported, never aborts)
 
