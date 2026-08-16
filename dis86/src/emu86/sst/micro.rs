@@ -15,10 +15,10 @@
 //! - **FAILREPRO files**: the lane asserts each entry diverges EXACTLY as
 //!   recorded in the expectations table below (mirrored in
 //!   `data/sst/micro/FAILREPRO.txt`), keyed by the test's SHA1. These pin the
-//!   KNOWN emu86-bug behavior classified in docs/emu86/sst.md, guarding both
-//!   the harness and emu86: when a future emu86 fix flips an entry to PASS the
-//!   lane fails, prompting a corpus + registry update (documented contract in
-//!   docs/emu86/sst.md).
+//!   KNOWN emu86 divergences (emu86-bug or harness-caveat) classified in
+//!   docs/emu86/sst.md, guarding both the harness and emu86: when a future fix
+//!   flips an entry to PASS the lane fails, prompting a corpus + registry
+//!   update (documented contract in docs/emu86/sst.md).
 //!
 //! Regeneration (from the pinned full fetch) is out-of-band via
 //! `emu86_sst micro-extract data/sst/micro/spec.txt`; spec.txt is the single
@@ -77,10 +77,10 @@ const FAILREPRO_EXPECT: &[FailExpect] = &[
   },
   FailExpect {
     file: "C1.4",
-    cluster: "SST-D-009",
+    cluster: "SST-D-002",
     hash_prefix: "aa19e33e8c0c96929dba",
-    bucket: "PANIC",
-    detail: "panic: assertion failed: val as u8 as u16 == val",
+    bucket: "FAIL",
+    detail: "flags exp=0x0C07 act=0x0C17 umask=0x0FD7",
   },
   FailExpect {
     file: "87",

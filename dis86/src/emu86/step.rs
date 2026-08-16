@@ -142,10 +142,9 @@ impl Machine {
     let rhs = self.operand_read(instr, 1);
     let count = match rhs {
       Value::U8(val) => val,
-      Value::U16(val) => {
-        assert!(val as u8 as u16 == val);
-        val as u8
-      }
+      // Counts are only ever the low byte of a sign-extended imm8 (OPER_IMM8_EXT)
+      // or CL; the high byte is discarded here and alu::shift masks to 5 bits.
+      Value::U16(val) => val as u8,
       _ => panic!("Invalid value for count: {:?}", rhs),
     };
     let (result, flags) = alu::shift(op, lhs, count, self.flag_read_all());

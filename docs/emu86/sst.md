@@ -289,25 +289,25 @@ Up to 3 samples per form (idx / name / first-16-of-sha1 / detail) from run outpu
 |   |   |   | idx=0 `sar byte [ds:EDBFh],DDh` `3f6c78fb359fbbb0…` flags exp=0x0056 act=0x0856 umask=0x0FD7; FLAGS exp=0x0056 act=0x0856 |
 |   |   |   | idx=3 `sar byte [ss:bp+si],4Ah` `f366e9ea5e9b93e0…` flags exp=0x0097 act=0x0887 umask=0x0FD7; FLAGS exp=0x0097 act=0x0887 |
 |   |   |   | idx=4 `sar byte [ds:si-38h],C1h` `039c6fafde14fc3f…` flags exp=0x0093 act=0x0083 umask=0x0FD7; FLAGS exp=0x0093 act=0x0083 |
-| `C1.0` | 3971 | 654 | FAIL=1336 PANIC=1953 |
+| `C1.0` | 3971 | 1194 | FAIL=2749 |
 |   |   |   | idx=1 `rol word [ss:bp+di],77h` `2f312bb94476919e…` flags exp=0x08D3 act=0x00D3 umask=0x0FD7; FLAGS exp=0x08D3 act=0x00D3 |
 |   |   |   | idx=3 `rol word [ds:bx-6Eh],3Fh` `60243e6a3b9565fb…` flags exp=0x04D2 act=0x0CD3 umask=0x0FD7; FLAGS exp=0x04D2 act=0x0CD3 |
 |   |   |   | idx=5 `rol word [ss:bp+di-1Dh],6` `88fdc30d48edb8a2…` flags exp=0x0056 act=0x0857 umask=0x0FD7; FLAGS exp=0x0056 act=0x0857 |
-| `C1.4` | 3973 | 677 | FAIL=1314 PANIC=1955 |
+| `C1.4` | 3973 | 1230 | FAIL=2716 |
 |   |   |   | idx=1 `shl word [ss:bp+di-1Dh],6` `9b139f2e7435cfcc…` flags exp=0x0882 act=0x0892 umask=0x0FD7; FLAGS exp=0x0882 act=0x0892 |
-|   |   |   | idx=2 `shl word [ss:bp+di+6BDh],CBh` `aa19e33e8c0c9692…` panic: assertion failed: val as u8 as u16 == val |
+|   |   |   | idx=2 `shl word [ss:bp+di+6BDh],CBh` `aa19e33e8c0c9692…` flags exp=0x0C07 act=0x0C17 umask=0x0FD7; FLAGS exp=0x0C07 act=0x0C17 |
 |   |   |   | idx=3 `shl word [ds:bx+si+7110h],Fh` `46a278ff7b99ca1e…` flags exp=0x0847 act=0x0857 umask=0x0FD7; FLAGS exp=0x0847 act=0x0857 |
-| `C1.5` | 3974 | 697 | FAIL=1294 PANIC=1955 |
+| `C1.5` | 3974 | 1274 | FAIL=2672 |
 |   |   |   | idx=0 `shr word [ss:bp+di-1Dh],6` `a9598688620f50ab…` flags exp=0x0013 act=0x0813 umask=0x0FD7; FLAGS exp=0x0013 act=0x0813 |
 |   |   |   | idx=1 `shr word [ss:bp+si-B3Bh],2Bh` `4901b41303ccd4e0…` flags exp=0x0013 act=0x0003 umask=0x0FD7; FLAGS exp=0x0013 act=0x0003 |
 |   |   |   | idx=2 `shr word [ds:bx+si+7110h],Fh` `16a05454da0356f6…` flags exp=0x0012 act=0x0812 umask=0x0FD7; FLAGS exp=0x0012 act=0x0812 |
-| `C1.6` | 3974 | 663 | FAIL=1328 PANIC=1955 |
-|   |   |   | idx=0 `sal word [ss:bp+di+6BDh],CBh` `4f612338ff4c540c…` panic: assertion failed: val as u8 as u16 == val |
+| `C1.6` | 3974 | 1223 | FAIL=2723 |
+|   |   |   | idx=0 `sal word [ss:bp+di+6BDh],CBh` `4f612338ff4c540c…` flags exp=0x0C07 act=0x0C17 umask=0x0FD7; FLAGS exp=0x0C07 act=0x0C17 |
 |   |   |   | idx=1 `sal word [ds:bx+si+7110h],Fh` `f0ec00c4b39a05a2…` flags exp=0x0046 act=0x0856 umask=0x0FD7; FLAGS exp=0x0046 act=0x0856 |
 |   |   |   | idx=2 `sal word [ss:bp+si-B3Bh],2Bh` `cb3109c9a173cc24…` flags exp=0x0807 act=0x0007 umask=0x0FD7; FLAGS exp=0x0807 act=0x0007 |
-| `C1.7` | 3974 | 696 | FAIL=1295 PANIC=1955 |
+| `C1.7` | 3974 | 1274 | FAIL=2672 |
 |   |   |   | idx=0 `sar word [ds:bx+si+7110h],Fh` `32175bcd3c54ddc9…` flags exp=0x0056 act=0x0856 umask=0x0FD7; FLAGS exp=0x0056 act=0x0856 |
-|   |   |   | idx=1 `sar word [ss:bp+di+6BDh],CBh` `db2b42518a857da7…` panic: assertion failed: val as u8 as u16 == val |
+|   |   |   | idx=1 `sar word [ss:bp+di+6BDh],CBh` `db2b42518a857da7…` flags exp=0x0497 act=0x0C97 umask=0x0FD7; FLAGS exp=0x0497 act=0x0C97 |
 |   |   |   | idx=2 `sar word [ss:bp+di-1Dh],6` `103f503ce9a0621a…` flags exp=0x0093 act=0x0893 umask=0x0FD7; FLAGS exp=0x0093 act=0x0893 |
 | `C2` | 4848 | 2481 | PANIC=2343 |
 |   |   |   | idx=0 `ret D907h` `140ebe1c3bf05d00…` panic: attempt to add with overflow |
@@ -466,7 +466,9 @@ error because the bit is architecturally undefined).
 
 **SST-D-002 — shift/rotate-adjacent AF/OF undefined-bit noise.**
 Forms: C0.4-C0.7, C1.4-C1.7 (FAIL part), D0.4-D0.7, D1.4-D1.7, D2.4-D2.7,
-D3.4-D3.7 — 53,030 FAIL (47,799 for 8-bit/16-bit-by-1/CL forms + 5,231 C1.x FAIL).
+D3.4-D3.7 — 58,582 FAIL (47,799 for 8-bit/16-bit-by-1/CL forms + 10,783 C1.x FAIL;
+up from 53,030: after the SST-D-009 fix, formerly-PANIC C1.4-C1.7 imm-count
+tests complete and now fail on these same undefined bits, +5,552).
 Bit analysis: AF(4) appears everywhere; OF(11) appears for count>1 forms
 (C0.x imm-count, D2.x/D3.x by-CL). Intel 80286: SHL/SHR/SAR define OF only for
 count==1 and leave AF undefined; emu86's `update_flags_shl/shr/sar` correctly set
@@ -476,7 +478,9 @@ FAILs are entirely in undefined AF and (count>1) undefined OF. Classification:
 count==1"; residual undefined-bit comparison).
 
 **SST-D-003 — ROL: emu86 does not update CF/OF at all.**
-Forms: C0.0, C1.0 (FAIL part), D0.0, D1.0, D2.0, D3.0 — 15,472 FAIL.
+Forms: C0.0, C1.0 (FAIL part), D0.0, D1.0, D2.0, D3.0 — 16,885 FAIL (15,472 +
+1,413 C1.0 from the formerly-PANIC C1.x imm-count tests, which now complete and
+fail on the missing ROL CF/OF update).
 `alu::shift(ShiftOp::Rol)` contains `// TODO SET FLAGS ?` and leaves every flag
 unchanged; the 80C286 sets CF (rotated-out bit) and, for count==1, OF. Samples
 all show `CF(0)`/`OF(11)` diffs, e.g. `rol dl,1` exp=0x0087 act=0x0886. Intel
@@ -567,6 +571,21 @@ The 80C286 masks shift counts to 5 bits (count & 0x1F). Samples:
 `shl word [ss:bp+di+6BDh],CBh` panics. Classification: **emu86-bug** (shift-count
 assert on sign-extended imm8; counts ≥ 0x80 not masked to 5 bits).
 
+**RESOLVED 2026-08-16 (F3):** `step.rs:145` now truncates the count to its low
+byte (`Value::U16(val) => val as u8`) before passing it to `alu::shift`, which
+already masks to 5 bits (`n & 0x1f`; `rotate_left` reduces mod width) matching
+the 80C286. No C1.x PANIC remains (all 5 C1.x forms: 0 PANIC). The 9,773
+former-PANIC tests now complete: 2,808 → PASS and 6,965 → FAIL. The residual
+FAILs are *not* the D-009 bug — C1.4-C1.7 fail only on undefined-AF (and
+count>1 OF) bits, which is the SST-D-002 harness-caveat (+5,552; D-002 total
+now 58,582), and C1.0 fails on the missing ROL CF/OF update, which is the
+SST-D-003 emu86-bug (+1,413; D-003 total now 16,885). Fix demonstrated by the
+step-level mirror tests in `shift_semantics_test.rs` (pinned C1.4 sample
+`shl word [ss:bp+di+6BDh],CBh`, count byte 0xCB sign-extends to 0xFFCB →
+masked to 0x0B, result 0x8000 << 11 = 0x0000, machine advances without
+trapping); `cargo test --locked --all-targets` 320 passed; hermetic micro lane
+green after re-pinning C1.4 to bucket=FAIL (SST-D-002).
+
 **SST-D-010 — IDIV "Divide Error" panic.** 723 PANIC, same root as SST-D-005
 (unsigned divmod asserting quotient > 0xffff). Classification: **emu86-bug**.
 
@@ -587,13 +606,16 @@ FAILREPRO pin existed for this cluster.
 
 ### Cluster size accounting
 
-- FAIL 157,081 = harness-caveat (139,886: SST-D-001 79,739 + SST-D-002 53,030 +
-  SST-D-004-undefined part 7,117) + emu86-bug (17,195: SST-D-003 15,472 +
+- FAIL 164,046 = harness-caveat (145,438: SST-D-001 79,739 + SST-D-002 58,582 +
+  SST-D-004-undefined part 7,117) + emu86-bug (18,608: SST-D-003 16,885 +
   SST-D-004-CF/OF 507 + SST-D-005 334 + SST-D-006 878 + SST-D-007 4).
-- PANIC 10,496 = SST-D-009 9,773 + SST-D-010 723
+  (FAIL rose from 157,081: the SST-D-009 fix turned 9,773 PANIC into 6,965 FAIL
+  on residual undefined-AF / ROL-flag bits + 2,808 PASS.)
+- PANIC 723 = SST-D-010 723
   (SST-D-008 resolved 2026-08-16 — non-wrapping stack arithmetic, no longer
-  counted; SST-D-011 resolved 2026-08-16 — debug-only trap).
-- Sum check: 139,886 + 17,195 = 157,081 ✓ ; 10,496 ✓.
+  counted; SST-D-011 resolved 2026-08-16 — debug-only trap; SST-D-009 resolved
+  2026-08-16 — C1.x shift-count assert, no longer counted).
+- Sum check: 145,438 + 18,608 = 164,046 ✓ ; 723 ✓.
 
 ## Coverage statement (honest)
 
@@ -628,9 +650,10 @@ LES/LDS, ENTER/LEAVE). These have **no** hardware evidence in this ledger.
 - XCHG memory EA (SST-D-006): compute EA once before writing the register operand.
 - Far indirect CALL/JMP CS load (SST-D-007): wrap the EA offset at 0x10000 for
   multi-byte reads (fixes the far-pointer boundary case).
-- Shift-count masking for C1.x (SST-D-009) so debug builds do not trap.
   (SST-D-008 stack wrap fixed 2026-08-16 — wrapping stack/XLAT/RET
-  arithmetic; SST-D-011 NEG i16::MIN fixed 2026-08-16 — `wrapping_neg`.)
+  arithmetic; SST-D-011 NEG i16::MIN fixed 2026-08-16 — `wrapping_neg`;
+  SST-D-009 C1.x shift-count assert fixed 2026-08-16 — count masked to low
+  byte, 5-bit in `alu::shift`.)
 
 ## Hermetic micro-corpus (checked-in)
 
@@ -661,20 +684,23 @@ helper; the checked-in files are what the lane runs).
   leading prefix byte, no exception key). Note the logical-ops entries (0C/24/35/
   F6.0) are the init-AF=0 subset that does not trip the SST-D-001 undefined-AF
   caveat; the shift entry (D1.4) is an init-AF=0 case outside the SST-D-002 noise.
-- **6 FAILREPRO files**, one per pinned emu86-bug cluster, each expected to
+- **6 FAILREPRO files**, one per pinned divergence, each expected to
   *diverge*: ROL flags (D1.0, SST-D-003), IMUL CF/OF (F7.5, SST-D-004),
   IDIV-as-unsigned (F7.7, SST-D-005), XCHG memory-EA recompute (87, SST-D-006),
-  far-branch 64KB offset wrap (FF.5, SST-D-007), and the C1.x shift-count assert
-  panic (C1.4, SST-D-009). Their SHA1s, cluster IDs, and exact recorded
-  divergences are listed in `micro/FAILREPRO.txt` and asserted byte-for-byte in
-  the `micro.rs` expectations table.
+  far-branch 64KB offset wrap (FF.5, SST-D-007), and the C1.x shift undefined-AF
+  residual (C1.4, SST-D-002 — re-pinned 2026-08-16 from SST-D-009 PANIC: the
+  shift-count assert is fixed, the sample now diverges only on undefined AF).
+  Their SHA1s, cluster IDs, and exact recorded divergences are listed in
+  `micro/FAILREPRO.txt` and asserted byte-for-byte in the `micro.rs`
+  expectations table.
 
 **Expected-FAILREPRO contract:** these six entries are regression pins for
-*known* emu86 behavior, not tests to make green. When a future emu86 fix flips
-one of them to PASS, the lane **fails**; the fix's author then (a) drops the
-entry from `spec.txt`, (b) regenerates the corpus, and (c) moves the entry from
-`FAILREPRO.txt` + the `micro.rs` expectations table into the PASS list. Do not
-weaken the lane assertion instead — that would hide a real semantic change.
+*known* emu86 divergences (emu86-bug or harness-caveat), not tests to make
+green. When a future fix flips one of them to PASS, the lane **fails**; the
+fix's author then (a) drops the entry from `spec.txt`, (b) regenerates the
+corpus, and (c) moves the entry from `FAILREPRO.txt` + the `micro.rs`
+expectations table into the PASS list. Do not weaken the lane assertion instead
+— that would hide a real semantic change.
 
 **Honest framing:** this corpus is *not* new coverage — it is the same
 hardware-anchored evidence as the full P3 run above, pinned hermetically so

@@ -1,6 +1,9 @@
 use super::alu::{self, ShiftOp};
+use super::cpu::{BP, CS, DI, IP, SS};
 use super::cpu_flags::*;
+use super::machine::Machine;
 use super::value::Value;
+use crate::segoff::SegOff;
 
 fn flags_with(of: bool, af: bool) -> Flags {
   let mut f = Flags(0);
@@ -180,4 +183,44 @@ fn sar_count_31_keeps_the_sign_bit_in_result_and_cf() {
 
   assert_eq!(result, Value::U8(0xff));
   assert_flags(flags, true, false, true, false, true, true);
+}
+
+// --- step-level: C1.x sign-extended imm8 count (SST-D-009) ---
+
+fn run_shift_at() -> (Machine, Value) {
+  // `shl word [ss:bp+di+6BDh],CBh` decode path (pinned C1.4 sample: bytes
+  // C1 A3 BD 06 CB): C1 /4 with a mem operand exercises OPER_IMM8_EXT (imm8
+  // sign-extended to u16). The count byte 0xCB sign-extends to 0xFFCB, which
+  // must be masked to the low byte (0xCB -> 5-bit 0x0B) rather than tripping
+  // an assertion.
+  let mut m = Machine::new(None);
+  m.reg_write_u16(CS, 0x0000);
+  m.reg_write_u16(IP, 0x0000);
+  m.reg_write_u16(SS, 0x1000);
+  // shl word [ss:bp+di+6BDh],CBh  =>  C1 A3 BD 06 CB
+  // (mod=10 reg=100/SHL rm=011/bp+di, disp16 06BDh, imm8 CBh)
+  let code: [u8; 5] = [0xC1, 0xA3, 0xBD, 0x06, 0xCB];
+  for (i, b) in code.iter().enumerate() {
+    m.mem.write_u8(SegOff::new(0x0000, i as u16), *b);
+  }
+  m.reg_write_u16(BP, 0x0100);
+  m.reg_write_u16(DI, 0x0004);
+  // seed the memory operand at ss:bp+di+06BDh = 0x1000:0x07C1
+  let mem_addr = SegOff::new(0x1000, 0x07C1);
+  m.mem.write_u16(mem_addr, 0x8000);
+
+  m.step().unwrap();
+
+  let result = m.mem.read_u16(mem_addr);
+  (m, Value::U16(result))
+}
+
+#[test]
+fn c1x_sign_extended_count_masks_to_low_byte() {
+  // 0x8000 << 0x0B (11) = 0x0000; the old assert `val as u8 as u16 == val`
+  // panicked on the sign-extended 0xFFCB. The shift must complete (no trap,
+  // machine advances) and produce the 5-bit-masked result.
+  let (m, result) = run_shift_at();
+  assert_eq!(result, Value::U16(0x0000));
+  assert_eq!(m.exec_count, 1);
 }
