@@ -35,8 +35,9 @@ use super::runner::{run_file, FileSummary, RunOpts, DEFAULT_FLAGS_UMASK};
 /// Stems of the PASS micro files (one per family), mirroring `spec.txt`.
 const PASS_STEMS: &[&str] = &[
   "04", "0C", "14", "1C", "24", "2D", "35", "3D", "40", "4F", "50", "58", "74",
-  "87", "89", "8B", "91", "98", "99", "9C", "A2", "B8", "C3", "D1.0", "D1.4",
-  "E2", "E3", "EB", "F6.0", "F6.2", "F7.3", "F7.5", "F7.7", "FF.5", "F8", "FC",
+  "87", "89", "8B", "91", "98", "99", "9C", "A2", "B8", "C1.4", "C3", "D1.0",
+  "D1.4", "E2", "E3", "EB", "F6.0", "F6.2", "F7.3", "F7.5", "F7.7", "FF.5", "F8",
+  "FC",
 ];
 
 /// Expected divergence of one FAILREPRO entry, keyed by filename and SHA1.
@@ -54,13 +55,9 @@ struct FailExpect {
 }
 
 const FAILREPRO_EXPECT: &[FailExpect] = &[
-  FailExpect {
-    file: "C1.4",
-    cluster: "SST-D-002",
-    hash_prefix: "aa19e33e8c0c96929dba",
-    bucket: "FAIL",
-    detail: "flags exp=0x0C07 act=0x0C17 umask=0x0FD7",
-  },
+  // No remaining FAILREPRO pins. The last pin — C1.4 (SST-D-002, undefined-AF
+  // residual) — flipped to PASS when the Track 2 undefined-flag umasks were
+  // applied to the shift forms, and was advanced to the PASS list (2026-08-16).
 ];
 
 fn failrepro_stems() -> Vec<&'static str> {

@@ -56,5 +56,7 @@ D1.0.MOO      pass      D1.0 0
 F7.5.MOO    pass      F7.5 13
 FF.5.MOO    pass      FF.5 2914
 F7.7.MOO    pass      F7.7 7
+C1.4.MOO    pass      C1.4 2
 # ---- Known-FAILREPRO entries (one per pinned P3 divergence cluster) ----
-C1.4.MOO    failrepro C1.4 2
+# (none remaining — the last pin, C1.4 / SST-D-002, flipped to PASS when the
+# Track 2 undefined-flag umasks were applied; advanced to the PASS list)

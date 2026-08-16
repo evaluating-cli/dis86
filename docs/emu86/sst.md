@@ -45,8 +45,8 @@ no REP/prefix semantics, no I/O, no far-segment decode path, or no step arm.
 | files run | 258 |
 | tests visited (total in files) | 1,162,000 |
 | tests executed (visited − filtered − revoked) | 1,014,157 |
-| **PASS** | **850,133** (83.83% of executed) |
-| **FAIL** | **152,384** (15.03%) |
+| **PASS** | **1,002,517** (98.85% of executed) |
+| **FAIL** | **0** |
 | **DECODE_ERR** | **0** |
 | **PANIC** | **0** |
 | SKIP_EXCEPTION | 11,640 |
@@ -57,15 +57,17 @@ no REP/prefix semantics, no I/O, no far-segment decode path, or no step arm.
 Bucket-sum check: `PASS+FAIL+DECODE_ERR+PANIC+SKIP_EXCEPTION+SKIP_32BIT == executed`
 holds; `executed+filtered+revoked == visited` holds.
 
-Files with any FAIL/DECODE_ERR/PANIC: **68** (out of 258).
+Files with any FAIL/DECODE_ERR/PANIC: **0** (out of 258).
 DECODE_ERR count: **0** across the whole run.
 
 ## Per-form breakdown (only forms with non-pass, non-filtered, non-skip-exception outcomes)
 
-68 forms have FAIL and/or PANIC (recounted from the D-012 full run: F8 resolved
-F7.7 and D-012 resolved the 20 short-branch forms 70-7F (minus 77), E0-E3, EB,
-down from the F7 recount of 90; the table retains stale rows for already-resolved
-clusters — 07, D7, F7.3, F7.5, FF.3, FF.5, F7.7 — kept as historical record).
+0 forms have FAIL and/or PANIC (Track 2 applied per-form `flags_umask` to every
+harness-caveat form — D-001 logical-AF, D-002 shift-AF/OF, D-004-undefined
+IMUL bits — masking the architecturally-undefined bits per Intel 80286 docs;
+all 258 V1 forms now pass 100% on the defined bits). The historical per-form
+table below is retained as the audit trail of every divergence cluster and its
+resolution; rows that previously carried FAIL/PANIC are marked RESOLVED.
 Table columns: form | executed | PASS | outcomes. Up to 3 samples per form
 (idx / name / first-16-of-sha1 / detail) from run output.
 
@@ -709,15 +711,15 @@ FAILREPRO pin existed for this cluster.
 
 ### Cluster size accounting
 
-- FAIL 152,384 = harness-caveat only (SST-D-001 79,739 + SST-D-002 65,208 +
-  SST-D-004-undefined part 7,437). All emu86-bug FAIL clusters are now resolved.
-  (The prior total 152,402 under-counted the clean-F6 actual 152,978 by 576:
-  320 from the D-004-undefined miscount (7,117 → 7,437 — the 69/6B undefined-
-  flag part recomputed from the F7 sweep: 69 3,726 + 6B 3,711) and 256 from the
-  SST-D-012 short-branch FAILs absent from the ledger. The F7 fix then turned
-  the 4 SST-D-007 FAILs into PASS: 152,978 → 152,974. The F8 fix then turned
-  the 334 SST-D-005 FAILs into PASS: 152,974 → 152,640. The D-012 runner fix
-  then turned the 256 SST-D-012 false FAILs into PASS: 152,640 → 152,384.)
+- FAIL **0** = no remaining FAIL clusters. Track 2 applied per-form
+  `flags_umask` to every harness-caveat form, masking the architecturally-
+  undefined bits (D-001 logical AF, D-002 shift AF/OF, D-004-undefined IMUL
+  bits) per Intel 80286 docs. All emu86-bug clusters were already resolved by
+  Track 1 (F1-F8 + D-012); the harness-caveat residuals are now masked.
+  (History: the F7 sweep had FAIL 152,974 = harness-caveat 152,384 +
+  emu86-bug 334 (D-005) + runner-bug 256 (D-012). F8 resolved D-005 → 152,640.
+  D-012 resolved the runner false-FAILs → 152,384. Track 2 masked the
+  remaining 152,384 harness-caveat FAILs → 0.)
 - PANIC 0 = no remaining PANIC clusters
   (SST-D-010 resolved 2026-08-16 — signed IDIV, no longer counted; SST-D-008
   resolved 2026-08-16 — non-wrapping stack arithmetic, no longer counted;
@@ -726,7 +728,7 @@ FAILREPRO pin existed for this cluster.
   2026-08-16 — ROL CF/OF, no longer counted; SST-D-006 resolved 2026-08-16 —
   XCHG memory EA, no longer counted; SST-D-007 resolved 2026-08-16 — multi-byte
   reads wrap the EA offset at 0x10000, no longer counted).
-- Sum check: 79,739 + 65,208 + 7,437 = 152,384 ✓ ; PANIC 0 ✓.
+- Sum check: 0 = 0 ✓ ; PANIC 0 ✓.
 
 ## Coverage statement (honest)
 
@@ -737,9 +739,12 @@ PUSH/POP (all forms), PUSHF/POPF, XCHG, MOV (all forms), TEST, LEA, NOP, CBW/CWD
 far/near CALL/JMP/RET, Jcc/LOOP/JCXZ, flag ops (CLC/STC/CLD/STD/CLI/STI),
 XLAT, shifts/rotates (SHL/SHR/SAR/ROL), grp3 TEST, MUL/IMUL/DIV/IDIV. For all of
 these, the *defined* flag bits and register/memory results match hardware except
-for the clusters above; 83.83% of executed tests pass outright and the FAIL
-surface is now **entirely harness-caveat** (architecturally-undefined AF/OF bits);
-all emu86-bug clusters are resolved.
+for the clusters above; **98.85% of executed tests pass outright and the entire
+remaining surface (SKIP_EXCEPTION 11,640) is exception-expected tests the suite
+itself skips** — all FAIL and PANIC clusters are resolved. Per-form `flags_umask`
+now masks the architecturally-undefined bits (logical-op AF, shift AF/OF,
+IMUL undefined bits) per Intel 80286 docs, so the conservative V1 subset
+compares only defined bits. **The conservative V1 sweep is at 0 FAIL / 0 PANIC.**
 
 **Planned-but-not-validated (deferred, per policy):** REP/string family
 (MOVS/CMPS/STOS/LODS/SCAS/INS/OUTS), segment/operand/address/LOCK prefixes, IN/OUT
@@ -750,10 +755,11 @@ LES/LDS, ENTER/LEAVE). These have **no** hardware evidence in this ledger.
 
 ## Open items (out of scope here — potential fixes live here, not in this doc)
 
-- Policy `flags_umask` gap: logical-op forms (SST-D-001) and shift forms
-  (SST-D-002) compare Intel-undefined AF (and OF for count>1); per-form umasks or
-  a "mask AF for logicals/shifts" rule would turn ~133K FAILs into PASS without
-  any emu86 change. This is the entire remaining FAIL surface (Track 2).
+- No remaining FAIL/PANIC items in the conservative V1 sweep. The full
+  divergence ledger is closed: every emu86-bug cluster (D-003..D-011) is
+  resolved by Track 1 (F1-F8), the runner false-FAIL D-012 is resolved, and the
+  harness-caveat residuals (D-001/D-002/D-004-undefined) are masked by per-form
+  `flags_umask` (Track 2). The FAILREPRO registry is empty.
   (SST-D-008 stack wrap fixed 2026-08-16 — wrapping stack/XLAT/RET
   arithmetic; SST-D-011 NEG i16::MIN fixed 2026-08-16 — `wrapping_neg`;
   SST-D-009 C1.x shift-count assert fixed 2026-08-16 — count masked to low
@@ -764,7 +770,11 @@ LES/LDS, ENTER/LEAVE). These have **no** hardware evidence in this ledger.
   multi-byte reads wrap the EA offset at 0x10000; SST-D-005/SST-D-010 IDIV
   signed division fixed 2026-08-16 — `DivideOp` signed arm, `OP_IDIV`;
   SST-D-012 short-branch IP off-by-one fixed 2026-08-16 — runner absent-IP
-  `−1` convention, 256 false FAILs → PASS.)
+  `−1` convention, 256 false FAILs → PASS; SST-D-001 logical AF + SST-D-002
+  shift AF/OF + SST-D-004-undefined IMUL bits masked 2026-08-16 — per-form
+  `flags_umask`, Track 2, 152,384 harness-caveat FAILs → PASS.)
+- Forward work: Track 3 (REP-vs-dosemu2 reconciliation) and Track 4 (Hydra
+  Option C/D) remain, per `.opencode/plan.md`.
 
 ## Hermetic micro-corpus (checked-in)
 
@@ -784,40 +794,33 @@ helper; the checked-in files are what the lane runs).
 
 **Counts (37 entries, ~22KB total):**
 
-- **36 PASS-representative files** spanning the conservative breadth — ADD (04),
+- **37 PASS-representative files** spanning the conservative breadth — ADD (04),
   OR (0C), ADC (14), SBB (1C), AND (24), SUB (2D), XOR (35), CMP (3D),
   INC (40), DEC (4F), PUSH r16 (50), POP r16 (58), MOV (89/8B/B8), XCHG (91),
   CBW/CWD (98/99), Jcc (74), JMP rel8 (EB), RET (C3), LOOP (E2), JCXZ (E3),
-  MOV moffs8 write (A2), SHL r/m16,1 (D1.4), grp3 TEST/NOT/NEG (F6.0/F6.2/F7.3),
-  IDIV (F7.7), flag ops (F8/FC), PUSHF (9C). Every entry was verified with the
-  release runner before inclusion; each must execute 100% PASS with **zero**
-  FILTERED / SKIP_EXCEPTION / FAIL / DECODE_ERR / PANIC (entries are chosen
-  clean: no leading prefix byte, no exception key). Note the logical-ops entries
-  (0C/24/35/F6.0) are the init-AF=0 subset that does not trip the SST-D-001
-  undefined-AF caveat; the shift entry (D1.4) is an init-AF=0 case outside the
-  SST-D-002 noise; the IDIV entry (F7.7) is a signed case that only passed after
-  the F8 fix.
-- **1 FAILREPRO file**, one per pinned divergence, each expected to
-  *diverge*: the C1.x shift undefined-AF residual (C1.4, SST-D-002 — re-pinned
-  2026-08-16 from SST-D-009 PANIC: the shift-count assert is fixed, the sample
-  now diverges only on undefined AF). D1.0 (SST-D-003) moved to the PASS list
-  2026-08-16 when the ROL CF/OF fix flipped it to PASS; 87 (SST-D-006) moved to
-  the PASS list 2026-08-16 when the XCHG memory-EA fix flipped it to PASS; F7.5
-  (SST-D-004) moved to the PASS list 2026-08-16 when the IMUL CF/OF fix flipped
-  it to PASS; FF.5 (SST-D-007) moved to the PASS list 2026-08-16 when the 64KB
-  offset wrap fix flipped it to PASS; F7.7 (SST-D-005/SST-D-010) moved to the
-  PASS list 2026-08-16 when the signed-IDIV fix flipped it to PASS. Their
-  SHA1s, cluster IDs, and exact recorded divergences are listed in
-  `micro/FAILREPRO.txt` and asserted byte-for-byte in the `micro.rs`
-  expectations table.
+  MOV moffs8 write (A2), SHL r/m16,1 (D1.4) and its variable-count sibling
+  (C1.4), grp3 TEST/NOT/NEG (F6.0/F6.2/F7.3), IDIV (F7.7), flag ops (F8/FC),
+  PUSHF (9C). Every entry was verified with the release runner before inclusion;
+  each must execute 100% PASS with **zero** FILTERED / SKIP_EXCEPTION / FAIL /
+  DECODE_ERR / PANIC (entries are chosen clean: no leading prefix byte, no
+  exception key). The logical-ops entries (0C/24/35/F6.0) and the shift entries
+  (C1.4/D1.4) pass under their per-form `flags_umask` (AF masked for logicals
+  and shifts; OF masked for variable-count shifts), so the lane now exercises
+  the masked-undefined-bit path that Track 2 established.
+- **0 FAILREPRO files** — the registry is empty. The last pin, C1.4 (SST-D-002,
+  the shift undefined-AF residual), flipped to PASS on 2026-08-16 when Track 2
+  masked AF/OF for the shift forms and was advanced to the PASS list. Earlier
+  pins were advanced by their respective fixes: D1.0 (SST-D-003, ROL CF/OF),
+  87 (SST-D-006, XCHG memory-EA), F7.5 (SST-D-004, IMUL CF/OF), FF.5 (SST-D-007,
+  64KB offset wrap), F7.7 (SST-D-005/SST-D-010, signed IDIV).
 
-**Expected-FAILREPRO contract:** the remaining entry is a regression pin for a
-*known* emu86 divergence (harness-caveat), not a test to make green. When a
-future fix flips it to PASS, the lane **fails**; the fix's author then (a)
-drops the entry from `spec.txt`, (b) regenerates the corpus, and (c) moves the
-entry from `FAILREPRO.txt` + the `micro.rs` expectations table into the PASS
-list. Do not weaken the lane assertion instead — that would hide a real
-semantic change.
+**Expected-FAILREPRO contract:** with zero pins remaining, the lane now asserts
+only that every micro file PASSES. If a future change introduces a divergence,
+the `pass_micro_files_all_pass_cleanly` test will catch it. (The historical
+contract is retained in `FAILREPRO.txt` for reference: a future pin would again
+require (a) dropping the entry from `spec.txt`, (b) regenerating the corpus, and
+(c) moving the entry from `FAILREPRO.txt` + the `micro.rs` expectations table
+into the PASS list — never weakening the assertion.)
 
 **Honest framing:** this corpus is *not* new coverage — it is the same
 hardware-anchored evidence as the full P3 run above, pinned hermetically so
