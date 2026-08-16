@@ -176,6 +176,19 @@ impl Machine {
     self.operand_write(&instr, 1, Value::U16(result as u16));
   }
 
+  pub fn op_divide(&mut self, instr: &Instr, op: alu::DivideOp) {
+    let high = self.operand_read(&instr, 0);
+    let low = self.operand_read(&instr, 1);
+    let lhs = Value::join(high, low);
+    let rhs = self.operand_read(&instr, 2);
+
+    let (quotient, remainder, flags) = alu::divmod(op, lhs, rhs, self.flag_read_all());
+    self.flag_write_all(flags);
+
+    self.operand_write(&instr, 1, quotient);
+    self.operand_write(&instr, 0, remainder);
+  }
+
   pub fn op_signed_multiply_trunc(&mut self, instr: &Instr) {
     let lhs = self.operand_read(&instr, 1);
     let rhs = self.operand_read(&instr, 2);
@@ -478,18 +491,8 @@ impl Machine {
       Opcode::OP_IMUL => self.op_multiply(&instr, alu::MultiplyOp::Signed),
       Opcode::OP_IMUL_TRUNC => self.op_signed_multiply_trunc(&instr),
 
-      Opcode::OP_DIV => {
-        let high = self.operand_read(&instr, 0);
-        let low = self.operand_read(&instr, 1);
-        let lhs = Value::join(high, low);
-        let rhs = self.operand_read(&instr, 2);
-
-        let (quotient, remainder, flags) = alu::divmod(lhs, rhs, self.flag_read_all());
-        self.flag_write_all(flags);
-
-        self.operand_write(&instr, 1, quotient);
-        self.operand_write(&instr, 0, remainder);
-      }
+      Opcode::OP_DIV  => self.op_divide(&instr, alu::DivideOp::Unsigned),
+      Opcode::OP_IDIV => self.op_divide(&instr, alu::DivideOp::Signed),
 
       Opcode::OP_XCHG => {
         // Pre-compute the memory operand's EA before the first write: the

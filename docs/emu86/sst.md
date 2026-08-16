@@ -45,10 +45,10 @@ no REP/prefix semantics, no I/O, no far-segment decode path, or no step arm.
 | files run | 258 |
 | tests visited (total in files) | 1,162,000 |
 | tests executed (visited − filtered − revoked) | 1,014,157 |
-| **PASS** | **827,177** (81.56% of executed) |
-| **FAIL** | **157,081** (15.49%) |
+| **PASS** | **849,877** (83.81% of executed) |
+| **FAIL** | **152,640** (15.05%) |
 | **DECODE_ERR** | **0** |
-| **PANIC** | **18,259** (1.80%) |
+| **PANIC** | **0** |
 | SKIP_EXCEPTION | 11,640 |
 | SKIP_32BIT | 0 |
 | FILTERED (prefix-collateral) | 147,841 |
@@ -62,8 +62,8 @@ DECODE_ERR count: **0** across the whole run.
 
 ## Per-form breakdown (only forms with non-pass, non-filtered, non-skip-exception outcomes)
 
-90 forms have FAIL and/or PANIC (recounted from the F7 run: 25 forms resolved to
-zero FAIL/PANIC by fixes F1-F7, and the 20 short-branch forms 70-7F (minus 77),
+90 forms have FAIL and/or PANIC (recounted from the F7 run: 26 forms resolved to
+zero FAIL/PANIC by fixes F1-F8, and the 20 short-branch forms 70-7F (minus 77),
 E0-E3, EB marked SST-D-012 below are now explicitly listed — the original count
 of 95 omitted them). Table columns: form | executed | PASS | outcomes.
 Up to 3 samples per form (idx / name / first-16-of-sha1 / detail) from run output.
@@ -430,10 +430,8 @@ Up to 3 samples per form (idx / name / first-16-of-sha1 / detail) from run outpu
 | `F7.3` | 3967 | 3938 | PANIC=1 |
 |   |   |   | idx=1207 `neg word [ds:bx+si]` `d4d5e5cb5b0d37c9…` panic: attempt to negate with overflow |
 | `F7.5` | 3958 | 3930 | FAIL=0 |
-| `F7.7` | 3965 | 332 | FAIL=334 PANIC=723 |
-|   |   |   | idx=7 `idiv word [ss:bp+di]` `b08f0b9dd03d3b7d…` AX exp=0xE5AA act=0x133E; DX exp=0x5DB7 act=0x2FB3 |
-|   |   |   | idx=9 `idiv word [ds:si+3D3Bh]` `2bcb8be3ab9e9cb6…` panic: Divide Error |
-|   |   |   | idx=10 `idiv word [ds:bx+di+59h]` `5e8c66d6508cec66…` panic: Divide Error |
+| `F7.7` | 3965 | 1389 | FAIL=0 PANIC=0 |
+|   |   |   | (RESOLVED 2026-08-16 F8: signed IDIV; idx=7 sample now PASS) |
 | `FF.3` | 3968 | 2948 | FAIL=0 |
 | `FF.5` | 3968 | 2945 | FAIL=0 |
 
@@ -543,6 +541,21 @@ in the unsigned domain, alu.rs:136-137) fire where the 80C286 produced a valid
 signed result. The 2,576 SKIP_EXCEPTION are the suite's exception-expected
 divide-overflow tests, correctly skipped. Classification: **emu86-bug** (IDIV
 computed as unsigned DIV).
+
+**RESOLVED 2026-08-16 (F8):** `Opcode::OP_IDIV` added (decode F6/7 + F7/7 →
+`OP_IDIV`; F6/6 + F7/6 stay `OP_DIV`); `alu::divmod` now takes a `DivideOp`
+(Unsigned/Signed) mirroring `MultiplyOp`, and the Signed arm does 32/16 signed
+division (`a as i32 as i64 / b as i16 as i64`, truncated toward zero, remainder
+keeps the dividend's sign) with the divide-error surface kept as a `panic!`
+(emu86 has no exception machinery; the corpus's #DE tests are marked
+SkipException and never execute the panic). Fix demonstrated by the mirror test
+`idiv_word_signed_division_matches_pinned_sample` (pinned F7.7 sample: dividend
+DX:AX=0x0B1E:0x9A19, divisor [ss:bp+di]=0x93ED → quotient 0xE5AA / remainder
+0x5DB7) plus the alu-level `divmod_signed_*` tests in `shift_semantics_test.rs`;
+`cargo test --locked --all-targets` 338 passed; hermetic micro lane green after
+moving F7.7 from FAILREPRO to the PASS list (spec.txt, micro.rs PASS_STEMS,
+FAILREPRO.txt). Release-mode re-run: F7.7 PASS=1389 FAIL=0 PANIC=0; F7.6 (DIV)
+unchanged PASS=1847 FAIL=0 PANIC=0.
 
 **SST-D-006 — XCHG with a memory operand whose EA uses the exchanged register.**
 Forms: 86 (283 FAIL), 87 (595 FAIL) — 878 FAIL total.
@@ -663,6 +676,10 @@ green after re-pinning C1.4 to bucket=FAIL (SST-D-002).
 
 **SST-D-010 — IDIV "Divide Error" panic.** 723 PANIC, same root as SST-D-005
 (unsigned divmod asserting quotient > 0xffff). Classification: **emu86-bug**.
+RESOLVED 2026-08-16 (F8) with SST-D-005: the signed divmod only panics on a
+genuine #DE (zero divisor / signed quotient overflow), which the corpus marks
+SkipException; the 723 former panics were valid signed results and now PASS
+(F7.7 PANIC=0).
 
 **SST-D-011 — F7.3 NEG "attempt to negate with overflow".** 1 PANIC
 (`alu::unary` NEG `-(a as i16)` overflows at i16::MIN). Debug-mode overflow trap.
@@ -681,23 +698,25 @@ FAILREPRO pin existed for this cluster.
 
 ### Cluster size accounting
 
-- FAIL 152,974 = harness-caveat (152,384: SST-D-001 79,739 + SST-D-002 65,208 +
-  SST-D-004-undefined part 7,437) + emu86-bug (334: SST-D-005) + SST-D-012 256
+- FAIL 152,640 = harness-caveat (152,384: SST-D-001 79,739 + SST-D-002 65,208 +
+  SST-D-004-undefined part 7,437) + SST-D-012 256
   (short-branch IP off-by-one — runner terminating-HALT convention, harness bug,
   open; identified below).
   (The prior total 152,402 under-counted the clean-F6 actual 152,978 by 576:
   320 from the D-004-undefined miscount (7,117 → 7,437 — the 69/6B undefined-
   flag part recomputed from the F7 sweep: 69 3,726 + 6B 3,711) and 256 from the
   SST-D-012 short-branch FAILs absent from the ledger. The F7 fix then turned
-  the 4 SST-D-007 FAILs into PASS: 152,978 → 152,974.)
-- PANIC 723 = SST-D-010 723
-  (SST-D-008 resolved 2026-08-16 — non-wrapping stack arithmetic, no longer
-  counted; SST-D-011 resolved 2026-08-16 — debug-only trap; SST-D-009 resolved
+  the 4 SST-D-007 FAILs into PASS: 152,978 → 152,974. The F8 fix then turned
+  the 334 SST-D-005 FAILs into PASS: 152,974 → 152,640.)
+- PANIC 0 = no remaining PANIC clusters
+  (SST-D-010 resolved 2026-08-16 — signed IDIV, no longer counted; SST-D-008
+  resolved 2026-08-16 — non-wrapping stack arithmetic, no longer counted;
+  SST-D-011 resolved 2026-08-16 — debug-only trap; SST-D-009 resolved
   2026-08-16 — C1.x shift-count assert, no longer counted; SST-D-003 resolved
   2026-08-16 — ROL CF/OF, no longer counted; SST-D-006 resolved 2026-08-16 —
   XCHG memory EA, no longer counted; SST-D-007 resolved 2026-08-16 — multi-byte
   reads wrap the EA offset at 0x10000, no longer counted).
-- Sum check: 152,384 + 334 + 256 = 152,974 ✓ ; 723 ✓.
+- Sum check: 152,384 + 256 = 152,640 ✓ ; PANIC 0 ✓.
 
 ## Coverage statement (honest)
 
@@ -725,8 +744,6 @@ LES/LDS, ENTER/LEAVE). These have **no** hardware evidence in this ledger.
   (SST-D-002) compare Intel-undefined AF (and OF for count>1); per-form umasks or
   a "mask AF for logicals/shifts" rule would turn ~133K FAILs into PASS without
   any emu86 change.
-- IDIV signed division (SST-D-005/SST-D-010): replace unsigned divmod path with a
-  signed one; hardware-anchored expected flags.
 - Short-branch IP off-by-one (SST-D-012): runner `compare_state` absent-IP case
   does not apply the terminating-HALT −1; one-liner at `runner.rs:230`
   (`init[IP_IDX].wrapping_sub(1)`); flips 256 false FAILs to PASS, zero emu86
@@ -738,7 +755,8 @@ LES/LDS, ENTER/LEAVE). These have **no** hardware evidence in this ledger.
   rotated-out bit, OF for count==1; SST-D-006 XCHG memory-EA fixed 2026-08-16
   — EA computed pre-swap; SST-D-004 IMUL CF/OF fixed 2026-08-16 — sign-
   extension overflow check; SST-D-007 far-branch 64KB wrap fixed 2026-08-16 —
-  multi-byte reads wrap the EA offset at 0x10000.)
+  multi-byte reads wrap the EA offset at 0x10000; SST-D-005/SST-D-010 IDIV
+  signed division fixed 2026-08-16 — `DivideOp` signed arm, `OP_IDIV`.)
 
 ## Hermetic micro-corpus (checked-in)
 
@@ -758,37 +776,40 @@ helper; the checked-in files are what the lane runs).
 
 **Counts (37 entries, ~22KB total):**
 
-- **35 PASS-representative files** spanning the conservative breadth — ADD (04),
+- **36 PASS-representative files** spanning the conservative breadth — ADD (04),
   OR (0C), ADC (14), SBB (1C), AND (24), SUB (2D), XOR (35), CMP (3D),
   INC (40), DEC (4F), PUSH r16 (50), POP r16 (58), MOV (89/8B/B8), XCHG (91),
   CBW/CWD (98/99), Jcc (74), JMP rel8 (EB), RET (C3), LOOP (E2), JCXZ (E3),
   MOV moffs8 write (A2), SHL r/m16,1 (D1.4), grp3 TEST/NOT/NEG (F6.0/F6.2/F7.3),
-  flag ops (F8/FC), PUSHF (9C). Every entry was verified with the release
-  runner before inclusion; each must execute 100% PASS with **zero** FILTERED /
-  SKIP_EXCEPTION / FAIL / DECODE_ERR / PANIC (entries are chosen clean: no
-  leading prefix byte, no exception key). Note the logical-ops entries (0C/24/35/
-  F6.0) are the init-AF=0 subset that does not trip the SST-D-001 undefined-AF
-  caveat; the shift entry (D1.4) is an init-AF=0 case outside the SST-D-002 noise.
-- **2 FAILREPRO files**, one per pinned divergence, each expected to
-  *diverge*: IDIV-as-unsigned (F7.7, SST-D-005) and the C1.x shift undefined-AF
-  residual (C1.4, SST-D-002 — re-pinned 2026-08-16 from SST-D-009 PANIC: the
-  shift-count assert is fixed, the sample now diverges only on undefined AF).
-  D1.0 (SST-D-003) moved to the PASS list 2026-08-16 when the ROL CF/OF fix
-  flipped it to PASS; 87 (SST-D-006) moved to the PASS list 2026-08-16 when the
-  XCHG memory-EA fix flipped it to PASS; F7.5 (SST-D-004) moved to the PASS list
-  2026-08-16 when the IMUL CF/OF fix flipped it to PASS; FF.5 (SST-D-007) moved
-  to the PASS list 2026-08-16 when the 64KB offset wrap fix flipped it to PASS.
-  Their SHA1s, cluster IDs, and exact recorded divergences are listed in
+  IDIV (F7.7), flag ops (F8/FC), PUSHF (9C). Every entry was verified with the
+  release runner before inclusion; each must execute 100% PASS with **zero**
+  FILTERED / SKIP_EXCEPTION / FAIL / DECODE_ERR / PANIC (entries are chosen
+  clean: no leading prefix byte, no exception key). Note the logical-ops entries
+  (0C/24/35/F6.0) are the init-AF=0 subset that does not trip the SST-D-001
+  undefined-AF caveat; the shift entry (D1.4) is an init-AF=0 case outside the
+  SST-D-002 noise; the IDIV entry (F7.7) is a signed case that only passed after
+  the F8 fix.
+- **1 FAILREPRO file**, one per pinned divergence, each expected to
+  *diverge*: the C1.x shift undefined-AF residual (C1.4, SST-D-002 — re-pinned
+  2026-08-16 from SST-D-009 PANIC: the shift-count assert is fixed, the sample
+  now diverges only on undefined AF). D1.0 (SST-D-003) moved to the PASS list
+  2026-08-16 when the ROL CF/OF fix flipped it to PASS; 87 (SST-D-006) moved to
+  the PASS list 2026-08-16 when the XCHG memory-EA fix flipped it to PASS; F7.5
+  (SST-D-004) moved to the PASS list 2026-08-16 when the IMUL CF/OF fix flipped
+  it to PASS; FF.5 (SST-D-007) moved to the PASS list 2026-08-16 when the 64KB
+  offset wrap fix flipped it to PASS; F7.7 (SST-D-005/SST-D-010) moved to the
+  PASS list 2026-08-16 when the signed-IDIV fix flipped it to PASS. Their
+  SHA1s, cluster IDs, and exact recorded divergences are listed in
   `micro/FAILREPRO.txt` and asserted byte-for-byte in the `micro.rs`
   expectations table.
 
-**Expected-FAILREPRO contract:** these two entries are regression pins for
-*known* emu86 divergences (emu86-bug or harness-caveat), not tests to make
-green. When a future fix flips one of them to PASS, the lane **fails**; the
-fix's author then (a) drops the entry from `spec.txt`, (b) regenerates the
-corpus, and (c) moves the entry from `FAILREPRO.txt` + the `micro.rs`
-expectations table into the PASS list. Do not weaken the lane assertion instead
-— that would hide a real semantic change.
+**Expected-FAILREPRO contract:** the remaining entry is a regression pin for a
+*known* emu86 divergence (harness-caveat), not a test to make green. When a
+future fix flips it to PASS, the lane **fails**; the fix's author then (a)
+drops the entry from `spec.txt`, (b) regenerates the corpus, and (c) moves the
+entry from `FAILREPRO.txt` + the `micro.rs` expectations table into the PASS
+list. Do not weaken the lane assertion instead — that would hide a real
+semantic change.
 
 **Honest framing:** this corpus is *not* new coverage — it is the same
 hardware-anchored evidence as the full P3 run above, pinned hermetically so

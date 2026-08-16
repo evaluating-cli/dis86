@@ -1082,6 +1082,17 @@ impl IRBuilder<'_> {
         self.append_asm_dst_operand(&ins.operands[0], upper_out);
         self.append_asm_dst_operand(&ins.operands[1], lower_out);
       }
+      instr::Opcode::OP_IDIV => {
+        let upper_in = self.append_asm_src_operand(&ins.operands[0]);
+        let lower_in = self.append_asm_src_operand(&ins.operands[1]);
+        let divisor = self.append_asm_src_operand(&ins.operands[2]);
+        let dividend = self.append_instr(Type::U32, Opcode::Make32, vec![upper_in, lower_in]);
+        let divisor = self.append_instr(Type::U32, Opcode::SignExtTo32, vec![divisor]);
+        let quotient = self.append_instr(Type::U32, Opcode::IDiv, vec![dividend, divisor]);
+        let (upper_out, lower_out) = self.append_upper_lower_split(quotient);
+        self.append_asm_dst_operand(&ins.operands[0], upper_out);
+        self.append_asm_dst_operand(&ins.operands[1], lower_out);
+      }
       instr::Opcode::OP_STOS => {
         let src = self.append_asm_src_operand(&ins.operands[1]);
         self.append_asm_dst_operand(&ins.operands[0], src);

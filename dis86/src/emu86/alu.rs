@@ -20,6 +20,11 @@ pub enum MultiplyOp {
   Signed,
 }
 
+pub enum DivideOp {
+  Unsigned,
+  Signed,
+}
+
 pub enum UnaryOp {
   Neg,
   Inc,
@@ -125,16 +130,37 @@ fn update_flags_sar(f: &mut Flags, a: i32, n: u8, r: u16, sign_mask: u16, value_
 }
 
 // Returns (quotient, remainder, flags)
-pub fn divmod(a: Value, b: Value, mut f: Flags) -> (Value, Value, Flags) {
+pub fn divmod(op: DivideOp, a: Value, b: Value, mut f: Flags) -> (Value, Value, Flags) {
   let Value::U32(a) = a else { panic!("expected u32 for lhs") };
   let Value::U16(b) = b else { panic!("expected u16 for rhs") };
-  let b = b as u32;
 
-  let quotient = a / b;
-  let remainder = a % b;
-
-  if quotient > 0xffff {
-    panic!("Divide Error"); // What should be done about this??
+  // DIV: unsigned 32/16 division, quotient must fit 16 bits. IDIV: signed
+  // 32/16 division (both operands sign-extended), quotient must fit signed 16
+  // bits. Both raise #DE (divide error) on overflow or a zero divisor; emu86
+  // has no exception machinery, so the corpus marks #DE tests SkipException
+  // and the panic below is the divide-error surface.
+  let quotient;
+  let remainder;
+  match op {
+    DivideOp::Unsigned => {
+      let b = b as u32;
+      if b == 0 { panic!("Divide Error"); }
+      quotient = a / b;
+      remainder = a % b;
+      if quotient > 0xffff {
+        panic!("Divide Error"); // What should be done about this??
+      }
+    }
+    DivideOp::Signed => {
+      let dividend = a as i32 as i64;
+      let divisor = b as i16 as i64;
+      if divisor == 0 { panic!("Divide Error"); }
+      quotient = (dividend / divisor) as u32;
+      remainder = (dividend % divisor) as u32;
+      if (quotient as i32) > 0x7fff || (quotient as i32) < -0x8000 {
+        panic!("Divide Error");
+      }
+    }
   }
 
   // Mirroring the behaviour of dosbox-x

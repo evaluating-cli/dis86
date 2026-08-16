@@ -144,6 +144,7 @@ pub fn instr_details(ins: &Instr, binary: &Binary) -> Result<InstrDetails, Strin
     Opcode::OP_DIV        => (),
     Opcode::OP_ENTER      => (),
     // Opcode::OP_HLT     => (),
+    Opcode::OP_IDIV       => (),
     Opcode::OP_IMUL       => (),
     Opcode::OP_IMUL_TRUNC => (),
     Opcode::OP_IN         => (),

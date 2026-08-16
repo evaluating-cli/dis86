@@ -1,5 +1,5 @@
-use super::alu::{self, ShiftOp};
-use super::cpu::{BP, BX, CS, DI, DS, IP, SS};
+use super::alu::{self, DivideOp, ShiftOp};
+use super::cpu::{AX, BP, BX, CS, DI, DS, DX, IP, SS};
 use super::cpu_flags::*;
 use super::machine::Machine;
 use super::value::Value;
@@ -346,4 +346,76 @@ fn jmp_far_mem_wraps_far_pointer_at_64kb_boundary() {
   assert_eq!(m.reg(CS), 0x848f);
   assert_eq!(m.reg(IP), 0x74cd);
   assert_eq!(m.exec_count, 1);
+}
+
+// --- signed IDIV (SST-D-005): IDIV signed 32/16 division. Pinned F7.7 sample
+// `idiv word [ss:bp+di]` (bytes F7 3B, ss=0xEED4 bp=0x97C7 di=0x35DC): the
+// 32-bit dividend DX:AX = 0x0B1E:0x9A19 (186,554,905) divided by the i16
+// divisor 0x93ED (-27,667) gives quotient -6742 (0xE5AA) and remainder +23991
+// (0x5DB7). The old unsigned-only divmod produced 0x133E / 0x2FB3. ---
+
+#[test]
+fn idiv_word_signed_division_matches_pinned_sample() {
+  let mut m = Machine::new(None);
+  m.reg_write_u16(CS, 0x0000);
+  m.reg_write_u16(IP, 0x0000);
+  m.reg_write_u16(SS, 0xeed4);
+  m.reg_write_u16(BP, 0x97c7);
+  m.reg_write_u16(DI, 0x35dc);
+  m.reg_write_u16(AX, 0x9a19);
+  m.reg_write_u16(DX, 0x0b1e);
+  // `idiv word [ss:bp+di]` = F7 3B (modrm 0x3B: mod=00 reg=111/IDIV rm=011/[bp+di])
+  for (i, &b) in [0xF7u8, 0x3B].iter().enumerate() {
+    m.mem.write_u8(SegOff::new(0x0000, i as u16), b);
+  }
+  // divisor at ss:bp+di = 0xEED4:(0x97C7+0x35DC=0xCDA3) = 0x93ED
+  let mem_addr = SegOff::new(0xeed4, 0xcda3);
+  m.mem.write_u16(mem_addr, 0x93ed);
+
+  m.step().unwrap();
+
+  assert_eq!(m.reg(AX), 0xe5aa);
+  assert_eq!(m.reg(DX), 0x5db7);
+  assert_eq!(m.exec_count, 1);
+}
+
+#[test]
+fn divmod_signed_truncates_toward_zero_and_keeps_dividend_sign() {
+  // 186,554,905 / -27,667 = -6742 (truncated toward zero), remainder +23991.
+  let f = Flags(0);
+  let (q, r, _) = alu::divmod(
+    DivideOp::Signed,
+    Value::U32(0x0b1e9a19),
+    Value::U16(0x93ed),
+    f,
+  );
+  assert_eq!(q, Value::U16(0xe5aa));
+  assert_eq!(r, Value::U16(0x5db7));
+
+  // -10 / 3 = -3 (truncation toward zero, not floor), remainder -1.
+  let (q, r, _) = alu::divmod(DivideOp::Signed, Value::U32(0xfffffff6), Value::U16(3), Flags(0));
+  assert_eq!(q, Value::U16(0xfffd)); // -3
+  assert_eq!(r, Value::U16(0xffff)); // -1
+}
+
+#[test]
+fn divmod_unsigned_still_wraps_like_div() {
+  // 0x0B1E9A19 / 0x93ED (unsigned 37,869) = 4,926 (0x133E), remainder 12,211
+  // (0x2FB3) — matches the pre-fix emu86 behaviour for the same operands.
+  let (q, r, _) = alu::divmod(DivideOp::Unsigned, Value::U32(0x0b1e9a19), Value::U16(0x93ed), Flags(0));
+  assert_eq!(q, Value::U16(0x133e));
+  assert_eq!(r, Value::U16(0x2fb3));
+}
+
+#[test]
+#[should_panic(expected = "Divide Error")]
+fn divmod_signed_divide_by_zero_panics() {
+  alu::divmod(DivideOp::Signed, Value::U32(0x100), Value::U16(0), Flags(0));
+}
+
+#[test]
+#[should_panic(expected = "Divide Error")]
+fn divmod_signed_quotient_overflow_panics() {
+  // -32768 / -1 overflows signed 16 bits -> #DE.
+  alu::divmod(DivideOp::Signed, Value::U32(0xffff8000), Value::U16(0xffff), Flags(0));
 }
