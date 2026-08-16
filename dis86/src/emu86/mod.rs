@@ -8,6 +8,7 @@ mod cpu_scas;
 mod cpu_cmps;
 mod cpu_stos;
 mod cpu_movs;
+mod cpu_lods;
 
 pub mod alu;
 

@@ -54,10 +54,12 @@ fn operand_src(sz: Size, sreg: Option<Reg>) -> Result<Operand, String> {
   }))
 }
 
-fn operand_dst(sz: Size, sreg: Option<Reg>) -> Result<Operand, String> {
+fn operand_dst(sz: Size, _sreg: Option<Reg>) -> Result<Operand, String> {
+  // String-op destination is always ES:DI; a segment-override prefix applies
+  // only to the source (DS:SI), never to the destination.
   Ok(Operand::Mem(OperandMem {
     sz: sz,
-    sreg: sreg.unwrap_or(Reg::ES),
+    sreg: Reg::ES,
     reg1: Some(Reg::DI),
     reg2: None,
     off: None,

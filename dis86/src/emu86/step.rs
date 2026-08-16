@@ -262,6 +262,7 @@ impl Machine {
       Opcode::OP_STOS => return self.opcode_stos(&instr),
       Opcode::OP_MOVS => return self.opcode_movs(&instr),
       Opcode::OP_CMPS => return self.opcode_cmps(&instr),
+      Opcode::OP_LODS => return self.opcode_lods(&instr),
       _ => (),
     }
 
@@ -383,20 +384,6 @@ impl Machine {
       Opcode::OP_STI => self.flag_write(FLAG_IF, true),
       Opcode::OP_CLC => self.flag_write(FLAG_CF, false),
       Opcode::OP_STC => self.flag_write(FLAG_CF, true),
-
-      Opcode::OP_LODS => {
-        let value = self.operand_read(&instr, 1);
-        self.operand_write(&instr, 0, value);
-
-        let idx = self.reg_read_u16(SI);
-        let sz = value.size() as u16;
-        let new_idx = if !self.flag_read(FLAG_DF) {
-          idx.wrapping_add(sz)
-        } else {
-          idx.wrapping_sub(sz)
-        };
-        self.reg_write_u16(SI, new_idx);
-      },
 
       Opcode::OP_IN => {
         let port = self.operand_read_u16(&instr, 1);

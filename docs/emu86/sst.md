@@ -635,6 +635,59 @@ FAIL 152,640 → 152,384, PANIC 0; all 20 short-branch forms now 100% PASS
 byte at init−1, absent final IP → PASS); `cargo test --locked --all-targets`
 339 passed.
 
+---
+
+## Track 3 R1 — String-family arbitration (A4-AF)
+
+R1 extended the pinned fetch to the string family (A4-AF MOVS/CMPS/STOS/LODS/SCAS,
+fetched from the pinned commit; sha256 pinned in `data/sst/manifest.txt`). The
+forms are `cap: Implemented` but `scope: Deferred(RepString)` — not in the V1
+sweep. Empirical inspection (`emu86_sst run --all`, conservative filter off):
+
+- **Bare string ops (no prefix)**: 100% PASS — emu86's single-iteration string
+  ops (MOVS/CMPS/STOS/LODS/SCAS) match hardware exactly.
+- **REP-prefixed MOVS/CMPS/STOS/SCAS**: 100% PASS — the `opcode_*` while-loop
+  REP implementation (cpu_movs/scas/stos/cmps.rs) completes a whole-REP test in
+  one `step()` and matches the hardware final state.
+- **Segment-override + string ops** (26/2E/36/3E + A4-AF): FAIL — SST-D-013.
+- **REP-prefixed LODS** (F2/F3 + AC/AD): PANIC — SST-D-014.
+- **LOCK-prefixed string ops** (F0 + A4-AF): DECODE_ERR — SST-D-015 (open).
+
+**SST-D-013 — segment-override prefix applied to string-op destination.**
+Forms: A4-AF with a 26/2E/36/3E prefix. `operand_dst` (decode.rs:57) used
+`sreg.unwrap_or(Reg::ES)`, so a segment-override prefix overrode the destination
+segment too — but a string-op dest is **always ES:DI**; the override applies
+only to the source (DS:SI). For `3E A4` (DS:MOVSB) emu86 wrote to DS:DI instead
+of ES:DI. Classification: **emu86-bug** (decoder).
+**RESOLVED 2026-08-16 (R1):** `operand_dst` now always uses `Reg::ES`, ignoring
+the prefix. Demonstrated by `ds_override_movsb_writes_dest_to_es_not_ds` in
+`cpu_movs.rs`; all 10 string forms 0 FAIL with `--all`.
+
+**SST-D-014 — REP LODS panicked ("REP prefix is not yet implemented").**
+Forms: AC/AD with F2/F3. The `OP_LODS` arm in step.rs did not `return` early, so
+REP LODS fell through to the line-268 `panic!`. Classification: **emu86-bug**.
+**RESOLVED 2026-08-16 (R1):** LODS extracted to `cpu_lods.rs::opcode_lods`
+mirroring the MOVS/SCAS pattern (CX-counted while-loop, no ZF break since LODS
+sets no flags), and added to the rep-aware dispatch list. Demonstrated by the
+`rep_lodsb_*` / `rep_lodsw_*` tests in `cpu_lods.rs`; all REP LODS tests 0 PANIC.
+
+**SST-D-015 — LOCK prefix (0xF0) not parsed by the decoder (open).**
+Forms: any with an F0 prefix (e.g. `cs lock movsb` = 2E F0 A4). The decoder's
+prefix loop (decode.rs:170-181) handles 26/2E/36/3E/F2/F3 but not F0, so a LOCK
+prefix is treated as the opcode → DECODE_ERR. The 80C286 executes `lock movsb`
+(LOCK ignored on string ops; exception: none). ~115 DECODE_ERR per byte-string
+form, ~100-108 per word-string form. OPEN: add 0xF0 to the prefix loop
+(parse-and-ignore for the single-step model, where LOCK is a no-op). This is a
+general prefix issue (affects all forms, not just string) and is a prerequisite
+for lifting the string scope without introducing DECODE_ERR into the V1 sweep.
+
+**R1 status:** string forms fetched and pinned; bare + REP + segment-override
+string ops now 100% PASS/PANIC-free with `--all`. Scope lift (Deferred → V1) +
+scoped un-filtering of the string family is deferred until SST-D-015 (LOCK) is
+resolved, to keep the V1 sweep at 0 FAIL / 0 DECODE_ERR / 0 PANIC. `cargo test
+--locked --all-targets` 347 passed (incl. 8 new string-op unit tests); V1 sweep
+totals unchanged (string forms remain Deferred scope).
+
 ### PANIC clusters (all `catch_unwind`-captured; reported, never aborts)
 
 **SST-D-008 — stack-pointer wrap panics ("attempt to add with overflow").**
