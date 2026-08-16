@@ -29,8 +29,10 @@ impl Memory {
 
   // Multi-byte accesses wrap the EA offset at the 64KB segment boundary
   // (SST-D-007): byte i lives at seg:(off + i) mod 0x10000, not at the linear
-  // continuation. This matches the 80286's real-mode behavior and matters for
-  // operands that straddle the boundary, e.g. a far pointer read at off 0xFFFE.
+  // continuation. This matches the pinned Harris 80C286 captures (a far
+  // pointer straddling off 0xFFFE loads its CS word from the wrapped
+  // seg:0x0000); note a stock Intel 80286 would instead fault #GP(0) on a word
+  // operand at offset 0xFFFF — emu86 follows the Harris anchor.
   pub fn read_u16(&self, addr: SegOff) -> u16 {
     let base = addr.seg.unwrap_normal() as usize * 16;
     let off = addr.off.0 as usize;

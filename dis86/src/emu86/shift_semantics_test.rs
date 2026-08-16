@@ -316,11 +316,11 @@ fn xchg_mem_ea_uses_pre_swap_register() {
 
 #[test]
 fn jmp_far_mem_wraps_far_pointer_at_64kb_boundary() {
-  // ds:bx+di = 0x0FBA:(0xFFFF+0xFFFF) -> EA ds:0xFFFE. IP bytes at
-  // ds:0xFFFE/0xFFFF = CD 74 -> 0x74CD; CS bytes at the *wrapped*
-  // ds:0x0000/0x0001 = 8F 84 -> 0x848F. The linear continuation
-  // (0x1FBA:0x0000/0x0001) holds 00 00, so a non-wrapping read would load
-  // CS=0x0000 and jump to the wrong segment.
+  // ds:bx+di = 0x0FBA:(0xFFFF+0xFFFF) -> EA ds:0xFFFE (linear 0x1F99E). IP
+  // bytes at ds:0xFFFE/0xFFFF = CD 74 -> 0x74CD; CS bytes at the *wrapped*
+  // ds:0x0000/0x0001 = 8F 84 -> 0x848F. The linear continuation of the 4-byte
+  // read (linear 0x1F9A0/0x1F9A1) holds 12 34, so a non-wrapping read would
+  // load CS=0x3412 and jump to the wrong segment.
   let mut m = Machine::new(None);
   m.reg_write_u16(CS, 0x0000);
   m.reg_write_u16(IP, 0x0100);
@@ -332,14 +332,14 @@ fn jmp_far_mem_wraps_far_pointer_at_64kb_boundary() {
     m.mem.write_u8(SegOff::new(0x0000, 0x0100 + i as u16), b);
   }
   // Far pointer at ds:0xFFFE: IP=0x74CD (CD 74), CS=0x848F (8F 84 at the
-  // wrapped ds:0x0000/0x0001). Linear-continuation bytes differ so a
-  // non-wrapping read would load the wrong CS.
+  // wrapped ds:0x0000/0x0001). The linear-continuation bytes (0x1F9A:0x0000/
+  // 0x0001) hold 12 34, so a non-wrapping read would load CS=0x3412.
   m.mem.write_u8(SegOff::new(0x0fba, 0xfffe), 0xCD);
   m.mem.write_u8(SegOff::new(0x0fba, 0xffff), 0x74);
   m.mem.write_u8(SegOff::new(0x0fba, 0x0000), 0x8F);
   m.mem.write_u8(SegOff::new(0x0fba, 0x0001), 0x84);
-  m.mem.write_u8(SegOff::new(0x1fba, 0x0000), 0x00);
-  m.mem.write_u8(SegOff::new(0x1fba, 0x0001), 0x00);
+  m.mem.write_u8(SegOff::new(0x1f9a, 0x0000), 0x12);
+  m.mem.write_u8(SegOff::new(0x1f9a, 0x0001), 0x34);
 
   m.step().unwrap();
 
