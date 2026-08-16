@@ -53,8 +53,8 @@ FC.MOO      pass      FC   0
 9C.MOO      pass      9C   0
 D1.0.MOO      pass      D1.0 0
 87.MOO      pass      87   0
+F7.5.MOO    pass      F7.5 13
 # ---- Known-FAILREPRO entries (one per pinned P3 divergence cluster) ----
-F7.5.MOO    failrepro F7.5 13
 F7.7.MOO    failrepro F7.7 7
 C1.4.MOO    failrepro C1.4 2
 FF.5.MOO    failrepro FF.5 2914

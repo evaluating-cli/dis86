@@ -844,3 +844,66 @@ fn neg16_positive_parity() {
   // -2 = 0xFFFE: low byte 0xFE = 7 ones = odd parity, AF=1 (low nibble 0 - 2 borrows)
   check_neg16!(0x0002, cf=1, zf=0, sf=1, of=0, pf=0, af=1);
 }
+
+macro_rules! check_imul16_cf_of {
+  ($lhs:expr, $rhs:expr, cf=$cf:expr, of=$of:expr) => {
+    let (result, f) = alu::multiply(alu::MultiplyOp::Signed, Value::U16($lhs), Value::U16($rhs), Flags(0));
+    let _ = result;
+    assert_eq!(f.get(FLAG_CF), $cf != 0, "CF mismatch");
+    assert_eq!(f.get(FLAG_OF), $of != 0, "OF mismatch");
+  };
+}
+
+macro_rules! check_imul8_cf_of {
+  ($lhs:expr, $rhs:expr, cf=$cf:expr, of=$of:expr) => {
+    let (result, f) = alu::multiply(alu::MultiplyOp::Signed, Value::U8($lhs), Value::U8($rhs), Flags(0));
+    let _ = result;
+    assert_eq!(f.get(FLAG_CF), $cf != 0, "CF mismatch");
+    assert_eq!(f.get(FLAG_OF), $of != 0, "OF mismatch");
+  };
+}
+
+// SST-D-004: IMUL CF/OF is set only when the product does not fit the
+// destination half (AX for r8, DX:AX for r16) — i.e. when the result is not
+// a sign-extension of its low half. Pinned F7.5 sample:
+// `imul word [ds:bx-44FAh]`, AX=0x01DB, operand=0xFFFF (-1) -> 0xFFFFFE25,
+// which fits in a signed word (0xFE25 = -475): hardware CF=OF=0. The old
+// `(result & value_mask) != result` check wrongly reported overflow because
+// the high word 0xFFFF is a valid sign-extension.
+#[test]
+fn imul16_fits_reports_no_overflow() {
+  check_imul16_cf_of!(0x01DB, 0xFFFF, cf=0, of=0);
+}
+
+#[test]
+fn imul16_positive_fits() {
+  // 100 * 100 = 10000 = 0x2710, fits: CF=OF=0.
+  check_imul16_cf_of!(0x0064, 0x0064, cf=0, of=0);
+}
+
+#[test]
+fn imul16_overflow_sets_cf_of() {
+  // 0x8000 * 0x8000 = 0x40000000, high word 0x4000 is not a sign-extension of
+  // the low word 0x0000: overflow.
+  check_imul16_cf_of!(0x8000, 0x8000, cf=1, of=1);
+}
+
+#[test]
+fn imul16_negative_overflow_sets_cf_of() {
+  // 0x8000 * 0x0002 = -32768 * 2 = -65536 = 0xFFFF0000: high word 0xFFFF, low
+  // word 0x0000 (sign of 0x0000 is 0, not 0xFFFF): overflow.
+  check_imul16_cf_of!(0x8000, 0x0002, cf=1, of=1);
+}
+
+#[test]
+fn imul8_fits_reports_no_overflow() {
+  // -1 * -1 = 1, fits in a byte: CF=OF=0.
+  check_imul8_cf_of!(0xFF, 0xFF, cf=0, of=0);
+}
+
+#[test]
+fn imul8_overflow_sets_cf_of() {
+  // 0x80 * 0x80 = -128 * -128 = 16384 = 0x4000, high byte 0x40 is not a
+  // sign-extension of the low byte 0x00: overflow.
+  check_imul8_cf_of!(0x80, 0x80, cf=1, of=1);
+}

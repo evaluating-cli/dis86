@@ -177,7 +177,16 @@ pub fn multiply(op: MultiplyOp, a: Value, b: Value, mut f: Flags) -> (Value, Fla
         _ => unreachable!(),
       };
 
-      let ovf = (result & (value_mask as u32)) != result;
+      // IMUL sets CF/OF only when the product does not fit the destination
+      // half (AX for size 1, DX:AX for size 2): i.e. when the result is not a
+      // sign-extension of its low half. `result & value_mask != result` was
+      // wrong: e.g. imul word AX*0xFFFF = 0xFFFFFE25 has high word 0xFFFF
+      // (sign-extended 0xFE25) and fits, but that check reported ovf.
+      let ovf = match size {
+        1 => (result as u16) != ((result & 0xff) as i8 as i16 as u16),
+        2 => result != ((result & 0xffff) as i16 as i32 as u32),
+        _ => unreachable!(),
+      };
       f.set(FLAG_CF, ovf);
       f.set(FLAG_OF, ovf);
       //f.set(FLAG_ZF, result == 0);

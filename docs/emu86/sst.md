@@ -181,13 +181,8 @@ Up to 3 samples per form (idx / name / first-16-of-sha1 / detail) from run outpu
 |   |   |   | idx=10 `pop di` `a85d97ee0f04a54c…` panic: attempt to add with overflow |
 |   |   |   | idx=42 `pop di` `393335c02897ccdf…` panic: attempt to add with overflow |
 |   |   |   | idx=77 `pop di` `608aee387acb28ad…` panic: attempt to add with overflow |
-| `69` | 3986 | 216 | FAIL=3734 |
-|   |   |   | idx=0 `imul ax,[ds:bx+di-7945h],F76h` `0a5d3b8908512d35…` flags exp=0x0893 act=0x08D7 umask=0x0FD7; FLAGS exp=0x0893 act=0x08D7 |
-|   |   |   | idx=1 `imul si,[ss:bp+36h],F75h` `c40434206a432d0d…` flags exp=0x0C97 act=0x0C13 umask=0x0FD7; FLAGS exp=0x0C97 act=0x0C13 |
-|   |   |   | idx=3 `imul si,[ss:bp+si-620Ah],58E5h` `18c2588b8db21f53…` flags exp=0x0813 act=0x0803 umask=0x0FD7; FLAGS exp=0x0813 act=0x0803 |
-| `6B` | 3982 | 223 | FAIL=3723 |
-|   |   |   | idx=0 `imul di,[ss:bp-39D0h],40h` `d10a7dd5501d53b5…` flags exp=0x0096 act=0x08D3 umask=0x0FD7; FLAGS exp=0x0096 act=0x08D3 |
-|   |   |   | idx=1 `imul dx,si,FFD6h` `bfe2373b9e3c4347…` flags exp=0x0893 act=0x0887 umask=0x0FD7; FLAGS exp=0x0893 act=0x0887 |
+| `69` | 3986 | 224 | FAIL=3726 |
+| `6B` | 3982 | 235 | FAIL=3711 |
 |   |   |   | idx=2 `imul si,[ds:bx+si-51h],FFF4h` `ab64f9df2ab273e8…` flags exp=0x0C17 act=0x0C53 umask=0x0FD7; FLAGS exp=0x0C17 act=0x0C53 |
 | `80.1` | 3972 | 1988 | FAIL=1984 |
 |   |   |   | idx=1 `or byte [ds:bx+124Eh],B3h` `baf6d20652456c60…` flags exp=0x0482 act=0x0492 umask=0x0FD7; FLAGS exp=0x0482 act=0x0492 |
@@ -411,10 +406,7 @@ Up to 3 samples per form (idx / name / first-16-of-sha1 / detail) from run outpu
 |   |   |   | idx=11 `test word [ss:bp+30h],9E75h` `07e13d20c586e5c4…` flags exp=0x0006 act=0x0016 umask=0x0FD7; FLAGS exp=0x0006 act=0x0016 |
 | `F7.3` | 3967 | 3938 | PANIC=1 |
 |   |   |   | idx=1207 `neg word [ds:bx+si]` `d4d5e5cb5b0d37c9…` panic: attempt to negate with overflow |
-| `F7.5` | 3958 | 3763 | FAIL=167 |
-|   |   |   | idx=13 `imul word [ds:bx-44FAh]` `6b0be02aa172b5cd…` flags exp=0x0096 act=0x0883 umask=0x0801; FLAGS exp=0x0096 act=0x0883 |
-|   |   |   | idx=20 `imul bx` `e4707bccc333bf9e…` flags exp=0x0496 act=0x0C93 umask=0x0801; FLAGS exp=0x0496 act=0x0C93 |
-|   |   |   | idx=37 `imul word [ds:di]` `349066fd49b53932…` flags exp=0x0496 act=0x0C93 umask=0x0801; FLAGS exp=0x0496 act=0x0C93 |
+| `F7.5` | 3958 | 3930 | FAIL=0 |
 | `F7.7` | 3965 | 332 | FAIL=334 PANIC=723 |
 |   |   |   | idx=7 `idiv word [ss:bp+di]` `b08f0b9dd03d3b7d…` AX exp=0xE5AA act=0x133E; DX exp=0x5DB7 act=0x2FB3 |
 |   |   |   | idx=9 `idiv word [ds:si+3D3Bh]` `2bcb8be3ab9e9cb6…` panic: Divide Error |
@@ -505,6 +497,22 @@ hardware's IMUL overflow flag for some operand pairs. Classification:
 (69: 3,734→90; 6B: 3,723→250) is undefined SF/ZF/AF/PF noise → **harness-caveat**
 for that portion (7,117 FAIL) because the policy note already says "CF/OF defined,
 rest undefined (Intel 80286)" but the form's flags_umask was left None.
+
+**RESOLVED 2026-08-16 (F6):** the signed IMUL overflow test in `alu::multiply`
+is now the sign-extension check: CF/OF is set only when the product does not fit
+the destination half (AX for size 1, DX:AX for size 2), i.e. when the result is
+*not* a sign-extension of its low half. The old `(result & value_mask) != result`
+wrongly flagged a valid sign-extended result: pinned F7.5 sample
+`imul word [ds:bx-44FAh]` with AX=0x01DB × operand=0xFFFF (−1) → 0xFFFFFE25 fits
+in a signed word (0xFE25 = −475), hardware CF=OF=0. All three forms now pass
+100% under `--umask 0x0801` (69: PASS=3950 FAIL=0; 6B: PASS=3946 FAIL=0; F7.5:
+PASS=3930 FAIL=0); F7.5 also passes under the default umask (its policy is
+already 0x0801). The residual 69/6B FAILs under the default umask are unchanged
+undefined SF/ZF/AF/PF noise (the D-004-undefined harness-caveat, Track 2). Fix
+demonstrated by the `imul16_*` / `imul8_*` mirror tests in `alu_test.rs`;
+`cargo test --locked --all-targets` 332 passed; hermetic micro lane green after
+moving F7.5 from FAILREPRO to the PASS list (spec.txt, micro.rs PASS_STEMS,
+FAILREPRO.txt).
 
 **SST-D-005 — IDIV (F7.7): signed division.**
 F7.7: 334 FAIL + 723 PANIC + 2,576 SKIP_EXCEPTION.
@@ -625,19 +633,19 @@ FAILREPRO pin existed for this cluster.
 
 ### Cluster size accounting
 
-- FAIL 152,909 = harness-caveat (152,064: SST-D-001 79,739 + SST-D-002 65,208 +
-  SST-D-004-undefined part 7,117) + emu86-bug (845: SST-D-003 0 + SST-D-004-CF/OF
-  507 + SST-D-005 334 + SST-D-006 0 + SST-D-007 4).
-  (FAIL fell from 153,787: the SST-D-003 fix earlier turned 16,885 ROL FAILs into
-  10,259 PASS + 6,626 undefined-OF FAIL reclassified into SST-D-002; the
-  SST-D-006 fix turned all 878 XCHG FAILs into PASS.)
+- FAIL 152,402 = harness-caveat (152,064: SST-D-001 79,739 + SST-D-002 65,208 +
+  SST-D-004-undefined part 7,117) + emu86-bug (338: SST-D-003 0 + SST-D-004-CF/OF
+  0 + SST-D-005 334 + SST-D-006 0 + SST-D-007 4).
+  (FAIL fell from 152,909: the SST-D-006 fix earlier turned all 878 XCHG FAILs
+  into PASS; the SST-D-004 fix turned all 507 IMUL CF/OF FAILs into PASS, leaving
+  only the undefined-flag harness-caveat for 69/6B.)
 - PANIC 723 = SST-D-010 723
   (SST-D-008 resolved 2026-08-16 — non-wrapping stack arithmetic, no longer
   counted; SST-D-011 resolved 2026-08-16 — debug-only trap; SST-D-009 resolved
   2026-08-16 — C1.x shift-count assert, no longer counted; SST-D-003 resolved
   2026-08-16 — ROL CF/OF, no longer counted; SST-D-006 resolved 2026-08-16 —
   XCHG memory EA, no longer counted).
-- Sum check: 152,064 + 845 = 152,909 ✓ ; 723 ✓.
+- Sum check: 152,064 + 338 = 152,402 ✓ ; 723 ✓.
 
 ## Coverage statement (honest)
 
@@ -665,7 +673,6 @@ LES/LDS, ENTER/LEAVE). These have **no** hardware evidence in this ledger.
   (SST-D-002) compare Intel-undefined AF (and OF for count>1); per-form umasks or
   a "mask AF for logicals/shifts" rule would turn ~133K FAILs into PASS without
   any emu86 change.
-- IMUL CF/OF (SST-D-004): signed-overflow flag vs Harris.
 - IDIV signed division (SST-D-005/SST-D-010): replace unsigned divmod path with a
   signed one; hardware-anchored expected flags.
 - Far indirect CALL/JMP CS load (SST-D-007): wrap the EA offset at 0x10000 for
@@ -675,7 +682,8 @@ LES/LDS, ENTER/LEAVE). These have **no** hardware evidence in this ledger.
   SST-D-009 C1.x shift-count assert fixed 2026-08-16 — count masked to low
   byte, 5-bit in `alu::shift`; SST-D-003 ROL CF/OF fixed 2026-08-16 — CF =
   rotated-out bit, OF for count==1; SST-D-006 XCHG memory-EA fixed 2026-08-16
-  — EA computed pre-swap.)
+  — EA computed pre-swap; SST-D-004 IMUL CF/OF fixed 2026-08-16 — sign-
+  extension overflow check.)
 
 ## Hermetic micro-corpus (checked-in)
 
@@ -706,19 +714,20 @@ helper; the checked-in files are what the lane runs).
   leading prefix byte, no exception key). Note the logical-ops entries (0C/24/35/
   F6.0) are the init-AF=0 subset that does not trip the SST-D-001 undefined-AF
   caveat; the shift entry (D1.4) is an init-AF=0 case outside the SST-D-002 noise.
-- **4 FAILREPRO files**, one per pinned divergence, each expected to
-  *diverge*: IMUL CF/OF (F7.5, SST-D-004), IDIV-as-unsigned (F7.7, SST-D-005),
-  far-branch 64KB offset wrap (FF.5, SST-D-007), and the C1.x shift
-  undefined-AF residual (C1.4, SST-D-002 — re-pinned 2026-08-16 from SST-D-009
-  PANIC: the shift-count assert is fixed, the sample now diverges only on
-  undefined AF). D1.0 (SST-D-003) moved to the PASS list 2026-08-16 when the
-  ROL CF/OF fix flipped it to PASS; 87 (SST-D-006) moved to the PASS list
-  2026-08-16 when the XCHG memory-EA fix flipped it to PASS.
+- **3 FAILREPRO files**, one per pinned divergence, each expected to
+  *diverge*: IDIV-as-unsigned (F7.7, SST-D-005), far-branch 64KB offset wrap
+  (FF.5, SST-D-007), and the C1.x shift undefined-AF residual (C1.4, SST-D-002
+  — re-pinned 2026-08-16 from SST-D-009 PANIC: the shift-count assert is fixed,
+  the sample now diverges only on undefined AF). D1.0 (SST-D-003) moved to the
+  PASS list 2026-08-16 when the ROL CF/OF fix flipped it to PASS; 87
+  (SST-D-006) moved to the PASS list 2026-08-16 when the XCHG memory-EA fix
+  flipped it to PASS; F7.5 (SST-D-004) moved to the PASS list 2026-08-16 when
+  the IMUL CF/OF fix flipped it to PASS.
   Their SHA1s, cluster IDs, and exact recorded divergences are listed in
   `micro/FAILREPRO.txt` and asserted byte-for-byte in the `micro.rs`
   expectations table.
 
-**Expected-FAILREPRO contract:** these four entries are regression pins for
+**Expected-FAILREPRO contract:** these three entries are regression pins for
 *known* emu86 divergences (emu86-bug or harness-caveat), not tests to make
 green. When a future fix flips one of them to PASS, the lane **fails**; the
 fix's author then (a) drops the entry from `spec.txt`, (b) regenerates the
