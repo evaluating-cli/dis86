@@ -20,5 +20,4 @@
 F7.5.MOO | F7.5 | 13  | SST-D-004 | FAIL  | 6b0be02aa172b5cd3b83950cb610e327ccf097c4 | flags exp=0x0096 act=0x0883 umask=0x0801
 F7.7.MOO | F7.7 | 7   | SST-D-005 | FAIL  | b08f0b9dd03d3b7d264647f32c24a7c6b451044c | AX exp=0xE5AA act=0x133E; DX exp=0x5DB7 act=0x2FB3
 C1.4.MOO | C1.4 | 2   | SST-D-002 | FAIL  | aa19e33e8c0c96929dba01a5cbb85545701b2610 | flags exp=0x0C07 act=0x0C17 umask=0x0FD7
-87.MOO   | 87   | 0   | SST-D-006 | FAIL  | eb65e3ae7e2c04e115929edc43a7b3c83cd1be46 | [0xB4356] exp=0xA6 act=0x1E; [0xB4357] exp=0x8A act=0xA9
 FF.5.MOO | FF.5 | 2914| SST-D-007 | FAIL  | 0921a4aa520839742a7c3a73a91a927d9e877be2 | CS exp=0x848F act=0x0000

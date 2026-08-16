@@ -1,5 +1,5 @@
 use super::alu::{self, ShiftOp};
-use super::cpu::{BP, CS, DI, IP, SS};
+use super::cpu::{BP, CS, DI, DS, IP, SS};
 use super::cpu_flags::*;
 use super::machine::Machine;
 use super::value::Value;
@@ -278,4 +278,32 @@ fn rol_count_0_is_a_noop() {
   let (result, flags) = alu::shift(ShiftOp::Rol, Value::U8(0xa5), 0, input);
   assert_eq!(result, Value::U8(0xa5));
   assert_eq!(flags.0, input.0);
+}
+
+// --- step-level: XCHG with a memory operand whose EA uses the swapped
+// register (SST-D-006). Pinned 87 sample `xchg di,[ds:di]` (bytes 87 3D F4):
+// the EA must be computed from the pre-swap di. ---
+
+#[test]
+fn xchg_mem_ea_uses_pre_swap_register() {
+  // ds:di = 0xAB8B:0x8AA6 -> linear 0xB4356, initial mem = 0xA91E, di = 0x8AA6.
+  // A correct XCHG stores the old di (0x8AA6) to that address; re-deriving the
+  // EA from the post-swap di (0xA91E -> 0xB34CE) would write to the wrong place.
+  let mut m = Machine::new(None);
+  m.reg_write_u16(CS, 0x0000);
+  m.reg_write_u16(IP, 0x0000);
+  m.reg_write_u16(DS, 0xab8b);
+  m.reg_write_u16(DI, 0x8aa6);
+  let code: [u8; 3] = [0x87, 0x3D, 0xF4];
+  for (i, b) in code.iter().enumerate() {
+    m.mem.write_u8(SegOff::new(0x0000, i as u16), *b);
+  }
+  let mem_addr = SegOff::new(0xab8b, 0x8aa6);
+  m.mem.write_u16(mem_addr, 0xa91e);
+
+  m.step().unwrap();
+
+  assert_eq!(m.reg(DI), 0xa91e);
+  assert_eq!(m.mem.read_u16(mem_addr), 0x8aa6);
+  assert_eq!(m.exec_count, 1);
 }

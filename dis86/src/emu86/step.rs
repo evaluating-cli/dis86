@@ -61,6 +61,13 @@ impl Machine {
 
   pub fn operand_mem_write(&mut self, mem: &OperandMem, val: Value) {
     let addr = self.operand_mem_addr(mem);
+    self.operand_mem_write_at(addr, val)
+  }
+
+  /// Write to a pre-computed effective address. Used when the EA must be
+  /// fixed before a sibling register write changes the register it depends on
+  /// (e.g. `xchg di,[ds:di]`).
+  pub fn operand_mem_write_at(&mut self, addr: SegOff, val: Value) {
     match val {
       Value::U8(val)  => self.mem.write_u8(addr, val),
       Value::U16(val) => self.mem.write_u16(addr, val),
@@ -485,10 +492,21 @@ impl Machine {
       }
 
       Opcode::OP_XCHG => {
+        // Pre-compute the memory operand's EA before the first write: the
+        // swapped register may be one the EA depends on (e.g. `xchg di,[ds:di]`),
+        // and re-deriving it after the write would target a stale address.
+        // SST-D-006: EA must reflect the pre-swap register values.
+        let mem_addr = match instr.operands[1] {
+          Operand::Mem(mem) => Some(self.operand_mem_addr(&mem)),
+          _ => None,
+        };
         let lhs = self.operand_read(&instr, 0);
         let rhs = self.operand_read(&instr, 1);
         self.operand_write(&instr, 0, rhs);
-        self.operand_write(&instr, 1, lhs);
+        match (mem_addr, instr.operands[1]) {
+          (Some(addr), Operand::Mem(_)) => self.operand_mem_write_at(addr, lhs),
+          _ => self.operand_write(&instr, 1, lhs),
+        }
       }
 
       Opcode::OP_CBW => {
