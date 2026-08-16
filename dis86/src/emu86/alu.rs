@@ -259,7 +259,7 @@ pub fn unary(op: UnaryOp, a: Value, mut f: Flags) -> (Value, Flags) {
   let result;
   match op {
     UnaryOp::Neg => {
-      result = -(a as i16) as u16;
+      result = (a as i16).wrapping_neg() as u16;
       update_flags_sub(&mut f, 0, a, 0, result, sign_mask, value_mask, true);
     }
     UnaryOp::Inc => {

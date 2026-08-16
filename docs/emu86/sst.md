@@ -555,13 +555,22 @@ assert on sign-extended imm8; counts ≥ 0x80 not masked to 5 bits).
 (`alu::unary` NEG `-(a as i16)` overflows at i16::MIN). Debug-mode overflow trap.
 Classification: **emu86-bug**.
 
+**RESOLVED 2026-08-16 (F1):** `alu.rs:262` NEG now uses `(a as i16).wrapping_neg()`
+(i16::MIN wraps to itself, matching the 80C286 result 0x8000). Verification:
+release-mode runs on the affected NEG forms — `F6.3` 3968/3968 PASS, `F7.3`
+3939/3939 PASS, 0 FAIL, 0 PANIC (28 pre-existing exception-expected tests, all
+#GP #13, unchanged from baseline); hermetic micro lane `F7.3.MOO` PASS;
+`cargo test --locked --all-targets` 315 passed. No FAILREPRO pin existed for
+this cluster.
+
 ### Cluster size accounting
 
 - FAIL 157,081 = harness-caveat (139,886: SST-D-001 79,739 + SST-D-002 53,030 +
   SST-D-004-undefined part 7,117) + emu86-bug (17,195: SST-D-003 15,472 +
   SST-D-004-CF/OF 507 + SST-D-005 334 + SST-D-006 878 + SST-D-007 4).
-- PANIC 18,259 = SST-D-008 7,762 + SST-D-009 9,773 + SST-D-010 723 + SST-D-011 1.
-- Sum check: 139,886 + 17,195 = 157,081 ✓ ; 18,259 ✓.
+- PANIC 18,258 = SST-D-008 7,762 + SST-D-009 9,773 + SST-D-010 723
+  (SST-D-011 resolved 2026-08-16 — debug-only trap, no longer counted).
+- Sum check: 139,886 + 17,195 = 157,081 ✓ ; 18,258 ✓.
 
 ## Coverage statement (honest)
 
@@ -597,7 +606,8 @@ LES/LDS, ENTER/LEAVE). These have **no** hardware evidence in this ledger.
 - Far indirect CALL/JMP CS load (SST-D-007): wrap the EA offset at 0x10000 for
   multi-byte reads (fixes the far-pointer boundary case).
 - Stack-pointer wrap arithmetic (SST-D-008) and shift-count masking for C1.x
-  (SST-D-009) so debug builds do not trap; NEG at i16::MIN (SST-D-011).
+  (SST-D-009) so debug builds do not trap. (SST-D-011 NEG i16::MIN fixed
+  2026-08-16 — `wrapping_neg`.)
 
 ## Hermetic micro-corpus (checked-in)
 

@@ -761,3 +761,86 @@ fn sbb16_zero_minus_one_no_borrow_in() {
   // 0x0000 - 0x0001 - 0 = 0xFFFF: CF=1, SF=1, low byte 0xFF = even parity, AF=1
   check_sbb16!(0x0000, 0x0001, cf_in=0, cf=1, zf=0, sf=1, of=0, pf=1, af=1);
 }
+
+macro_rules! check_neg8 {
+  ($lhs:expr, cf=$cf:expr, zf=$zf:expr, sf=$sf:expr, of=$of:expr, pf=$pf:expr, af=$af:expr) => {{
+    let (result, f) = alu::unary(alu::UnaryOp::Neg, Value::U8($lhs), Flags(0));
+    assert_eq!(result, Value::U8((0u16).wrapping_sub($lhs as u16) as u8), "result mismatch");
+    assert_eq!(f.get(FLAG_CF), $cf != 0, "CF mismatch");
+    assert_eq!(f.get(FLAG_ZF), $zf != 0, "ZF mismatch");
+    assert_eq!(f.get(FLAG_SF), $sf != 0, "SF mismatch");
+    assert_eq!(f.get(FLAG_OF), $of != 0, "OF mismatch");
+    assert_eq!(f.get(FLAG_PF), $pf != 0, "PF mismatch");
+    assert_eq!(f.get(FLAG_AF), $af != 0, "AF mismatch");
+  }};
+}
+
+macro_rules! check_neg16 {
+  ($lhs:expr, cf=$cf:expr, zf=$zf:expr, sf=$sf:expr, of=$of:expr, pf=$pf:expr, af=$af:expr) => {{
+    let (result, f) = alu::unary(alu::UnaryOp::Neg, Value::U16($lhs), Flags(0));
+    assert_eq!(result, Value::U16((0u16).wrapping_sub($lhs)), "result mismatch");
+    assert_eq!(f.get(FLAG_CF), $cf != 0, "CF mismatch");
+    assert_eq!(f.get(FLAG_ZF), $zf != 0, "ZF mismatch");
+    assert_eq!(f.get(FLAG_SF), $sf != 0, "SF mismatch");
+    assert_eq!(f.get(FLAG_OF), $of != 0, "OF mismatch");
+    assert_eq!(f.get(FLAG_PF), $pf != 0, "PF mismatch");
+    assert_eq!(f.get(FLAG_AF), $af != 0, "AF mismatch");
+  }};
+}
+
+// --- neg8 ---
+
+#[test]
+fn neg8_zero() {
+  // -0 = 0: ZF set, CF clear (0 - 0, no borrow)
+  check_neg8!(0x00, cf=0, zf=1, sf=0, of=0, pf=1, af=0);
+}
+
+#[test]
+fn neg8_positive() {
+  // -1 = 0xFF: CF set (borrow), SF set, even parity
+  check_neg8!(0x01, cf=1, zf=0, sf=1, of=0, pf=1, af=1);
+}
+
+#[test]
+fn neg8_min_i8() {
+  // -(-128) = -128 (wraps): OF set, CF set, result 0x80
+  check_neg8!(0x80, cf=1, zf=0, sf=1, of=1, pf=0, af=0);
+}
+
+#[test]
+fn neg8_max_i8() {
+  // -(127) = -127 = 0x81: CF set, SF set, 0x81 = 2 ones = even parity
+  check_neg8!(0x7F, cf=1, zf=0, sf=1, of=0, pf=1, af=1);
+}
+
+// --- neg16 ---
+
+#[test]
+fn neg16_zero() {
+  check_neg16!(0x0000, cf=0, zf=1, sf=0, of=0, pf=1, af=0);
+}
+
+#[test]
+fn neg16_positive() {
+  // -1 = 0xFFFF: CF set, SF set
+  check_neg16!(0x0001, cf=1, zf=0, sf=1, of=0, pf=1, af=1);
+}
+
+#[test]
+fn neg16_min_i16() {
+  // -(i16::MIN) wraps to i16::MIN: OF set (0 - MIN overflows), CF set, result 0x8000
+  check_neg16!(0x8000, cf=1, zf=0, sf=1, of=1, pf=1, af=0);
+}
+
+#[test]
+fn neg16_max_i16() {
+  // -(32767) = -32767 = 0x8001: no OF, CF set, SF set, low byte 0x01 = odd parity
+  check_neg16!(0x7FFF, cf=1, zf=0, sf=1, of=0, pf=0, af=1);
+}
+
+#[test]
+fn neg16_positive_parity() {
+  // -2 = 0xFFFE: low byte 0xFE = 7 ones = odd parity, AF=1 (low nibble 0 - 2 borrows)
+  check_neg16!(0x0002, cf=1, zf=0, sf=1, of=0, pf=0, af=1);
+}
