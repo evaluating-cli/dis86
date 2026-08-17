@@ -1,5 +1,7 @@
 # Phase 1 specification: dosemu2 validator hook and lockstep transport
 
+> **Note (2026-08-17):** SST (SingleStepTests hardware captures) is the validation authority for emu86; the dosemu2 differential validator is no longer the validation method. This spec describes the dosemu2 validator hook and lockstep transport and is now the frozen reference for the transport/ABI that Track 4 Option D (Hydra hosting plugin) research builds on. Section 9 (Required expanded corpus) is SUPERSEDED — SST validates all forms against hardware.
+
 **Scope:** 16-bit real-mode `simx86` and `emu86_validator`  
 **Pinned dosemu2:** `604ce0cdd1a71f657e2a2df623d216d5ab289313`  
 **ABI:** version 1
@@ -148,7 +150,7 @@ The metadata/outcome plumbing is implemented. These semantics are not integratio
 
 The parent performs cooperative bounded shutdown and explicitly reaps the child; kill is fallback only. Focused pinned-runtime coverage exists for this path.
 
-## 9. Required expanded corpus
+## 9. Required expanded corpus [SUPERSEDED]
 
 The remaining gate shall compare architectural state and relevant memory after each normalized boundary and include:
 

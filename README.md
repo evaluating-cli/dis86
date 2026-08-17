@@ -8,14 +8,14 @@ Dis86 has been built for doing reverse-engineering work such as analyzing and re
 
 ## Current direction
 
-1. **Port the runtime and validation strategy onto dosemu2, replacing the historical patched DOSBox-X fork.** The dosemu2 differential-validator transport is delivered and its shared-memory contract is frozen at ABI v1 (see [`docs/dosemu2/`](docs/dosemu2/README.md)). Remaining port work is the expanded differential corpus and porting Hydra's native-function hosting onto dosemu2.
+1. **Validate emu86 against real 80C286 hardware captures.** SST (SingleStepTests) is the validation authority — a hardware-anchor ledger of SingleStepTests 80286 captures run against emu86 (see [`docs/emu86/sst.md`](docs/emu86/sst.md)); the dosemu2 differential validator is no longer the validation method. dosemu2's remaining role is Hydra hosting via an in-process plugin (Track 4 Option D), for which the frozen `simx86` boundary-hook transport and its ABI-v1 shared-memory contract are kept as reference (see [`docs/dosemu2/`](docs/dosemu2/README.md)).
 2. **Continue decompiler development beyond upstream.** The fork carries and continues to land decompiler, SSA, optimizer, and AST improvements that upstream does not have.
 
 ## Repository layout
 
 | Path | Contents |
 | --- | --- |
-| `dis86/` | The decompiler (Rust): decode → analysis → SSA IR → optimization → control flow → AST → C codegen. Also contains emu86, the in-repo 8086/286 reference CPU emulator, and the differential validator that checks execution against it. |
+| `dis86/` | The decompiler (Rust): decode → analysis → SSA IR → optimization → control flow → AST → C codegen. Also contains emu86, the in-repo 8086/286 reference CPU emulator, validated against the SST hardware-anchor ledger ([`docs/emu86/sst.md`](docs/emu86/sst.md)), and the archived differential validator (transport layer kept as reference for the dosemu2 hosting work). |
 | `bsl/` | Barebones Specification Language (small C parser) for configuration/annotation tables. |
 | `confgen/` | Python generators that produce `.bsl` configuration. |
 | `hydra/` | Hybrid runtime (C, Meson) linking native decompiled code with remaining x86-16 machine code. Emulator-independent core; see [`hydra/README.md`](hydra/README.md). |
@@ -61,7 +61,7 @@ For the host-independent test suite used by pull requests (no dosemu2 checkout o
 just check
 ```
 
-See [`docs/dosemu2/TESTING.md`](docs/dosemu2/TESTING.md) for the dosemu2 testing strategy and the optional interactive `emu86` build (SDL-gated).
+See [`docs/emu86/sst.md`](docs/emu86/sst.md) for the SST hardware-anchor validation ledger — the validation authority for emu86. [`docs/dosemu2/TESTING.md`](docs/dosemu2/TESTING.md) covers the frozen transport evidence and hosting reference for Hydra-on-dosemu2 (Option D), not the validation strategy; the optional interactive `emu86` build is SDL-gated.
 
 ## Some Commands
 
@@ -124,7 +124,7 @@ Some specific known limitations:
 - Handling of some IR ops is unimplemented in the ir->ast convert step. Implementations are added as needed.
 - Control-flow synthesis is limited to while-loops, if-stmts, and switch-stmts. If-else is unimplemented.
 - Block scheduling and placement is very unoptimal for more complicated control-flow.
-- emu86 implements only the instruction/device subset exercised by the project's target binaries; the dosemu2 differential validator is used to bring behavior into alignment incrementally.
+- emu86 implements only the instruction/device subset exercised by the project's target binaries; the SST hardware-anchor ledger validates emu86 against real 80C286 captures.
 - emu86's real-mode instruction behavior is hardware-anchored against the SingleStepTests 80286 corpus (V1 conservative family: ~1.01M hardware executions, 81.6% PASS; 11 classified emu86-bug clusters documented in [`docs/emu86/sst.md`](docs/emu86/sst.md)); a hermetic checked-in micro-corpus guards the `just check` harness lane.
 - Constant folding of signed comparisons assumes the 16-bit const-pool domain and can mis-fold an 8-bit signed compare whose operands are both constants (see the known-limitation comment in `constant_folding`, `dis86/src/decompile/opt.rs`).
 - ... and many more ...
@@ -142,7 +142,7 @@ Feature wishlist:
 - Improved type-aware IR
 - Less verbose output C code patterns for common operations (e.g. passing pointer as a function call arg)
 - dosemu2 as the Hydra hybrid-runtime host (native-function interception; see [`hydra/README.md`](hydra/README.md))
-- Expanded dosemu2 differential validation corpus (see [`docs/dosemu2/TESTING.md`](docs/dosemu2/TESTING.md))
+- dosemu2 Option D hosting workstream: in-process dosemu2 plugin carrying Hydra's native-function hosting (frozen `simx86` transport kept as reference in [`docs/dosemu2/`](docs/dosemu2/))
 
 ## Lineage
 

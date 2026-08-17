@@ -1,6 +1,6 @@
 # dosemu2 migration testing
 
-This is the authoritative evidence ledger for the migration; other documents link here rather than maintaining parallel checklists.
+SST (SingleStepTests hardware captures) is the validation authority for emu86; this document covers the frozen dosemu2 transport evidence and the hosting reference for Hydra-on-dosemu2 (Track 4 Option D). Other documents link here rather than maintaining parallel checklists.
 
 ## Test levels
 
@@ -28,14 +28,18 @@ It also covers the emu86-only fixture corpora in `dis86/src/emu86/validator/fixt
 
 These are unit-test evidence about emu86's own behavior; they are not differential evidence.
 
-### Hardware-anchored emu86 coverage (separate evidence axis)
+### Hardware-anchored emu86 coverage (validation authority)
+
+SST is the replacement validation authority for the dosemu2 differential validator:
+emu86 is validated against real 80C286 hardware captures, and the dosemu2
+differential corpus is no longer a validation gate.
 
 `just check` also runs a hermetic checked-in micro-corpus of real SingleStepTests
 80286 hardware captures through the emu86 SST harness (V1 conservative family:
 ~1.01M hardware executions, 81.6% PASS; 11 classified emu86-bug clusters, see
-`docs/emu86/sst.md`). This is a *hardware*-anchoring axis (emu86 vs a real
-Harris 80C286), distinct from — and neither implied by nor implying — the
-twin-equivalence claims above about emu86 vs dosemu2 simx86.
+`docs/emu86/sst.md`). This is the *hardware*-anchoring validation axis (emu86 vs
+a real Harris 80C286); the dosemu2 simx86 transport is kept only as reference for
+Hydra hosting (Option D), not as a validation axis.
 
 The optional SDL frontend remains separate:
 
@@ -63,6 +67,8 @@ Current focused runtime evidence includes:
 These prove that the hook, transport, live low-memory alias, basic adapter path, terminal/fault outcomes, the standalone unprefixed host-service normalization path, and the corpus/memory-comparison plumbing execute on the pinned runtime. Host-service normalization is distinct from application-handler lockstep: unchanged eligible vectors are deferred to their saved return, whereas application-installed handlers must remain controller-stepped. They are not a substitute for a representative differential corpus.
 
 ## Expanded pinned-runtime corpus still required
+
+**SUPERSEDED:** this differential corpus is no longer a validation gate. SST validates REP and all other instruction forms against real 80C286 hardware captures (`docs/emu86/sst.md`); the dosemu2 differential corpus below is retained as frozen transport evidence only, relevant for the Hydra-on-dosemu2 hosting work (Track 4 Option D).
 
 Do **not** mark the following integration-tested until checked-in fixtures exercise them against the pinned runtime:
 

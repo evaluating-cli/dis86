@@ -25,8 +25,13 @@ dosemu2-backed differential validator (see `../docs/dosemu2/`) is the first
 delivered piece of that port, and is not, by itself, a Hydra native-function
 host. Hydra-on-dosemu2 is the intended end state: porting Hydra's
 arbitrary-address function interception and native/guest control transfer onto
-the pinned, validated dosemu2 base is the remaining integration step on the
+the dosemu2 hosting target is the remaining integration step on the
 roadmap.
+
+Validation of emu86 is handled by SST (SingleStepTests hardware captures), not
+the dosemu2 differential validator. dosemu2's role is Hydra hosting via an
+in-process plugin (Track 4 Option D); emu86 is validated by SST. The frozen
+simx86 transport/ABI is kept as reference for the plugin research.
 
 ## Function hooks
 

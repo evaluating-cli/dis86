@@ -1,13 +1,15 @@
 # dosemu2 port
 
-This directory documents the dosemu2 port: the 16-bit real-mode `simx86` backend used by the dis86 differential validator. The validator transport documented here is the first delivered piece of the port off the historical patched DOSBox-X fork; porting Hydra's native-function hosting onto dosemu2 is the roadmap (see [`hydra/README.md`](../../hydra/README.md)).
+**Supersession note:** SST (SingleStepTests hardware captures) is the validation authority. The dosemu2 differential validator is no longer the validation method. This directory documents the frozen transport/hosting layer for Hydra-on-dosemu2 (Track 4 Option D).
+
+This directory documents the frozen dosemu2 port layer: the 16-bit real-mode `simx86` boundary-hook transport that served as the dis86 differential validator's stepping host. dosemu2's current role is Hydra hosting, not validation: the `simx86` backend is the transport for the in-process Hydra hosting plugin (Track 4 Option D), not the validation lockstep. The frozen transport and its ABI-v1 shared-memory contract are kept as reference for that hosting work (see [`hydra/README.md`](../../hydra/README.md)).
 
 ## Roles and glossary
 
 - **emu86** — the upstream-authored Rust 8086/286 interpreter in `dis86/src/emu86/`. It is the project's semantic **reference CPU model**: the readable, authoritative statement of expected instruction, flag, and DOS behavior that this project maintains.
-- **dosemu2 simx86** — the lockstep execution host, patched by the frozen carrier below. It steps one translated node per request and publishes state; its observable behavior must be brought into alignment with emu86's documented semantics across the validation corpus.
+- **dosemu2 simx86** — the frozen `simx86` boundary-hook transport, patched by the frozen carrier below (reference for Option D plugin research). It steps one translated node per request and publishes state.
 - **`reference`/`candidate` (validator code)** — internal naming on the *stepping* axis only: `reference` is the stepped host (dosemu2) whose decoded-node counts drive the loop, `candidate` is emu86 replaying them. It says nothing about semantic priority; semantic authority remains with emu86 as the reference CPU model.
-- **differential validator (`emu86_validator`)** — the harness that runs both engines in lockstep and halts on the first state divergence.
+- **differential validator (`emu86_validator`)** — archived: the differential validation layers have been deleted, and only the transport layer remains as reference. It was the harness that ran both engines in lockstep and halted on the first state divergence.
 - **ABI v1** — the frozen 88-byte shared-memory control contract between the Rust validator and patched dosemu2 (see [`FREEZE_ABI_V1.md`](FREEZE_ABI_V1.md)).
 - **carrier** — the two squash-frozen `git am` patches in `patches/dosemu2/` that implement the dosemu2 side of the contract.
 
@@ -28,7 +30,7 @@ Historical patch 0010 implemented deferred acknowledgement for standalone nonter
 
 **Host-only proven (emu86, unit level):** the REP string-op matrix and the seeded register/segment mutation corpus in `dis86/src/emu86/validator/fixture.rs`, and the memory-window comparison logic against fake emulators.
 
-**Not integration-tested:** prefixed service calls; application-installed handlers outside the target MCB; broader BIOS coverage; differential REP semantics (whole-REP-per-step in emu86 vs per-iteration SAME_PC in dosemu2 — open reconciliation item); interrupt shadow and shadow composition; child/helper exclusion; helper/lifecycle transitions; differential register/segment mutation (notably segment-override memory and stack effects); broad state/control redirection; and the representative per-boundary differential corpus.
+**Not integration-tested:** prefixed service calls; application-installed handlers outside the target MCB; broader BIOS coverage; differential REP semantics (whole-REP-per-step in emu86 vs per-iteration SAME_PC in dosemu2 — resolved by SST: Track 3 R1 validated REP against hardware, and the dosemu2 differential corpus is no longer a validation gate); interrupt shadow and shadow composition; child/helper exclusion; helper/lifecycle transitions; differential register/segment mutation (notably segment-override memory and stack effects); broad state/control redirection; and the representative per-boundary differential corpus.
 
 On a separate axis, emu86's instruction behavior is *hardware*-anchored against the SingleStepTests 80286 captures via the SST harness (`docs/emu86/sst.md`); that axis is unrelated to — and does not speak to — twin equivalence with dosemu2 simx86.
 
