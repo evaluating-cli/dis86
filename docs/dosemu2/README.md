@@ -1,25 +1,36 @@
-# dosemu2 port
+# dosemu2 hosting
 
-**Supersession note:** SST (SingleStepTests hardware captures) is the validation authority. The dosemu2 differential validator is no longer the validation method. This directory documents the frozen transport/hosting layer for Hydra-on-dosemu2 (Track 4 Option D).
+Hydra hosts on the **stock, unmodified** dosemu2 binary. No rebuild, no patching, no
+fork. Hydra runs as an external process that drives dosemu2 through its built-in
+debugger protocol (dosdebug FIFOs) and maps guest memory via `/proc/<pid>/fd/`. The
+design is in [`OPTION_D_DESIGN.md`](OPTION_D_DESIGN.md).
 
-This directory documents the frozen dosemu2 port layer: the 16-bit real-mode `simx86` boundary-hook transport that served as the dis86 differential validator's stepping host. dosemu2's current role is Hydra hosting, not validation: the `simx86` backend is the transport for the in-process Hydra hosting plugin (Track 4 Option D), not the validation lockstep. The frozen transport and its ABI-v1 shared-memory contract are kept as reference for that hosting work (see [`hydra/README.md`](../../hydra/README.md)).
+SST (SingleStepTests hardware captures) is the validation authority for emu86. dosemu2's
+role is Hydra hosting only — not validation.
 
-## Roles and glossary
+## How it works
 
-- **emu86** — the upstream-authored Rust 8086/286 interpreter in `dis86/src/emu86/`. It is the project's semantic **reference CPU model**: the readable, authoritative statement of expected instruction, flag, and DOS behavior that this project maintains.
-- **dosemu2 simx86** — the frozen `simx86` boundary-hook transport, patched by the frozen carrier below (reference for Option D plugin research). It steps one translated node per request and publishes state.
-- **`reference`/`candidate` (validator code)** — internal naming on the *stepping* axis only: `reference` is the stepped host (dosemu2) whose decoded-node counts drive the loop, `candidate` is emu86 replaying them. It says nothing about semantic priority; semantic authority remains with emu86 as the reference CPU model.
-- **differential validator (`emu86_validator`)** — archived: the differential validation layers have been deleted, and only the transport layer remains as reference. It was the harness that ran both engines in lockstep and halted on the first state divergence.
-- **ABI v1** — the frozen 88-byte shared-memory control contract between the Rust validator and patched dosemu2 (see [`FREEZE_ABI_V1.md`](FREEZE_ABI_V1.md)).
-- **carrier** — the two squash-frozen `git am` patches in `patches/dosemu2/` that implement the dosemu2 side of the contract.
+1. **Launch stock dosemu2** with simx86 (`$_cpu_vm = "emulated"`, `$_cpuemu = (1)`) and
+   the target DOS program.
+2. **Connect via dosdebug** — two FIFOs in `$XDG_RUNTIME_DIR/dosemu2/` (`dosemu.dbgin.<pid>`,
+   `dosemu.dbgout.<pid>`), created automatically by the stock binary.
+3. **Map guest memory** — open dosemu2's lowmem memfd via `/proc/<dosemu_pid>/fd/<fd>`
+   and mmap it `MAP_SHARED`. Provides the raw pointer Hydra needs (`mem_hostaddr`).
+4. **Set breakpoints** at function entry points (`bp ADDR`). Continue (`g`).
+5. **On hit** — parse register dump, execute native decompiled function, write return
+   registers (`r REG val`), continue (`g`).
 
-## Current coordinates
+Function-level hooking is the right granularity for a decompilation tool. Instruction-
+level hooking is not needed.
 
-- **Implementation carrier:** `patches/dosemu2/series` (two squashed frozen `git am` patches)
-- **Pinned dosemu2 base:** `604ce0cdd1a71f657e2a2df623d216d5ab289313`
-- **Shared-memory ABI:** version 1; 88-byte append-only structure preserving the 64-byte Hydra prefix
-- **Scope:** one validator instance controlling a 16-bit real-mode MZ executable
+## Reference: retired validator transport
 
+<<<<<<< ours
+The frozen transport layer (`patches/dosemu2/0001`, `0002`) and the ABI-v1 shared-memory
+contract were the retired differential validator's mechanism. They are kept as reference
+for the boundary-hook and low-memory-backing semantics — not applied, not active. The
+ABI is briefly described in [`FREEZE_ABI_V1.md`](FREEZE_ABI_V1.md).
+=======
 Development patches 0001–0010 are closed historical development. The active carrier is the two-patch squashed frozen series, governed by [`FREEZE_ABI_V1.md`](FREEZE_ABI_V1.md).
 
 Historical patch 0010 implemented deferred acknowledgement for standalone nonterminating host services. Eligible unchanged DOS/BIOS vectors are normalized at the exact saved return `CS:IP`. Application-installed handlers are a different contract: they remain visible and controller-stepped in lockstep.
@@ -35,17 +46,17 @@ Historical patch 0010 implemented deferred acknowledgement for standalone nonter
 On a separate axis, emu86's instruction behavior is *hardware*-anchored against the SingleStepTests 80286 captures via the SST harness (`docs/emu86/sst.md`); that axis is unrelated to — and does not speak to — twin equivalence with dosemu2 simx86.
 
 “Implemented,” “host-only tested,” and “pinned-runtime tested” are distinct claims. Focused runtime proofs must not be reported as completion of the expanded corpus. Correctness smoke tests also establish no performance claim.
+>>>>>>> theirs
 
 ## Document map
 
-| Document | Authority |
+| Document | Content |
 | --- | --- |
-| [`FREEZE_ABI_V1.md`](FREEZE_ABI_V1.md) | Versioned ABI-v1 freeze and mandatory change gate. |
-| [`PHASE1_SPEC.md`](PHASE1_SPEC.md) | Normative execution, ABI, ownership, interrupt, and shutdown contract. |
-| [`PHASE1_IMPLEMENTATION.md`](PHASE1_IMPLEMENTATION.md) | Current implementation map and design details. |
-| [`TESTING.md`](TESTING.md) | Evidence levels, commands, proven paths, and remaining integration gate. |
-| [`REVIEW.md`](REVIEW.md) | Design decisions and review cautions not repeated by the spec. |
+| [`OPTION_D_DESIGN.md`](OPTION_D_DESIGN.md) | Current design: external Hydra client via dosdebug + `/proc/pid/fd` mmap. |
+| [`FREEZE_ABI_V1.md`](FREEZE_ABI_V1.md) | Reference-only: the retired validator's 88-byte ABI-v1 contract. |
+| [`PHASE1_SPEC.md`](PHASE1_SPEC.md) | Reference-only: normative execution/ABI/ownership/interrupt/shutdown contract. |
+| [`PHASE1_IMPLEMENTATION.md`](PHASE1_IMPLEMENTATION.md) | Reference-only: implementation map for the frozen transport. |
+| [`TESTING.md`](TESTING.md) | Reference-only: evidence levels and proven paths for the frozen transport. |
+| [`REVIEW.md`](REVIEW.md) | Reference-only: design decisions and review cautions. |
 | [`SOURCES.md`](SOURCES.md) | Code and upstream source coordinates. |
-| [`patches/dosemu2/README.md`](../../patches/dosemu2/README.md) | Patch application, provenance, and carrier mechanics. |
-
-Earlier phase-gate and PR-description records were removed from this directory; they remain available in git history for provenance and are not current status or implementation guidance.
+| [`patches/dosemu2/README.md`](../../patches/dosemu2/README.md) | Reference-only: patch provenance and carrier mechanics. |
