@@ -20,13 +20,7 @@ just check
 
 This covers Rust/reference CPU tests and local ABI/state/comparison logic. PR #23 specifically covers the exact host command, MZ-derived identity, canonical target path, page-sized mapping with its 88-byte ABI prefix, and launcher/descendant PID ownership without making normal repository checks depend on a dosemu2 checkout or graphical stack. Passing it is unit-test evidence, not dosemu2 integration evidence.
 
-It also covers the emu86-only fixture corpora in `dis86/src/emu86/validator/fixture.rs`:
-
-- the REP matrix (MOVS/STOS/CMPS/SCAS × byte/word × direction × termination mode), verified as MZ fixtures stepped on emu86 alone;
-- the seeded register/segment mutation corpus (ALU/MOV/XCHG/PUSH/POP/segment-override sequences), verified against an independent replay model of emu86's instruction effects; and
-- the fixture builder itself plus host-side memory-window comparison logic.
-
-These are unit-test evidence about emu86's own behavior; they are not differential evidence.
+The emu86-only fixture corpora (`dis86/src/emu86/validator/fixture.rs` — the REP matrix, the seeded register/segment mutation corpus, and the fixture builder plus host-side memory-window comparison logic) were archived when the differential validator was deleted and are no longer part of `just check` coverage.
 
 ### Hardware-anchored emu86 coverage (validation authority)
 
@@ -62,9 +56,9 @@ Current focused runtime evidence includes:
 - one small terminating MZ fixture driven through the dosemu2 backend/validator path;
 - PR #21 target-exit and architectural-fault publication;
 - PR #25/patch 0010 nonterminating unprefixed `INT 21h/AH=30h`, acknowledged at the post-service target PC with DOS-returned state that the next target instruction consumes; and
-- the validator corpus mode (`emu86_validator --corpus`), which runs the Rust-side declarative fixture set on the pinned runtime with per-boundary register comparison plus a memory-window comparison over each fixture's deterministic region (`dis86/src/emu86/validator/`).
+- (archived) the validator corpus mode (`emu86_validator --corpus`), which ran the Rust-side declarative fixture set on the pinned runtime with per-boundary register comparison plus a memory-window comparison over each fixture's deterministic region (`dis86/src/emu86/validator/`) — proven before the validator binary and fixture corpus were deleted.
 
-These prove that the hook, transport, live low-memory alias, basic adapter path, terminal/fault outcomes, the standalone unprefixed host-service normalization path, and the corpus/memory-comparison plumbing execute on the pinned runtime. Host-service normalization is distinct from application-handler lockstep: unchanged eligible vectors are deferred to their saved return, whereas application-installed handlers must remain controller-stepped. They are not a substitute for a representative differential corpus.
+These proved that the hook, transport, live low-memory alias, basic adapter path, terminal/fault outcomes, the standalone unprefixed host-service normalization path, and the corpus/memory-comparison plumbing executed on the pinned runtime. Host-service normalization is distinct from application-handler lockstep: unchanged eligible vectors are deferred to their saved return, whereas application-installed handlers must remain controller-stepped. They are not a substitute for a representative differential corpus.
 
 ## Expanded pinned-runtime corpus still required
 
@@ -72,8 +66,8 @@ These prove that the hook, transport, live low-memory alias, basic adapter path,
 
 Do **not** mark the following integration-tested until checked-in fixtures exercise them against the pinned runtime:
 
-- REP MOVS/STOS/CMPS/SCAS differential alignment. The matrix is captured host-side on emu86 (`fixture.rs` rep_fixtures), but the differential stepping models differ: emu86 completes a REP string op inside one `step()` (whole-REP-per-step) while dosemu2 publishes one SAME_PC node per REP iteration. Reconciling these (classification and possibly an expected-boundary-mapping convention) is required before REP fixtures join the differential corpus;
-- differential (pinned-runtime) coverage of the register/segment mutation corpus. It is host-side model-tested on emu86 (`fixture.rs` mutation_fixtures); the differential variants — particularly segment-override memory writes and PUSH/POP stack effects inside a compared window — remain pending;
+- REP MOVS/STOS/CMPS/SCAS differential alignment. The matrix was captured host-side on emu86, but the differential stepping models differ: emu86 completes a REP string op inside one `step()` (whole-REP-per-step) while dosemu2 publishes one SAME_PC node per REP iteration. Reconciling these (classification and possibly an expected-boundary-mapping convention) is required before REP fixtures join the differential corpus;
+- differential (pinned-runtime) coverage of the register/segment mutation corpus. It was host-side model-tested on emu86; the differential variants — particularly segment-override memory writes and PUSH/POP stack effects inside a compared window — remain pending;
 - interrupt-shadow behavior for STI, MOV SS, and POP SS, including shadow + REP composition;
 - prefixed host-service encodings, application-installed handler lockstep (including outside the target MCB), and broader BIOS coverage;
 - descendant child/helper exclusion;
