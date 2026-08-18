@@ -5,6 +5,8 @@
 
 static hydra_exec_ctx_t executions[MAX_EXEC];
 static hydra_exec_ctx_t *thread_active = NULL;
+static size_t hook_dispatch_count = 0;
+static int last_result_type = HYDRA_RESULT_TYPE_RESUME;
 
 typedef struct overlay_entry overlay_entry_t;
 struct overlay_entry
@@ -50,6 +52,29 @@ hydra_exec_ctx_t *execution_context_get(u16 *opt_exec_id)
 void execution_context_set(hydra_exec_ctx_t *exec)
 {
   thread_active = exec;
+}
+
+/* The result type of the most recent hydra_exec_run() call. The dosemu2 host
+ * driver uses this to decide whether a CALL/CALL_NEAR result needs a return
+ * stub breakpoint planted before the guest CPU is continued. */
+int hydra_exec_last_result_type(void)
+{
+  return last_result_type;
+}
+
+/* Id of the currently active execution context (thread_active). The host
+ * driver reads this after a CALL result to plant the matching return stub. */
+u16 hydra_exec_active_id(void)
+{
+  u16 id = 0;
+  execution_context_get(&id);
+  return id;
+}
+
+/* Number of hook functions dispatched since startup (run_begin, not resumed). */
+size_t hydra_exec_hook_dispatch_count(void)
+{
+  return hook_dispatch_count;
 }
 
 static void *thread_func(void *_usr)
@@ -120,6 +145,7 @@ static hydra_result_t run_wait(hydra_exec_ctx_t *exec, hydra_machine_t *m)
 
 static hydra_result_t run_begin(hydra_hook_t *hook, hydra_machine_t *m)
 {
+  hook_dispatch_count++;
   if (hook->flags & HYDRA_HOOK_FLAGS_OVERLAY) {
     // On first entry to the overlay, it calls an interrupt "int 0x3f"
     // to page in the segment. We want to allow this to happen. After the
@@ -262,6 +288,8 @@ int hydra_exec_run(hydra_machine_t *m)
       result = run_begin(ent, m);
     }
   }
+
+  last_result_type = result.type;
 
   // Figure out how to update / re-direct the CS:IP
   switch (result.type) {

@@ -39,6 +39,13 @@ hydra_hook_t * hydra_hook_find(addr_t addr)
   return NULL;
 }
 
+void hydra_hook_foreach(void (*fn)(const hydra_hook_t *hook, void *user), void *user)
+{
+  for (size_t i = 0; i < num_hooks; i++) {
+    fn(&hooks[i], user);
+  }
+}
+
 void hydra_impl_register_addr(hydra_result_t (*func)(hydra_machine_t *m), u16 seg, u16 off, int flags)
 {
   hydra_hook_t ent = {NULL, func, ADDR_MAKE(seg, off), flags};

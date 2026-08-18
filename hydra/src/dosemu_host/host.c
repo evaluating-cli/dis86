@@ -328,6 +328,7 @@ void hydra_user_init(hydra_conf_t *conf,
 
     ctx->code_load_offset = host_conf_u16(confstr, "code_load=", 0);
     ctx->data_section_seg = host_conf_u16(confstr, "data_seg=", 0);
+    conf->raw_code_offset = (uint32_t)host_conf_u16(confstr, "raw_code=", 0x1c00);
 
     long pid = host_conf_pid(confstr);
 

@@ -149,10 +149,21 @@ void hydra_impl_raw_code(u8 *code, size_t code_sz)
   hydra_exec_ctx_t *exec = execution_context_get(NULL);
   hydra_machine_t *m = &exec->machine;
 
+  /* The dosemu2 simx86 JIT caches translated guest code keyed by guest linear
+     address and never re-reads externally-written bytes (host memfd writes
+     bypass it), so re-executing a slot would run a stale translation. Place
+     every snippet at a monotonically increasing slot address: each slot is
+     executed at most once, so the JIT always translates fresh bytes. */
+  static u32 raw_slot = 0;
+  const u32 max_slots = 0x10000u / MAX_RAW_CODE; /* 64KB region */
+  if (raw_slot >= max_slots) FAIL("Raw-code slot region exhausted");
+  u32 slot_addr = (u32)HYDRA_CONF->raw_code_offset + raw_slot * MAX_RAW_CODE;
+  raw_slot++;
+
   u8   code_saved[MAX_RAW_CODE];
-  u16  code_seg  = CODE_START_SEG;
-  u32  code_addr = (u32)code_seg << 4;
-  u8 * code_ptr  = m->hardware->mem_hostaddr(m->hardware->ctx, code_addr);
+  u16  code_seg = (u16)(slot_addr >> 4);
+  u16  code_off = (u16)(slot_addr & 0xf);
+  u8 * code_ptr = m->hardware->mem_hostaddr(m->hardware->ctx, slot_addr);
 
   // save
   memcpy(code_saved, code_ptr, MAX_RAW_CODE);
@@ -161,7 +172,7 @@ void hydra_impl_raw_code(u8 *code, size_t code_sz)
   memcpy(code_ptr, code, code_sz);
 
   // call
-  hydra_impl_call_far(0, 0);
+  hydra_impl_call_far(code_seg - CODE_START_SEG, code_off);
 
   // restore
   memcpy(code_ptr, code_saved, MAX_RAW_CODE);

@@ -738,6 +738,15 @@ int dosdebug_go(dosdebug_t *db)
     return 0;
 }
 
+int dosdebug_step(dosdebug_t *db)
+{
+    if (!db || !db->connected)
+        return -1;
+    if (send_cmd(db, "t\n") != 0)
+        return -1;
+    return 0;
+}
+
 int dosdebug_stop(dosdebug_t *db)
 {
     if (!db || !db->connected)

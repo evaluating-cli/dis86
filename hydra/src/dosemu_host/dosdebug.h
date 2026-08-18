@@ -44,6 +44,10 @@ int dosdebug_clear_bp(dosdebug_t *db, int bp_index);
 // Continue execution (g). Returns immediately.
 int dosdebug_go(dosdebug_t *db);
 
+// Single-step (t). Executes one instruction (stepping over INTs).
+// Returns immediately; use dosdebug_wait_stop to read the result.
+int dosdebug_step(dosdebug_t *db);
+
 // Stop execution. Returns immediately.
 int dosdebug_stop(dosdebug_t *db);
 

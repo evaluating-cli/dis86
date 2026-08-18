@@ -5,6 +5,7 @@
 
 dosemu_host_src = files([
   'host.c',
+  'host_driver.c',
   'dosdebug.c',
   'lowmem.c',
 ])
@@ -31,4 +32,20 @@ test_lowmem = executable(
 test_host = executable(
   'test_host', 'test_host.c',
   link_with : [libhydra, libhydra_dosemu],
+)
+
+## Phase 4/5: guest program (nasm -> .COM) + driver integration test.
+
+testprog_com = custom_target(
+  'testprog.com',
+  input : 'testprog.asm',
+  output : 'testprog.com',
+  command : ['nasm', '-f', 'bin', '-o', '@OUTPUT@', '@INPUT@'],
+)
+
+test_driver = executable(
+  'test_driver', 'test_driver.c',
+  link_with : [libhydra, libhydra_dosemu],
+  sources : [testprog_com],
+  c_args : ['-DTESTPROG_COM_PATH="' + testprog_com.full_path() + '"'],
 )
