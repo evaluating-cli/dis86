@@ -19,6 +19,9 @@ typedef struct {
 // Returns NULL on failure.
 dosdebug_t *dosdebug_connect(pid_t pid);
 
+// Return the dosemu2 pid this connection is bound to (0 if not connected).
+pid_t dosdebug_get_pid(dosdebug_t *db);
+
 // Disconnect (closes FIFOs).
 void dosdebug_disconnect(dosdebug_t *db);
 

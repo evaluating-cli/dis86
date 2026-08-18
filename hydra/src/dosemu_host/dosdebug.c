@@ -579,6 +579,13 @@ void dosdebug_disconnect(dosdebug_t *db)
     free(db);
 }
 
+pid_t dosdebug_get_pid(dosdebug_t *db)
+{
+    if (!db || !db->connected)
+        return 0;
+    return db->pid;
+}
+
 /* ---------------- public API ---------------- */
 
 /* Issue 'stop'; drains its response. Idempotent: safe whether running/stopped.
