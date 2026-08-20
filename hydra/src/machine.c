@@ -8,6 +8,11 @@ void hydra_impl_unknown(const char *func, int line)
 
 #define U32_MAKE(upper, lower) ((u32)(upper) << 16 | (u32)(lower))
 
+/* Raw-code slot counter (see hydra_impl_raw_code). Reset to 0 by the
+ * host driver at each hook dispatch boundary so the slot region is
+ * reused across hooks without exhausting the 64KB region. */
+static u32 raw_code_slot = 0;
+
 u32 hydra_impl_call_far(u16 seg, u16 off)
 {
   // Grab the current execution context
@@ -152,13 +157,14 @@ void hydra_impl_raw_code(u8 *code, size_t code_sz)
   /* The dosemu2 simx86 JIT caches translated guest code keyed by guest linear
      address and never re-reads externally-written bytes (host memfd writes
      bypass it), so re-executing a slot would run a stale translation. Place
-     every snippet at a monotonically increasing slot address: each slot is
-     executed at most once, so the JIT always translates fresh bytes. */
-  static u32 raw_slot = 0;
+     every snippet at a monotonically increasing slot address within the
+     current hook dispatch: each slot is executed at most once before the
+     driver resets the counter at the next hook boundary, so the JIT always
+     translates fresh bytes. */
   const u32 max_slots = 0x10000u / MAX_RAW_CODE; /* 64KB region */
-  if (raw_slot >= max_slots) FAIL("Raw-code slot region exhausted");
-  u32 slot_addr = (u32)HYDRA_CONF->raw_code_offset + raw_slot * MAX_RAW_CODE;
-  raw_slot++;
+  if (raw_code_slot >= max_slots) raw_code_slot = 0; /* wrap (safety) */
+  u32 slot_addr = (u32)HYDRA_CONF->raw_code_offset + raw_code_slot * MAX_RAW_CODE;
+  raw_code_slot++;
 
   u8   code_saved[MAX_RAW_CODE];
   u16  code_seg = (u16)(slot_addr >> 4);
@@ -176,6 +182,15 @@ void hydra_impl_raw_code(u8 *code, size_t code_sz)
 
   // restore
   memcpy(code_ptr, code_saved, MAX_RAW_CODE);
+}
+
+/* Called by the host driver at each hook dispatch boundary so the
+ * raw-code slot counter starts fresh. By the time the next hook fires,
+ * the JIT has executed other (non-raw-code) guest code in between, so
+ * reusing slot 0 is safe. */
+void hydra_impl_raw_code_reset(void)
+{
+  raw_code_slot = 0;
 }
 
 void hydra_impl_nop(void)

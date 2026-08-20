@@ -210,10 +210,7 @@ int main(int argc, char **argv)
   g_hookcnt_phys = com_phys + HOOKCNT_OFF;
   g_result_phys  = com_phys + RESULT_OFF;
 
-  /* 4. plant breakpoints and release the guest */
-  int installed = host_run_install_hook_breakpoints(ctx);
-  CHECK(installed == 1, "hook breakpoint installed (count=%d)", installed);
-
+  /* 4. release the guest (host_run plants/clears breakpoints itself) */
   lowmem_write8(ctx->lm, com_phys + GOFLAG_OFF, 1);
   printf("go flag set; running the guest...\n");
 

@@ -10,10 +10,11 @@
  *     hydra_machine_exec(), pushes the updated register state back, and
  *     continues,
  *   - when hydra_machine_exec() returns a CALL / CALL_NEAR result (a snippet
- *     of guest opcode from hydra_impl_raw_code()), it plants a one-shot return
- *     stub breakpoint (0xffff:exec_id far / cs:0xff00+exec_id near), runs the
- *     raw code to completion, clears the stub on the hit, and resumes the
- *     hook through the Hydra exec engine (try_resume path).
+ *     of guest opcode from hydra_impl_raw_code()), it single-steps (dosdebug
+ *     't') through the raw-code slot on dosemu2 until the RETF/RET lands at
+ *     the return address, then feeds the post-raw-code state back to the
+ *     Hydra exec engine to resume the hook.
+ *   - on exit, clears all breakpoints it planted.
  */
 
 #include <stddef.h>

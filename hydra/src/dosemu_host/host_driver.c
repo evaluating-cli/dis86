@@ -3,9 +3,9 @@
  *
  * See host_driver.h for the design. The driver runs the guest CPU through
  * dosemu2's int3 breakpoints, dispatching each stop through the Hydra core
- * (hydra_machine_exec) and planting one-shot return-stub breakpoints so that
- * guest-opcode snippets (hydra_impl_raw_code) can run to completion and hand
- * control back to the hook via the Hydra exec engine.
+ * (hydra_machine_exec). When a hook requests raw-code execution, the driver
+ * single-steps (dosdebug 't') through the raw-code slot until RETF/RET
+ * lands at the return address, then feeds the state back to the exec engine.
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -37,7 +37,7 @@ static host_bp_entry_t *host_bp_find(host_bp_entry_t *bps, uint32_t linear)
 }
 
 static int host_bp_add(host_bp_entry_t *bps, int index, uint32_t linear,
-                       int is_stub)
+                        int is_stub)
 {
   if (host_bp_find(bps, linear))
     return 0; /* already tracked (dosemu rejects duplicates anyway) */
@@ -51,6 +51,16 @@ static int host_bp_add(host_bp_entry_t *bps, int index, uint32_t linear,
     }
   }
   return -1; /* table full */
+}
+
+/* Clear every tracked breakpoint (call before discarding the bps table). */
+static void host_bp_clear_all(host_ctx_t *ctx, host_bp_entry_t *bps)
+{
+  for (size_t i = 0; i < HOST_RUN_MAX_BPS; i++) {
+    if (bps[i].used)
+      host_clear_bp(ctx, bps[i].index);
+    bps[i].used = 0;
+  }
 }
 
 /* ------------------------------------------------------------------ */
@@ -197,6 +207,11 @@ host_run_stop_reason_t host_run(host_ctx_t *ctx, hydra_machine_t *m,
     }
     st.stops++;
 
+    /* Reset the raw-code slot counter — the previous hook (if any) has
+     * completed and the JIT has since executed non-raw-code guest code,
+     * so reusing slot 0 for the next hook is safe. */
+    hydra_impl_raw_code_reset();
+
     /* Dispatch the hook through the Hydra core. The hook may issue
      * multiple raw-code requests (CLI, STI, INT, INB, OUTB, ...) before
      * completing. Each raw-code request produces a CALL/CALL_NEAR result;
@@ -278,6 +293,7 @@ host_run_stop_reason_t host_run(host_ctx_t *ctx, hydra_machine_t *m,
   }
 
 done:
+  host_bp_clear_all(ctx, bps);
   if (stats)
     *stats = st;
   return reason;
