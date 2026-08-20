@@ -1,5 +1,13 @@
 # Hydra hosting on dosemu2: external client via dosdebug + /proc/pid/fd
 
+> **Status (2026-08-20): SHIPPED.** Phases 0–5 complete; integration test passes
+> (5 hook dispatches, 25 raw-code executions, guest observed result 0xBE00).
+> Commits: `5a575ec` (dosdebug client + lowmem mmap), `c188fb7` (Hydra vtable
+> bridge), `079d1fc` (Phase 4/5 function-level hooking), `a8af5f2` (review fixes).
+> Implementation: `hydra/src/dosemu_host/`. Where this doc and the shipped code
+> differ (raw-code execution is single-step-trace-based, not return-stub-based),
+> §6/§8 note the as-built behavior.
+
 **Scope:** design doc for hosting Hydra on the **stock, unmodified** dosemu2 binary.
 No rebuild, no patching, no fork, no plugin. Hydra runs as an external process that
 drives dosemu2 through its built-in debugger protocol and maps guest memory via procfs.
@@ -21,7 +29,7 @@ binary provides all three without modification:
 | Register write (return values) | dosdebug `r REG val` (per-register) | yes |
 | Memory read/write (fallback) | dosdebug `d ADDR SIZE` / `m ADDR val` | yes |
 | Raw pointer to guest memory (`mem_hostaddr`) | mmap dosemu2's lowmem backing via `/proc/<pid>/fd/<fd>` | yes — memfd/shm accessible via procfs |
-| I/O port access | Guest opcode execution (Hydra writes `IN`/`OUT` into code, dosemu2 executes on `g`) | yes |
+| I/O port access | Guest opcode execution (Hydra writes `IN`/`OUT` into a raw-code slot, driver single-steps `t` until RET) | yes |
 
 **Key insight:** instruction-level hooking is not needed for a decompilation tool.
 Function-level hooking via breakpoints is the right granularity, and the dosdebug
@@ -124,13 +132,36 @@ After executing a native hook function, Hydra writes return registers via indivi
 register writes per hook return (one per register); all safe because the CPU only
 resumes on `g`.
 
-## 6. I/O
+## 6. I/O and raw-code execution (as shipped)
 
-Hydra implements I/O by writing real 8086 `IN`/`OUT` opcodes into the guest code
-segment (`hydra_impl_raw_code`, `machine.c:155`) and executing them. With the mmap'd
-lowmem pointer, `hydra_impl_raw_code`'s `memcpy` block save/write/restore works
-directly. When dosemu2 continues (`g`), it executes the opcodes through its normal port
-handling — no dosdebug I/O port access needed.
+Hydra implements I/O by writing real 8086 `IN`/`OUT` opcodes into a guest code slot
+(`hydra_impl_raw_code`, `machine.c`). With the mmap'd lowmem pointer, the slot
+write/restore works directly — no dosdebug I/O port access needed.
+
+**As shipped, execution is single-step-trace-based, not `g`-based:**
+
+- Each raw-code snippet occupies a fresh 128-byte slot in a 64KB region below
+  0x10000 (`raw_code_offset`, default 0x1c00), monotonically allocated within one
+  hook dispatch. This dodges the simx86 JIT cache: the JIT never re-reads
+  externally-written bytes, so re-running a slot with new bytes would execute a
+  stale translation. The driver calls `hydra_impl_raw_code_reset()` at each hook
+  boundary — by the next hook the JIT has run other guest code, so slots restart
+  at 0 safely.
+- After Hydra redirects CS:IP to the slot (CALL/CALL_NEAR result), the driver
+  pushes the redirect into dosemu2 (`r cs` / `r ip`) and single-steps
+  (`dosdebug_step()` → `t\n`; `t` steps over INTs, as dosemu2's tracer treats
+  INT like CALL) until the terminating RETF/RET lands at the Hydra return
+  address, then feeds the post-raw-code registers back into the exec engine.
+- A hook may emit several sequential raw-code requests (e.g. CLI, STI, INT, INB,
+  OUTB in one hook); the driver's inner loop handles each until the hook returns
+  no redirect.
+- **No return-stub breakpoint is planted.** The designed one-shot stub at
+  `ffff:0000` never fired (that address holds BIOS ROM content — boot vector +
+  date string — in a running guest, and conflicts with dosemu2's ONE_STEP
+  breakpointManager), which is why tracing replaced it.
+- Calling `hydra_machine_notify(m)` after every `hydra_machine_exec(m, 0)` is
+  mandatory — without it, the `hydra_callstack_trigger_enter` assertion
+  (`call_event == CALL_EVENT_NONE`) fires on the second exec.
 
 ## 7. Hydra bridge mapping
 
@@ -138,7 +169,7 @@ handling — no dosdebug I/O port access needed.
 |---|---|---|
 | `mem_hostaddr` | `mmap'd_lowmem + addr` via `/proc/<pid>/fd/<fd>` | this doc §4 |
 | `mem_read8/16`, `mem_write8/16` | direct dereference of mmap'd pointer (or `LOWMEM_READ/WRITE_*` equivalents) | this doc §4 |
-| `io_in8/16`, `io_out8/16` | guest opcode execution via `hydra_impl_raw_code` | this doc §6 |
+| `io_in8/16`, `io_out8/16` | guest opcode execution via `hydra_impl_raw_code` + single-step trace | this doc §6 |
 | `update_registers` | dosdebug `r REG val` per register | this doc §5 |
 | `state_save` | dosdebug `r` → parse register dump | this doc §5 |
 | `state_restore` | dosdebug `r REG val` per register | this doc §5 |
@@ -146,26 +177,32 @@ handling — no dosdebug I/O port access needed.
 | `hydra_machine_exec(m, interrupt_count)` | set breakpoints + `g` (run until next hook) | this doc §3 |
 | `hydra_machine_notify` / `step_hook` | breakpoint hit handler | this doc §5 |
 
-## 8. Phased implementation sketch
+## 8. Phased implementation (all complete)
 
 - **Phase 0 — empirical verification:** launch stock dosemu2 headless with simx86
   (`$_cpu_vm = "emulated"`, `$_cpuemu = (1)`); connect dosdebug FIFO; find and mmap
-  lowmem via `/proc/pid/fd`; set a breakpoint and verify it fires. Proves the
-  end-to-end feasibility on the stock binary.
-- **Phase 1 — dosdebug client:** implement a dosdebug protocol client (Rust or C):
-  FIFO connection, PID discovery, command encoding, response parsing (register dumps,
-  state notifications). Register read/write, memory read/write, breakpoints, continue/stop.
-- **Phase 2 — lowmem mmap bridge:** find and mmap dosemu2's lowmem backing via
-  `/proc/<pid>/fd/`. Provide `mem_hostaddr`, `mem_read8/16`, `mem_write8/16`.
-- **Phase 3 — Hydra bridge:** wire the full `hydra_machine_hardware_t` vtable:
-  `mem_hostaddr` from mmap, `update_registers` / `state_save` / `state_restore` from
-  dosdebug, `hydra_machine_init` (connect + mmap), `hydra_machine_exec` (breakpoints +
-  continue), I/O via guest opcode execution.
-- **Phase 4 — function-level hooking:** breakpoint management (set/clear at function
-  addresses), hook dispatch (on hit: read regs → execute native → write regs → continue),
-  `hydra_impl_raw_code` integration (write opcodes, continue dosemu2, stop after).
-- **Phase 5 — integration testing:** end-to-end with a target DOS program: launch
-  dosemu2, set hooks, verify function interception, verify register/memory/I/O.
+  lowmem via `/proc/pid/fd`; set a breakpoint and verify it fires. **Done** — also
+  established that `$_mapping = "mapmshm"` (memfd lowmem) and `$_hdimage = "+1"`
+  (FreeDOS boot off a bare working dir) are required.
+- **Phase 1 — dosdebug client:** C client in `hydra/src/dosemu_host/dosdebug.c`:
+  FIFO connection, PID discovery, command encoding, response parsing, register
+  read/write, breakpoints, go/stop, single-step. **Commit `5a575ec`.**
+- **Phase 2 — lowmem mmap bridge:** `lowmem.c` finds and mmaps the lowmem
+  backing via `/proc/<pid>/fd/`. Provides `mem_hostaddr`, `mem_read8/16`,
+  `mem_write8/16`. **Commit `5a575ec`.**
+- **Phase 3 — Hydra bridge:** full `hydra_machine_hardware_t` vtable (14
+  callbacks) in `host.c`: `mem_hostaddr` from mmap, `update_registers` /
+  `state_save` / `state_restore` via dosdebug, emulated `DOS_REAL` hardware
+  context for test mode, I/O via guest opcode execution. **Commit `c188fb7`.**
+- **Phase 4 — function-level hooking:** `host_driver.c` run loop — plant INT3 at
+  every registered hook (cleared on exit), dispatch through
+  `hydra_machine_exec` + `hydra_machine_notify`, trace-based raw-code execution
+  per §6. **Commit `079d1fc`** (+ review fixes `a8af5f2`).
+- **Phase 5 — integration testing:** `test_driver.c` + `run_driver_test.sh`:
+  26-byte NASM COM guest loops 5× calling a hooked function
+  (CLI/STI/INT/INB/OUTB/ret); hook returns 0xBE00 in AX. Result: 5 hook
+  dispatches, 25 raw-code runs, all returned via trace, guest observed the
+  result — **PASSED. Commit `079d1fc`.**
 
 ## 9. Reference: prior in-process plugin research (appendix)
 

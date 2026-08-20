@@ -1,6 +1,68 @@
-# dosemu2 migration testing
+# dosemu2 hosting testing
 
-SST (SingleStepTests hardware captures) is the validation authority for emu86; this document covers the frozen dosemu2 transport evidence and the hosting reference for Hydra-on-dosemu2 (Track 4 Option D). Other documents link here rather than maintaining parallel checklists.
+SST (SingleStepTests hardware captures) is the validation authority for emu86; this document covers the **current Hydra-on-dosemu2 hosting tests** (first section) and the reference-only frozen dosemu2 transport evidence (remaining sections, historical).
+
+## Current: Hydra-on-dosemu2 hosting (external client, shipped 2026-08-20)
+
+Build:
+
+```sh
+meson setup /home/p/dis86/hydra/build /home/p/dis86/hydra   # once
+ninja -C /home/p/dis86/hydra/build
+```
+
+Integration test (launches a fresh headless dosemu2, runs the guest COM, hooks a
+function, verifies 5 hook dispatches × 5 raw-code executions and the hook result):
+
+```sh
+pkill -9 -x dosemu2.bin 2>/dev/null; sleep 1
+cd /home/p/dis86/hydra/src/dosemu_host
+timeout 120 bash run_driver_test.sh
+```
+
+Reference dosemu2 config (`/tmp/opencode/dosemu_mshm.conf` — create if absent):
+
+```
+$_cpu_vm = "emulated"
+$_cpuemu = (1)
+$_sound = (off)
+$_layout = "us"
+$_vbios_post = (off)
+$_console = (0)
+$_video = "vga"
+$_hdimage = "+1"
+$_mapping = "mapmshm"
+```
+
+Required keys: `$_mapping = "mapmshm"` (memfd lowmem backing, so
+`/proc/<pid>/fd/` mmap works), `$_hdimage = "+1"` (FreeDOS boot off the working
+directory, which must contain `testprog.com`). The test script sets
+`XDG_RUNTIME_DIR=/tmp/opencode/runtime` so the dosdebug FIFOs land predictably;
+it kills dosemu2 on exit. Expected output ends with:
+
+```
+stops=5 hook_dispatches=5 raw_code_runs=25 stub_hits=25
+...
+=== TEST PASSED ===
+```
+
+Note: the `stub_hits` stat counts raw-code returns detected by single-step trace;
+no stub breakpoint is planted (see `OPTION_D_DESIGN.md` §6).
+
+emu86 validation authority (unchanged, host-independent):
+
+```sh
+cargo test --locked --all-targets   # 277 passed
+# emu86_sst audit --probe           # 0 PROBE-MISMATCH
+```
+
+---
+
+## Reference-only: frozen transport evidence (historical)
+
+Everything below describes the retired differential validator's pinned-runtime
+transport. Kept for provenance; not a validation gate and not the current
+approach.
 
 ## Test levels
 

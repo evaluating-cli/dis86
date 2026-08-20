@@ -5,32 +5,35 @@ fork. Hydra runs as an external process that drives dosemu2 through its built-in
 debugger protocol (dosdebug FIFOs) and maps guest memory via `/proc/<pid>/fd/`. The
 design is in [`OPTION_D_DESIGN.md`](OPTION_D_DESIGN.md).
 
+> **Status (2026-08-20): SHIPPED.** Phases 0–5 complete; integration test passes.
+> Code lives in `hydra/src/dosemu_host/` (dosdebug client, lowmem mmap bridge,
+> Hydra vtable bridge, `host_driver` run loop, `test_driver` integration test).
+> Run it: `cd hydra/src/dosemu_host && bash run_driver_test.sh` (see
+> [`TESTING.md`](TESTING.md)).
+
 SST (SingleStepTests hardware captures) is the validation authority for emu86. dosemu2's
 role is Hydra hosting only — not validation.
 
 ## How it works
 
-1. **Launch stock dosemu2** with simx86 (`$_cpu_vm = "emulated"`, `$_cpuemu = (1)`) and
+1. **Launch stock dosemu2** with simx86 (`$_cpu_vm = "emulated"`, `$_cpuemu = (1)`),
+   `$_mapping = "mapmshm"` (memfd lowmem), `$_hdimage = "+1"` (FreeDOS boot), and
    the target DOS program.
 2. **Connect via dosdebug** — two FIFOs in `$XDG_RUNTIME_DIR/dosemu2/` (`dosemu.dbgin.<pid>`,
    `dosemu.dbgout.<pid>`), created automatically by the stock binary.
 3. **Map guest memory** — open dosemu2's lowmem memfd via `/proc/<dosemu_pid>/fd/<fd>`
    and mmap it `MAP_SHARED`. Provides the raw pointer Hydra needs (`mem_hostaddr`).
 4. **Set breakpoints** at function entry points (`bp ADDR`). Continue (`g`).
-5. **On hit** — parse register dump, execute native decompiled function, write return
-   registers (`r REG val`), continue (`g`).
+5. **On hit** — parse register dump, dispatch the hook through the Hydra exec engine,
+   write return registers (`r REG val`), continue (`g`). Guest-opcode (raw-code)
+   requests inside a hook are single-stepped (`t`) until the slot's RET lands at the
+   return address — no return-stub breakpoints.
 
 Function-level hooking is the right granularity for a decompilation tool. Instruction-
 level hooking is not needed.
 
 ## Reference: retired validator transport
 
-<<<<<<< ours
-The frozen transport layer (`patches/dosemu2/0001`, `0002`) and the ABI-v1 shared-memory
-contract were the retired differential validator's mechanism. They are kept as reference
-for the boundary-hook and low-memory-backing semantics — not applied, not active. The
-ABI is briefly described in [`FREEZE_ABI_V1.md`](FREEZE_ABI_V1.md).
-=======
 Development patches 0001–0010 are closed historical development. The active carrier is the two-patch squashed frozen series, governed by [`FREEZE_ABI_V1.md`](FREEZE_ABI_V1.md).
 
 Historical patch 0010 implemented deferred acknowledgement for standalone nonterminating host services. Eligible unchanged DOS/BIOS vectors are normalized at the exact saved return `CS:IP`. Application-installed handlers are a different contract: they remain visible and controller-stepped in lockstep.
@@ -46,17 +49,16 @@ Historical patch 0010 implemented deferred acknowledgement for standalone nonter
 On a separate axis, emu86's instruction behavior is *hardware*-anchored against the SingleStepTests 80286 captures via the SST harness (`docs/emu86/sst.md`); that axis is unrelated to — and does not speak to — twin equivalence with dosemu2 simx86.
 
 “Implemented,” “host-only tested,” and “pinned-runtime tested” are distinct claims. Focused runtime proofs must not be reported as completion of the expanded corpus. Correctness smoke tests also establish no performance claim.
->>>>>>> theirs
 
 ## Document map
 
 | Document | Content |
 | --- | --- |
-| [`OPTION_D_DESIGN.md`](OPTION_D_DESIGN.md) | Current design: external Hydra client via dosdebug + `/proc/pid/fd` mmap. |
+| [`OPTION_D_DESIGN.md`](OPTION_D_DESIGN.md) | Current design (shipped): external Hydra client via dosdebug + `/proc/pid/fd` mmap. |
 | [`FREEZE_ABI_V1.md`](FREEZE_ABI_V1.md) | Reference-only: the retired validator's 88-byte ABI-v1 contract. |
 | [`PHASE1_SPEC.md`](PHASE1_SPEC.md) | Reference-only: normative execution/ABI/ownership/interrupt/shutdown contract. |
 | [`PHASE1_IMPLEMENTATION.md`](PHASE1_IMPLEMENTATION.md) | Reference-only: implementation map for the frozen transport. |
-| [`TESTING.md`](TESTING.md) | Reference-only: evidence levels and proven paths for the frozen transport. |
+| [`TESTING.md`](TESTING.md) | Current hosting tests (Hydra-on-dosemu2) + reference-only frozen-transport evidence. |
 | [`REVIEW.md`](REVIEW.md) | Reference-only: design decisions and review cautions. |
 | [`SOURCES.md`](SOURCES.md) | Code and upstream source coordinates. |
 | [`patches/dosemu2/README.md`](../../patches/dosemu2/README.md) | Reference-only: patch provenance and carrier mechanics. |
