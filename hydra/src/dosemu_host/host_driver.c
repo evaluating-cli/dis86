@@ -316,8 +316,14 @@ static host_run_stop_reason_t dispatch_hook(run_ctx_t *r, dosdebug_regs_t *dr,
 
     r->st->raw_code_runs++;
 
+    /* dr holds the last parsed dump from the real CPU (bp stop via
+     * host_go_and_wait, trace steps via dosdebug_wait_stop, nested
+     * completions via their verified final push) — i.e. the live state the
+     * diff-write below can skip. Capture it before machine_to_regs clobbers
+     * dr. */
+    dosdebug_regs_t base = *dr;
     machine_to_regs(r->m->registers, dr);
-    if (host_set_regs(r->ctx, dr) != 0)
+    if (host_set_regs_diff(r->ctx, dr, &base) != 0)
       return HOST_RUN_STOP_ERROR;
 
     u16 eid = hydra_exec_active_id();
@@ -335,8 +341,13 @@ static host_run_stop_reason_t dispatch_hook(run_ctx_t *r, dosdebug_regs_t *dr,
       return tr;
   }
 
+  /* Push the final state into the guest CPU (idempotent for the caller of
+   * host_run; required before a nested trace continues stepping). Same base
+   * provenance as the redirect push above. The recursion's own final push
+   * handles its own diff base; trace_to_return itself is untouched. */
+  dosdebug_regs_t base = *dr;
   machine_to_regs(r->m->registers, dr);
-  if (host_set_regs(r->ctx, dr) != 0)
+  if (host_set_regs_diff(r->ctx, dr, &base) != 0)
     return HOST_RUN_STOP_ERROR;
 
   return HOST_RUN_STOP_NONE;

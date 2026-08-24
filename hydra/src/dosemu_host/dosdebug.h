@@ -35,6 +35,15 @@ int dosdebug_write_reg(dosdebug_t *db, const char *reg_name, uint16_t val);
 // Write all registers from a regs struct (issues multiple write_reg calls).
 int dosdebug_write_regs(dosdebug_t *db, const dosdebug_regs_t *regs);
 
+// Diff-write: write only the registers that differ from *base, which must
+// hold the live CPU state (the last parsed dump). FL is always written
+// (dosemu forces IF/IOPL/bit1, so flags can never be diffed away).
+// Verification is identical to dosdebug_write_regs: a full r0 read-back is
+// compared against ALL registers, so a stale base fails loudly instead of
+// corrupting silently.
+int dosdebug_write_regs_diff(dosdebug_t *db, const dosdebug_regs_t *regs,
+                             const dosdebug_regs_t *base);
+
 // Set a breakpoint at seg:off. Returns breakpoint index >= 0, or -1 on failure.
 int dosdebug_set_bp(dosdebug_t *db, uint16_t seg, uint16_t off);
 

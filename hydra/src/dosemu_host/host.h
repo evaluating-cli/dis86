@@ -36,6 +36,13 @@ int host_set_regs(host_ctx_t *ctx, const dosdebug_regs_t *regs);
 int host_reserve_raw_code(host_ctx_t *ctx, uint32_t addr, size_t size);
 bool host_raw_code_ready(const host_ctx_t *ctx);
 
+/* Diff-write: push only registers that differ from *base (the live CPU
+ * state); FL is always written. Same verification as host_set_regs. */
+int host_set_regs_diff(host_ctx_t *ctx, const dosdebug_regs_t *regs,
+                       const dosdebug_regs_t *base);
+
+/* Set a breakpoint at seg:off; returns index >= 0 or -1. */
+>>>>>>> b0a5a94 (dosemu_host: diff-writes for register pushes (2.8x test speedup))
 int host_set_bp(host_ctx_t *ctx, uint16_t seg, uint16_t off);
 int host_clear_bp(host_ctx_t *ctx, int bp_index);
 int host_go_and_wait(host_ctx_t *ctx, dosdebug_regs_t *regs, int timeout_ms);

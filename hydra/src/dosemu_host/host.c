@@ -321,6 +321,12 @@ bool host_raw_code_ready(const host_ctx_t *ctx)
            ctx->raw_code_size >= HOST_RAW_SLOT_SIZE;
 }
 
+int host_set_regs_diff(host_ctx_t *ctx, const dosdebug_regs_t *regs,
+                       const dosdebug_regs_t *base)
+{
+    return dosdebug_write_regs_diff(ctx->db, regs, base);
+}
+
 int host_set_bp(host_ctx_t *ctx, uint16_t seg, uint16_t off)
 {
     return dosdebug_set_bp(ctx->db, seg, off);
