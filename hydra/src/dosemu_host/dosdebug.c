@@ -345,14 +345,17 @@ static int parse_regs_from_buffer(dosdebug_t *db, dosdebug_regs_t *regs)
         return -1;     /* complete line(s) but no SS:SP field: corrupt dump */
     }
     cur = spos + 6;
+    /* A field that started but is incomplete/mangled here means the dump is
+     * still arriving (or, in the worst case, corrupt — the enclosing read
+     * timeout will catch that); wait for more data rather than failing. */
     if (!parse_hex4(cur, &ss))
-        return -1;
+        return 0;
     cur += 4;
     if (cur >= end || *cur != ':')
-        return -1;
+        return 0;
     cur++;
     if (!parse_hex4(cur, &sp))
-        return -1;
+        return 0;
     cur += 4;
 
     regs->ax = gpr[0]; regs->bx = gpr[1]; regs->cx = gpr[2]; regs->dx = gpr[3];
@@ -702,8 +705,23 @@ int dosdebug_write_regs(dosdebug_t *db, const dosdebug_regs_t *regs)
      * then verifies the FULL EFLAGS — which false-fails ("failed to set
      * register 'FL'") even when the low 16 bits landed. Ignore the command
      * verdict; the r0 read-back below is the source of truth.
+     *
+     * The forced bits impose a platform blind spot: a guest state with
+     * IF=0 (after CLI) can neither be restored nor even observed through
+     * this protocol. Verify the NON-forced bits exactly (a real write
+     * failure there is always a bug) and warn once if the requested state
+     * needs bits dosemu will not honor.
      */
     uint16_t want_fl = (uint16_t)(regs->flags | 0x3202u);
+    if ((regs->flags & 0x3200u) != 0x3200u) {
+        static int warned = 0;
+        if (!warned) {
+            fprintf(stderr, "dosdebug: WARNING: guest flags 0x%04x request "
+                    "IF=0/non-3 IOPL; dosemu forces these on, the guest will "
+                    "resume with interrupts enabled\n", (unsigned)regs->flags);
+            warned = 1;
+        }
+    }
     (void)dosdebug_write_reg(db, "FL", want_fl);
 
     /* Verify with a full read-back dump. */
@@ -721,9 +739,10 @@ int dosdebug_write_regs(dosdebug_t *db, const dosdebug_regs_t *regs)
             return -1;
         }
     }
-    if (now.flags != want_fl) {
+    /* Status/other flags must match exactly apart from the forced bits. */
+    if ((now.flags & (uint16_t)~0x3202u) != (regs->flags & (uint16_t)~0x3202u)) {
         fprintf(stderr, "dosdebug: FL write failed: wrote 0x%04x, "
-                "read back 0x%04x\n", (unsigned)want_fl, (unsigned)now.flags);
+                "read back 0x%04x\n", (unsigned)regs->flags, (unsigned)now.flags);
         return -1;
     }
     return 0;

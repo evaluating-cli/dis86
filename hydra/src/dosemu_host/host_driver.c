@@ -165,6 +165,10 @@ static void machine_to_regs(const hydra_machine_registers_t *hr, dosdebug_regs_t
 
 #define HOST_RUN_DEFAULT_TRACE_STEPS 10000u
 
+/* Upper bound for any single trace step (see trace_to_return). Generous for
+ * one instruction plus a DOS syscall round-trip. */
+#define HOST_STEP_TIMEOUT_MS 10000
+
 /* Max nested-hook recursion (hook -> guest call -> hook -> ...). */
 #define HOST_RUN_MAX_DEPTH 8
 
@@ -195,14 +199,25 @@ static host_run_stop_reason_t trace_to_return(run_ctx_t *r, dosdebug_regs_t *dr,
   const size_t max_steps =
       (r->opts && r->opts->max_trace_steps) ? r->opts->max_trace_steps
                                             : HOST_RUN_DEFAULT_TRACE_STEPS;
+  /* Per-step wait is ALWAYS bounded, even when the caller asked for infinite
+   * go_and_wait (timeout_ms < 0): dosdebug 't' steps INTO DOS syscalls
+   * (INT 21h/2Fh/28h/33h), and a callthrough whose callee blocks on console
+   * input would otherwise hang host_run forever inside step 0's wait. */
+  const int step_timeout =
+      (r->timeout_ms < 0 || r->timeout_ms > HOST_STEP_TIMEOUT_MS)
+          ? HOST_STEP_TIMEOUT_MS : r->timeout_ms;
   for (size_t i = 0; i < max_steps; i++) {
     /* Single-step one instruction; wait_stop blocks for the post-step dump.
      * Drain after it, too: a step can produce extra unsolicited output
      * (e.g. landing on a breakpoint mid-trace) which would otherwise
      * desynchronize the command/response stream by one block. */
     if (dosdebug_step(r->ctx->db) != 0) return HOST_RUN_STOP_ERROR;
-    if (dosdebug_wait_stop(r->ctx->db, dr, r->timeout_ms) != 0)
+    if (dosdebug_wait_stop(r->ctx->db, dr, step_timeout) != 0) {
+      fprintf(stderr, "host_run: guest step did not complete within %dms "
+              "at %04x:%04x (blocking DOS I/O in a traced callee?)\n",
+              step_timeout, dr->cs, dr->ip);
       return HOST_RUN_STOP_ERROR;
+    }
     dosdebug_drain(r->ctx->db);
     if (r->verbose > 1)
       printf("  trace[%zu] %04x:%04x (want %04x:%04x)\n",

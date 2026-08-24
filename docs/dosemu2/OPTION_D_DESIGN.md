@@ -112,6 +112,14 @@ No framing, no length prefixes, no structured replies. Buffer limit 8192 bytes
   unsolicited text; drain before/after steps.
 - **`r FL` false-fails** even on success (full-EFLAGS verify after forcing
   IF/IOPL/bit-1); always verify flags via read-back.
+- **Interrupt-flag blind spot**: dosemu's `set_FLAGS()` forces IF and IOPL on,
+  so a guest state with IF=0 (after CLI) can neither be restored nor even
+  observed through this protocol — register dumps always present IF=1. Code
+  needing exact IF semantics cannot be served by the dosdebug client alone.
+- **Traced callees must not do blocking DOS I/O**: `t` steps *into* INT
+  21h/2Fh/28h/33h handlers; a callthrough whose callee blocks on console
+  input stalls the trace. host_run bounds any single step
+  (HOST_STEP_TIMEOUT_MS, 10s) and reports it, even in infinite-wait mode.
 
 ## 4. Memory access: /proc/pid/fd mmap
 

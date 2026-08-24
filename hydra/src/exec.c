@@ -233,7 +233,14 @@ static bool try_resume(hydra_machine_t *m, hydra_result_t *_result)
     size_t idx = m->registers->ip & 0xff;
     hydra_exec_ctx_t *exec = &executions[idx];
     if (exec->state == HYDRA_EXEC_STATE_ACTIVE) {
-      if (!exec->maybe_reloc && m->registers->cs != exec->saved_cs) FAIL("Expected matching code segments");
+      /* An ordinary guest RET to an offset >= 0xff00 can collide with the
+       * magic window while a context is ACTIVE. Only resume when the calling
+       * segment matches the one recorded at the call; a mismatch means this
+       * is (almost certainly) foreign code — treat it as not-a-magic-return
+       * instead of aborting the host. maybe_reloc contexts cannot be verified
+       * and are accepted as before. */
+      if (!exec->maybe_reloc && m->registers->cs != exec->saved_cs)
+        return false;
       *_result = run_continue(m, exec);
       return true;
     }
