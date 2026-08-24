@@ -130,14 +130,6 @@ u32 hydra_impl_call_far_indirect(u32 addr)
   return hydra_impl_call_far(seg - CODE_START_SEG, off);
 }
 
-// FIXME
-/* void hydra_impl_call_func(const char *name) */
-/* { */
-/*   addr_t addr = {}; */
-/*   if (!function_addr(name, &addr)) FAIL("Failed to find function to call: %s", name); */
-/*   hydra_impl_call_far(addr.seg, addr.off); */
-/* } */
-
 void hydra_impl_raw_code(u8 *code, size_t code_sz)
 {
   /* So this is a fun trick. Occasionally, we need to execute actual 8086
@@ -196,8 +188,8 @@ void hydra_impl_raw_code_reset(void)
 void hydra_impl_nop(void)
 {
   // NO-OP
-  u8 code[] = {0x90};
-  hydra_impl_raw_code(code, 1);
+  u8 code[] = {0x90, 0xcb}; /* nop; retf; */
+  hydra_impl_raw_code(code, ARRAY_SIZE(code));
 }
 
 // cld

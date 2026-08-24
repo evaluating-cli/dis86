@@ -1,9 +1,15 @@
 # Hydra hosting on dosemu2: external client via dosdebug + /proc/pid/fd
 
-> **Status (2026-08-20): SHIPPED.** Phases 0–5 complete; integration test passes
-> (5 hook dispatches, 25 raw-code executions, guest observed result 0xBE00).
+> **Status (2026-08-20): SHIPPED + hardened (Phase 6).** Phases 0–5 complete;
+> Phase 6 (real-workload hardening) complete: native→guest call completion
+> (trace until magic return, no step cap), nested hook dispatch mid-trace,
+> loud breakpoint-install failures, run-until-stop_fn mode, SS:SP/flags
+> strictness with r0 read-back verify, paced command writes. Integration test
+> passes: 17 hook dispatches (incl. nested), 41 traced executions, flags
+> preserved — see `TESTING.md`.
 > Commits: `5a575ec` (dosdebug client + lowmem mmap), `c188fb7` (Hydra vtable
-> bridge), `079d1fc` (Phase 4/5 function-level hooking), `a8af5f2` (review fixes).
+> bridge), `079d1fc` (Phase 4/5 hooking), `a8af5f2` (review fixes), Phase 6
+> commit (see git log).
 > Implementation: `hydra/src/dosemu_host/`. Where this doc and the shipped code
 > differ (raw-code execution is single-step-trace-based, not return-stub-based),
 > §6/§8 note the as-built behavior.
@@ -97,6 +103,15 @@ No framing, no length prefixes, no structured replies. Buffer limit 8192 bytes
 - No atomic state snapshot (registers read/written one at a time).
 - No structured response format (client must parse text).
 - One FIFO round-trip per breakpoint hit or single-step.
+- **Command bursts are unreliable** (Phase 6, verified via raw stream logs):
+  bursts of set-register commands get some commands silently dropped, and at
+  high cadence the CPU occasionally executes while the debugger reports
+  "stopped". Pace commands (per-command round-trips) and verify with `r0`
+  read-back.
+- **Response stream can desync by one block** when a step produces extra
+  unsolicited text; drain before/after steps.
+- **`r FL` false-fails** even on success (full-EFLAGS verify after forcing
+  IF/IOPL/bit-1); always verify flags via read-back.
 
 ## 4. Memory access: /proc/pid/fd mmap
 
@@ -152,9 +167,13 @@ write/restore works directly — no dosdebug I/O port access needed.
   (`dosdebug_step()` → `t\n`; `t` steps over INTs, as dosemu2's tracer treats
   INT like CALL) until the terminating RETF/RET lands at the Hydra return
   address, then feeds the post-raw-code registers back into the exec engine.
+- The same trace path completes **native→guest calls** (callstub CALL_FAR/CALL_NEAR
+  into unhooked guest code): the step budget is `opts->max_trace_steps`
+  (default 10000), and if the traced guest enters another hook's breakpoint,
+  that hook is dispatched **recursively mid-trace** (depth cap 8).
 - A hook may emit several sequential raw-code requests (e.g. CLI, STI, INT, INB,
   OUTB in one hook); the driver's inner loop handles each until the hook returns
-  no redirect.
+  no redirect (cap 256 per dispatch).
 - **No return-stub breakpoint is planted.** The designed one-shot stub at
   `ffff:0000` never fired (that address holds BIOS ROM content — boot vector +
   date string — in a running guest, and conflicts with dosemu2's ONE_STEP

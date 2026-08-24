@@ -74,6 +74,7 @@ typedef struct bp_install {
   host_ctx_t *ctx;
   host_bp_entry_t *bps;
   int count;
+  int failed;   /* hooks that could not get a breakpoint */
 } bp_install_t;
 
 static void bp_visitor(const hydra_hook_t *hook, void *user)
@@ -86,11 +87,25 @@ static void bp_visitor(const hydra_hook_t *hook, void *user)
   u16 seg = (u16)(ins->ctx->code_load_offset + addr_seg(hook->addr));
   u16 off = addr_off(hook->addr);
   int idx = host_set_bp(ins->ctx, seg, off);
-  if (idx >= 0) {
-    uint32_t linear = ((uint32_t)seg << 4) + off;
-    if (host_bp_add(ins->bps, idx, linear, 0) == 0)
-      ins->count++;
+  if (idx < 0) {
+    /* dosemu bp table full (64 max) or dosdebug error: the hook would
+     * silently never fire — record the failure loudly instead. */
+    fprintf(stderr, "host_run: FAILED to plant breakpoint for hook at rel %04x:%04x\n",
+            addr_seg(hook->addr), addr_off(hook->addr));
+    ins->failed++;
+    return;
   }
+  uint32_t linear = ((uint32_t)seg << 4) + off;
+  if (host_bp_add(ins->bps, idx, linear, 0) != 0) {
+    /* local tracking table full: clear the dosemu bp we just planted so
+     * nothing is left dangling, then record the failure. */
+    host_clear_bp(ins->ctx, idx);
+    fprintf(stderr, "host_run: breakpoint table full (%d); hook at rel %04x:%04x dropped\n",
+            HOST_RUN_MAX_BPS, addr_seg(hook->addr), addr_off(hook->addr));
+    ins->failed++;
+    return;
+  }
+  ins->count++;
 }
 
 int host_hook_breakpoint_count(host_ctx_t *ctx)
@@ -106,14 +121,6 @@ static void hook_counter(const hydra_hook_t *hook, void *user)
   int *count = user;
   if (!(hook->flags & HYDRA_HOOK_FLAGS_OVERLAY))
     (*count)++;
-}
-
-int host_run_install_hook_breakpoints(host_ctx_t *ctx)
-{
-  host_bp_entry_t bps[HOST_RUN_MAX_BPS] = {{0}};
-  bp_install_t ins = { ctx, bps, 0 };
-  hydra_hook_foreach(bp_visitor, &ins);
-  return ins.count;
 }
 
 /* ------------------------------------------------------------------ */
@@ -137,39 +144,166 @@ static void machine_to_regs(const hydra_machine_registers_t *hr, dosdebug_regs_t
 }
 
 /* ------------------------------------------------------------------ */
-/* raw-code execution (trace-based, avoids JIT cache issues)          */
+/* raw-code / native->guest call execution (trace-based)              */
 /* ------------------------------------------------------------------ */
 
-/* When hydra_exec_run returns CALL/CALL_NEAR, the hook called
- * hydra_impl_raw_code which wrote opcodes (e.g. CLI;RETF) at a raw-code
- * slot and hydra_impl_call_far pushed a return address (ffff:exec_id for
- * far, cs:0xff00+exec_id for near) on the guest stack. The driver has
- * already pushed CS:IP = raw-code slot to dosemu2.
+/* When hydra_exec_run returns CALL/CALL_NEAR, the hook either
+ *   (a) called hydra_impl_raw_code (opcodes at a raw-code slot), or
+ *   (b) called through to guest code (native->guest call via a callstub).
+ * In both cases hydra_impl_call_far/near pushed a magic return address on
+ * the guest stack (0xffff:exec_id far, <caller_cs>:0xff00+exec_id near) and
+ * the driver has pushed CS:IP = call target into dosemu2.
  *
  * Instead of planting an INT3 breakpoint at the return address (which
  * fails because the simx86 JIT cache doesn't see memfd writes), we trace
- * through the raw code with `t` (step-over). The raw code is at most
- * 3 bytes (INT n;RETF) = 2 instructions, so 2 trace steps always reaches
- * the RETF and lands at the return address. */
+ * with `t` (step-over: nested calls and INTs execute in one step) until
+ * RETF/RET lands at the magic return address. Real guest functions need a
+ * generous step budget; the default is HOST_RUN_DEFAULT_TRACE_STEPS.
+ *
+ * If the traced guest enters another hook's breakpoint, that hook is
+ * dispatched recursively (nested native->guest call into a hooked fn). */
 
-/* Trace through the raw code and detect the return.
- * Returns 1 if the return was detected, 0 otherwise. */
-static int host_trace_raw_code(host_ctx_t *ctx, dosdebug_regs_t *dr,
-                               uint16_t ret_cs, uint16_t ret_ip,
-                               host_run_stats_t *st)
+#define HOST_RUN_DEFAULT_TRACE_STEPS 10000u
+
+/* Max nested-hook recursion (hook -> guest call -> hook -> ...). */
+#define HOST_RUN_MAX_DEPTH 8
+
+/* Max redirects (CALL/JUMP results) per hook dispatch. A hook that issues
+ * more than this is either pathological or the driver lost sync — bail out
+ * instead of spinning forever. */
+#define HOST_RUN_MAX_REDIRECTS 256
+
+typedef struct run_ctx {
+  host_ctx_t *ctx;
+  hydra_machine_t *m;
+  host_bp_entry_t *bps;
+  host_run_stats_t *st;
+  const host_run_options_t *opts;
+  int timeout_ms;
+  int verbose;
+} run_ctx_t;
+
+static host_run_stop_reason_t dispatch_hook(run_ctx_t *r, dosdebug_regs_t *dr,
+                                            int depth);
+
+/* Trace until the magic return address (or budget exhaustion / error).
+ * On HOST_RUN_STOP_NONE, *dr holds the CPU at ret_cs:ret_ip. */
+static host_run_stop_reason_t trace_to_return(run_ctx_t *r, dosdebug_regs_t *dr,
+                                              uint16_t ret_cs, uint16_t ret_ip,
+                                              int depth)
 {
-  for (int i = 0; i < 6; i++) {
-    /* Single-step one instruction. dosdebug_wait_stop blocks until the
-     * step completes and returns the new register state. */
-    if (dosdebug_step(ctx->db) != 0) return 0;
-    if (dosdebug_wait_stop(ctx->db, dr, 2000) != 0) return 0;
-    /* Check if we arrived at the return address */
+  const size_t max_steps =
+      (r->opts && r->opts->max_trace_steps) ? r->opts->max_trace_steps
+                                            : HOST_RUN_DEFAULT_TRACE_STEPS;
+  for (size_t i = 0; i < max_steps; i++) {
+    /* Single-step one instruction; wait_stop blocks for the post-step dump.
+     * Drain after it, too: a step can produce extra unsolicited output
+     * (e.g. landing on a breakpoint mid-trace) which would otherwise
+     * desynchronize the command/response stream by one block. */
+    if (dosdebug_step(r->ctx->db) != 0) return HOST_RUN_STOP_ERROR;
+    if (dosdebug_wait_stop(r->ctx->db, dr, r->timeout_ms) != 0)
+      return HOST_RUN_STOP_ERROR;
+    dosdebug_drain(r->ctx->db);
+    if (r->verbose > 1)
+      printf("  trace[%zu] %04x:%04x (want %04x:%04x)\n",
+             i, dr->cs, dr->ip, ret_cs, ret_ip);
+
+    /* Arrived at the magic return address? */
     if (dr->cs == ret_cs && dr->ip == ret_ip) {
-      st->stub_hits++;
-      return 1;
+      r->st->raw_code_returns++;
+      return HOST_RUN_STOP_NONE;
+    }
+
+    /* Stepped onto another hook's breakpoint: dispatch it nested. */
+    uint32_t lin = ((uint32_t)dr->cs << 4) + dr->ip;
+    if (host_bp_find(r->bps, lin)) {
+      if (r->verbose > 1)
+        printf("  nested hook at %04x:%04x (depth %d)\n", dr->cs, dr->ip, depth + 1);
+      host_run_stop_reason_t dn = dispatch_hook(r, dr, depth + 1);
+      if (dn != HOST_RUN_STOP_NONE)
+        return dn;
+      /* Nested dispatch ends with its final state pushed to dosemu (dr); the
+       * trace continues stepping from there. */
+      if (r->verbose > 1)
+        printf("  nested hook done -> %04x:%04x\n", dr->cs, dr->ip);
     }
   }
-  return 0; /* didn't arrive after 6 steps */
+  fprintf(stderr, "host_run: trace budget (%zu steps) exhausted before return "
+          "to %04x:%04x (cpu at %04x:%04x)\n",
+          max_steps, ret_cs, ret_ip, dr->cs, dr->ip);
+  return HOST_RUN_STOP_ERROR;
+}
+
+/* Dispatch one hook through the Hydra core, handling all of its redirects
+ * (CALL/CALL_NEAR traces, JUMP state updates). On success the hook is done
+ * and *dr holds the final guest state, already pushed to the dosemu2 CPU. */
+static host_run_stop_reason_t dispatch_hook(run_ctx_t *r, dosdebug_regs_t *dr,
+                                            int depth)
+{
+  if (depth > HOST_RUN_MAX_DEPTH) {
+    fprintf(stderr, "host_run: nested hook depth %d exceeded\n",
+            HOST_RUN_MAX_DEPTH);
+    return HOST_RUN_STOP_ERROR;
+  }
+
+  int redirects_this_dispatch = 0;
+  for (;;) {
+    regs_to_machine(dr, r->m->registers);
+    int ret = hydra_machine_exec(r->m, 0);
+    hydra_machine_notify(r->m);
+    int rtype = hydra_exec_last_result_type();
+
+    if (ret == 0)
+      break;  /* hook completed, no redirect */
+
+    r->st->redirects++;
+    if (++redirects_this_dispatch > HOST_RUN_MAX_REDIRECTS) {
+      if (r->verbose)
+        printf("host_run: redirect cap (%d) exceeded at %04x:%04x\n",
+               HOST_RUN_MAX_REDIRECTS, dr->cs, dr->ip);
+      return HOST_RUN_STOP_ERROR;
+    }
+
+    if (rtype != HYDRA_RESULT_TYPE_CALL &&
+        rtype != HYDRA_RESULT_TYPE_CALL_NEAR)
+      break;  /* JUMP or other redirect — no guest call to trace */
+
+    r->st->raw_code_runs++;
+
+    /* Push the redirect CS:IP (call target) into dosemu2. */
+    machine_to_regs(r->m->registers, dr);
+    if (host_set_regs(r->ctx, dr) != 0)
+      return HOST_RUN_STOP_ERROR;
+
+    /* Compute the expected magic return address. */
+    u16 eid = hydra_exec_active_id();
+    uint16_t ret_cs, ret_ip;
+    if (rtype == HYDRA_RESULT_TYPE_CALL) {
+      ret_cs = 0xffff;
+      ret_ip = eid;
+    } else {
+      ret_cs = r->m->registers->cs;
+      ret_ip = (uint16_t)(0xff00 + eid);
+    }
+
+    /* Trace until RETF/RET lands at the magic return address. */
+    host_run_stop_reason_t tr = trace_to_return(r, dr, ret_cs, ret_ip, depth);
+    if (tr != HOST_RUN_STOP_NONE) {
+      if (r->verbose)
+        printf("host_run: raw-code trace failed (%d) near %04x:%04x\n",
+               tr, dr->cs, dr->ip);
+      return tr;
+    }
+    /* dr now holds the post-call state; loop back to resume exec. */
+  }
+
+  /* Push the final state into the guest CPU (idempotent for the caller of
+   * host_run; required before a nested trace continues stepping). */
+  machine_to_regs(r->m->registers, dr);
+  if (host_set_regs(r->ctx, dr) != 0)
+    return HOST_RUN_STOP_ERROR;
+
+  return HOST_RUN_STOP_NONE;
 }
 
 /* ------------------------------------------------------------------ */
@@ -182,113 +316,77 @@ host_run_stop_reason_t host_run(host_ctx_t *ctx, hydra_machine_t *m,
 {
   host_bp_entry_t bps[HOST_RUN_MAX_BPS] = {{0}};
   host_run_stats_t st = {0};
-  const int timeout_ms = (opts && opts->timeout_ms > 0) ? opts->timeout_ms : 3000;
-  const int verbose = opts && opts->verbose;
+  const int timeout_ms = (opts && opts->timeout_ms) ? opts->timeout_ms : 3000;
+  const int verbose = opts ? opts->verbose : 0;
   const size_t max_steps = opts ? opts->max_steps : 0;
   const size_t start_hooks = hydra_exec_hook_dispatch_count();
   dosdebug_regs_t dr;
   size_t step = 0;
   host_run_stop_reason_t reason = HOST_RUN_STOP_NONE;
 
-  /* Plant a breakpoint at every registered hook. */
+  /* Plant a breakpoint at every registered hook. Every hook MUST get one;
+   * a silent drop means guest code runs unhooked — refuse to start. */
   {
-    bp_install_t ins = { ctx, bps, 0 };
+    bp_install_t ins = { ctx, bps, 0, 0 };
     hydra_hook_foreach(bp_visitor, &ins);
     st.hook_breakpoints = (uint64_t)ins.count;
+    if (ins.failed > 0) {
+      reason = HOST_RUN_STOP_ERROR;
+      goto done;
+    }
   }
 
-  for (;;) {
-    if (host_go_and_wait(ctx, &dr, timeout_ms) != 0) {
-      if (!dosdebug_is_alive(ctx->db))
-        reason = HOST_RUN_STOP_DOSEMU_EXIT;
-      else
-        reason = HOST_RUN_STOP_TIMEOUT;
-      break;
-    }
-    st.stops++;
+  {
+    run_ctx_t r = { ctx, m, bps, &st, opts, timeout_ms, verbose };
 
-    /* Reset the raw-code slot counter — the previous hook (if any) has
-     * completed and the JIT has since executed non-raw-code guest code,
-     * so reusing slot 0 for the next hook is safe. */
-    hydra_impl_raw_code_reset();
-
-    /* Dispatch the hook through the Hydra core. The hook may issue
-     * multiple raw-code requests (CLI, STI, INT, INB, OUTB, ...) before
-     * completing. Each raw-code request produces a CALL/CALL_NEAR result;
-     * we trace the raw code on dosemu2 and feed the result back. */
-    int rtype;
     for (;;) {
-      regs_to_machine(&dr, m->registers);
-      int ret = hydra_machine_exec(m, 0);
-      hydra_machine_notify(m);
-      rtype = hydra_exec_last_result_type();
+      if (host_go_and_wait(ctx, &dr, timeout_ms) != 0) {
+        if (!dosdebug_is_alive(ctx->db))
+          reason = HOST_RUN_STOP_DOSEMU_EXIT;
+        else
+          reason = HOST_RUN_STOP_TIMEOUT;
+        break;
+      }
+      st.stops++;
 
-      if (ret == 0)
-        break;  /* hook completed, no redirect */
+      /* Reset the raw-code slot counter — the previous hook (if any) has
+       * completed and the JIT has since executed non-raw-code guest code,
+       * so reusing slot 0 for the next hook is safe. Note: only done at this
+       * outer boundary, never inside a nested dispatch (which runs back-to-
+       * back with its parent and must keep the slots distinct for the JIT). */
+      hydra_impl_raw_code_reset();
 
-      st.redirects++;
-
-      if (rtype != HYDRA_RESULT_TYPE_CALL &&
-          rtype != HYDRA_RESULT_TYPE_CALL_NEAR)
-        break;  /* JUMP or other redirect — no raw code needed */
-
-      st.raw_code_runs++;
-
-      /* Push the redirect CS:IP (raw-code slot) into dosemu2. */
-      machine_to_regs(m->registers, &dr);
-      if (host_set_regs(ctx, &dr) != 0) {
-        reason = HOST_RUN_STOP_ERROR;
-        goto done;
+      /* Dispatch the hook through the Hydra core. The hook may issue
+       * multiple raw-code requests (CLI, STI, INT, INB, OUTB, ...) or call
+       * through to guest functions before completing. Each produces a
+       * CALL/CALL_NEAR result; we trace the guest on dosemu2 and feed the
+       * result back. */
+      host_run_stop_reason_t dn = dispatch_hook(&r, &dr, 0);
+      if (dn != HOST_RUN_STOP_NONE) {
+        reason = dn;
+        break;
       }
 
-      /* Compute the expected return address. */
-      u16 eid = hydra_exec_active_id();
-      uint16_t ret_cs, ret_ip;
-      if (rtype == HYDRA_RESULT_TYPE_CALL) {
-        ret_cs = 0xffff;
-        ret_ip = eid;
-      } else {
-        ret_cs = m->registers->cs;
-        ret_ip = (uint16_t)(0xff00 + eid);
+      st.hook_dispatches = hydra_exec_hook_dispatch_count() - start_hooks;
+
+      if (verbose) {
+        printf("host_run: stop %04x:%04x hooks=%lu raw=%lu ret=%lu\n",
+               dr.cs, dr.ip,
+               (unsigned long)st.hook_dispatches,
+               (unsigned long)st.raw_code_runs,
+               (unsigned long)st.raw_code_returns);
       }
 
-      /* Trace through the raw code (single-step until RETF/RET
-       * lands at the return address). */
-      if (!host_trace_raw_code(ctx, &dr, ret_cs, ret_ip, &st)) {
-        if (verbose)
-          printf("host_run: raw-code trace failed at %04x:%04x\n",
-                 dr.cs, dr.ip);
-        reason = HOST_RUN_STOP_ERROR;
-        goto done;
+      if (opts && opts->stop_fn &&
+          opts->stop_fn(ctx, &dr, &st, opts->stop_user)) {
+        reason = HOST_RUN_STOP_CALLBACK;
+        break;
       }
-      /* dr now holds the post-raw-code state; loop back to resume exec. */
-    }
-
-    st.hook_dispatches = hydra_exec_hook_dispatch_count() - start_hooks;
-
-    /* Push the updated state back into the guest CPU. */
-    machine_to_regs(m->registers, &dr);
-    if (host_set_regs(ctx, &dr) != 0) {
-      reason = HOST_RUN_STOP_ERROR;
-      break;
-    }
-
-    if (verbose) {
-      printf("host_run: stop %04x:%04x rtype=%d hooks=%lu raw=%lu stubs=%lu\n",
-             dr.cs, dr.ip, rtype,
-             (unsigned long)st.hook_dispatches,
-             (unsigned long)st.raw_code_runs,
-             (unsigned long)st.stub_hits);
-    }
-
-    if (opts && opts->stop_fn &&
-        opts->stop_fn(ctx, &dr, &st, opts->stop_user)) {
-      reason = HOST_RUN_STOP_CALLBACK;
-      break;
-    }
-    if (max_steps && ++step >= max_steps) {
-      reason = HOST_RUN_STOP_MAXSTEPS;
-      break;
+      if (max_steps && ++step >= max_steps) {
+        reason = HOST_RUN_STOP_MAXSTEPS;
+        break;
+      }
+      /* dispatch_hook already pushed the final guest state; resume. */
     }
   }
 

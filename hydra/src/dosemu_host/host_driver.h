@@ -23,7 +23,7 @@
 #include "hydra_machine.h"
 #include "host.h"
 
-/* Breakpoint table size (hook bps + far/near return stubs). */
+/* Hook breakpoint table size. dosemu2's dosdebug caps breakpoints at 64. */
 #define HOST_RUN_MAX_BPS 64
 
 /* How a host_run() loop ended. */
@@ -41,7 +41,7 @@ typedef struct host_run_stats {
   uint64_t stops;             /* debugger stops observed */
   uint64_t hook_dispatches;   /* hydra_exec_hook_dispatch_count delta */
   uint64_t raw_code_runs;     /* CALL/CALL_NEAR results (guest opcodes) */
-  uint64_t stub_hits;         /* far/near return stubs hit & cleared */
+  uint64_t raw_code_returns;  /* trace-detected returns (CALL/CALL_NEAR completed) */
   uint64_t redirects;         /* hydra_exec_run() returned redirect (1) */
   uint64_t hook_breakpoints;  /* hook bps installed by host_run */
 } host_run_stats_t;
@@ -52,7 +52,9 @@ typedef int (*host_run_stop_fn_t)(host_ctx_t *ctx, const dosdebug_regs_t *regs,
 
 typedef struct host_run_options {
   size_t max_steps;           /* 0 = unlimited */
-  int timeout_ms;             /* per go_and_wait; 0 = default (3000) */
+  size_t max_trace_steps;     /* per CALL/CALL_NEAR trace; 0 = default (10000) */
+  int timeout_ms;             /* per go_and_wait; 0 = default (3000), <0 = wait
+                                 forever (rely on stop_fn / dosemu exit) */
   int verbose;                /* print each stop to stdout */
   host_run_stop_fn_t stop_fn; /* called after each dispatch; nonzero stops */
   void *stop_user;
@@ -60,10 +62,6 @@ typedef struct host_run_options {
 
 /* Number of currently registered hydra hooks (breakpoints to install). */
 int host_hook_breakpoint_count(host_ctx_t *ctx);
-
-/* Install dosemu2 breakpoints at every registered hydra hook address.
- * Returns the number of breakpoints set (>= 0), or -1 on error. */
-int host_run_install_hook_breakpoints(host_ctx_t *ctx);
 
 /* Run the guest until one of the stop conditions is met. */
 host_run_stop_reason_t host_run(host_ctx_t *ctx, hydra_machine_t *m,

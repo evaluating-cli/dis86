@@ -45,8 +45,13 @@ int dosdebug_clear_bp(dosdebug_t *db, int bp_index);
 int dosdebug_go(dosdebug_t *db);
 
 // Single-step (t). Executes one instruction (stepping over INTs).
-// Returns immediately; use dosdebug_wait_stop to read the result.
+// Drains pending output first, so the step's dump stays in sync with the
+// command stream. Returns immediately; use dosdebug_wait_stop to read the result.
 int dosdebug_step(dosdebug_t *db);
+
+// Discard everything pending on the dbgout stream (user buffer + kernel fd),
+// without blocking. Used to keep the response stream synchronized.
+void dosdebug_drain(dosdebug_t *db);
 
 // Stop execution. Returns immediately.
 int dosdebug_stop(dosdebug_t *db);

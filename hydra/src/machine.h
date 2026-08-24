@@ -173,8 +173,6 @@
   POP_ARGS(args);                \
   ret; })
 
-#define CALL_FUNC(name) hydra_impl_call_func(#name)
-
 #define PUSH_ARGS(args) do { \
     for (size_t i = ARRAY_SIZE(args); i > 0; i--) { PUSH(args[i-1]); } \
 } while(0)
@@ -251,7 +249,6 @@ u32      hydra_impl_call_far_cs(u16 cs_reg_value, u16 off);
 u32      hydra_impl_call_far_indirect(u32 addr);
 u32      hydra_impl_call_near_off(u16 off, int maybe_reloc);
 u32      hydra_impl_call_near_abs(u16 abs_off);
-u32      hydra_impl_call_func(const char *name);
 void     hydra_impl_cld(void);
 void     hydra_impl_std(void);
 void     hydra_impl_cli(void);

@@ -12,6 +12,21 @@ pkill -9 -x dosemu2.bin 2>/dev/null
 pkill -9 -x dosemu 2>/dev/null
 sleep 1
 
+# /tmp may be wiped between sessions; regenerate the config if absent.
+if [ ! -f "$CONF" ]; then
+    cat > "$CONF" <<'EOF'
+$_cpu_vm = "emulated"
+$_cpuemu = (1)
+$_sound = (off)
+$_layout = "us"
+$_vbios_post = (off)
+$_console = (0)
+$_video = "vga"
+$_hdimage = "+1"
+$_mapping = "mapmshm"
+EOF
+fi
+
 cp "$COM" /tmp/opencode/testprog.com
 
 export XDG_RUNTIME_DIR=/tmp/opencode/runtime

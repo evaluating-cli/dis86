@@ -11,13 +11,16 @@ meson setup /home/p/dis86/hydra/build /home/p/dis86/hydra   # once
 ninja -C /home/p/dis86/hydra/build
 ```
 
-Integration test (launches a fresh headless dosemu2, runs the guest COM, hooks a
-function, verifies 5 hook dispatches × 5 raw-code executions and the hook result):
+Integration test (launches a fresh headless dosemu2, runs the guest COM, hooks
+three functions, drives 5 loop iterations — 17 hook dispatches, 41 traced
+raw-code/guest-call executions — and verifies dispatch counts, native→guest
+callthrough, last-iteration partial accounting, and flag preservation).
+Takes ~2.5 minutes:
 
 ```sh
 pkill -9 -x dosemu2.bin 2>/dev/null; sleep 1
 cd /home/p/dis86/hydra/src/dosemu_host
-timeout 120 bash run_driver_test.sh
+timeout 300 bash run_driver_test.sh
 ```
 
 Reference dosemu2 config (`/tmp/opencode/dosemu_mshm.conf` — create if absent):
@@ -41,13 +44,31 @@ directory, which must contain `testprog.com`). The test script sets
 it kills dosemu2 on exit. Expected output ends with:
 
 ```
-stops=5 hook_dispatches=5 raw_code_runs=25 stub_hits=25
+stops=13 hook_dispatches=17 raw_code_runs=41 raw_code_returns=41 redirects=58
 ...
 === TEST PASSED ===
 ```
 
-Note: the `stub_hits` stat counts raw-code returns detected by single-step trace;
-no stub breakpoint is planted (see `OPTION_D_DESIGN.md` §6).
+The test guest (`testprog.asm`, ~95 bytes) exercises:
+- 3 simultaneous hooks (raw-code opcodes, bare NOP hook, native→guest calls),
+- native→guest `CALL_FAR` callthroughs into unhooked guest functions
+  (helper2: 13 instructions — beyond the original 6-step trace limit),
+- a hooked function called from inside such a guest call — the breakpoint
+  fires mid-trace and dispatches as a nested hook,
+- guest flags (CF) surviving a full hook dispatch.
+
+dosdebug protocol hard-won lessons (raw stream logs verified these):
+- Send register writes PACED (per-command round-trips). Bursts of set-register
+  commands get some commands silently dropped by dosemu2's debugger, and at
+  high cadence the CPU occasionally executed while the debugger believed it
+  stopped. The writes are followed by an `r0` read-back verify that fails
+  hard on mismatch.
+- The response stream can desynchronize by one block when a step produces
+  extra unsolicited text; `dosdebug_drain()` resynchronizes before/after steps.
+- `r FL` reports "failed to set register 'FL'" even on success (dosemu
+  forces IF/IOPL/bit-1 then verifies the full EFLAGS); the low 16 bits do
+  land — always verify flags by read-back (`| 0x3202`).
+- `DOSDEBUG_STREAM_LOG=<path>` records the raw protocol stream for debugging.
 
 emu86 validation authority (unchanged, host-independent):
 

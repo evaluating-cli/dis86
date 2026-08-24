@@ -12,9 +12,6 @@
 #include "callstack.h"
 #include "functions.h"
 
-// FIXME: REMOVE THIS HARDCODING
-//#define CODE_START_SEG ((u16)0x823)
-
 #define ENABLE_DEBUG_CALLSTACK 0
 #define MAX_HOOKS 2048
 

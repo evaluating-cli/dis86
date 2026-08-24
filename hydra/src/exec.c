@@ -55,15 +55,16 @@ void execution_context_set(hydra_exec_ctx_t *exec)
 }
 
 /* The result type of the most recent hydra_exec_run() call. The dosemu2 host
- * driver uses this to decide whether a CALL/CALL_NEAR result needs a return
- * stub breakpoint planted before the guest CPU is continued. */
+ * driver uses this to decide whether a CALL/CALL_NEAR result must be traced
+ * on the guest CPU (single-step) before the hook can resume. */
 int hydra_exec_last_result_type(void)
 {
   return last_result_type;
 }
 
 /* Id of the currently active execution context (thread_active). The host
- * driver reads this after a CALL result to plant the matching return stub. */
+ * driver reads this after a CALL result to compute the magic return address
+ * (0xffff:<id> for far, <cs>:0xff00+<id> for near) the trace must reach. */
 u16 hydra_exec_active_id(void)
 {
   u16 id = 0;
@@ -212,20 +213,30 @@ static hydra_result_t run_continue(hydra_machine_t *m, hydra_exec_ctx_t *exec)
 
 static bool try_resume(hydra_machine_t *m, hydra_result_t *_result)
 {
-  // Resume a retf ?
+  // Resume a retf ? (magic far return address 0xffff:exec_id)
   if (m->registers->cs == 0xffff) {
-    hydra_exec_ctx_t *exec = &executions[m->registers->ip];
-    *_result = run_continue(m, exec);
-    return true;
+    /* Bounds + state check: 0xFFFF is also a legitimate ROM segment, so only
+     * treat the address as magic when the indexed context is live — i.e. the
+     * guest really RETF'd onto an address we pushed. */
+    if (m->registers->ip < ARRAY_SIZE(executions)) {
+      hydra_exec_ctx_t *exec = &executions[m->registers->ip];
+      if (exec->state == HYDRA_EXEC_STATE_ACTIVE) {
+        *_result = run_continue(m, exec);
+        return true;
+      }
+    }
+    return false;
   }
 
-  // Resume a ret ?
+  // Resume a ret ? (magic near return address cs:0xff00+exec_id)
   if (m->registers->cs != 0xf000 && m->registers->ip >= 0xff00) {
     size_t idx = m->registers->ip & 0xff;
     hydra_exec_ctx_t *exec = &executions[idx];
-    if (!exec->maybe_reloc && m->registers->cs != exec->saved_cs) FAIL("Expected matching code segments");
-    *_result = run_continue(m, exec);
-    return true;
+    if (exec->state == HYDRA_EXEC_STATE_ACTIVE) {
+      if (!exec->maybe_reloc && m->registers->cs != exec->saved_cs) FAIL("Expected matching code segments");
+      *_result = run_continue(m, exec);
+      return true;
+    }
   }
 
   return false;

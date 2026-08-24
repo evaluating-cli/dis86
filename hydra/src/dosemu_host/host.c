@@ -8,7 +8,8 @@
  *
  * Memory          -> lowmem memfd mapping (raw shared guest memory).
  * Registers/exec  -> dosdebug FIFO protocol (register get/set, breakpoints).
- * I/O             -> stubs; Phase 4 will drive real guest IN/OUT opcodes.
+ * I/O             -> guest IN/OUT opcodes via hydra_impl_raw_code (traced by
+ *                    the driver); the vtable io_* callbacks remain unused stubs.
  *
  * Register direction note: the current Hydra core has NO call sites for
  * update_registers() (checked machine.c, exec.c, callstack.c, api_impl.c).

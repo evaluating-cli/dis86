@@ -43,7 +43,18 @@ struct dosdebug {
     char buf[BUF_SIZE + 1];   /* read buffer (+1 for NUL terminator) */
     size_t bpos;              /* first unconsumed byte */
     size_t blen;              /* one past last valid byte */
+    FILE *stream_log;         /* optional raw protocol log (DOSDEBUG_STREAM_LOG) */
 };
+
+static void stream_write(dosdebug_t *db, const char *tag,
+                         const void *data, size_t n)
+{
+    if (!db->stream_log)
+        return;
+    fwrite(tag, 1, strlen(tag), db->stream_log);
+    fwrite(data, 1, n, db->stream_log);
+    fflush(db->stream_log);
+}
 
 /* ---------------- low-level helpers ---------------- */
 
@@ -104,8 +115,11 @@ static int recv_more(dosdebug_t *db, int timeout_ms)
     if (rc == 0)
         return 0; /* timeout */
     if (!(pfd.revents & POLLIN)) {
-        if (pfd.revents & (POLLHUP | POLLERR | POLLNVAL))
+        if (pfd.revents & (POLLHUP | POLLERR | POLLNVAL)) {
+            fprintf(stderr, "dosdebug: dbgout revents=0x%x (HUP/ERR)\n",
+                    (unsigned)pfd.revents);
             return -1;
+        }
         return 0;
     }
 
@@ -113,10 +127,14 @@ static int recv_more(dosdebug_t *db, int timeout_ms)
     if (r < 0) {
         if (errno == EINTR)
             return 0;
+        fprintf(stderr, "dosdebug: dbgout read error: %s\n", strerror(errno));
         return -1;
     }
-    if (r == 0)
-        return -1; /* EOF: dosemu2 closed the debugger fifo */
+    if (r == 0) {
+        fprintf(stderr, "dosdebug: dbgout EOF (dosemu2 closed the fifo)\n");
+        return -1;
+    }
+    stream_write(db, "<<< ", db->buf + db->blen, (size_t)r);
     db->blen += (size_t)r;
     buf_nul_terminate(db);
     return (int)r;
@@ -125,6 +143,7 @@ static int recv_more(dosdebug_t *db, int timeout_ms)
 /* Write a whole command line to dbgin. */
 static int send_cmd(dosdebug_t *db, const char *cmd)
 {
+    stream_write(db, ">>> ", cmd, strlen(cmd));
     size_t len = strlen(cmd);
     size_t off = 0;
     while (off < len) {
@@ -132,6 +151,9 @@ static int send_cmd(dosdebug_t *db, const char *cmd)
         if (r < 0) {
             if (errno == EINTR)
                 continue;
+            fprintf(stderr, "dosdebug: dbgin write error (cmd='%.*s'): %s\n",
+                    (int)(len > 1 && cmd[len-1] == '\n' ? len - 1 : len), cmd,
+                    strerror(errno));
             return -1;
         }
         off += (size_t)r;
@@ -312,18 +334,26 @@ static int parse_regs_from_buffer(dosdebug_t *db, dosdebug_regs_t *regs)
         return 0;
     cur += 4;
 
-    ss = 0;
-    sp = 0;
+    /* SS:SP is part of every real-mode dump we rely on. If it is missing or
+     * malformed, zeroing SS/SP and silently pushing them back into the CPU is
+     * a correctness hazard — treat the dump as unparseable instead. Distinguish
+     * "not fully arrived" (wait for more) from "complete but broken" (fail). */
     const char *spos = find_sub(cur, (size_t)(end - cur), "SS:SP=");
-    if (spos) {
-        cur = spos + 6;
-        if (parse_hex4(cur, &ss))
-            cur += 4;
-        if (cur < end && *cur == ':')
-            cur++;
-        if (parse_hex4(cur, &sp))
-            cur += 4;
+    if (!spos) {
+        if (!find_sub(cur, (size_t)(end - cur), "\n"))
+            return 0;  /* dump still arriving; wait for more data */
+        return -1;     /* complete line(s) but no SS:SP field: corrupt dump */
     }
+    cur = spos + 6;
+    if (!parse_hex4(cur, &ss))
+        return -1;
+    cur += 4;
+    if (cur >= end || *cur != ':')
+        return -1;
+    cur++;
+    if (!parse_hex4(cur, &sp))
+        return -1;
+    cur += 4;
 
     regs->ax = gpr[0]; regs->bx = gpr[1]; regs->cx = gpr[2]; regs->dx = gpr[3];
     regs->si = gpr[4]; regs->di = gpr[5]; regs->sp = gpr[6]; regs->bp = gpr[7];
@@ -526,6 +556,11 @@ dosdebug_t *dosdebug_connect(pid_t pid)
     dosdebug_t *db = calloc(1, sizeof(*db));
     if (!db)
         return NULL;
+    {
+        const char *sl = getenv("DOSDEBUG_STREAM_LOG");
+        if (sl && sl[0])
+            db->stream_log = fopen(sl, "w");
+    }
     db->pid = p;
     db->in_fd = -1;
     db->out_fd = -1;
@@ -567,6 +602,10 @@ void dosdebug_disconnect(dosdebug_t *db)
 {
     if (!db)
         return;
+    if (db->stream_log) {
+        fclose(db->stream_log);
+        db->stream_log = NULL;
+    }
     if (db->in_fd >= 0) {
         close(db->in_fd); /* EOF here makes dosemu2 auto-continue; expected */
         db->in_fd = -1;
@@ -641,31 +680,51 @@ int dosdebug_write_regs(dosdebug_t *db, const dosdebug_regs_t *regs)
     if (!db || !regs)
         return -1;
 
-    struct {
-        const char *name;
-        uint16_t val;
-    } all[] = {
-        { "AX", regs->ax }, { "BX", regs->bx }, { "CX", regs->cx },
-        { "DX", regs->dx }, { "SI", regs->si }, { "DI", regs->di },
-        { "BP", regs->bp }, { "SP", regs->sp }, { "IP", regs->ip },
-        { "CS", regs->cs }, { "DS", regs->ds }, { "ES", regs->es },
-        { "SS", regs->ss }, { "FL", regs->flags },
-    };
-    for (size_t i = 0; i < sizeof(all) / sizeof(all[0]); i++) {
-        uint16_t v = all[i].val;
-        if (strcmp(all[i].name, "FL") == 0) {
-            /*
-             * dosemu's set_FLAGS() forces IF (0x200) and IOPL on, then
-             * verifies; a write succeeds only for compatible bit patterns.
-             * Getting FL exactly right is a dosemu limitation, so a FL
-             * failure does not fail the whole batch.
-             */
-            if (dosdebug_write_reg(db, all[i].name, v) != 0)
-                continue;
-            continue;
-        }
-        if (dosdebug_write_reg(db, all[i].name, v) != 0)
+    /* Per-register paced writes: create a full command/response round-trip
+     * per register. Empirically this is the ONLY cadence dosemu2's debugger
+     * handles reliably during hook-heavy traces: back-to-back bursts of
+     * set-register commands get some commands silently dropped (observed
+     * via raw stream logs), and the CPU occasionally kept executing while
+     * the debugger believed it stopped. The r0 read-back verify below
+     * catches any residual failure deterministically. */
+    static const char *names[13] = { "AX", "BX", "CX", "DX", "SI", "DI",
+                                     "BP", "SP", "IP", "CS", "DS", "ES", "SS" };
+    uint16_t vals[13] = { regs->ax, regs->bx, regs->cx, regs->dx,
+                          regs->si, regs->di, regs->bp, regs->sp,
+                          regs->ip, regs->cs, regs->ds, regs->es, regs->ss };
+    for (int i = 0; i < 13; i++) {
+        if (dosdebug_write_reg(db, names[i], vals[i]) != 0)
             return -1;
+    }
+
+    /*
+     * FL: dosemu's set_FLAGS() forces IF (0x200), IOPL (0x3000) and bit 1,
+     * then verifies the FULL EFLAGS — which false-fails ("failed to set
+     * register 'FL'") even when the low 16 bits landed. Ignore the command
+     * verdict; the r0 read-back below is the source of truth.
+     */
+    uint16_t want_fl = (uint16_t)(regs->flags | 0x3202u);
+    (void)dosdebug_write_reg(db, "FL", want_fl);
+
+    /* Verify with a full read-back dump. */
+    dosdebug_regs_t now;
+    if (dosdebug_read_regs(db, &now) != 0)
+        return -1;
+    uint16_t nvals[13] = { now.ax, now.bx, now.cx, now.dx,
+                           now.si, now.di, now.bp, now.sp,
+                           now.ip, now.cs, now.ds, now.es, now.ss };
+    for (int i = 0; i < 13; i++) {
+        if (nvals[i] != vals[i]) {
+            fprintf(stderr, "dosdebug: reg %s write failed: "
+                    "wrote 0x%04x, read back 0x%04x\n",
+                    names[i], (unsigned)vals[i], (unsigned)nvals[i]);
+            return -1;
+        }
+    }
+    if (now.flags != want_fl) {
+        fprintf(stderr, "dosdebug: FL write failed: wrote 0x%04x, "
+                "read back 0x%04x\n", (unsigned)want_fl, (unsigned)now.flags);
+        return -1;
     }
     return 0;
 }
@@ -738,10 +797,43 @@ int dosdebug_go(dosdebug_t *db)
     return 0;
 }
 
+/*
+ * Drop everything pending on dbgout: user-space buffer + bytes already queued
+ * in the kernel fd, without blocking. Used to resynchronize the response
+ * stream: dosemu can emit extra unsolicited text (e.g. an extra stop/trap
+ * notification when a 't' step lands on a breakpoint), and any byte left
+ * unread desynchronizes EVERY subsequent command/response pair by one.
+ */
+void dosdebug_drain(dosdebug_t *db)
+{
+    if (!db)
+        return;
+    db->bpos = db->blen = 0;
+    buf_nul_terminate(db);
+
+    for (;;) {
+        struct pollfd pfd;
+        pfd.fd = db->out_fd;
+        pfd.events = POLLIN;
+        pfd.revents = 0;
+        int rc = poll(&pfd, 1, 0);
+        if (rc <= 0 || !(pfd.revents & POLLIN))
+            break;
+        ssize_t r = read(db->out_fd, db->buf, BUF_SIZE);
+        if (r <= 0)
+            break;
+    }
+    db->bpos = db->blen = 0;
+    buf_nul_terminate(db);
+}
+
 int dosdebug_step(dosdebug_t *db)
 {
     if (!db || !db->connected)
         return -1;
+    /* The CPU must be stopped here; any pending output is stale, discard it
+     * so the step's register dump is read in perfect sync. */
+    dosdebug_drain(db);
     if (send_cmd(db, "t\n") != 0)
         return -1;
     return 0;
@@ -764,6 +856,7 @@ int dosdebug_wait_stop(dosdebug_t *db, dosdebug_regs_t *regs, int timeout_ms)
 {
     if (!db || !db->connected)
         return -1;
+    const int infinite = timeout_ms < 0;
     int total = timeout_ms > 0 ? timeout_ms : DEFAULT_TIMEOUT_MS;
 
     struct timespec t0;
@@ -776,15 +869,20 @@ int dosdebug_wait_stop(dosdebug_t *db, dosdebug_regs_t *regs, int timeout_ms)
         if (r == -1)
             return -1;
 
-        struct timespec now;
-        clock_gettime(CLOCK_MONOTONIC, &now);
-        long elapsed_ms = (long)(now.tv_sec - t0.tv_sec) * 1000
-                        + (now.tv_nsec - t0.tv_nsec) / 1000000;
-        long remaining = (long)total - elapsed_ms;
-        if (remaining <= 0)
-            return -1;
+        long poll_ms = 30000;
+        if (!infinite) {
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            long elapsed_ms = (long)(now.tv_sec - t0.tv_sec) * 1000
+                            + (now.tv_nsec - t0.tv_nsec) / 1000000;
+            long remaining = (long)total - elapsed_ms;
+            if (remaining <= 0)
+                return -1;
+            if (remaining < poll_ms)
+                poll_ms = remaining;
+        }
 
-        int n = recv_more(db, remaining > 30000 ? 30000 : (int)remaining);
+        int n = recv_more(db, (int)poll_ms);
         if (n < 0)
             return -1;
     }
