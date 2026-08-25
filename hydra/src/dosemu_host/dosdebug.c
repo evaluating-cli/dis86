@@ -35,6 +35,12 @@
 /* Fallback when XDG_RUNTIME_DIR is not set (Phase 0 default). */
 #define DEFAULT_XDG_RUNTIME "/tmp/opencode/runtime"
 
+/* dosemu stores the guest-visible interrupt flag in VIF while physical IF is
+ * forced on in vm86 state. r0 prints raw 32-bit EFLAGS, so reconstruct the
+ * architectural 16-bit IF from this bit instead of trusting raw bit 9. */
+#define DOSEMU_EFLAGS_IF   0x00000200u
+#define DOSEMU_EFLAGS_VIF  0x00080000u
+
 struct dosdebug {
     pid_t pid;          /* dosemu2 process id */
     int in_fd;          /* dbgin  writer fd (kept open!) */
@@ -212,19 +218,19 @@ static int parse_hex4(const char *p, uint16_t *out)
     return 1;
 }
 
-/* Parse up to 8 hex digits into *out (low 16 bits used). */
-static int parse_hex8(const char *p, uint16_t *out)
+/* Parse exactly 8 hex digits into *out. */
+static int parse_hex8(const char *p, uint32_t *out)
 {
-    int v = 0;
+    uint32_t v = 0;
     for (int i = 0; i < 8; i++) {
         int h = hexval(p[i]);
         if (h < 0)
             return 0;
-        v = (v << 4) | h;
+        v = (v << 4) | (uint32_t)h;
     }
     if (ishex((unsigned char)p[8]))
         return 0;
-    *out = (uint16_t)(v & 0xffff);
+    *out = v;
     return 1;
 }
 
@@ -279,12 +285,13 @@ static int parse_regs_from_buffer(dosdebug_t *db, dosdebug_regs_t *regs)
         cur = skip_spaces(cur + 4, end);
     }
 
-    /* Segment line: DS= ES= FS= GS= FL= */
+    /* Segment line: DS= ES= FS= GS= FL=. FL is raw 32-bit EFLAGS. */
     const char *q = find_sub(cur, (size_t)(end - cur), "DS=");
     if (!q)
         return 0;
     cur = q;
-    uint16_t ds, es, fs, gs, fl;
+    uint16_t ds, es, fs, gs;
+    uint32_t raw_fl;
     (void)fs;
     (void)gs;
     if ((size_t)(end - cur) < 3 || strncmp(cur, "DS=", 3) != 0)
@@ -314,7 +321,7 @@ static int parse_regs_from_buffer(dosdebug_t *db, dosdebug_regs_t *regs)
     if ((size_t)(end - cur) < 3 || strncmp(cur, "FL=", 3) != 0)
         return 0;
     cur += 3;
-    if (!parse_hex8(cur, &fl))
+    if (!parse_hex8(cur, &raw_fl))
         return 0;
     cur += 8;
 
@@ -361,7 +368,15 @@ static int parse_regs_from_buffer(dosdebug_t *db, dosdebug_regs_t *regs)
     regs->ax = gpr[0]; regs->bx = gpr[1]; regs->cx = gpr[2]; regs->dx = gpr[3];
     regs->si = gpr[4]; regs->di = gpr[5]; regs->sp = gpr[6]; regs->bp = gpr[7];
     regs->ds = ds; regs->es = es; regs->ss = ss;
-    regs->flags = fl;
+
+    /* mhp_r0() prints REG(eflags), not get_FLAGS(). In vm86 dosemu forces
+     * physical IF on but records the DOS-visible IF in VIF. Preserve every
+     * low-16 flag bit from the dump except IF, which must come from VIF. */
+    regs->flags = (uint16_t)(raw_fl & 0xffffu);
+    regs->flags &= (uint16_t)~DOSEMU_EFLAGS_IF;
+    if (raw_fl & DOSEMU_EFLAGS_VIF)
+        regs->flags |= (uint16_t)DOSEMU_EFLAGS_IF;
+
     regs->cs = cs; regs->ip = ip;
 
     /*
@@ -688,7 +703,7 @@ int dosdebug_write_regs(dosdebug_t *db, const dosdebug_regs_t *regs)
      * handles reliably during hook-heavy traces: back-to-back bursts of
      * set-register commands get some commands silently dropped (observed
      * via raw stream logs), and the CPU occasionally kept executing while
-     * the debugger believed it stopped. The r0 read-back verify below
+     * the debugger believed it stopped. The architectural read-back below
      * catches any residual failure deterministically. */
     static const char *names[13] = { "AX", "BX", "CX", "DX", "SI", "DI",
                                      "BP", "SP", "IP", "CS", "DS", "ES", "SS" };
@@ -700,31 +715,16 @@ int dosdebug_write_regs(dosdebug_t *db, const dosdebug_regs_t *regs)
             return -1;
     }
 
-    /*
-     * FL: dosemu's set_FLAGS() forces IF (0x200), IOPL (0x3000) and bit 1,
-     * then verifies the FULL EFLAGS — which false-fails ("failed to set
-     * register 'FL'") even when the low 16 bits landed. Ignore the command
-     * verdict; the r0 read-back below is the source of truth.
-     *
-     * The forced bits impose a platform blind spot: a guest state with
-     * IF=0 (after CLI) can neither be restored nor even observed through
-     * this protocol. Verify the NON-forced bits exactly (a real write
-     * failure there is always a bug) and warn once if the requested state
-     * needs bits dosemu will not honor.
-     */
-    uint16_t want_fl = (uint16_t)(regs->flags | 0x3202u);
-    if ((regs->flags & 0x3200u) != 0x3200u) {
-        static int warned = 0;
-        if (!warned) {
-            fprintf(stderr, "dosdebug: WARNING: guest flags 0x%04x request "
-                    "IF=0/non-3 IOPL; dosemu forces these on, the guest will "
-                    "resume with interrupts enabled\n", (unsigned)regs->flags);
-            warned = 1;
-        }
-    }
-    (void)dosdebug_write_reg(db, "FL", want_fl);
+    /* FL is special under vm86. dosemu forces physical IF and IOPL=3, but
+     * set_FLAGS() records the requested guest IF in VIF. Keep the requested
+     * IF untouched; normalize only host-managed IOPL and reserved bit 1 so
+     * the debugger's own set/read-back comparison succeeds. */
+    uint16_t want_fl = (uint16_t)(regs->flags | 0x3002u);
+    if (dosdebug_write_reg(db, "FL", want_fl) != 0)
+        return -1;
 
-    /* Verify with a full read-back dump. */
+    /* Verify with a full read-back dump. parse_regs_from_buffer reconstructs
+     * architectural IF from raw EFLAGS.VIF, matching dosemu get_FLAGS(). */
     dosdebug_regs_t now;
     if (dosdebug_read_regs(db, &now) != 0)
         return -1;
@@ -739,8 +739,10 @@ int dosdebug_write_regs(dosdebug_t *db, const dosdebug_regs_t *regs)
             return -1;
         }
     }
-    /* Status/other flags must match exactly apart from the forced bits. */
-    if ((now.flags & (uint16_t)~0x3202u) != (regs->flags & (uint16_t)~0x3202u)) {
+    /* IOPL and reserved bit 1 are host-managed. Every other low-16 flag,
+     * including guest IF, must round-trip exactly. */
+    const uint16_t fl_verify_mask = (uint16_t)~0x3002u;
+    if ((now.flags & fl_verify_mask) != (regs->flags & fl_verify_mask)) {
         fprintf(stderr, "dosdebug: FL write failed: wrote 0x%04x, "
                 "read back 0x%04x\n", (unsigned)regs->flags, (unsigned)now.flags);
         return -1;
@@ -851,7 +853,7 @@ int dosdebug_step(dosdebug_t *db)
     if (!db || !db->connected)
         return -1;
     /* The CPU must be stopped here; any pending output is stale, discard it
-     * so the step's register dump is read in perfect sync. */
+     * so the step's register dump stays in sync. */
     dosdebug_drain(db);
     if (send_cmd(db, "t\n") != 0)
         return -1;
