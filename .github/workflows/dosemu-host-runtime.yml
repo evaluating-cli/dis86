@@ -57,6 +57,12 @@ jobs:
           meson setup hydra/build hydra
           ninja -C hydra/build
 
+      - name: Verify overlay hooks fail closed
+        run: |
+          set -euo pipefail
+          hydra/build/src/dosemu_host/test_overlay_reject
+          echo "test_overlay_reject: PASS" >> "$GITHUB_STEP_SUMMARY"
+
       - name: Run host state/transport test
         run: |
           set -euo pipefail
