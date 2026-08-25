@@ -25,11 +25,13 @@
 #include "header.h"
 
 extern char *HYDRA_CMDLINE_CONF;
+extern hydra_conf_t HYDRA_CONF[1];
 
 #define HOST_SNAPSHOT_MAGIC "HYDSNP1"
 #define HOST_SNAPSHOT_VERSION 1u
 #define HOST_SNAPSHOT_MEM_SIZE 0x110000u
 #define HOST_FLAGS_VERIFY_MASK ((uint16_t)~(0x3000u | 0x0002u))
+#define HOST_RAW_SLOT_SIZE 128u
 
 typedef struct host_snapshot_file_header {
     char magic[8];
@@ -149,10 +151,9 @@ int host_set_regs(host_ctx_t *ctx, const dosdebug_regs_t *regs)
     if (dosdebug_write_regs(ctx->db, regs) != 0)
         return -1;
 
-    /* dosdebug_write_regs historically ORed IF/IOPL before invoking the FL
-     * setter. Re-apply the exact requested guest FLAGS. dosemu's set_FLAGS()
-     * stores guest IF through VIF/set_IF()/clear_IF(); get_FLAGS() exposes it
-     * again even though the physical vm86 IF remains forced on. */
+    /* dosemu's physical IF remains forced for vm86, but set_FLAGS() keeps the
+     * requested guest IF in VIF and get_FLAGS() exposes it. Re-apply the exact
+     * guest value because dosdebug_write_regs() historically ORed IF/IOPL. */
     (void)dosdebug_write_reg(ctx->db, "FL", regs->flags);
 
     dosdebug_regs_t now;
@@ -251,6 +252,7 @@ static int host_read_snapshot(host_ctx_t *ctx, const char *path,
         return -1;
     }
 
+    /* Memory first: restored CS:IP may point into this image on resume. */
     memcpy(lowmem_base(ctx->lm), mem, HOST_SNAPSHOT_MEM_SIZE);
     free(mem);
     *regs = h.regs;
@@ -287,6 +289,31 @@ int host_get_regs(host_ctx_t *ctx, dosdebug_regs_t *regs)
 int host_set_reg(host_ctx_t *ctx, const char *name, uint16_t val)
 {
     return dosdebug_write_reg(ctx->db, name, val);
+}
+
+int host_reserve_raw_code(host_ctx_t *ctx, uint32_t addr, size_t size)
+{
+    if (!ctx || !ctx->lm || size < HOST_RAW_SLOT_SIZE || size > UINT32_MAX)
+        return -1;
+    if ((addr & 0x0fu) != 0)
+        return -1;
+    if ((uint64_t)addr + size > lowmem_size(ctx->lm))
+        return -1;
+    if ((addr >> 4) < ctx->code_load_offset)
+        return -1;
+
+    ctx->raw_code_addr = addr;
+    ctx->raw_code_size = size;
+    ctx->raw_code_reserved = 1;
+    HYDRA_CONF->raw_code_offset = addr;
+    HYDRA_CONF->raw_code_size = (uint32_t)size;
+    return 0;
+}
+
+bool host_raw_code_ready(const host_ctx_t *ctx)
+{
+    return ctx && ctx->raw_code_reserved &&
+           ctx->raw_code_size >= HOST_RAW_SLOT_SIZE;
 }
 
 int host_set_bp(host_ctx_t *ctx, uint16_t seg, uint16_t off)
@@ -330,6 +357,10 @@ void host_disconnect(host_ctx_t *ctx)
         dosdebug_disconnect(ctx->db);
     if (ctx->lm)
         lowmem_disconnect(ctx->lm);
+    if (HYDRA_CONF->raw_code_offset == ctx->raw_code_addr) {
+        HYDRA_CONF->raw_code_offset = 0;
+        HYDRA_CONF->raw_code_size = 0;
+    }
     ctx->db = NULL;
     ctx->lm = NULL;
     free(ctx);
@@ -360,7 +391,10 @@ void hydra_user_init(hydra_conf_t *conf,
 
     ctx->code_load_offset = host_conf_u16(confstr, "code_load=", 0);
     ctx->data_section_seg = host_conf_u16(confstr, "data_seg=", 0);
-    conf->raw_code_offset = (uint32_t)host_conf_u16(confstr, "raw_code=", 0x1c00);
+    /* No implicit raw-code address. A guest/launcher-owned reservation must be
+     * supplied with host_reserve_raw_code() after the target is loaded. */
+    conf->raw_code_offset = 0;
+    conf->raw_code_size = 0;
 
     long pid = host_conf_pid(confstr);
     ctx->db = dosdebug_connect((pid_t)pid);
@@ -368,9 +402,8 @@ void hydra_user_init(hydra_conf_t *conf,
         FAIL("dosemu host: failed to connect to dosemu2 (pid=%ld)", pid);
     ctx->pid = dosdebug_get_pid(ctx->db);
 
-    /* The memfd name is not unique: mapmshm may create several dosemu_<pid>
-     * objects. Read two stable low-memory regions independently through
-     * dosdebug, then require exactly one candidate backing to match both. */
+    /* mapmshm creates multiple identically named memfds. Cross-check two
+     * independent dosdebug reads and require one unique matching backing. */
     uint8_t ivt_probe[16];
     uint8_t bda_probe[16];
     if (dosdebug_read_mem(ctx->db, 0, 0x0000, ivt_probe, sizeof(ivt_probe)) !=
