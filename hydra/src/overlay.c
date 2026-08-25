@@ -1,7 +1,7 @@
 #include "internal.h"
 
-static u16 overlay_segments[64] = {};
-static bool overlay_valid[64] = {false};
+static u16 overlay_segments[HYDRA_OVERLAY_SEGMENT_COUNT] = {};
+static bool overlay_valid[HYDRA_OVERLAY_SEGMENT_COUNT] = {false};
 
 void hydra_overlay_segment_set(u16 overlay_num, u16 segment)
 {

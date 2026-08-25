@@ -3,12 +3,18 @@
 ## library is loaded into the test executable so dlsym(RTLD_DEFAULT) finds
 ## hydra_user_init / hydra_user_functions / hydra_user_callstack.
 
-dosemu_host_src = files([
-  'host.c',
-  'host_driver.c',
-  'dosdebug.c',
-  'lowmem.c',
-])
+## Keep the hardened FIFO client in dosdebug.c unchanged and append the tiny
+## Option-E command wrappers in the same translation unit so they can reuse
+## its private protocol helpers without widening that internal API.
+dosdebug_combined = custom_target(
+  'dosdebug_combined.c',
+  input : ['dosdebug.c', 'dosdebug_commands.inc'],
+  output : 'dosdebug_combined.c',
+  command : ['cat', '@INPUT@'],
+  capture : true,
+)
+
+dosemu_host_src = files('host.c', 'host_driver.c', 'lowmem.c') + [dosdebug_combined]
 
 libhydra_dosemu = shared_library(
   'hydra_dosemu',
@@ -38,6 +44,13 @@ test_host = executable(
 ## external backend rejects overlay hooks before releasing guest execution.
 test_overlay_reject = executable(
   'test_overlay_reject', 'test_overlay_reject.c',
+  link_with : [libhydra, libhydra_dosemu],
+)
+
+## Host-independent capacity regression: a dynamic overlay site counts against
+## the same 64-entry dosdebug budget as static hooks.
+test_overlay_budget = executable(
+  'test_overlay_budget', 'test_overlay_budget.c',
   link_with : [libhydra, libhydra_dosemu],
 )
 
@@ -101,4 +114,20 @@ test_driver_cap = executable(
   link_with : [libhydra, libhydra_dosemu],
   sources : [testprog_exe],
   c_args : ['-DTESTPROG_EXE_PATH="' + testprog_exe.full_path() + '"'],
+)
+
+## Phase 7 Item E: overlay support - VROOMM-style page-in stub guest and
+## the full page-in/decompiled-takeover integration test.
+testprog_ovl_com = custom_target(
+  'testprog_ovl.com',
+  input : 'testprog_ovl.asm',
+  output : 'testprog_ovl.com',
+  command : ['nasm', '-f', 'bin', '-o', '@OUTPUT@', '@INPUT@'],
+)
+
+test_driver_ovl = executable(
+  'test_driver_ovl', 'test_driver_ovl.c',
+  link_with : [libhydra, libhydra_dosemu],
+  sources : [testprog_ovl_com],
+  c_args : ['-DTESTPROG_OVL_PATH="' + testprog_ovl_com.full_path() + '"'],
 )
