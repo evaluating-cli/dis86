@@ -251,7 +251,7 @@ static void metadata_probe(void)
    *    notify() push it at a neutral CS:IP. */
   hydra_callstack_trigger_enter(css, 0x0100);
   pm.registers->cs = css;
-  pm.registers->ip = 0x013d;
+  pm.registers->ip = 0x014a;
   hydra_callstack_notify(&pm);
 
   /* 2. "stop" at the injected JUMPRET conf -> deferred JMP_RET leave. */
@@ -319,7 +319,7 @@ uint32_t com_phys = (uint32_t)com_seg << 4;
     addr_t md_addr;
     CHECK(hydra_function_addr("F_func2", &md_addr) &&
               addr_seg(md_addr) == 0 && addr_off(md_addr) == 0x0142,
-          "injected metadata: hydra_function_addr(F_func2) == 0000:0135");
+          "injected metadata: hydra_function_addr(F_func2) == 0000:0142");
   }
 
   /* 2b. fake-machine probe through the injected callstack confs */
