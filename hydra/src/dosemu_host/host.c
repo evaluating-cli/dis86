@@ -383,15 +383,27 @@ static int host_snapshot_write_file(host_ctx_t *ctx, const char *path,
     hydsnap_put16(hdr + 0x2A, ctx->code_load_offset);
     hydsnap_put16(hdr + 0x2C, ctx->data_section_seg);
     hydsnap_put32(hdr + 0x34, (uint32_t)blob);
-    hydsnap_put32(hdr + 0x38, hydsnap_crc32(lowmem_base(ctx->lm), blob));
+
+    /* Copy the guest window once and compute the CRC over the private
+     * copy: the live mapping is shared with dosemu2 and keeps mutating
+     * (BDA ticks et al.), so CRC-then-write in two passes over the live
+     * mapping can produce a self-invalid snapshot (TOCTOU). */
+    uint8_t *snap = malloc(blob);
+    if (!snap)
+        return -1;
+    memcpy(snap, lowmem_base(ctx->lm), blob);
+    hydsnap_put32(hdr + 0x38, hydsnap_crc32(snap, blob));
 
     FILE *f = fopen(path, "wb");
-    if (!f)
+    if (!f) {
+        free(snap);
         return -1;
+    }
     int ok = fwrite(hdr, 1, sizeof(hdr), f) == sizeof(hdr) &&
-             fwrite(lowmem_base(ctx->lm), 1, blob, f) == blob;
+             fwrite(snap, 1, blob, f) == blob;
     if (fclose(f) != 0)
         ok = 0;
+    free(snap);
     return ok ? 0 : -1;
 }
 
