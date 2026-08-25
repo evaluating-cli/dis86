@@ -11,6 +11,14 @@ void hydra_hook_register(hydra_hook_t ent)
 
 addr_t hydra_hook_entry_addr(void)
 {
+  /* RESTORE mode may override the legacy navigator entry. Keep the effective
+   * address in this single resolver so both the Hydra core and external hosts
+   * (which plant breakpoints from hydra_hook_entry_addr()) agree exactly. */
+  if (HYDRA_MODE->mode == HYDRA_MODE_RESTORE && HYDRA_MODE->has_restore_entry) {
+    return ADDR_MAKE((u16)(CODE_START_SEG + addr_seg(HYDRA_MODE->restore_entry)),
+                     addr_off(HYDRA_MODE->restore_entry));
+  }
+
   // FIXME: ADD TO THE USER CONFIG
   // navigator
   u16 main_seg = 0x02e0 + CODE_START_SEG;
@@ -20,12 +28,6 @@ addr_t hydra_hook_entry_addr(void)
 
 bool hydra_hook_entry(addr_t addr)
 {
-  /* RESTORE mode: an optional "restore|<path>|<seg:off>" config entry
-   * selects the guest entry point that triggers the snapshot restore. */
-  if (HYDRA_MODE->mode == HYDRA_MODE_RESTORE && HYDRA_MODE->has_restore_entry) {
-    return addr_seg(addr) == addr_seg(HYDRA_MODE->restore_entry) + CODE_START_SEG &&
-           addr_off(addr) == addr_off(HYDRA_MODE->restore_entry);
-  }
   return addr_equal(addr, hydra_hook_entry_addr());
 }
 
