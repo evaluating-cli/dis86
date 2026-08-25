@@ -5,10 +5,12 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "hydra_machine.h"
 #include "host.h"
+#include "internal.h"
 
 static int g_failures;
 #define CHECK(cond, label) do {                                      \
@@ -33,6 +35,26 @@ int main(int argc, char **argv)
   if (!ctx) return 1;
   CHECK(host_pid(ctx) != 0, "connected to dosemu2");
   CHECK(ctx->have_initial_regs, "initial register state read");
+
+  /* A configured restore entry must flow through the same resolver used by
+   * host_driver.c for breakpoint installation/detection. */
+  {
+    int old_mode = HYDRA_MODE->mode;
+    int old_has = HYDRA_MODE->has_restore_entry;
+    addr_t old_entry = HYDRA_MODE->restore_entry;
+    HYDRA_MODE->mode = HYDRA_MODE_RESTORE;
+    HYDRA_MODE->has_restore_entry = 1;
+    HYDRA_MODE->restore_entry = ADDR_MAKE(0x0012, 0x3456);
+    addr_t effective = hydra_hook_entry_addr();
+    CHECK(addr_seg(effective) == (uint16_t)(ctx->code_load_offset + 0x0012) &&
+          addr_off(effective) == 0x3456,
+          "configured restore entry resolves through code-load base");
+    CHECK(hydra_hook_entry(effective),
+          "configured restore entry matches core entry predicate");
+    HYDRA_MODE->mode = old_mode;
+    HYDRA_MODE->has_restore_entry = old_has;
+    HYDRA_MODE->restore_entry = old_entry;
+  }
 
   /* Verified lowmem selection is exercised by hydra_machine_init itself. */
   uint8_t *ivt = m.hardware->mem_hostaddr(m.hardware->ctx, 0);
@@ -83,6 +105,90 @@ int main(int argc, char **argv)
   CHECK(m.hardware->mem_read16(m.hardware->ctx, scratch) == 0x1234,
         "snapshot restored guest low memory");
   unlink(snap);
+
+  /* HYDSNAP-specific regression coverage: persist a non-zero data-section
+   * offset, mutate both host/core layout state, and verify restore adopts it
+   * before recalculating the datasection base pointer. */
+  char hydsnap[160];
+  snprintf(hydsnap, sizeof(hydsnap), "/tmp/hydra_host_hydsnap_%ld.bin",
+           (long)getpid());
+  unlink(hydsnap);
+  uint16_t original_code_load = ctx->code_load_offset;
+  uint16_t original_data_seg = ctx->data_section_seg;
+  int original_mode = HYDRA_MODE->mode;
+
+  ctx->data_section_seg = 0x0017;
+  host_set_code_load(ctx, original_code_load);
+  HYDRA_MODE->mode = HYDRA_MODE_CAPTURE;
+  m.hardware->state_save(m.hardware->ctx, hydsnap);
+  CHECK(stat(hydsnap, &st) == 0 && st.st_size > 0x110000,
+        "HYDSNAP persisted with full guest window");
+
+  ctx->data_section_seg = 0;
+  host_set_code_load(ctx, original_code_load);
+  HYDRA_MODE->mode = HYDRA_MODE_RESTORE;
+  m.hardware->state_restore(m.hardware->ctx, hydsnap);
+  CHECK(ctx->data_section_seg == 0x0017 &&
+        HYDRA_CONF->data_section_seg == 0x0017,
+        "HYDSNAP restored non-zero data-section layout into host and core");
+  CHECK(hydra_datasection_baseptr() ==
+        lowmem_hostaddr(ctx->lm,
+                        (uint32_t)(ctx->code_load_offset + 0x0017u) << 4),
+        "HYDSNAP recomputed datasection base from restored layout");
+
+  /* Header fields are architectural state too. Corrupt one register byte in
+   * a copy and verify the restore path fails before any replay. */
+  char corrupt[180];
+  snprintf(corrupt, sizeof(corrupt), "%s.corrupt", hydsnap);
+  unlink(corrupt);
+  {
+    FILE *src = fopen(hydsnap, "rb");
+    FILE *dst = fopen(corrupt, "wb");
+    int copy_ok = src && dst;
+    if (copy_ok) {
+      unsigned char buf[4096];
+      size_t n;
+      while ((n = fread(buf, 1, sizeof(buf), src)) != 0) {
+        if (fwrite(buf, 1, n, dst) != n) {
+          copy_ok = 0;
+          break;
+        }
+      }
+    }
+    if (src) fclose(src);
+    if (dst && fclose(dst) != 0) copy_ok = 0;
+    CHECK(copy_ok, "copied HYDSNAP for header-integrity negative test");
+  }
+  {
+    FILE *f = fopen(corrupt, "r+b");
+    int flip_ok = 0;
+    if (f && fseek(f, 0x0c, SEEK_SET) == 0) {
+      int b = fgetc(f);
+      if (b != EOF && fseek(f, 0x0c, SEEK_SET) == 0 &&
+          fputc(b ^ 0x01, f) != EOF)
+        flip_ok = 1;
+    }
+    if (f) fclose(f);
+    CHECK(flip_ok, "corrupted a HYDSNAP register header byte");
+  }
+  {
+    pid_t child = fork();
+    if (child == 0) {
+      HYDRA_MODE->mode = HYDRA_MODE_RESTORE;
+      m.hardware->state_restore(m.hardware->ctx, corrupt);
+      _exit(0);
+    }
+    int status = 0;
+    int waited = child > 0 && waitpid(child, &status, 0) == child;
+    CHECK(waited && (!WIFEXITED(status) || WEXITSTATUS(status) != 0),
+          "HYDSNAP rejects corrupted architectural header before replay");
+  }
+  unlink(corrupt);
+  unlink(hydsnap);
+
+  ctx->data_section_seg = original_data_seg;
+  host_set_code_load(ctx, original_code_load);
+  HYDRA_MODE->mode = original_mode;
 
   /* Put the live guest back exactly as found before destructive checks. */
   m.hardware->mem_write16(m.hardware->ctx, scratch, original_mem);
