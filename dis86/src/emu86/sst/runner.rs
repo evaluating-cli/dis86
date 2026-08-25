@@ -11,7 +11,10 @@ use moo::types::MooRamEntry;
 use std::collections::HashSet;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 
+use crate::asm::decode::decode_one;
+use crate::asm::instr::{Opcode, Operand, OperandReg, Reg};
 use crate::emu86::machine::*;
+use crate::region::RegionIter;
 
 /// Default set of FLAGS bits that the runner compares (emu86's FLAG_MASK).
 pub const DEFAULT_FLAGS_UMASK: u16 = 0x0FD7;
@@ -25,6 +28,7 @@ pub const REG_NAMES: [&str; 14] = [
 
 const IP_IDX: usize = 8;
 const FLAGS_IDX: usize = 13;
+const CX_IDX: usize = 1;
 
 /// Maximum number of `unexpected_writes` entries retained on an `Outcome::Fail`
 /// to keep memory-bounded reporting sane.
@@ -33,16 +37,26 @@ const MAX_UNEXPECTED_SAMPLES: usize = 8;
 /// Per-instruction run options.
 #[derive(Clone, Copy, Debug)]
 pub struct RunOpts {
-  /// Bits of FLAGS that are actually compared (any other bits are ignored).
+  /// Baseline set of FLAGS bits to compare. When `count_sensitive_flags` is
+  /// enabled, shift/rotate undefined bits are refined from the decoded test's
+  /// effective count so count==1 defined OF cannot be hidden by a form-wide mask.
   pub flags_umask: u16,
-  /// If true, snapshot memory before stepping and report any writes not
-  /// declared in the test's `final.ram` as `unexpected_writes`.
+  /// If true, track memory writes and report final changes not declared in the
+  /// test's `final.ram` as `unexpected_writes`. Tracking records only touched
+  /// addresses; it does not clone the whole memory image.
   pub check_extra_writes: bool,
+  /// Refine shift/rotate FLAGS definedness using the effective count. Disable
+  /// only for an explicit diagnostic `--umask`, where the caller's mask is exact.
+  pub count_sensitive_flags: bool,
 }
 
 impl Default for RunOpts {
   fn default() -> Self {
-    RunOpts { flags_umask: DEFAULT_FLAGS_UMASK, check_extra_writes: false }
+    RunOpts {
+      flags_umask: DEFAULT_FLAGS_UMASK,
+      check_extra_writes: true,
+      count_sensitive_flags: true,
+    }
   }
 }
 
@@ -183,6 +197,53 @@ fn initial_regs(init: &MooRegisters16) -> [u16; 14] {
   ]
 }
 
+/// Refine FLAGS definedness for group-2 shift/rotate operations using the
+/// *effective* 80286 count. The static per-form policy remains the baseline,
+/// but it cannot express count==0 / count==1 / count>1 differences.
+fn effective_flags_umask(test: &MooTest, init: &[u16; 14], opts: &RunOpts) -> u16 {
+  if !opts.count_sensitive_flags {
+    return opts.flags_umask;
+  }
+
+  let mut bin = RegionIter::new(test.bytes(), SegOff::new(0, 0));
+  let instr = match decode_one(&mut bin) {
+    Ok(Some((instr, _))) => instr,
+    _ => return opts.flags_umask,
+  };
+
+  let count = match instr.operands.get(1) {
+    Some(Operand::Imm(imm)) => (imm.val as u8) & 0x1f,
+    Some(Operand::Reg(OperandReg(Reg::CL))) => (init[CX_IDX] as u8) & 0x1f,
+    _ => return opts.flags_umask,
+  };
+
+  match instr.opcode {
+    Opcode::OP_SHL | Opcode::OP_SHR | Opcode::OP_SAR => {
+      // Shift forms historically carry form-wide masks that drop AF and, for
+      // variable/immediate counts, OF. Restore them first, then remove only the
+      // bits that are actually undefined for this test's effective count.
+      let mut mask = opts.flags_umask | FLAG_AF | FLAG_OF;
+      if count != 0 {
+        mask &= !FLAG_AF; // AF undefined for a non-zero shift.
+      }
+      if count > 1 {
+        mask &= !FLAG_OF; // OF defined only for count==1; count==0 preserves it.
+      }
+      mask
+    }
+    Opcode::OP_ROL => {
+      // ROL preserves SF/ZF/PF/AF. CF is defined for non-zero counts and OF is
+      // defined only for count==1; count==0 is a complete FLAGS-preserving no-op.
+      let mut mask = opts.flags_umask | FLAG_AF | FLAG_OF;
+      if count > 1 {
+        mask &= !FLAG_OF;
+      }
+      mask
+    }
+    _ => opts.flags_umask,
+  }
+}
+
 /// Write the test's initial RAM (sparse) into the machine's flat memory.
 /// Returns an `InvalidVector` outcome (without running) if any address is out
 /// of bounds, or `Ok(())` on success.
@@ -224,7 +285,6 @@ fn read_actual_regs(machine: &Machine) -> [u16; 14] {
 /// Returns `None` if there were no divergences, else the diff vectors.
 fn compare_state(
   machine: &Machine,
-  snapshot: Option<&[u8]>,
   init: &[u16; 14],
   fin: &MooRegisters16,
   fin_ram: &[MooRamEntry],
@@ -272,19 +332,17 @@ fn compare_state(
 
   let mut unexpected: Vec<(u32, u8, u8)> = Vec::new();
   let mut unexpected_total: usize = 0;
-  if let Some(snap) = snapshot {
+  if let Some(writes) = machine.mem.tracked_write_originals() {
     let mut fin_map: Vec<u32> = fin_ram.iter().map(|e| e.address).collect();
     fin_map.sort_unstable();
-    for (addr, &before) in snap.iter().enumerate() {
+    let mut tracked: Vec<(usize, u8)> = writes.iter().map(|(&addr, &before)| (addr, before)).collect();
+    tracked.sort_unstable_by_key(|(addr, _)| *addr);
+    for (addr, before) in tracked {
       let after = machine.mem.0[addr];
-      if before != after {
-        // Only writes not declared in final.ram count as unexpected —
-        // both in the total and in the samples.
-        if fin_map.binary_search(&(addr as u32)).is_err() {
-          unexpected_total += 1;
-          if unexpected.len() < MAX_UNEXPECTED_SAMPLES {
-            unexpected.push((addr as u32, before, after));
-          }
+      if before != after && fin_map.binary_search(&(addr as u32)).is_err() {
+        unexpected_total += 1;
+        if unexpected.len() < MAX_UNEXPECTED_SAMPLES {
+          unexpected.push((addr as u32, before, after));
         }
       }
     }
@@ -316,6 +374,8 @@ pub fn run_test(test: &MooTest, opts: &RunOpts) -> Outcome {
   };
 
   let init_regs = initial_regs(&init);
+  let mut compare_opts = *opts;
+  compare_opts.flags_umask = effective_flags_umask(test, &init_regs, opts);
 
   let mut machine = Machine::new(None);
 
@@ -327,8 +387,11 @@ pub fn run_test(test: &MooTest, opts: &RunOpts) -> Outcome {
   // 4. Set all 14 registers.
   set_registers(&mut machine, &init_regs);
 
-  // 5. Snapshot memory if extra-write detection is requested.
-  let snapshot = if opts.check_extra_writes { Some(machine.mem.0.clone()) } else { None };
+  // 5. Enable address-level tracking after setup so initial-state writes do not
+  // count. This is cheap enough to remain enabled for the full hardware sweep.
+  if opts.check_extra_writes {
+    machine.mem.begin_write_tracking();
+  }
 
   // 6. Execute exactly one instruction, catching panics.
   let step_result = catch_unwind(AssertUnwindSafe(|| machine.step()));
@@ -350,7 +413,7 @@ pub fn run_test(test: &MooTest, opts: &RunOpts) -> Outcome {
 
   // 7-10. Compare registers + RAM + unexpected writes, then bucket.
   let fin_ram = test.final_state().ram();
-  match compare_state(&machine, snapshot.as_deref(), &init_regs, &fin, fin_ram, opts) {
+  match compare_state(&machine, &init_regs, &fin, fin_ram, &compare_opts) {
     None => Outcome::Pass,
     Some((reg_diffs, ram_diffs, unexpected, unexpected_total, flags_diff)) => Outcome::Fail {
       reg_diffs,
@@ -685,8 +748,7 @@ mod tests {
   #[test]
   fn unexpected_write_reported_when_not_in_final_ram() {
     let test = mov_test(vec![]);
-    let opts = RunOpts { check_extra_writes: true, ..RunOpts::default() };
-    match run_test(&test, &opts) {
+    match run_test(&test, &RunOpts::default()) {
       Outcome::Fail { unexpected_writes, unexpected_writes_total, reg_diffs, ram_diffs, .. } => {
         assert_eq!(unexpected_writes_total, 1, "reg: {:?} ram: {:?}", reg_diffs, ram_diffs);
         assert!(unexpected_writes.contains(&(0x20000, 0x00, 0x5A)), "got {:?}", unexpected_writes);
@@ -698,8 +760,7 @@ mod tests {
   #[test]
   fn write_declared_in_final_ram_is_not_unexpected() {
     let test = mov_test(ram(&[(0x20000, 0x5A)]));
-    let opts = RunOpts { check_extra_writes: true, ..RunOpts::default() };
-    let outcome = run_test(&test, &opts);
+    let outcome = run_test(&test, &RunOpts::default());
     assert_eq!(outcome, Outcome::Pass, "outcome: {:?}", outcome);
   }
 
@@ -711,7 +772,11 @@ mod tests {
     assert_eq!(run_test(&test, &RunOpts::default()), Outcome::Pass);
 
     // ...and with a umask that also compares bit 3 it must Fail.
-    let opts = RunOpts { flags_umask: DEFAULT_FLAGS_UMASK | 0x0008, ..RunOpts::default() };
+    let opts = RunOpts {
+      flags_umask: DEFAULT_FLAGS_UMASK | 0x0008,
+      count_sensitive_flags: false,
+      ..RunOpts::default()
+    };
     match run_test(&test, &opts) {
       Outcome::Fail { flags_diff, .. } => {
         let fd = flags_diff.expect("flags_diff must be present");
@@ -720,6 +785,75 @@ mod tests {
         assert_eq!(fd.umask, DEFAULT_FLAGS_UMASK | 0x0008);
       }
       other => panic!("expected Fail, got {:?}", other),
+    }
+  }
+
+  #[test]
+  fn shift_count_one_reenables_defined_of() {
+    // D2 /4 = SHL AL,CL. The historical form-wide mask 0x07C7 drops OF,
+    // but OF is architecturally defined when effective count==1. Deliberately
+    // omit hardware OF from the expected state: the count-sensitive runner
+    // must expose the mismatch instead of hiding it.
+    let mut init = base_init();
+    init.ax = 0x0040;
+    init.cx = 0x0001;
+    let mut fin = init.clone();
+    fin.ax = 0x0080;
+    fin.ip = 3;
+    fin.flags = 0x0082; // actual is 0x0882: only defined OF differs.
+    let init_ram = ram(&[(0x00000, 0xD2), (0x00001, 0xE0), (0x00002, 0xF4)]);
+    let test = make_test("shl al,cl count=1", &[0xD2, 0xE0, 0xF4], init, fin, init_ram, vec![]);
+    let policy_umask = policy_for_file("D2.4").unwrap().flags_umask.unwrap();
+    assert_eq!(policy_umask, 0x07C7);
+    let opts = RunOpts { flags_umask: policy_umask, ..RunOpts::default() };
+    match run_test(&test, &opts) {
+      Outcome::Fail { flags_diff: Some(fd), .. } => {
+        assert_eq!(fd.umask, 0x0FC7);
+        assert_eq!((fd.expected ^ fd.actual) & FLAG_OF, FLAG_OF);
+      }
+      other => panic!("defined count==1 OF mismatch must fail, got {:?}", other),
+    }
+  }
+
+  #[test]
+  fn shift_count_gt_one_keeps_of_masked() {
+    // Same form, CL=2: OF is undefined, so a difference only in OF must pass.
+    let mut init = base_init();
+    init.ax = 0x0040;
+    init.cx = 0x0002;
+    let mut fin = init.clone();
+    fin.ax = 0x0000;
+    fin.ip = 3;
+    fin.flags = 0x0847; // emu86 yields 0x0047; OF is undefined for count>1.
+    let init_ram = ram(&[(0x00000, 0xD2), (0x00001, 0xE0), (0x00002, 0xF4)]);
+    let test = make_test("shl al,cl count=2", &[0xD2, 0xE0, 0xF4], init, fin, init_ram, vec![]);
+    let policy_umask = policy_for_file("D2.4").unwrap().flags_umask.unwrap();
+    let opts = RunOpts { flags_umask: policy_umask, ..RunOpts::default() };
+    assert_eq!(run_test(&test, &opts), Outcome::Pass);
+  }
+
+  #[test]
+  fn rol_preserved_af_is_compared() {
+    // D0 /0 = ROL AL,1. ROL preserves AF; a form-wide shift mask must not hide
+    // an AF mismatch merely because AF is undefined for SHL/SHR/SAR.
+    let mut init = base_init();
+    init.ax = 0x0080;
+    init.flags = 0x0012; // AF=1
+    let mut fin = init.clone();
+    fin.ax = 0x0001;
+    fin.ip = 3;
+    fin.flags = 0x0803; // deliberately clear preserved AF; actual is 0x0813.
+    let init_ram = ram(&[(0x00000, 0xD0), (0x00001, 0xC0), (0x00002, 0xF4)]);
+    let test = make_test("rol al,1 preserves af", &[0xD0, 0xC0, 0xF4], init, fin, init_ram, vec![]);
+    let policy_umask = policy_for_file("D0.0").unwrap().flags_umask.unwrap();
+    assert_eq!(policy_umask, 0x0FC7);
+    let opts = RunOpts { flags_umask: policy_umask, ..RunOpts::default() };
+    match run_test(&test, &opts) {
+      Outcome::Fail { flags_diff: Some(fd), .. } => {
+        assert_eq!(fd.umask, DEFAULT_FLAGS_UMASK);
+        assert_eq!((fd.expected ^ fd.actual) & FLAG_AF, FLAG_AF);
+      }
+      other => panic!("ROL preserved-AF mismatch must fail, got {:?}", other),
     }
   }
 
@@ -931,4 +1065,3 @@ mod tests {
     assert_eq!(summary.pass, 2);
   }
 }
-
