@@ -1,19 +1,19 @@
 # Hydra hosting on dosemu2: external client via dosdebug + /proc/pid/fd
 
-> **Status (2026-08-25): implementation hardened; exact-head runtime verification pending.**
+> **Status (2026-08-25): implementation hardened and runtime verified for the supported static-hook scope.**
 > The external stock-dosemu2 host implements function-level hooks, independently
 > verified lowmem mapping, exact guest-visible IF restoration, persistent
 > register+lowmem snapshots, explicit guest-owned raw-code scratch, and
-> capture/restore special-mode breakpoints. Overlay hooks are **not supported** by
-> this backend and are rejected before guest execution instead of being silently
-> skipped.
+> capture/restore special-mode breakpoints. Overlay hooks are **not supported by
+> default** in this backend and are rejected before guest execution instead of being
+> silently skipped.
 >
-> The branch records a real-dosemu integration verification before the final
-> raw-slot and capture/restore hardening (`d4cf069`, "verify guest-owned scratch
-> and guest IF in real host test"). Later commits changed raw-code slot lifetime
-> and special-mode breakpoint handling, so that older pass is **not** accepted as
-> proof for the current head. A fresh `run_driver_test.sh` plus host snapshot test
-> on the exact merge candidate is a merge condition; see `TESTING.md`.
+> Final behavioral candidate `3beac7989b1a982f1645ee597192d0c8a40d8080`
+> passed both host-independent CI and the stock-dosemu2 runtime workflow on
+> dosemu2 2.0pre9 / Revision 7076. See `TESTING.md` for the recorded commands,
+> package identity, counters, FLAGS samples, and PASS evidence. Any later commits
+> in PR #34 are documentation/verification-record changes only and must still clear
+> both workflows before merge.
 >
 > Implementation: `hydra/src/dosemu_host/`.
 
@@ -106,8 +106,8 @@ the integration work exports the debugger symbols.
 - Register writes are not atomic; the host keeps the CPU stopped, writes them one at a time, then performs read-back verification before `g`.
 - **Command bursts are unreliable** on the tested runtime. The client uses paced per-command round-trips.
 - **Response stream can desynchronize by one block** when a step produces extra unsolicited text; `dosdebug_drain()` is used to re-synchronize around tracing.
-- **`r FL` can report a misleading failure** because dosemu normalizes physical EFLAGS/IOPL. The low-level helper therefore cannot use the command verdict alone.
-- **Guest IF is not a blind spot in the hardened host.** dosemu keeps physical vm86 IF managed by the emulator, but `set_FLAGS()` records the requested guest IF through VIF/`set_IF()`/`clear_IF()`, and `get_FLAGS()` exposes that guest-visible state. `host_set_regs()` re-applies the caller's unmodified `FL` value after the compatibility write and verifies all guest-visible bits; IOPL and reserved bit 1 remain host-managed. The real-host tests include an IF=0 round-trip.
+- **`r0` exposes raw vm86 EFLAGS, not directly Hydra's architectural 16-bit FLAGS.** Physical IF remains forced by dosemu while guest-visible IF is represented in VIF. The client reconstructs bit 9 from VIF before exposing the register set to Hydra.
+- **`r FL value` can apply the requested guest IF yet emit a misleading textual failure.** Stock dosemu's immediate command verifier compares against raw/normalized flags and may print `failed to set register 'FL'` when guest IF=1. The client tolerates only that known FL textual false verdict. FIFO/transport failures remain fatal, and `host_set_regs()` verifies the resulting guest-visible FLAGS by architectural readback; IOPL and reserved bit 1 remain host-managed.
 - **Traced callees must not do blocking DOS I/O**: a single `t` operation that enters a blocking service can stall. The driver bounds each step (`HOST_STEP_TIMEOUT_MS`, 10 s) and reports failure.
 
 ## 4. Memory access: /proc/pid/fd mmap
@@ -154,10 +154,10 @@ exact guest `FL` so IF=0 survives a complete hook round-trip.
   window;
 - capture writes a sibling temporary file, `fsync`s it, then renames atomically;
 - restore validates the header, restores memory first, then restores registers;
-- software INT3 breakpoint patches are cleared before capture/restore so they are not
-  serialized or overwritten underneath dosdebug's breakpoint table;
+- the vtable callbacks fail hard if snapshot read/write or register restoration fails, because their interface has no error return and silent continuation would create a false-success capture/restore;
+- software INT3 breakpoint patches are cleared before capture/restore and every clear must succeed, so breakpoint bytes are neither serialized nor overwritten underneath dosdebug's breakpoint table;
 - restore pulls the restored CPU state back into Hydra and then re-arms static hook
-  breakpoints against the restored memory image.
+  breakpoints against the restored memory image before guest execution resumes.
 
 Capture and restore are special instruction-boundary modes in the Hydra core. Because
 those addresses are not necessarily ordinary registered hooks, the external driver
@@ -210,8 +210,10 @@ Capture/restore special-mode breakpoints also consume debugger entries when acti
 overlay hook cannot be translated to a stable physical breakpoint before the overlay
 mapping exists. Silently omitting those hooks is semantically wrong, so
 `HYDRA_HOOK_FLAGS_OVERLAY` causes breakpoint installation to fail and `host_run()`
-refuses to run. Dynamic overlay discovery/re-arming is future work and is not claimed by
-this PR.
+refuses to run. `test_overlay_reject` makes that default-mode behavior a regression
+contract. Dynamic/lazy overlay discovery and arming remains follow-up work and is not
+claimed by PR #34; any future implementation must be explicitly opted in if it changes
+this default behavior.
 
 ## 8. Hydra bridge mapping
 
@@ -221,43 +223,40 @@ this PR.
 | `mem_read8/16`, `mem_write8/16` | direct access through the verified shared mapping |
 | `io_in8/16`, `io_out8/16` | guest opcode execution via explicit raw-code reservation + trace |
 | `update_registers` | **pull** dosdebug register dump into Hydra machine registers |
-| complete register push | paced dosdebug writes + read-back + exact guest-FL reapply |
-| `state_save` | atomic file containing registers + `0x110000` guest lowmem/HMA |
-| `state_restore` | restore memory, restore CPU registers, pull CPU state, re-arm breakpoints |
+| complete register push | paced dosdebug writes + VIF-aware read-back + exact guest-FL verification |
+| `state_save` | atomic file containing registers + `0x110000` guest lowmem/HMA; failure is fatal |
+| `state_restore` | restore memory, restore CPU registers, pull CPU state, re-arm breakpoints; failure is fatal |
 | `hydra_machine_init` | connect dosdebug + independently verify/select lowmem backing; raw scratch remains unconfigured |
 | hook execution | static INT3 breakpoints + `g`; trace only for raw/native→guest calls |
-| capture/restore execution | explicit special-mode breakpoints |
-| overlay hooks | unsupported; fail closed before guest execution |
+| capture/restore execution | explicit special-mode breakpoints with checked breakpoint cleanup |
+| overlay hooks | unsupported by default; fail closed before guest execution |
 
 ## 9. Phased implementation and verification state
 
 - **Phase 0 — empirical verification:** stock dosemu2 debugger + procfs memory transport established.
 - **Phase 1 — dosdebug client:** FIFO connection, command pacing, parsing, register access, breakpoints, run/stop/step.
 - **Phase 2 — lowmem mmap bridge:** candidate enumeration plus independent dosdebug probe verification; ambiguous backing selection fails closed.
-- **Phase 3 — Hydra bridge:** vtable wiring, exact guest-visible register restoration, and persistent register+lowmem snapshot files.
-- **Phase 4 — function-level hooking:** static INT3 hook breakpoints, trace-based raw/native→guest execution, nested dispatch, strict 64-breakpoint failure handling, and explicit rejection of overlays.
-- **Phase 5 — integration fixture:** three static hooks plus native→guest callthrough/nested hook, CF and IF=0 checks, and an 8 KiB guest-owned raw-code reservation. The current test code expects 21 hook dispatches and 45 raw/guest-call executions for the five-iteration fixture.
-- **Phase 6 — review hardening:** exact lowmem provenance, explicit scratch ownership/no slot reuse, persistent capture/restore reachability and breakpoint safety, and fail-closed unsupported/resource cases.
+- **Phase 3 — Hydra bridge:** vtable wiring, VIF-aware guest-visible register restoration, and persistent register+lowmem snapshot files.
+- **Phase 4 — function-level hooking:** static INT3 hook breakpoints, trace-based raw/native→guest execution, nested dispatch, strict 64-breakpoint failure handling, and explicit rejection of overlays by default.
+- **Phase 5 — integration fixture:** three static hooks plus native→guest callthrough/nested hook, CF and IF=0 checks, and an 8 KiB guest-owned raw-code reservation. The verified five-iteration fixture produced 21 hook dispatches, 45 raw/guest-call runs, and 45 returns.
+- **Phase 6 — review hardening:** exact lowmem provenance, explicit scratch ownership/no slot reuse, persistent capture/restore reachability and breakpoint safety, fail-hard snapshot callbacks, checked breakpoint cleanup, and fail-closed unsupported/resource cases.
 
 ### Merge verification gate
 
-The implementation is not considered merge-verified solely because an older branch
-state passed the real-dosemu fixture. Before merge, run the real-dosemu tests on the
-**exact candidate head** and record the commit SHA, commands, and complete result in
-`TESTING.md` and the PR discussion. Required evidence:
+**PASS for behavioral candidate `3beac7989b1a982f1645ee597192d0c8a40d8080`.**
 
-1. `test_host` passes verified-lowmem selection, guest IF=0 register round-trip,
-   persistent snapshot register+memory restore, and breakpoint smoke checks.
-2. `run_driver_test.sh` passes the current three-hook fixture, including nested
-   callthrough, IF=0 preservation, 21 expected hook dispatches, 45 raw/guest-call runs,
-   and byte-for-byte restoration of the guest-owned 8 KiB scratch reservation.
-3. A negative overlay fixture or host-independent test demonstrates that registering an
-   overlay hook fails before guest execution; this backend must not claim overlay support.
-4. Host-independent CI compiles the `hydra/src/dosemu_host/*.c` implementation, not only
-   the top-level Hydra C files.
+The candidate was tested on stock dosemu2 2.0pre9 / Revision 7076 and passed all four
+required gates:
 
-Until those exact-head results are recorded, the runtime verification gate is
-**PENDING**.
+1. `test_host` — verified-lowmem selection, guest IF=0 register round-trip, persistent snapshot register+memory restore, and breakpoint smoke.
+2. `run_driver_test.sh` — three-hook fixture, nested callthrough, CF/IF=0 preservation, `hook_dispatches=21`, `raw_code_runs=45`, `raw_code_returns=45`, `redirects=66`, and byte-for-byte restoration of the guest-owned 8 KiB scratch reservation.
+3. `test_overlay_reject` — a genuine overlay-typed hook fails before guest execution in default mode.
+4. Host-independent CI — Rust tests plus syntax coverage for top-level Hydra and all `hydra/src/dosemu_host/*.c` implementation/test sources.
+
+The exact commands, runtime package identity, workflow/run IDs, and observed FLAGS
+samples are recorded in `TESTING.md`. Documentation-only commits after the behavioral
+candidate still have to clear both workflows on their final PR head before merge; that
+final-head result is recorded in the PR discussion.
 
 ## 10. Reference: prior in-process plugin research (appendix)
 
