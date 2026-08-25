@@ -60,13 +60,23 @@ static int host_bp_ensure(host_ctx_t *ctx, host_bp_entry_t *bps,
   return 0;
 }
 
-static void host_bp_clear_all(host_ctx_t *ctx, host_bp_entry_t *bps)
+/* Clear every tracked software breakpoint. A failed clear remains tracked so
+ * cleanup can be retried by the caller; this is especially important before
+ * capture/restore because an uncleared INT3 must never enter or be overwritten
+ * by a memory snapshot. */
+static int host_bp_clear_all(host_ctx_t *ctx, host_bp_entry_t *bps)
 {
+  int failed = 0;
   for (size_t i = 0; i < HOST_RUN_MAX_BPS; i++) {
-    if (bps[i].used)
-      host_clear_bp(ctx, bps[i].index);
+    if (!bps[i].used)
+      continue;
+    if (host_clear_bp(ctx, bps[i].index) != 0) {
+      failed = 1;
+      continue;
+    }
     bps[i].used = 0;
   }
+  return failed ? -1 : 0;
 }
 
 static void hook_counter(const hydra_hook_t *hook, void *user);
@@ -253,10 +263,14 @@ static host_run_stop_reason_t dispatch_hook(run_ctx_t *r, dosdebug_regs_t *dr,
 
     /* Breakpoints are software patches in guest memory. A capture must not
      * serialize those patches, and a restore must not overwrite live patched
-     * bytes underneath dosdebug's breakpoint table. Remove every tracked bp
-     * before either memory-image operation. */
-    if (capture_stop || restore_stop)
-      host_bp_clear_all(r->ctx, r->bps);
+     * bytes underneath dosdebug's breakpoint table. Require every tracked bp
+     * to be removed before either memory-image operation. */
+    if ((capture_stop || restore_stop) && host_bp_clear_all(r->ctx, r->bps) != 0) {
+      fprintf(stderr,
+              "host_run: failed to clear all breakpoints before %s\n",
+              capture_stop ? "state capture" : "state restore");
+      return HOST_RUN_STOP_ERROR;
+    }
 
     regs_to_machine(dr, r->m->registers);
     int mode_before = HYDRA_MODE->mode;
@@ -449,7 +463,11 @@ host_run_stop_reason_t host_run(host_ctx_t *ctx, hydra_machine_t *m,
   }
 
 done:
-  host_bp_clear_all(ctx, bps);
+  if (host_bp_clear_all(ctx, bps) != 0) {
+    fprintf(stderr, "host_run: failed to clear all breakpoints during cleanup\n");
+    if (reason != HOST_RUN_STOP_DOSEMU_EXIT)
+      reason = HOST_RUN_STOP_ERROR;
+  }
   if (stats)
     *stats = st;
   return reason;
