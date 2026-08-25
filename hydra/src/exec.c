@@ -5,6 +5,8 @@
 
 static hydra_exec_ctx_t executions[MAX_EXEC];
 static hydra_exec_ctx_t *thread_active = NULL;
+static size_t hook_dispatch_count = 0;
+static int last_result_type = HYDRA_RESULT_TYPE_RESUME;
 
 typedef struct overlay_entry overlay_entry_t;
 struct overlay_entry
@@ -50,6 +52,30 @@ hydra_exec_ctx_t *execution_context_get(u16 *opt_exec_id)
 void execution_context_set(hydra_exec_ctx_t *exec)
 {
   thread_active = exec;
+}
+
+/* The result type of the most recent hydra_exec_run() call. The dosemu2 host
+ * driver uses this to decide whether a CALL/CALL_NEAR result must be traced
+ * on the guest CPU (single-step) before the hook can resume. */
+int hydra_exec_last_result_type(void)
+{
+  return last_result_type;
+}
+
+/* Id of the currently active execution context (thread_active). The host
+ * driver reads this after a CALL result to compute the magic return address
+ * (0xffff:<id> for far, <cs>:0xff00+<id> for near) the trace must reach. */
+u16 hydra_exec_active_id(void)
+{
+  u16 id = 0;
+  execution_context_get(&id);
+  return id;
+}
+
+/* Number of hook functions dispatched since startup (run_begin, not resumed). */
+size_t hydra_exec_hook_dispatch_count(void)
+{
+  return hook_dispatch_count;
 }
 
 static void *thread_func(void *_usr)
@@ -120,6 +146,7 @@ static hydra_result_t run_wait(hydra_exec_ctx_t *exec, hydra_machine_t *m)
 
 static hydra_result_t run_begin(hydra_hook_t *hook, hydra_machine_t *m)
 {
+  hook_dispatch_count++;
   if (hook->flags & HYDRA_HOOK_FLAGS_OVERLAY) {
     // On first entry to the overlay, it calls an interrupt "int 0x3f"
     // to page in the segment. We want to allow this to happen. After the
@@ -186,20 +213,37 @@ static hydra_result_t run_continue(hydra_machine_t *m, hydra_exec_ctx_t *exec)
 
 static bool try_resume(hydra_machine_t *m, hydra_result_t *_result)
 {
-  // Resume a retf ?
+  // Resume a retf ? (magic far return address 0xffff:exec_id)
   if (m->registers->cs == 0xffff) {
-    hydra_exec_ctx_t *exec = &executions[m->registers->ip];
-    *_result = run_continue(m, exec);
-    return true;
+    /* Bounds + state check: 0xFFFF is also a legitimate ROM segment, so only
+     * treat the address as magic when the indexed context is live — i.e. the
+     * guest really RETF'd onto an address we pushed. */
+    if (m->registers->ip < ARRAY_SIZE(executions)) {
+      hydra_exec_ctx_t *exec = &executions[m->registers->ip];
+      if (exec->state == HYDRA_EXEC_STATE_ACTIVE) {
+        *_result = run_continue(m, exec);
+        return true;
+      }
+    }
+    return false;
   }
 
-  // Resume a ret ?
+  // Resume a ret ? (magic near return address cs:0xff00+exec_id)
   if (m->registers->cs != 0xf000 && m->registers->ip >= 0xff00) {
     size_t idx = m->registers->ip & 0xff;
     hydra_exec_ctx_t *exec = &executions[idx];
-    if (!exec->maybe_reloc && m->registers->cs != exec->saved_cs) FAIL("Expected matching code segments");
-    *_result = run_continue(m, exec);
-    return true;
+    if (exec->state == HYDRA_EXEC_STATE_ACTIVE) {
+      /* An ordinary guest RET to an offset >= 0xff00 can collide with the
+       * magic window while a context is ACTIVE. Only resume when the calling
+       * segment matches the one recorded at the call; a mismatch means this
+       * is (almost certainly) foreign code — treat it as not-a-magic-return
+       * instead of aborting the host. maybe_reloc contexts cannot be verified
+       * and are accepted as before. */
+      if (!exec->maybe_reloc && m->registers->cs != exec->saved_cs)
+        return false;
+      *_result = run_continue(m, exec);
+      return true;
+    }
   }
 
   return false;
@@ -262,6 +306,8 @@ int hydra_exec_run(hydra_machine_t *m)
       result = run_begin(ent, m);
     }
   }
+
+  last_result_type = result.type;
 
   // Figure out how to update / re-direct the CS:IP
   switch (result.type) {

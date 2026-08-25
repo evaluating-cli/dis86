@@ -173,8 +173,6 @@
   POP_ARGS(args);                \
   ret; })
 
-#define CALL_FUNC(name) hydra_impl_call_func(#name)
-
 #define PUSH_ARGS(args) do { \
     for (size_t i = ARRAY_SIZE(args); i > 0; i--) { PUSH(args[i-1]); } \
 } while(0)
@@ -251,7 +249,6 @@ u32      hydra_impl_call_far_cs(u16 cs_reg_value, u16 off);
 u32      hydra_impl_call_far_indirect(u32 addr);
 u32      hydra_impl_call_near_off(u16 off, int maybe_reloc);
 u32      hydra_impl_call_near_abs(u16 abs_off);
-u32      hydra_impl_call_func(const char *name);
 void     hydra_impl_cld(void);
 void     hydra_impl_std(void);
 void     hydra_impl_cli(void);
@@ -260,6 +257,7 @@ u8       hydra_impl_inb(u16 port);
 void     hydra_impl_outb(u16 port, u8 val);
 void     hydra_impl_int(u8 num);
 void     hydra_impl_nop(void);
+void     hydra_impl_raw_code_reset(void); /* host driver: reset slot counter at hook boundary */
 addr_t   hydra_impl_ptr_to_addr(hydra_machine_t *m, void *ptr);
 u16      hydra_impl_ptr_to_off(hydra_machine_t *m, void *ptr, u16 seg);
 u32      hydra_impl_ptr_to_32(hydra_machine_t *m, void *ptr);

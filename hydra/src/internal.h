@@ -12,9 +12,6 @@
 #include "callstack.h"
 #include "functions.h"
 
-// FIXME: REMOVE THIS HARDCODING
-//#define CODE_START_SEG ((u16)0x823)
-
 #define ENABLE_DEBUG_CALLSTACK 0
 #define MAX_HOOKS 2048
 
@@ -53,7 +50,9 @@ struct hydra_hook
 
 void hydra_hook_register(hydra_hook_t entry);
 hydra_hook_t * hydra_hook_find(addr_t addr);
+addr_t hydra_hook_entry_addr(void);
 bool hydra_hook_entry(addr_t addr);
+void hydra_hook_foreach(void (*fn)(const hydra_hook_t *hook, void *user), void *user);
 
 /********************************************************************/
 /* exec.c */
@@ -88,6 +87,11 @@ void               execution_context_set(hydra_exec_ctx_t *ctx);
 
 void hydra_exec_init(hydra_machine_hardware_t *hw, hydra_machine_audio_t *audio);
 int hydra_exec_run(hydra_machine_t *m);
+
+/* Exposed for the dosemu2 host driver (host_driver.c). */
+int   hydra_exec_last_result_type(void);
+u16   hydra_exec_active_id(void);
+size_t hydra_exec_hook_dispatch_count(void);
 
 /********************************************************************/
 /* callstack.c */

@@ -1,0 +1,143 @@
+name: dosemu host runtime
+
+on:
+  push:
+    branches: [pr/3-hydra-dosemu2-host]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  runtime:
+    name: Stock dosemu2 host integration
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install stock dosemu2 runtime
+        run: |
+          set -euo pipefail
+          sudo apt-get update -q
+          sudo apt-get install -y software-properties-common
+
+          # Launchpad occasionally returns a transient signing-key 500 while
+          # resolving the PPA. Retry the repository setup so an infrastructure
+          # blip does not masquerade as a Hydra runtime failure.
+          added=0
+          for attempt in 1 2 3; do
+            if sudo add-apt-repository -y ppa:dosemu2/ppa; then
+              added=1
+              break
+            fi
+            echo "dosemu2 PPA setup attempt $attempt failed" >&2
+            sleep $((attempt * 5))
+          done
+          if [ "$added" -ne 1 ]; then
+            echo "dosemu2 PPA setup failed after retries" >&2
+            exit 1
+          fi
+
+          sudo apt-get update -q
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            dosemu2 fdpp nasm meson ninja-build
+
+          echo "### Runtime package identity" >> "$GITHUB_STEP_SUMMARY"
+          echo '```text' >> "$GITHUB_STEP_SUMMARY"
+          apt-cache policy dosemu2 fdpp | tee -a "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          command -v dosemu
+          dosemu --version || true
+
+      - name: Build Hydra host tests
+        run: |
+          set -euo pipefail
+          meson setup hydra/build hydra
+          ninja -C hydra/build
+
+      - name: Verify overlay hooks fail closed
+        run: |
+          set -euo pipefail
+          hydra/build/src/dosemu_host/test_overlay_reject
+          echo "test_overlay_reject: PASS" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run host state/transport test
+        run: |
+          set -euo pipefail
+
+          CONF=/tmp/opencode/dosemu_mshm.conf
+          LOG=/tmp/opencode/host_test_dosemu.log
+          COM="$GITHUB_WORKSPACE/hydra/build/src/dosemu_host/testprog.com"
+          HOST_TEST="$GITHUB_WORKSPACE/hydra/build/src/dosemu_host/test_host"
+
+          mkdir -p /tmp/opencode
+          cat > "$CONF" <<'EOF'
+          $_cpu_vm = "emulated"
+          $_cpuemu = (1)
+          $_sound = (off)
+          $_layout = "us"
+          $_vbios_post = (off)
+          $_console = (0)
+          $_video = "vga"
+          $_hdimage = "+1"
+          $_mapping = "mapmshm"
+          EOF
+
+          cp "$COM" /tmp/opencode/testprog.com
+          export XDG_RUNTIME_DIR=/tmp/opencode/runtime
+          mkdir -p "$XDG_RUNTIME_DIR/dosemu2"
+          rm -f "$LOG"
+
+          cleanup() {
+            pkill -9 -x dosemu2.bin 2>/dev/null || true
+            pkill -9 -x dosemu 2>/dev/null || true
+          }
+          trap cleanup EXIT
+          cleanup
+          sleep 1
+
+          setsid bash -c \
+            "tail -f /dev/null | timeout 180 /usr/bin/dosemu -p -f '$CONF' -dumb -H1 -E testprog.com -K /tmp/opencode </dev/null >'$LOG' 2>&1" \
+            </dev/null >/dev/null 2>&1 &
+
+          DOPID=""
+          for _ in $(seq 1 80); do
+            DOPID=$(pgrep -x dosemu2.bin | head -1 || true)
+            [ -n "$DOPID" ] && break
+            sleep 0.5
+          done
+          if [ -z "$DOPID" ]; then
+            echo "dosemu2 did not start" >&2
+            cat "$LOG" >&2 || true
+            exit 2
+          fi
+
+          # Give -E testprog.com time to reach its guest wait loop so test_host's
+          # breakpoint smoke operates in the writable COM segment.
+          sleep 3
+          "$HOST_TEST" "$DOPID"
+
+          echo "tested commit: $(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+          echo "test_host: PASS" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Run function-hook driver integration
+        run: |
+          set -euo pipefail
+          export DOSDEBUG_STREAM_LOG=/tmp/opencode/dosdebug_driver_stream.log
+          rm -f "$DOSDEBUG_STREAM_LOG"
+          timeout 300 bash hydra/src/dosemu_host/run_driver_test.sh \
+            "$GITHUB_WORKSPACE/hydra/build/src/dosemu_host/testprog.com" \
+            "$GITHUB_WORKSPACE/hydra/build/src/dosemu_host/test_driver"
+          echo "run_driver_test.sh: PASS" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Show dosemu log on failure
+        if: failure()
+        run: |
+          echo "--- /tmp/opencode/host_test_dosemu.log ---"
+          tail -200 /tmp/opencode/host_test_dosemu.log 2>/dev/null || true
+          echo "--- /tmp/opencode/driver_test.log ---"
+          tail -200 /tmp/opencode/driver_test.log 2>/dev/null || true
+          echo "--- /tmp/opencode/dosdebug_driver_stream.log ---"
+          tail -600 /tmp/opencode/dosdebug_driver_stream.log 2>/dev/null || true

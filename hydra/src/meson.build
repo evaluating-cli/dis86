@@ -16,3 +16,5 @@ HYDRA_SRC = files([
 libhydra = shared_library(
   'hydra', HYDRA_SRC,
 )
+
+subdir('dosemu_host')

@@ -16,8 +16,9 @@ build-dis86:
   cp dis86/target/debug/dis86 build/bin/
   cp dis86/target/debug/mzfile build/bin/
 
-# Run the host-independent checks used by CI. Hydra is syntax-checked from its
-# own sources, proving the retained runtime no longer needs an emulator submodule.
+# Run the host-independent checks used by CI. Syntax-check both the Hydra core
+# and the external dosemu2 host/tests so a green workflow covers the code added
+# by the hosting PR without requiring a dosemu2 runtime.
 check:
   #!/bin/bash
   set -euo pipefail
@@ -25,6 +26,9 @@ check:
   cargo test --manifest-path dis86/Cargo.toml --locked --all-targets
   cc -std=c11 -D_GNU_SOURCE -Dtypeof=__typeof__ \
     -Ihydra/src -Ihydra/include -fsyntax-only hydra/src/*.c
+  cc -std=c11 -D_GNU_SOURCE -Dtypeof=__typeof__ \
+    -Ihydra/src -Ihydra/include -Ihydra/src/dosemu_host \
+    -fsyntax-only hydra/src/dosemu_host/*.c
 
 # Build the hydra component only
 build-hydra:
