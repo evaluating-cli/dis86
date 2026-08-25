@@ -226,6 +226,25 @@ int main(int argc, char **argv)
         lowmem_read8(ctx->lm, stub_phys + 1) == 0x3F,
         "stub starts exactly CD 3F");
 
+  /* Fail-closed regression: corrupt the unexecuted stub, invoke host_run, and
+   * prove classification rejects it before the guest advances. Restore CD3F
+   * afterwards and run the real scenario on the same connection. */
+  {
+    host_run_stats_t bad_stats = {0};
+    uint8_t saved = lowmem_read8(ctx->lm, stub_phys);
+    lowmem_write8(ctx->lm, stub_phys, 0x90);
+    host_run_stop_reason_t bad = host_run(ctx, &m, NULL, &bad_stats);
+    CHECK(bad == HOST_RUN_STOP_ERROR,
+          "malformed stub fails closed before execution (reason=%s)",
+          reason_name(bad));
+    CHECK(bad_stats.stops == 0 && bad_stats.hook_dispatches == 0,
+          "malformed stub rejection observes zero guest stops/dispatches");
+    lowmem_write8(ctx->lm, stub_phys, saved);
+    CHECK(lowmem_read8(ctx->lm, stub_phys) == 0xCD &&
+          lowmem_read8(ctx->lm, stub_phys + 1) == 0x3F,
+          "stub restored to exact CD 3F after negative probe");
+  }
+
   g_ovlcnt_phys = com_phys + OVLCNT_OFF;
   lowmem_write8(ctx->lm, com_phys + GOFLAG_OFF, 1);
   printf("go flag set; running the guest...\n");
