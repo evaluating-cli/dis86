@@ -222,21 +222,21 @@ fn effective_flags_umask(test: &MooTest, init: &[u16; 14], opts: &RunOpts) -> u1
       // Shift forms historically carry form-wide masks that drop AF and, for
       // variable/immediate counts, OF. Restore them first, then remove only the
       // bits that are actually undefined for this test's effective count.
-      let mut mask = opts.flags_umask | FLAG_AF | FLAG_OF;
+      let mut mask = opts.flags_umask | FLAG_AF.mask | FLAG_OF.mask;
       if count != 0 {
-        mask &= !FLAG_AF; // AF undefined for a non-zero shift.
+        mask &= !FLAG_AF.mask; // AF undefined for a non-zero shift.
       }
       if count > 1 {
-        mask &= !FLAG_OF; // OF defined only for count==1; count==0 preserves it.
+        mask &= !FLAG_OF.mask; // OF defined only for count==1; count==0 preserves it.
       }
       mask
     }
     Opcode::OP_ROL => {
       // ROL preserves SF/ZF/PF/AF. CF is defined for non-zero counts and OF is
       // defined only for count==1; count==0 is a complete FLAGS-preserving no-op.
-      let mut mask = opts.flags_umask | FLAG_AF | FLAG_OF;
+      let mut mask = opts.flags_umask | FLAG_AF.mask | FLAG_OF.mask;
       if count > 1 {
-        mask &= !FLAG_OF;
+        mask &= !FLAG_OF.mask;
       }
       mask
     }
@@ -809,7 +809,7 @@ mod tests {
     match run_test(&test, &opts) {
       Outcome::Fail { flags_diff: Some(fd), .. } => {
         assert_eq!(fd.umask, 0x0FC7);
-        assert_eq!((fd.expected ^ fd.actual) & FLAG_OF, FLAG_OF);
+        assert_eq!((fd.expected ^ fd.actual) & FLAG_OF.mask, FLAG_OF.mask);
       }
       other => panic!("defined count==1 OF mismatch must fail, got {:?}", other),
     }
@@ -851,7 +851,7 @@ mod tests {
     match run_test(&test, &opts) {
       Outcome::Fail { flags_diff: Some(fd), .. } => {
         assert_eq!(fd.umask, DEFAULT_FLAGS_UMASK);
-        assert_eq!((fd.expected ^ fd.actual) & FLAG_AF, FLAG_AF);
+        assert_eq!((fd.expected ^ fd.actual) & FLAG_AF.mask, FLAG_AF.mask);
       }
       other => panic!("ROL preserved-AF mismatch must fail, got {:?}", other),
     }
