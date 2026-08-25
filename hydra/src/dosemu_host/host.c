@@ -8,6 +8,8 @@
 
 #define _POSIX_C_SOURCE 200809L
 
+#include <ctype.h>
+#include <dlfcn.h>
 #include <errno.h>
 #include <limits.h>
 #include <stdio.h>
@@ -17,12 +19,7 @@
 
 #include "host.h"
 #include "hydra_machine.h"
-#include "typedefs.h"
-#include "addr.h"
-#include "conf.h"
-#include "functions.h"
-#include "callstack.h"
-#include "header.h"
+#include "internal.h"
 
 extern char *HYDRA_CMDLINE_CONF;
 extern hydra_conf_t HYDRA_CONF[1];
@@ -39,6 +36,13 @@ typedef struct host_snapshot_file_header {
     uint32_t memory_size;
     dosdebug_regs_t regs;
 } host_snapshot_file_header_t;
+/* ------------------------------------------------------------------ */
+/* conf string parsing                                                 */
+/*                                                                    */
+/* Format: "dosemu|pid=<dec>|code_load=<hex>|data_seg=<hex>|lib=<path>" */
+/* Any field may be omitted; if pid is absent, $DOSEMU_PID is tried,   */
+/* then auto-discovery (pid 0).                                        */
+/* ------------------------------------------------------------------ */
 
 static long host_conf_pid(const char *conf)
 {
@@ -59,6 +63,24 @@ static long host_conf_pid(const char *conf)
             return v;
     }
     return 0;
+}
+
+/* Copy the value of a string-valued conf key ("key=value", up to the next
+ * '|' or end of string). Returns 1 if present, 0 if absent. */
+static int host_conf_string(const char *conf, const char *key,
+                            char *out, size_t out_len)
+{
+    const char *p = conf ? strstr(conf, key) : NULL;
+    if (!p)
+        return 0;
+    p += strlen(key);
+    const char *end = strchr(p, '|');
+    size_t len = end ? (size_t)(end - p) : strlen(p);
+    if (len == 0 || len >= out_len)
+        return 0;
+    memcpy(out, p, len);
+    out[len] = '\0';
+    return 1;
 }
 
 static uint16_t host_conf_u16(const char *conf, const char *key, uint16_t dflt)
@@ -258,24 +280,281 @@ static int host_read_snapshot(host_ctx_t *ctx, const char *path,
     return 0;
 }
 
+/* ------------------------------------------------------------------ */
+/* HYDSNAP v1: full-memory + register state snapshots (Phase 7 Item D) */
+/*                                                                    */
+/* Layout (little-endian, byte-exact):                                */
+/*   0x00  8   magic "HYDSNAP\0"                                      */
+/*   0x08  4   version (u32, =1)                                      */
+/*   0x0C 28   regs[14] u16: ax bx cx dx si di bp sp ip cs ds es ss   */
+/*             flags                                                  */
+/*   0x28  2   psp (informational; 0 = unknown)                       */
+/*   0x2A  2   code_load_offset (CODE_START_SEG at capture time)      */
+/*   0x2C  2   data_section_seg                                       */
+/*   0x2E  2   reserved (0)                                           */
+/*   0x30  4   reserved (0)                                           */
+/*   0x34  4   guest_size (u32, must equal the guest-addressable window) */
+/*   0x38  4   crc32 of header (this field zeroed) + lowmem blob      */
+/*   0x3C  4   reserved (0)                                           */
+/*   0x40 ...  lowmem blob (lowmem_size bytes)                        */
+/*                                                                    */
+/* NOT captured (documented limitation): simx86 JIT state (harmless   */
+/* after a full reload), device/IRQ/PIT state, DOS handles/SFT/JFT    */
+/* backing host fds/latches (the guest bytes are restored but the     */
+/* underlying host-side file state isn't; acceptable for CI-style     */
+/* restore-into-fresh-instance use), memory above the lowmem window   */
+/* (HMA top), dosemu debugger breakpoints (replanted by host_run).    */
+/* ------------------------------------------------------------------ */
+
+#define HYDSNAP_MAGIC   "HYDSNAP\0"
+#define HYDSNAP_VERSION 1u
+#define HYDSNAP_HDR_LEN 0x40u
+
+static uint32_t hydsnap_crc32_update(uint32_t crc, const uint8_t *data, size_t len)
+{
+    for (size_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (int b = 0; b < 8; b++)
+            crc = (crc >> 1) ^ (crc & 1 ? 0xedb88320u : 0);
+    }
+    return crc;
+}
+
+static uint32_t hydsnap_crc32_snapshot(const uint8_t hdr[HYDSNAP_HDR_LEN],
+                                       const uint8_t *data, size_t len)
+{
+    uint8_t hdr_copy[HYDSNAP_HDR_LEN];
+    memcpy(hdr_copy, hdr, sizeof(hdr_copy));
+    memset(hdr_copy + 0x38, 0, 4);
+
+    uint32_t crc = 0xffffffffu;
+    crc = hydsnap_crc32_update(crc, hdr_copy, sizeof(hdr_copy));
+    crc = hydsnap_crc32_update(crc, data, len);
+    return ~crc;
+}
+
+static void hydsnap_put16(uint8_t *p, uint16_t v)
+{
+    p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
+}
+
+static void hydsnap_put32(uint8_t *p, uint32_t v)
+{
+    p[0] = (uint8_t)v;         p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
+}
+
+static uint16_t hydsnap_get16(const uint8_t *p)
+{
+    return (uint16_t)(p[0] | (p[1] << 8));
+}
+
+static uint32_t hydsnap_get32(const uint8_t *p)
+{
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static void hydsnap_fill_regrange(uint8_t *hdr, const dosdebug_regs_t *dr)
+{
+    uint16_t vals[14] = { dr->ax, dr->bx, dr->cx, dr->dx,
+                          dr->si, dr->di, dr->bp, dr->sp,
+                          dr->ip, dr->cs, dr->ds, dr->es, dr->ss,
+                          dr->flags };
+    for (int i = 0; i < 14; i++)
+        hydsnap_put16(hdr + 0x0C + 2 * i, vals[i]);
+}
+
+static void hydsnap_read_regrange(const uint8_t *hdr, dosdebug_regs_t *dr)
+{
+    dr->ax = hydsnap_get16(hdr + 0x0C);      dr->bx = hydsnap_get16(hdr + 0x0E);
+    dr->cx = hydsnap_get16(hdr + 0x10);      dr->dx = hydsnap_get16(hdr + 0x12);
+    dr->si = hydsnap_get16(hdr + 0x14);      dr->di = hydsnap_get16(hdr + 0x16);
+    dr->bp = hydsnap_get16(hdr + 0x18);      dr->sp = hydsnap_get16(hdr + 0x1A);
+    dr->ip = hydsnap_get16(hdr + 0x1C);      dr->cs = hydsnap_get16(hdr + 0x1E);
+    dr->ds = hydsnap_get16(hdr + 0x20);      dr->es = hydsnap_get16(hdr + 0x22);
+    dr->ss = hydsnap_get16(hdr + 0x24);      dr->flags = hydsnap_get16(hdr + 0x26);
+}
+
+/* Write a full snapshot (regs + the whole guest-addressable window) to
+ * path. NOTE: lowmem_size() is the raw memfd mapping length, which dosemu
+ * pads to hundreds of MB; only lowmem_guest_size() (lowmem + HMA) holds
+ * guest-visible state and must be captured. */
+static int host_snapshot_write_file(host_ctx_t *ctx, const char *path,
+                                    const dosdebug_regs_t *dr)
+{
+    size_t blob = lowmem_guest_size();
+    if (blob > lowmem_size(ctx->lm))
+        return -1; /* mapping smaller than the guest window: cannot capture */
+    uint8_t hdr[HYDSNAP_HDR_LEN] = {0};
+
+    memcpy(hdr, HYDSNAP_MAGIC, 8);
+    hydsnap_put32(hdr + 0x08, HYDSNAP_VERSION);
+    hydsnap_fill_regrange(hdr, dr);
+    hydsnap_put16(hdr + 0x28, ctx->mz_psp);
+    hydsnap_put16(hdr + 0x2A, ctx->code_load_offset);
+    hydsnap_put16(hdr + 0x2C, ctx->data_section_seg);
+    hydsnap_put32(hdr + 0x34, (uint32_t)blob);
+
+    /* Copy the guest window once and compute the CRC over the exact header
+     * and private memory image that will be written. The live mapping keeps
+     * mutating (BDA ticks et al.), so no second pass over it is allowed. */
+    uint8_t *snap = malloc(blob);
+    if (!snap)
+        return -1;
+    memcpy(snap, lowmem_base(ctx->lm), blob);
+    hydsnap_put32(hdr + 0x38, hydsnap_crc32_snapshot(hdr, snap, blob));
+
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        free(snap);
+        return -1;
+    }
+    int ok = fwrite(hdr, 1, sizeof(hdr), f) == sizeof(hdr) &&
+             fwrite(snap, 1, blob, f) == blob;
+    if (fclose(f) != 0)
+        ok = 0;
+    free(snap);
+    return ok ? 0 : -1;
+}
+
+/* Read + validate a snapshot file. Allocates the blob; caller frees. */
+static int host_snapshot_read_file(const char *path, uint8_t hdr[HYDSNAP_HDR_LEN],
+                                   uint8_t **blob_out, size_t *blob_size_out)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f)
+        return -1;
+    if (fread(hdr, 1, HYDSNAP_HDR_LEN, f) != HYDSNAP_HDR_LEN) {
+        fclose(f);
+        return -1;
+    }
+    if (memcmp(hdr, HYDSNAP_MAGIC, 8) != 0 ||
+        hydsnap_get32(hdr + 0x08) != HYDSNAP_VERSION) {
+        fclose(f);
+        return -1;
+    }
+    uint32_t blob = hydsnap_get32(hdr + 0x34);
+    if (blob == 0 || blob > 2u * 1024u * 1024u) {   /* sanity bound */
+        fclose(f);
+        return -1;
+    }
+    uint8_t *mem = malloc(blob);
+    if (!mem) {
+        fclose(f);
+        return -1;
+    }
+    int ok = fread(mem, 1, blob, f) == blob;
+    fclose(f);
+    if (ok && hydsnap_crc32_snapshot(hdr, mem, blob) ==
+                  hydsnap_get32(hdr + 0x38)) {
+        *blob_out = mem;
+        *blob_size_out = blob;
+        return 0;
+    }
+    free(mem);
+    return -1;
+}
+
+static host_snapshot_t *host_snapshot_find(host_ctx_t *ctx, const char *label,
+                                           int alloc)
+{
+    host_snapshot_t *free_slot = NULL;
+
+    for (size_t i = 0; i < HOST_MAX_SNAPSHOTS; i++) {
+        host_snapshot_t *s = &ctx->snapshots[i];
+        if (s->used && strcmp(s->label, label) == 0)
+            return s;
+        if (!s->used && !free_slot)
+            free_slot = s;
+    }
+
+    if (!alloc)
+        return NULL;
+
+    /* No existing slot: reuse the first (oldest) if none are free. */
+    if (!free_slot)
+        free_slot = &ctx->snapshots[0];
+
+    strncpy(free_slot->label, label, HOST_SNAPSHOT_LABEL_MAX - 1);
+    free_slot->label[HOST_SNAPSHOT_LABEL_MAX - 1] = '\0';
+    free_slot->used = 1;
+
+    return free_slot;
+}
+
 static void host_state_save(hydra_machine_ctx_t *_ctx, const char *label)
 {
     host_ctx_t *ctx = (host_ctx_t *)_ctx;
     dosdebug_regs_t dr;
-    if (dosdebug_read_regs(ctx->db, &dr) != 0 ||
-        host_write_snapshot(ctx, label, &dr) != 0) {
+    if (dosdebug_read_regs(ctx->db, &dr) != 0)
+        FAIL("dosemu host: failed to read CPU state for %s",
+             label ? label : "(null)");
+
+    /* CAPTURE mode (HYDRA core): persist a full-memory HYDSNAP snapshot to
+     * state_path (passed as label). NOTE: the xhost core then exit(0)s; on
+     * this external host the caller drives the shutdown. */
+    if (HYDRA_MODE->mode == HYDRA_MODE_CAPTURE) {
+        if (host_snapshot_write_file(ctx, label, &dr) != 0)
+            FAIL("dosemu host: failed to write HYDSNAP state '%s'", label);
+        return;
+    }
+
+    if (host_write_snapshot(ctx, label, &dr) != 0) {
         /* The hardware vtable callback is void and capture exits immediately
          * after it returns. Logging and returning would therefore turn a
          * failed checkpoint into exit(0). Fail hard instead. */
         FAIL("dosemu host: state_save failed for %s",
              label ? label : "(null)");
     }
+
+    host_snapshot_t *s = host_snapshot_find(ctx, label, 1);
+    if (s)
+        s->regs = dr;
 }
 
 static void host_state_restore(hydra_machine_ctx_t *_ctx, const char *label)
 {
-    host_ctx_t *ctx = (host_ctx_t *)_ctx;
     dosdebug_regs_t dr;
+
+    host_ctx_t *ctx = (host_ctx_t *)_ctx;
+    /* RESTORE mode (HYDRA core): load a HYDSNAP file. Memory FIRST, then the
+     * register state (full paced write with read-back verify; diff-writes
+     * are unsafe here because the live CPU state is unknown). Also adopt the
+     * snapshot's code/data offsets so image-relative hooks stay valid. */
+    if (HYDRA_MODE->mode == HYDRA_MODE_RESTORE) {
+        uint8_t hdr[HYDSNAP_HDR_LEN];
+        uint8_t *blob = NULL;
+        size_t blob_size = 0;
+        if (host_snapshot_read_file(label, hdr, &blob, &blob_size) != 0)
+            FAIL("dosemu host: failed to load HYDSNAP state '%s'", label);
+        if (blob_size != lowmem_guest_size())
+            FAIL("dosemu host: HYDSNAP blob size %zu != guest window %zu",
+                 blob_size, lowmem_guest_size());
+
+        memcpy(lowmem_base(ctx->lm), blob, blob_size);
+        free(blob);
+
+        hydsnap_read_regrange(hdr, &dr);
+        if (dosdebug_write_regs(ctx->db, &dr) != 0)
+            FAIL("dosemu host: failed to write restored registers");
+
+        uint16_t snap_psp = hydsnap_get16(hdr + 0x28);
+        ctx->mz_psp = snap_psp;
+        if (snap_psp && dr.ds != snap_psp)
+            fprintf(stderr, "dosemu host: WARNING: HYDSNAP psp=%04x but "
+                    "restored DS=%04x\n", snap_psp, dr.ds);
+
+        /* data_section_seg is part of the snapshot layout. Restore it before
+         * code_load_offset so host_set_code_load() recomputes the datasection
+         * base pointer using the captured value, and synchronize the core
+         * configuration at the same time. */
+        ctx->data_section_seg = hydsnap_get16(hdr + 0x2C);
+        HYDRA_CONF->data_section_seg = ctx->data_section_seg;
+        host_set_code_load(ctx, hydsnap_get16(hdr + 0x2A));
+        return;
+    }
+
     if (host_read_snapshot(ctx, label, &dr) != 0 ||
         host_set_regs(ctx, &dr) != 0) {
         /* A failed restore must not let the core switch back to NORMAL with
@@ -284,6 +563,12 @@ static void host_state_restore(hydra_machine_ctx_t *_ctx, const char *label)
         FAIL("dosemu host: state_restore failed for %s",
              label ? label : "(null)");
     }
+
+    host_snapshot_t *s = host_snapshot_find(ctx, label, 0);
+    if (!s)
+        return;
+
+    host_set_regs(ctx, &s->regs);
 }
 
 int host_get_regs(host_ctx_t *ctx, dosdebug_regs_t *regs)
@@ -321,6 +606,12 @@ bool host_raw_code_ready(const host_ctx_t *ctx)
            ctx->raw_code_size >= HOST_RAW_SLOT_SIZE;
 }
 
+int host_set_regs_diff(host_ctx_t *ctx, const dosdebug_regs_t *regs,
+                       const dosdebug_regs_t *base)
+{
+    return dosdebug_write_regs_diff(ctx->db, regs, base);
+}
+
 int host_set_bp(host_ctx_t *ctx, uint16_t seg, uint16_t off)
 {
     return dosdebug_set_bp(ctx->db, seg, off);
@@ -349,6 +640,18 @@ int host_clear_breakpoints(host_ctx_t *ctx)
     return 0;
 }
 
+void host_set_code_load(host_ctx_t *ctx, uint16_t seg)
+{
+    ctx->code_load_offset = seg;
+    HYDRA_CONF->code_load_offset = seg;
+    HYDRA_CONF->data_section_seg = ctx->data_section_seg;
+
+    /* Keep the datasection basepointer coherent with the host-owned layout. */
+    u16 dseg = (u16)(seg + ctx->data_section_seg);
+    hydra_datasection_baseptr_set(lowmem_hostaddr(ctx->lm,
+                                                 (uint32_t)dseg << 4));
+}
+
 pid_t host_pid(host_ctx_t *ctx)
 {
     return ctx->pid;
@@ -371,6 +674,29 @@ void host_disconnect(host_ctx_t *ctx)
     free(ctx);
 }
 
+/* ------------------------------------------------------------------ */
+/* Hydra user metadata (required by functions.c / callstack.c)         */
+/*                                                                    */
+/* Without a user library these are empty stubs: they exist so that    */
+/* api_impl.c's dlsym(RTLD_DEFAULT) binding of hydra_user_functions/   */
+/* hydra_user_callstack always succeeds on this platform. When the     */
+/* conf string carries lib=/path/user.so (see user_init), the real     */
+/* providers are resolved from that library BY HANDLE and pushed into  */
+/* the core via hydra_function_metadata_set()/                         */
+/* hydra_callstack_metadata_set(), which take precedence over the      */
+/* stubs cached at core init time.                                     */
+/*                                                                    */
+/* WHY BY-HANDLE RESOLUTION IS MANDATORY: dlsym(RTLD_DEFAULT, ...)     */
+/* searches the default lookup scope, where this host object's own     */
+/* stub symbols sit ahead of anything dlopened later — a user library  */
+/* exporting the same names would ALWAYS be shadowed.                  */
+/*                                                                    */
+/* RULE: the user .so must NOT export hydra_user_init. The host owns   */
+/* that symbol on this platform; api_impl binds THIS object's copy, so */
+/* a hydra_user_init inside the user .so would never run (and any      */
+/* one-time setup it attempted would silently not happen).             */
+/* ------------------------------------------------------------------ */
+
 const hydra_function_metadata_t *hydra_user_functions(void)
 {
     static const hydra_function_metadata_t md = { 0, NULL };
@@ -382,6 +708,61 @@ const hydra_callstack_metadata_t *hydra_user_callstack(void)
     static const hydra_callstack_metadata_t md = { 0, NULL };
     return &md;
 }
+
+typedef const hydra_function_metadata_t *(*user_functions_fn_t)(void);
+typedef const hydra_callstack_metadata_t *(*user_callstack_fn_t)(void);
+
+/* Load the user metadata library (conf key "lib=<path>") and inject its
+ * provider tables into the core. Both providers MUST be present: a library
+ * that loads but is missing either symbol is a hard failure, never a
+ * silent fallback to the empty stubs above.
+ *
+ * The dlopen handle is kept for the process lifetime (stored in ctx): the
+ * injected tables point into the loaded object, so dlclose() would leave
+ * the core holding dangling pointers. Leaking one handle at exit is the
+ * deliberate trade. */
+static void host_load_user_library(host_ctx_t *ctx, const char *path)
+{
+    ctx->user_lib = dlopen(path, RTLD_NOW | RTLD_GLOBAL);
+    if (!ctx->user_lib)
+        FAIL("dosemu host: failed to load user metadata library '%s': %s",
+             path, dlerror());
+
+    user_functions_fn_t ufunctions = NULL;
+    *(void **)&ufunctions = dlsym(ctx->user_lib, "hydra_user_functions");
+    if (!ufunctions)
+        FAIL("dosemu host: user library '%s' does not export "
+             "hydra_user_functions(): %s", path, dlerror());
+
+    user_callstack_fn_t ucallstack = NULL;
+    *(void **)&ucallstack = dlsym(ctx->user_lib, "hydra_user_callstack");
+    if (!ucallstack)
+        FAIL("dosemu host: user library '%s' does not export "
+             "hydra_user_callstack(): %s", path, dlerror());
+
+    const hydra_function_metadata_t *fmd = ufunctions();
+    if (!fmd)
+        FAIL("dosemu host: hydra_user_functions() from '%s' returned NULL",
+             path);
+
+    const hydra_callstack_metadata_t *cmd = ucallstack();
+    if (!cmd)
+        FAIL("dosemu host: hydra_user_callstack() from '%s' returned NULL",
+             path);
+
+    hydra_function_metadata_set(fmd);
+    hydra_callstack_metadata_set(cmd);
+}
+
+/* ------------------------------------------------------------------ */
+/* hydra_user_init: the entry point Hydra discovers via dlsym.         */
+/*                                                                    */
+/* Note: this codebase's signature is                                 */
+/*   void hydra_user_init(hydra_conf_t *conf,                         */
+/*                        hydra_machine_hardware_t *hw,               */
+/*                        hydra_machine_audio_t *audio)               */
+/* (api_impl.c:18) - not the (hw, audio, conf) order.                 */
+/* ------------------------------------------------------------------ */
 
 void hydra_user_init(hydra_conf_t *conf,
                      hydra_machine_hardware_t *hw,
@@ -400,6 +781,16 @@ void hydra_user_init(hydra_conf_t *conf,
      * supplied with host_reserve_raw_code() after the target is loaded. */
     conf->raw_code_offset = 0;
     conf->raw_code_size = 0;
+
+    /* Optional user metadata library ("lib=/path/user.so"). Loaded before
+     * the emulator connection so a broken library fails fast. See the
+     * metadata block above for by-handle resolution + the no-hydra_user_init
+     * rule. */
+    {
+        char lib_path[4096];
+        if (host_conf_string(confstr, "lib=", lib_path, sizeof(lib_path)))
+            host_load_user_library(ctx, lib_path);
+    }
 
     long pid = host_conf_pid(confstr);
     ctx->db = dosdebug_connect((pid_t)pid);

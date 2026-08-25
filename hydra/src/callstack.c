@@ -45,6 +45,17 @@ void hydra_callstack_init(void)
   c->md = user_fn();
 }
 
+// Inject a metadata provider at runtime (takes precedence over the
+// dlsym-cached one). Used by hosts that load user metadata dynamically
+// (e.g. the dosemu host loading a user library via dlopen).
+int hydra_callstack_metadata_set(const hydra_callstack_metadata_t *_md)
+{
+  if (!_md) FAIL("hydra_callstack_metadata_set(NULL)");
+  if (_md->n_confs && !_md->confs) FAIL("hydra_callstack_metadata_set: n_confs != 0 but confs is NULL");
+  c->md = _md;
+  return 0;
+}
+
 void hydra_callstack_trigger_enter(u16 seg, u16 off)
 {
   assert(c->call_event == CALL_EVENT_NONE);

@@ -20,6 +20,10 @@
 #define TESTPROG_COM_PATH "/tmp/opencode/testprog.com"
 #endif
 
+#ifndef TEST_USERLIB_PATH
+#define TEST_USERLIB_PATH ""
+#endif
+
 #define GOFLAG_OFF   0x102
 #define RESULT_OFF   0x103
 #define HOOKCNT_OFF  0x105
@@ -39,6 +43,7 @@ static const uint8_t helper_sig[]   = { 0xB8, 0x44, 0x44 };
 static const uint8_t raw_marker[]   = "HYDRA_RAW_SLOT!!"; /* 16 bytes + C NUL */
 
 static uint32_t g_hookcnt_phys;
+static uint32_t g_result_phys;
 static uint32_t g_res4_phys;
 static uint16_t g_call_rel_seg;
 static uint16_t g_helper_off;
@@ -67,7 +72,7 @@ static const char *reason_name(host_run_stop_reason_t r)
   return "?";
 }
 
-HYDRA_FUNC(h_test_hook)
+HYDRA_FUNC(H_myfunc)
 {
   CLI();
   STI();
@@ -164,11 +169,109 @@ static size_t find_sig(const uint8_t *file, size_t file_len,
   return (size_t)-1;
 }
 
+/* ------------------------------------------------------------------ */
+/* Item B companion: fake-machine probe for injected callstack confs    */
+/* ------------------------------------------------------------------ */
+
+/* ------------------------------------------------------------------ */
+
+#define IS_OVERLAY_ENTRY_F_myfunc 0
+
+/* mainloop-tail jmp used by the Item B callstack probe (hardened layout) */
+#define OFF_JMPLOOP_PROBE 0x013c
+
+static uint8_t g_probe_ram[0x10000];
+
+static uint8_t probe_mem_read8(hydra_machine_ctx_t *_ctx, uint32_t addr)
+{
+  (void)_ctx;
+  return g_probe_ram[addr & 0xffff];
+}
+
+static uint16_t probe_mem_read16(hydra_machine_ctx_t *_ctx, uint32_t addr)
+{
+  (void)_ctx;
+  addr &= 0xffff;
+  return (uint16_t)(g_probe_ram[addr] |
+                    ((uint16_t)g_probe_ram[(addr + 1) & 0xffff] << 8));
+}
+
+static void probe_mem_write8(hydra_machine_ctx_t *_ctx, uint32_t addr, uint8_t v)
+{ (void)_ctx; g_probe_ram[addr & 0xffff] = v; }
+
+static void probe_mem_write16(hydra_machine_ctx_t *_ctx, uint32_t addr, uint16_t v)
+{
+  (void)_ctx;
+  addr &= 0xffff;
+  g_probe_ram[addr] = (uint8_t)v;
+  g_probe_ram[(addr + 1) & 0xffff] = (uint8_t)(v >> 8);
+}
+
+static uint8_t probe_io_in8(hydra_machine_ctx_t *_ctx, uint16_t port)
+{ (void)_ctx; (void)port; return 0; }
+
+static uint16_t probe_io_in16(hydra_machine_ctx_t *_ctx, uint16_t port)
+{ (void)_ctx; (void)port; return 0; }
+
+static void probe_io_out8(hydra_machine_ctx_t *_ctx, uint16_t port, uint8_t v)
+{ (void)_ctx; (void)port; (void)v; }
+
+static void probe_io_out16(hydra_machine_ctx_t *_ctx, uint16_t port, uint16_t v)
+{ (void)_ctx; (void)port; (void)v; }
+
+static void probe_noop_ctx(hydra_machine_ctx_t *_ctx, const char *label)
+{ (void)_ctx; (void)label; }
+
+static void probe_update_registers(hydra_machine_ctx_t *_ctx,
+                                   hydra_machine_registers_t *regs)
+{ (void)_ctx; (void)regs; }
+
+static void metadata_probe(void)
+{
+  u16 css = CODE_START_SEG;
+
+  /* jmp short at the JUMPRET site (a non-call/non-ret opcode so the
+   * instruction classifier stays out of the way). */
+  g_probe_ram[((u32)css << 4 | OFF_JMPLOOP_PROBE) & 0xffff] = 0xEB;
+
+  hydra_machine_t pm = {0};
+  pm.hardware->mem_read8         = probe_mem_read8;
+  pm.hardware->mem_read16        = probe_mem_read16;
+  pm.hardware->mem_write8        = probe_mem_write8;
+  pm.hardware->mem_write16       = probe_mem_write16;
+  pm.hardware->io_in8            = probe_io_in8;
+  pm.hardware->io_in16           = probe_io_in16;
+  pm.hardware->io_out8           = probe_io_out8;
+  pm.hardware->io_out16          = probe_io_out16;
+  pm.hardware->state_save        = probe_noop_ctx;
+  pm.hardware->state_restore     = probe_noop_ctx;
+  pm.hardware->update_registers  = probe_update_registers;
+
+  /* 1. defer a CALL whose source is the guest entry (raw seg), then let
+   *    notify() push it at a neutral CS:IP. */
+  hydra_callstack_trigger_enter(css, 0x0100);
+  pm.registers->cs = css;
+  pm.registers->ip = 0x014a;
+  hydra_callstack_notify(&pm);
+
+  /* 2. "stop" at the injected JUMPRET conf -> deferred JMP_RET leave. */
+  memset(pm.registers, 0, sizeof(pm.registers));
+  pm.registers->cs = css;
+  pm.registers->ip = OFF_JMPLOOP_PROBE;
+  hydra_callstack_track(&pm, 0);
+
+  /* 3. notify executes the leave; the popped frame expects 0000:0100 but
+   *    we are leaving at 0000:013c -> warning emitted to stdout. */
+  hydra_callstack_notify(&pm);
+}
+
+
 int main(int argc, char **argv)
 {
   pid_t pid = 0;
   if (argc > 1) pid = (pid_t)strtol(argv[1], NULL, 0);
   const char *com_path = (argc > 2) ? argv[2] : TESTPROG_COM_PATH;
+  const char *lib_path = (argc > 3) ? argv[3] : TEST_USERLIB_PATH;
 
   printf("=== Hydra dosemu2 integration test ===\n");
 
@@ -179,9 +282,11 @@ int main(int argc, char **argv)
     return 2;
   }
 
-  char conf[128];
-  snprintf(conf, sizeof(conf), "dosemu|pid=%ld|code_load=0x80|data_seg=0x0",
-           (long)pid);
+  char conf[512];
+  snprintf(conf, sizeof(conf),
+           "dosemu|pid=%ld|code_load=0x80|data_seg=0x0"
+           "|lib=%s",
+           (long)pid, lib_path);
 
   hydra_machine_t m = {0};
   hydra_machine_audio_t audio = {0};
@@ -191,7 +296,55 @@ int main(int argc, char **argv)
   uint16_t com_seg = wait_for_com(ctx, file, file_len);
   CHECK(com_seg != 0, "guest program loaded (segment %04x)", com_seg);
   if (!com_seg) { host_disconnect(ctx); free(file); return 1; }
-  uint32_t com_phys = (uint32_t)com_seg << 4;
+uint32_t com_phys = (uint32_t)com_seg << 4;
+
+  /* Adopt the discovered segment as CODE_START_SEG so every address -
+   * including the injected metadata tables from the user library, which are
+   * 0-based image-relative - is interpreted against the segment the guest
+   * actually runs in. Hook registrations below therefore use relative
+   * segment 0. */
+  host_set_code_load(ctx, com_seg);
+
+  /* 2a. Phase 7 Item B: user library loaded via lib=? Then the injected
+   * function metadata must resolve names/addresses right now, before any
+   * hook registration relies on it. */
+  {
+    const char *nm = hydra_function_name(ADDR_MAKE(0, 0x013e));
+    CHECK(nm && strcmp(nm, "F_myfunc") == 0,
+          "injected metadata: hydra_function_name(myfunc) == F_myfunc (got %s)",
+          nm ? nm : "(null)");
+    CHECK(hydra_function_name(ADDR_MAKE(0, 0xffee)) == NULL,
+          "injected metadata: unknown address resolves to NULL");
+
+    addr_t md_addr;
+    CHECK(hydra_function_addr("F_func2", &md_addr) &&
+              addr_seg(md_addr) == 0 && addr_off(md_addr) == 0x0142,
+          "injected metadata: hydra_function_addr(F_func2) == 0000:0142");
+  }
+
+  /* 2b. fake-machine probe through the injected callstack confs */
+  {
+    /* capture hydra_callstack_dump()'s stdout into memory */
+    char *capbuf = NULL;
+    size_t caplen = 0;
+    FILE *cap = open_memstream(&capbuf, &caplen);
+    FILE *saved_stdout = stdout;
+    if (cap) {
+      stdout = cap;
+      metadata_probe();
+      fflush(cap);
+      stdout = saved_stdout;
+      fclose(cap);
+
+      CHECK(strstr(capbuf, "Unexpected return location") != NULL,
+            "callstack probe: injected JUMPRET conf drove an unexpected-"
+            "return leave");
+      printf("  callstack probe output:\n%s", capbuf);
+      free(capbuf);
+    } else {
+      CHECK(0, "callstack probe: could not open capture stream");
+    }
+  }
 
   size_t myfunc_pos   = find_sig(file, file_len, myfunc_sig, sizeof myfunc_sig);
   size_t func2_pos    = find_sig(file, file_len, func2_sig, sizeof func2_sig);
@@ -220,17 +373,30 @@ int main(int argc, char **argv)
         "registered 8 KiB guest-owned raw-code reservation");
   CHECK(host_raw_code_ready(ctx), "raw-code reservation ready");
 
-  uint16_t hook_rel_seg = (uint16_t)(com_seg - CODE_LOAD);
+  uint16_t hook_rel_seg = 0;   /* addresses are com_seg-relative (CODE_START_SEG adopted above) */
   uint16_t myfunc_off   = (uint16_t)(0x100 + myfunc_pos);
   uint16_t func2_off    = (uint16_t)(0x100 + func2_pos);
   uint16_t callthru_off = (uint16_t)(0x100 + callthru_pos);
 
-  HYDRA_REGISTER_ADDR(h_test_hook,  hook_rel_seg, myfunc_off, 0);
+  {
+    addr_t a;
+    CHECK(hydra_function_addr("F_myfunc", &a) && addr_off(a) == myfunc_off,
+          "metadata F_myfunc offset %04x matches signature scan", myfunc_off);
+    CHECK(hydra_function_addr("F_func2", &a) && addr_off(a) == func2_off,
+          "metadata F_func2 offset %04x matches signature scan", func2_off);
+    CHECK(hydra_function_addr("F_callthru", &a) && addr_off(a) == callthru_off,
+          "metadata F_callthru offset %04x matches signature scan", callthru_off);
+  }
+
+  HYDRA_REGISTER(myfunc);
   HYDRA_REGISTER_ADDR(h_test_hook2, hook_rel_seg, func2_off, 0);
   HYDRA_REGISTER_ADDR(h_callthru,   hook_rel_seg, callthru_off, 0);
-  CHECK(host_hook_breakpoint_count(ctx) == 3, "3 static hooks registered");
+  CHECK(host_hook_breakpoint_count(ctx) == 3,
+        "3 hooks registered (myfunc by NAME; breakpoint count = %d)",
+        host_hook_breakpoint_count(ctx));
 
   g_hookcnt_phys = com_phys + HOOKCNT_OFF;
+  g_result_phys = com_phys + RESULT_OFF;
   g_res4_phys = com_phys + RES4_OFF;
   g_call_rel_seg = hook_rel_seg;
   g_helper_off = (uint16_t)(0x100 + helper_pos);

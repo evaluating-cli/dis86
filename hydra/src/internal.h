@@ -27,6 +27,8 @@ struct hydra_mode {
   int mode;
   addr_t capture_addr;       // valid only when mode == CAPTURE
   const char *state_path;
+  int has_restore_entry;     // valid only when mode == RESTORE
+  addr_t restore_entry;      // code-relative entry addr (like capture_addr)
 };
 extern hydra_mode_t HYDRA_MODE[1];
 

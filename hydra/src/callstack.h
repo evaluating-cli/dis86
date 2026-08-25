@@ -21,3 +21,5 @@ struct hydra_callstack_metadata
   size_t                   n_confs;
   hydra_callstack_conf_t * confs;
 };
+
+int hydra_callstack_metadata_set(const hydra_callstack_metadata_t *md);

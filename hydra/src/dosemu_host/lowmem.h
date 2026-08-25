@@ -45,8 +45,13 @@ void lowmem_write8(lowmem_t *lm, uint32_t addr, uint8_t val);
 void lowmem_write16(lowmem_t *lm, uint32_t addr, uint16_t val);
 
 // Get the base pointer and size (for direct pointer arithmetic).
+// NOTE: lowmem_size() is the raw memfd mapping length; dosemu reserves far
+// more than guest memory there. The guest-addressable window (conventional
+// memory + HMA) is lowmem_guest_size() — use that for full-state captures,
+// CRCs and copies.
 uint8_t *lowmem_base(lowmem_t *lm);
 size_t lowmem_size(lowmem_t *lm);
+size_t lowmem_guest_size(void);
 
 // Check if the mapping is still valid (dosemu2 still alive).
 bool lowmem_is_valid(lowmem_t *lm);

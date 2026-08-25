@@ -35,6 +35,15 @@ int dosdebug_write_reg(dosdebug_t *db, const char *reg_name, uint16_t val);
 // Write all registers from a regs struct (issues multiple write_reg calls).
 int dosdebug_write_regs(dosdebug_t *db, const dosdebug_regs_t *regs);
 
+// Diff-write: write only the registers that differ from *base, which must
+// hold the live CPU state (the last parsed dump). FL is always written
+// (dosemu forces IF/IOPL/bit1, so flags can never be diffed away).
+// Verification is identical to dosdebug_write_regs: a full r0 read-back is
+// compared against ALL registers, so a stale base fails loudly instead of
+// corrupting silently.
+int dosdebug_write_regs_diff(dosdebug_t *db, const dosdebug_regs_t *regs,
+                             const dosdebug_regs_t *base);
+
 // Set a breakpoint at seg:off. Returns breakpoint index >= 0, or -1 on failure.
 int dosdebug_set_bp(dosdebug_t *db, uint16_t seg, uint16_t off);
 
@@ -55,6 +64,12 @@ void dosdebug_drain(dosdebug_t *db);
 
 // Stop execution. Returns immediately.
 int dosdebug_stop(dosdebug_t *db);
+
+// Arm dosemu2's 'bpload' load breakpoint: hijacks the next INT21 EXEC
+// (AH=4B00) into a load-don't-execute and stops the machine AT the loaded
+// program's relocated entry (DS=ES=PSP, GP regs zeroed, TF set).
+// Must be issued while stopped, before the EXEC runs. Returns 0 on success.
+int dosdebug_bpload(dosdebug_t *db);
 
 // Wait for the machine to stop (breakpoint/exception). Reads the stop
 // notification and parses registers. Returns 0 on success, -1 on timeout.

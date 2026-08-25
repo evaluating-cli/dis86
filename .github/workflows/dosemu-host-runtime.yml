@@ -17,7 +17,7 @@ jobs:
   runtime:
     name: Stock dosemu2 host integration
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 30
 
     steps:
       - uses: actions/checkout@v4
@@ -127,15 +127,15 @@ jobs:
           echo "tested commit: $(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
           echo "test_host: PASS" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Run function-hook driver integration
+      - name: Run Phase 7 acceptance matrix
         run: |
           set -euo pipefail
           export DOSDEBUG_STREAM_LOG=/tmp/opencode/dosdebug_driver_stream.log
           rm -f "$DOSDEBUG_STREAM_LOG"
-          timeout 300 bash hydra/src/dosemu_host/run_driver_test.sh \
-            "$GITHUB_WORKSPACE/hydra/build/src/dosemu_host/testprog.com" \
-            "$GITHUB_WORKSPACE/hydra/build/src/dosemu_host/test_driver"
-          echo "run_driver_test.sh: PASS" >> "$GITHUB_STEP_SUMMARY"
+          TESTPROG_FLAVOR=both timeout 600 \
+            bash hydra/src/dosemu_host/run_driver_test.sh
+          echo "Phase 7 matrix: exe x1 / com x2 / capture x1 / restore x2 PASS" \
+            >> "$GITHUB_STEP_SUMMARY"
 
       - name: Show dosemu log on failure
         if: failure()

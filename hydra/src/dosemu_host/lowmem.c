@@ -289,6 +289,11 @@ size_t lowmem_size(lowmem_t *lm)
     return lm ? lm->size : 0;
 }
 
+size_t lowmem_guest_size(void)
+{
+    return TOTAL_SIZE;
+}
+
 bool lowmem_is_valid(lowmem_t *lm)
 {
     if (!lm || !lm->connected)

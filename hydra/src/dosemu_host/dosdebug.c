@@ -712,7 +712,22 @@ int dosdebug_write_reg(dosdebug_t *db, const char *reg_name, uint16_t val)
     return dosdebug_write_reg_command(db, reg_name, val, false);
 }
 
-int dosdebug_write_regs(dosdebug_t *db, const dosdebug_regs_t *regs)
+/*
+ * Core register-push path behind dosdebug_write_regs / dosdebug_write_regs_diff.
+ *
+ * When base != NULL it must hold the LIVE CPU state at push time (the last
+ * parsed dump); registers whose requested value equals base are SKIPPED
+ * (diff-write). Skipping is safe because every push ends with a verified r0
+ * read-back of ALL 13 registers + masked flags: a wrong base can only turn a
+ * needed write into a verify mismatch (loud failure), never into silent
+ * corruption.
+ *
+ * FL is ALWAYS written even in diff mode: dosemu forces IF/IOPL/bit1 on FL,
+ * so a live dump never matches an arbitrary request bit-for-bit anyway, and
+ * the flags write must not depend on base.
+ */
+static int write_regs_impl(dosdebug_t *db, const dosdebug_regs_t *regs,
+                           const dosdebug_regs_t *base)
 {
     if (!db || !regs)
         return -1;
@@ -722,14 +737,27 @@ int dosdebug_write_regs(dosdebug_t *db, const dosdebug_regs_t *regs)
      * handles reliably during hook-heavy traces: back-to-back bursts of
      * set-register commands get some commands silently dropped (observed
      * via raw stream logs), and the CPU occasionally kept executing while
-     * the debugger believed it stopped. The architectural read-back below
-     * catches any residual failure deterministically. */
+     * the debugger believed it stopped. The r0 read-back verify below
+     * catches any residual failure deterministically.
+     *
+     * Diff-writes (base != NULL) only remove some writes from this paced
+     * sequence; the remaining ones keep the same per-register cadence. */
     static const char *names[13] = { "AX", "BX", "CX", "DX", "SI", "DI",
                                      "BP", "SP", "IP", "CS", "DS", "ES", "SS" };
     uint16_t vals[13] = { regs->ax, regs->bx, regs->cx, regs->dx,
                           regs->si, regs->di, regs->bp, regs->sp,
                           regs->ip, regs->cs, regs->ds, regs->es, regs->ss };
+    uint16_t base_vals[13] = {0};
+    if (base) {
+        const uint16_t bv[13] = { base->ax, base->bx, base->cx, base->dx,
+                                  base->si, base->di, base->bp, base->sp,
+                                  base->ip, base->cs, base->ds, base->es,
+                                  base->ss };
+        memcpy(base_vals, bv, sizeof(base_vals));
+    }
     for (int i = 0; i < 13; i++) {
+        if (base && vals[i] == base_vals[i])
+            continue; /* unchanged relative to live CPU: no write needed */
         if (dosdebug_write_reg(db, names[i], vals[i]) != 0)
             return -1;
     }
@@ -767,6 +795,20 @@ int dosdebug_write_regs(dosdebug_t *db, const dosdebug_regs_t *regs)
         return -1;
     }
     return 0;
+}
+
+static int write_regs_impl(dosdebug_t *db, const dosdebug_regs_t *regs,
+                           const dosdebug_regs_t *base);
+
+int dosdebug_write_regs(dosdebug_t *db, const dosdebug_regs_t *regs)
+{
+    return write_regs_impl(db, regs, NULL);
+}
+
+int dosdebug_write_regs_diff(dosdebug_t *db, const dosdebug_regs_t *regs,
+                             const dosdebug_regs_t *base)
+{
+    return write_regs_impl(db, regs, base);
 }
 
 int dosdebug_set_bp(dosdebug_t *db, uint16_t seg, uint16_t off)
@@ -884,6 +926,26 @@ int dosdebug_stop(dosdebug_t *db)
     if (!db || !db->connected)
         return -1;
     if (send_cmd(db, "stop\n") != 0)
+        return -1;
+    if (read_until_quiet(db, 800) != 0)
+        return -1;
+    db->bpos = db->blen = 0;
+    buf_nul_terminate(db);
+    return 0;
+}
+
+/*
+ * Arm dosemu2's bpload (mhp_bpload, mhpdbgc.c): revector INT21 so the next
+ * EXEC AH=4B00 is turned into AH=4B01 and the machine stops at the loaded
+ * program's relocated entry. Prints nothing on success; a failed arm
+ * ("need to be in 'stopped' state...") is caught later by the load phase
+ * timing out. Must be issued while the machine is stopped.
+ */
+int dosdebug_bpload(dosdebug_t *db)
+{
+    if (!db || !db->connected)
+        return -1;
+    if (send_cmd(db, "bpload\n") != 0)
         return -1;
     if (read_until_quiet(db, 800) != 0)
         return -1;

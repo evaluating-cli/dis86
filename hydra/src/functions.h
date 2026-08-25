@@ -15,6 +15,7 @@ struct hydra_function_metadata
 };
 
 void                         hydra_function_metadata_init(void);
+int                          hydra_function_metadata_set(const hydra_function_metadata_t *md);
 const hydra_function_def_t * hydra_function_find(const char *name);
 const char *                 hydra_function_name(addr_t s);
 bool                         hydra_function_addr(const char *name, addr_t *_out);
