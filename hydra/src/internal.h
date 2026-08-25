@@ -50,6 +50,7 @@ struct hydra_hook
 
 void hydra_hook_register(hydra_hook_t entry);
 hydra_hook_t * hydra_hook_find(addr_t addr);
+addr_t hydra_hook_entry_addr(void);
 bool hydra_hook_entry(addr_t addr);
 void hydra_hook_foreach(void (*fn)(const hydra_hook_t *hook, void *user), void *user);
 
