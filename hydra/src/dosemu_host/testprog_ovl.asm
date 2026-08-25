@@ -16,12 +16,14 @@
 ;                 core takes over, so native page-in vs decompiled path is
 ;                 distinguishable in guest-visible results.
 ;
-; Mainloop: call hooked_fn; inc ovlcnt; call FAR cs:[stubptr] (4-byte frame);
-; store AX into an 8-word result ring indexed by ovlcnt; repeat.
+; The regular hook runs once before the overlay loop. There is deliberately
+; NO regular-hook stop and NO self-write of STUB between overlay calls: the
+; host must observe page-in itself and must not rely on a guest store to flush
+; simx86 translations before its debugger breakpoint can work.
 ;
 ; Memory map note (linear): image lives at com_seg<<4 (well below 64K),
-; raw-code region at 0x1C000 (driver conf raw_code=0x1c00), overlay body at
-; OVSEG<<4 = 0x30000. The three regions never overlap.
+; raw-code region at 0xF0000, overlay body at OVSEG<<4 = 0x30000. The three
+; regions never overlap.
 ;
 ; Layout (org 100h; offsets mirrored in test_driver_ovl.c):
 ;   0x100  start:    jmp short waitloop
@@ -30,7 +32,6 @@
 ;   0x105  ovlcnt    dw  0        <- overlay-call counter
 ;   0x107  ovlres    dw  0 x8     <- AX after each far call (result ring)
 ;   0x117  stubptr   dw  STUB, 0  <- far pointer; seg filled with cs at init
-;   0x11B  waitloop / mainloop / functions / stub / pager / body
 ;
 ; The loop uses conditional/relative branches only (never a direct self-jump),
 ; so dosemu2's simx86 "forever loop" exit (F_SLFJ, codegen.c) never triggers.
@@ -38,9 +39,9 @@
 BITS 16
         org 100h
 
-OVSEG    equ 0x3000              ; overlay segment (linear 0x30000)
-BODY_OFF equ 0                   ; body offset inside the overlay segment
-BODY_LEN equ 8                   ; bytes copied by the pager
+OVSEG    equ 0x3000
+BODY_OFF equ 0
+BODY_LEN equ 8
 
 start:
         jmp short waitloop
@@ -56,39 +57,37 @@ waitloop:
         test al, al
         jz waitloop
 
-        ; Install the INT 3F handler (fake VROOMM pager). Vector for INT 3F
-        ; lives at 0000:003F*4 = 0000:00FC. Interrupts are still enabled at
-        ; this point; that is fine (two-word IVT store).
+        ; Install the INT 3F handler (fake VROOMM pager).
         xor ax, ax
         mov ds, ax
         mov word [0x00FC], PAGER
         mov ax, cs
         mov [0x00FE], ax
         mov ax, cs
-        mov ds, ax               ; restore DS = CS (.COM convention)
-        mov [stubptr+2], ax      ; far pointer segment := cs
+        mov ds, ax
+        mov [stubptr+2], ax
+
+        ; One ordinary hook proves static hooks still coexist with the overlay
+        ; machinery, but it is intentionally outside the repeated overlay loop.
+        call hooked_fn
+        mov [hookres], ax
 
 mainloop:
-        call hooked_fn           ; near call, hooked by Hydra (RETURN_NEAR)
-        mov [hookres], ax
         inc word [ovlcnt]
         mov bx, [ovlcnt]
-        dec bx                   ; ring slot = (ovlcnt-1) & 7
+        dec bx
         and bx, 7
         shl bx, 1
-        mov ax, [STUB]           ; read-modify-write the stub's first word:
-        mov [STUB], ax           ; drops simx86 translations for it, so a
-        call far [stubptr]       ; debugger-planted CC is ALWAYS seen (and
-        mov [ovlres+bx], ax      ; always traps). Guest stores are the only
-        jmp mainloop             ; writes whose cache effects are visible.
+        call far [stubptr]
+        mov [ovlres+bx], ax
+        jmp mainloop
 
 hooked_fn:
         mov ax, 0x1111
         ret
 
 ; VROOMM-style page-in stub. Initially "int 3F"; the pager rewrites it in
-; place to "jmp far OVSEG:BODY_OFF" (0xEA off_off seg_seg). Keep the trailing
-; NOPs: they make the stub byte pattern unique for the host signature scan.
+; place to "jmp far OVSEG:BODY_OFF" (0xEA off_off seg_seg).
 STUB:
         db 0xCD, 0x3F
         dw BODY_OFF
@@ -111,8 +110,8 @@ PAGER:
         push es
         push ds
         mov bp, sp
-        mov bx, [bp+16]          ; IP after the int == stub_base + 2
-        sub bx, 2                ; bx = stub offset within cs
+        mov bx, [bp+16]
+        sub bx, 2
 
         ; copy the body: cs:OVLBODY -> OVSEG:BODY_OFF
         mov di, OVSEG
@@ -126,11 +125,11 @@ PAGER:
         rep movsb
 
         ; patch the stub in place: EA <off> <seg>
-        mov word [bx], 0x00EA        ; opcode + low byte of dest offset
-        mov word [bx+1], BODY_OFF    ; dest offset word
-        mov word [bx+3], OVSEG       ; dest segment word
+        mov word [bx], 0x00EA
+        mov word [bx+1], BODY_OFF
+        mov word [bx+3], OVSEG
 
-        mov [bp+16], bx         ; IRET lands ON the patched stub (executes EA)
+        mov [bp+16], bx
         pop ds
         pop es
         pop bp
