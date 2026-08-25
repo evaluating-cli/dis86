@@ -138,6 +138,13 @@ static uint16_t wait_for_com(host_ctx_t *ctx, const uint8_t *file, size_t file_l
   return 0;
 }
 
+static int release_go_flag(host_ctx_t *ctx, void *user)
+{
+  uint32_t goflag_phys = *(const uint32_t *)user;
+  lowmem_write8(ctx->lm, goflag_phys, 1);
+  return 0;
+}
+
 static int stop_when_hooked(host_ctx_t *ctx, const dosdebug_regs_t *regs,
                             const host_run_stats_t *stats, void *user)
 {
@@ -229,12 +236,13 @@ int main(int argc, char **argv)
   g_helper_off = (uint16_t)(0x100 + helper_pos);
   g_helper2_off = (uint16_t)(0x100 + helper2_pos);
 
-  lowmem_write8(ctx->lm, com_phys + GOFLAG_OFF, 1);
-
   host_run_stats_t stats;
   host_run_options_t opts = {0};
   size_t target = 5;
+  uint32_t goflag_phys = com_phys + GOFLAG_OFF;
   opts.timeout_ms = 3000;
+  opts.before_go_fn = release_go_flag;
+  opts.before_go_user = &goflag_phys;
   opts.stop_fn = stop_when_hooked;
   opts.stop_user = &target;
   opts.verbose = 1;
