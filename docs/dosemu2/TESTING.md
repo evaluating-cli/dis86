@@ -29,11 +29,13 @@ emu86 is validated against real 80C286 hardware captures, and the dosemu2
 differential corpus is no longer a validation gate.
 
 `just check` also runs a hermetic checked-in micro-corpus of real SingleStepTests
-80286 hardware captures through the emu86 SST harness (V1 conservative family:
-~1.01M hardware executions, 81.6% PASS; 11 classified emu86-bug clusters, see
-`docs/emu86/sst.md`). This is the *hardware*-anchoring validation axis (emu86 vs
-a real Harris 80C286); the dosemu2 simx86 transport is kept only as reference for
-Hydra hosting (Option D), not as a validation axis.
+80286 hardware captures through the emu86 SST harness. The authoritative hardened
+full-corpus run executed 1,064,157 tests across all 268 V1 forms with 1,050,652
+PASS, 0 FAIL, 0 DECODE_ERR, and 0 PANIC; see `docs/emu86/sst.md` for the complete
+aggregate, filtering/revocation counts, and pinned runner/corpus SHAs. This is the
+*hardware*-anchoring validation axis (emu86 vs a real Harris 80C286); the dosemu2
+simx86 transport is kept only as reference for Hydra hosting (Option D), not as a
+validation axis.
 
 The optional SDL frontend remains separate:
 
@@ -62,11 +64,11 @@ These proved that the hook, transport, live low-memory alias, basic adapter path
 
 ## Expanded pinned-runtime corpus still required
 
-**SUPERSEDED:** this differential corpus is no longer a validation gate. SST validates REP and all other instruction forms against real 80C286 hardware captures (`docs/emu86/sst.md`); the dosemu2 differential corpus below is retained as frozen transport evidence only, relevant for the Hydra-on-dosemu2 hosting work (Track 4 Option D).
+**SUPERSEDED:** this differential corpus is no longer a validation gate. SST validates REP and the other in-scope V1 instruction forms against real 80C286 hardware captures (`docs/emu86/sst.md`); the dosemu2 differential corpus below is retained as frozen transport evidence only, relevant for the Hydra-on-dosemu2 hosting work (Track 4 Option D).
 
 Do **not** mark the following integration-tested until checked-in fixtures exercise them against the pinned runtime:
 
-- REP MOVS/STOS/CMPS/SCAS differential alignment. The matrix was captured host-side on emu86, but the differential stepping models differ: emu86 completes a REP string op inside one `step()` (whole-REP-per-step) while dosemu2 publishes one SAME_PC node per REP iteration. Reconciling these (classification and possibly an expected-boundary-mapping convention) is required before REP fixtures join the differential corpus;
+- REP MOVS/STOS/CMPS/SCAS differential alignment. The matrix was captured host-side on emu86, but the differential stepping models differ: emu86 completes a REP string op inside one `step()` (whole-REP-per-step) while dosemu2 publishes one SAME_PC node per REP iteration. Reconciling these (classification and possibly an expected-boundary-mapping convention) would still be required to establish differential equivalence; SST establishes emu86's REP behavior against hardware, not emu86/dosemu2 boundary equivalence. This differential mismatch is no longer a validation gate;
 - differential (pinned-runtime) coverage of the register/segment mutation corpus. It was host-side model-tested on emu86; the differential variants — particularly segment-override memory writes and PUSH/POP stack effects inside a compared window — remain pending;
 - interrupt-shadow behavior for STI, MOV SS, and POP SS, including shadow + REP composition;
 - prefixed host-service encodings, application-installed handler lockstep (including outside the target MCB), and broader BIOS coverage;
