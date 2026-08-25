@@ -1,3 +1,6 @@
+#pragma once
+
+#define HYDRA_OVERLAY_SEGMENT_COUNT 64u
 
 void hydra_overlay_segment_set(u16 overlay_num, u16 segment);
 void hydra_overlay_segment_clear(u16 overlay_num);
