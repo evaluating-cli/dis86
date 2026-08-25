@@ -9,13 +9,18 @@ void hydra_hook_register(hydra_hook_t ent)
   hooks[num_hooks++] = ent;
 }
 
-bool hydra_hook_entry(addr_t addr)
+addr_t hydra_hook_entry_addr(void)
 {
   // FIXME: ADD TO THE USER CONFIG
   // navigator
   u16 main_seg = 0x02e0 + CODE_START_SEG;
   u16 main_off = 0x000f;
-  return addr_equal(addr, ADDR_MAKE(main_seg, main_off));
+  return ADDR_MAKE(main_seg, main_off);
+}
+
+bool hydra_hook_entry(addr_t addr)
+{
+  return addr_equal(addr, hydra_hook_entry_addr());
 }
 
 hydra_hook_t * hydra_hook_find(addr_t addr)
