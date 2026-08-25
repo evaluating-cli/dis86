@@ -2,7 +2,8 @@
 set -euo pipefail
 
 SST_COMMIT=37c73caf53dcd22d3dd369ff09305d13d117a4fe
-RAW_BASE="https://raw.githubusercontent.com/SingleStepTests/80286/${SST_COMMIT}/v1_real_mode"
+RAW_ROOT="https://raw.githubusercontent.com/SingleStepTests/80286/${SST_COMMIT}"
+RAW_BASE="${RAW_ROOT}/v1_real_mode"
 
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 repo_root=$(CDPATH= cd -- "$script_dir/.." && pwd)
@@ -55,6 +56,20 @@ fetch_one() {
   echo "fetched: $name.MOO ($(stat -c%s "$out") bytes, sha256 ok)"
 }
 
+fetch_auxiliary() {
+  # These files live at the pinned repository root, not under v1_real_mode.
+  # The commit pin makes their contents immutable and keeps the runner's
+  # revocation input tied to exactly the same hardware corpus revision.
+  local name tmp out
+  for name in revocation_list.txt CHANGELOG.md; do
+    out="$target_dir/$name"
+    tmp=$(mktemp)
+    curl -fsSL "${RAW_ROOT}/${name}" -o "$tmp"
+    mv "$tmp" "$out"
+    echo "fetched: $name ($(stat -c%s "$out") bytes, pinned commit)"
+  done
+}
+
 if [[ $# -eq 0 ]]; then
   while IFS= read -r line; do
     line=${line%%#*}
@@ -81,3 +96,5 @@ else
     fetch_one "$name" "$want"
   done
 fi
+
+fetch_auxiliary
