@@ -19,10 +19,12 @@ COMMANDS:
                           --stride K   every K-th test (default 1 = all)
                           --all        also run prefix-prefixed tests (default:
                                        conservative filter skips them)
-                          --check-writes  snapshot memory and report writes not
-                                       declared in final.ram (slower)
-                          --umask 0xXXXX   override the per-form FLAGS umask
-                                       (default: policy umask, else 0x0FD7)
+                          --check-writes  enable tracked undeclared-write checking
+                                       (default: on; retained for explicitness)
+                          --no-check-writes  disable undeclared-write checking
+                          --umask 0xXXXX   exact FLAGS mask override; disables the
+                                       count-sensitive shift/rotate refinement
+                                       (default: policy mask + count refinement)
                           --revocations <path>  SHA1 revocation list (default:
                                        <file-dir>/revocation_list.txt)
   audit [--probe]       Print the classified capability inventory of all
@@ -129,7 +131,7 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
   let mut sample: Option<usize> = None;
   let mut stride: Option<usize> = None;
   let mut all = false;
-  let mut check_writes = false;
+  let mut check_writes = true;
   let mut cli_umask: Option<u16> = None;
   let mut revocations: Option<String> = None;
 
@@ -159,6 +161,7 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
       }
       "--all" => all = true,
       "--check-writes" => check_writes = true,
+      "--no-check-writes" => check_writes = false,
       f => files.push(f),
     }
     i += 1;
@@ -194,7 +197,11 @@ fn cmd_run(args: &[String]) -> Result<(), String> {
     let effective_umask = cli_umask
       .or_else(|| policy.and_then(|p| p.flags_umask))
       .unwrap_or(DEFAULT_FLAGS_UMASK);
-    let opts = RunOpts { flags_umask: effective_umask, check_extra_writes: check_writes };
+    let opts = RunOpts {
+      flags_umask: effective_umask,
+      check_extra_writes: check_writes,
+      count_sensitive_flags: cli_umask.is_none(),
+    };
 
     let summary = run_file(file.tests(), &opts, stride_eff, !all, Some(&skip_hashes), |_, _| ());
 
