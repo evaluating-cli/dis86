@@ -1,6 +1,6 @@
 # Phase 1 specification: dosemu2 validator hook and lockstep transport
 
-> **Note (2026-08-17):** SST (SingleStepTests hardware captures) is the validation authority for emu86; the dosemu2 differential validator is no longer the validation method. This spec describes the dosemu2 validator hook and lockstep transport and is now the frozen reference for the transport/ABI that Track 4 Option D (Hydra hosting plugin) research builds on. Section 9 (Required expanded corpus) is SUPERSEDED — SST validates all forms against hardware.
+> **Note (2026-08-17):** SST (SingleStepTests hardware captures) is the validation authority for emu86; the dosemu2 differential validator is no longer the validation method. This spec describes the dosemu2 validator hook and lockstep transport and is now the frozen reference for the transport/ABI that Track 4 Option D (Hydra hosting plugin) research builds on. Section 9 (Required expanded corpus) is SUPERSEDED — SST validates the in-scope V1 forms against hardware.
 
 **Scope:** 16-bit real-mode `simx86` (the transport); the `emu86_validator` differential binary is archived  
 **Pinned dosemu2:** `604ce0cdd1a71f657e2a2df623d216d5ab289313`  
