@@ -761,3 +761,149 @@ fn sbb16_zero_minus_one_no_borrow_in() {
   // 0x0000 - 0x0001 - 0 = 0xFFFF: CF=1, SF=1, low byte 0xFF = even parity, AF=1
   check_sbb16!(0x0000, 0x0001, cf_in=0, cf=1, zf=0, sf=1, of=0, pf=1, af=1);
 }
+
+macro_rules! check_neg8 {
+  ($lhs:expr, cf=$cf:expr, zf=$zf:expr, sf=$sf:expr, of=$of:expr, pf=$pf:expr, af=$af:expr) => {{
+    let (result, f) = alu::unary(alu::UnaryOp::Neg, Value::U8($lhs), Flags(0));
+    assert_eq!(result, Value::U8((0u16).wrapping_sub($lhs as u16) as u8), "result mismatch");
+    assert_eq!(f.get(FLAG_CF), $cf != 0, "CF mismatch");
+    assert_eq!(f.get(FLAG_ZF), $zf != 0, "ZF mismatch");
+    assert_eq!(f.get(FLAG_SF), $sf != 0, "SF mismatch");
+    assert_eq!(f.get(FLAG_OF), $of != 0, "OF mismatch");
+    assert_eq!(f.get(FLAG_PF), $pf != 0, "PF mismatch");
+    assert_eq!(f.get(FLAG_AF), $af != 0, "AF mismatch");
+  }};
+}
+
+macro_rules! check_neg16 {
+  ($lhs:expr, cf=$cf:expr, zf=$zf:expr, sf=$sf:expr, of=$of:expr, pf=$pf:expr, af=$af:expr) => {{
+    let (result, f) = alu::unary(alu::UnaryOp::Neg, Value::U16($lhs), Flags(0));
+    assert_eq!(result, Value::U16((0u16).wrapping_sub($lhs)), "result mismatch");
+    assert_eq!(f.get(FLAG_CF), $cf != 0, "CF mismatch");
+    assert_eq!(f.get(FLAG_ZF), $zf != 0, "ZF mismatch");
+    assert_eq!(f.get(FLAG_SF), $sf != 0, "SF mismatch");
+    assert_eq!(f.get(FLAG_OF), $of != 0, "OF mismatch");
+    assert_eq!(f.get(FLAG_PF), $pf != 0, "PF mismatch");
+    assert_eq!(f.get(FLAG_AF), $af != 0, "AF mismatch");
+  }};
+}
+
+// --- neg8 ---
+
+#[test]
+fn neg8_zero() {
+  // -0 = 0: ZF set, CF clear (0 - 0, no borrow)
+  check_neg8!(0x00, cf=0, zf=1, sf=0, of=0, pf=1, af=0);
+}
+
+#[test]
+fn neg8_positive() {
+  // -1 = 0xFF: CF set (borrow), SF set, even parity
+  check_neg8!(0x01, cf=1, zf=0, sf=1, of=0, pf=1, af=1);
+}
+
+#[test]
+fn neg8_min_i8() {
+  // -(-128) = -128 (wraps): OF set, CF set, result 0x80
+  check_neg8!(0x80, cf=1, zf=0, sf=1, of=1, pf=0, af=0);
+}
+
+#[test]
+fn neg8_max_i8() {
+  // -(127) = -127 = 0x81: CF set, SF set, 0x81 = 2 ones = even parity
+  check_neg8!(0x7F, cf=1, zf=0, sf=1, of=0, pf=1, af=1);
+}
+
+// --- neg16 ---
+
+#[test]
+fn neg16_zero() {
+  check_neg16!(0x0000, cf=0, zf=1, sf=0, of=0, pf=1, af=0);
+}
+
+#[test]
+fn neg16_positive() {
+  // -1 = 0xFFFF: CF set, SF set
+  check_neg16!(0x0001, cf=1, zf=0, sf=1, of=0, pf=1, af=1);
+}
+
+#[test]
+fn neg16_min_i16() {
+  // -(i16::MIN) wraps to i16::MIN: OF set (0 - MIN overflows), CF set, result 0x8000
+  check_neg16!(0x8000, cf=1, zf=0, sf=1, of=1, pf=1, af=0);
+}
+
+#[test]
+fn neg16_max_i16() {
+  // -(32767) = -32767 = 0x8001: no OF, CF set, SF set, low byte 0x01 = odd parity
+  check_neg16!(0x7FFF, cf=1, zf=0, sf=1, of=0, pf=0, af=1);
+}
+
+#[test]
+fn neg16_positive_parity() {
+  // -2 = 0xFFFE: low byte 0xFE = 7 ones = odd parity, AF=1 (low nibble 0 - 2 borrows)
+  check_neg16!(0x0002, cf=1, zf=0, sf=1, of=0, pf=0, af=1);
+}
+
+macro_rules! check_imul16_cf_of {
+  ($lhs:expr, $rhs:expr, cf=$cf:expr, of=$of:expr) => {
+    let (result, f) = alu::multiply(alu::MultiplyOp::Signed, Value::U16($lhs), Value::U16($rhs), Flags(0));
+    let _ = result;
+    assert_eq!(f.get(FLAG_CF), $cf != 0, "CF mismatch");
+    assert_eq!(f.get(FLAG_OF), $of != 0, "OF mismatch");
+  };
+}
+
+macro_rules! check_imul8_cf_of {
+  ($lhs:expr, $rhs:expr, cf=$cf:expr, of=$of:expr) => {
+    let (result, f) = alu::multiply(alu::MultiplyOp::Signed, Value::U8($lhs), Value::U8($rhs), Flags(0));
+    let _ = result;
+    assert_eq!(f.get(FLAG_CF), $cf != 0, "CF mismatch");
+    assert_eq!(f.get(FLAG_OF), $of != 0, "OF mismatch");
+  };
+}
+
+// SST-D-004: IMUL CF/OF is set only when the product does not fit the
+// destination half (AX for r8, DX:AX for r16) — i.e. when the result is not
+// a sign-extension of its low half. Pinned F7.5 sample:
+// `imul word [ds:bx-44FAh]`, AX=0x01DB, operand=0xFFFF (-1) -> 0xFFFFFE25,
+// which fits in a signed word (0xFE25 = -475): hardware CF=OF=0. The old
+// `(result & value_mask) != result` check wrongly reported overflow because
+// the high word 0xFFFF is a valid sign-extension.
+#[test]
+fn imul16_fits_reports_no_overflow() {
+  check_imul16_cf_of!(0x01DB, 0xFFFF, cf=0, of=0);
+}
+
+#[test]
+fn imul16_positive_fits() {
+  // 100 * 100 = 10000 = 0x2710, fits: CF=OF=0.
+  check_imul16_cf_of!(0x0064, 0x0064, cf=0, of=0);
+}
+
+#[test]
+fn imul16_overflow_sets_cf_of() {
+  // 0x8000 * 0x8000 = 0x40000000, high word 0x4000 is not a sign-extension of
+  // the low word 0x0000: overflow.
+  check_imul16_cf_of!(0x8000, 0x8000, cf=1, of=1);
+}
+
+#[test]
+fn imul16_negative_overflow_sets_cf_of() {
+  // 0x8000 * 0x0002 = -32768 * 2 = -65536 = 0xFFFF0000: high word 0xFFFF, low
+  // word 0x0000 (sign of 0x0000 is 0, not 0xFFFF): overflow.
+  check_imul16_cf_of!(0x8000, 0x0002, cf=1, of=1);
+}
+
+#[test]
+fn imul8_fits_reports_no_overflow() {
+  // -1 * -1 = 1, fits in a byte: CF=OF=0.
+  check_imul8_cf_of!(0xFF, 0xFF, cf=0, of=0);
+}
+
+#[test]
+fn imul8_overflow_sets_cf_of() {
+  // 0x80 * 0x80 = -128 * -128 = 16384 = 0x4000, high byte 0x40 is not a
+  // sign-extension of the low byte 0x00: overflow.
+  check_imul8_cf_of!(0x80, 0x80, cf=1, of=1);
+}

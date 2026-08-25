@@ -28,6 +28,8 @@ Historical patch 0010 implemented deferred acknowledgement for standalone nonter
 
 **Not integration-tested:** prefixed service calls; application-installed handlers outside the target MCB; broader BIOS coverage; REP; interrupt shadow and shadow composition; child/helper exclusion; helper/lifecycle transitions; broad state/control redirection; and the full per-boundary differential corpus.
 
+On a separate axis, emu86's instruction behavior is *hardware*-anchored against the SingleStepTests 80286 captures via the SST harness (`docs/emu86/sst.md`); that axis is unrelated to — and does not speak to — twin equivalence with dosemu2 simx86.
+
 “Implemented,” “host-only tested,” and “pinned-runtime tested” are distinct claims. Focused runtime proofs must not be reported as completion of the expanded corpus. Correctness smoke tests also establish no performance claim.
 
 ## Document map

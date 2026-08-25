@@ -42,3 +42,75 @@ impl Machine {
     Ok(())
   }
 }
+
+#[cfg(test)]
+mod test {
+  use super::*;
+
+  fn mem_write_slice(m: &mut Machine, addr: SegOff, data: &[u8]) {
+    for i in 0..data.len() {
+      m.mem.write_u8(addr.add_offset(i as u16), data[i]);
+    }
+  }
+
+  /// SST-D-013: a segment-override prefix on MOVSB must override only the
+  /// SOURCE segment (DS:SI); the DESTINATION is always ES:DI. Before the fix
+  /// the decoder applied the override to the dest too, writing to DS:DI.
+  #[test]
+  fn ds_override_movsb_writes_dest_to_es_not_ds() {
+    let mut m = Machine::new(None);
+    // 3E A4 = DS: MOVSB
+    mem_write_slice(&mut m, SegOff::new(0x0000, 0x0000), &[0x3e, 0xa4, 0xf4]);
+    // Source at DS:SI = 0x1000:0000 -> linear 0x10000, value 0x5A.
+    m.reg_write_u16(DS, 0x1000);
+    m.reg_write_u16(SI, 0x0000);
+    m.mem.write_u8(SegOff::new(0x1000, 0x0000), 0x5A);
+    // Dest at ES:DI = 0x2000:0000 -> linear 0x20000 (distinct from DS:DI).
+    m.reg_write_u16(ES, 0x2000);
+    m.reg_write_u16(DI, 0x0000);
+    m.flag_write(FLAG_DF, false);
+    m.step().unwrap();
+    // The byte must land at ES:DI (0x20000), not DS:DI (0x10000).
+    assert_eq!(m.mem.read_u8(SegOff::new(0x2000, 0x0000)), 0x5A, "dest must be ES:DI");
+    assert_eq!(m.mem.read_u8(SegOff::new(0x1000, 0x0001)), 0x00, "DS:DI must be untouched");
+    assert_eq!(m.reg_read_u16(SI), 0x0001);
+    assert_eq!(m.reg_read_u16(DI), 0x0001);
+  }
+
+  /// Bare MOVSB (no prefix): source DS:SI, dest ES:DI — the canonical path.
+  #[test]
+  fn bare_movsb_copies_ds_si_to_es_di() {
+    let mut m = Machine::new(None);
+    mem_write_slice(&mut m, SegOff::new(0x0000, 0x0000), &[0xa4, 0xf4]);
+    m.reg_write_u16(DS, 0x1000);
+    m.reg_write_u16(SI, 0x0000);
+    m.mem.write_u8(SegOff::new(0x1000, 0x0000), 0x77);
+    m.reg_write_u16(ES, 0x2000);
+    m.reg_write_u16(DI, 0x0000);
+    m.flag_write(FLAG_DF, false);
+    m.step().unwrap();
+    assert_eq!(m.mem.read_u8(SegOff::new(0x2000, 0x0000)), 0x77);
+    assert_eq!(m.reg_read_u16(SI), 0x0001);
+    assert_eq!(m.reg_read_u16(DI), 0x0001);
+  }
+
+  /// SST-D-015: a LOCK prefix (0xF0) must be parsed-and-discarded by the
+  /// decoder so `lock movsb` (F0 A4) decodes and executes instead of DECODE_ERR.
+  /// The 80C286 executes `lock movsb` (LOCK ignored on string ops; exception:
+  /// none); emu86's single-step model treats LOCK as a no-op.
+  #[test]
+  fn lock_prefix_movsb_decodes_and_executes() {
+    let mut m = Machine::new(None);
+    mem_write_slice(&mut m, SegOff::new(0x0000, 0x0000), &[0xf0, 0xa4, 0xf4]);
+    m.reg_write_u16(DS, 0x1000);
+    m.reg_write_u16(SI, 0x0000);
+    m.mem.write_u8(SegOff::new(0x1000, 0x0000), 0x5A);
+    m.reg_write_u16(ES, 0x2000);
+    m.reg_write_u16(DI, 0x0000);
+    m.flag_write(FLAG_DF, false);
+    m.step().unwrap();
+    assert_eq!(m.mem.read_u8(SegOff::new(0x2000, 0x0000)), 0x5A);
+    assert_eq!(m.reg_read_u16(SI), 0x0001);
+    assert_eq!(m.reg_read_u16(DI), 0x0001);
+  }
+}

@@ -8,6 +8,7 @@ mod cpu_scas;
 mod cpu_cmps;
 mod cpu_stos;
 mod cpu_movs;
+mod cpu_lods;
 
 pub mod alu;
 
@@ -30,6 +31,8 @@ mod io;
 mod opl;
 
 mod mzhdr;
+
+pub mod sst;
 
 #[cfg(feature = "sdl")]
 mod sdl;

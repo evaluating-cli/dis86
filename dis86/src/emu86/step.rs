@@ -61,6 +61,13 @@ impl Machine {
 
   pub fn operand_mem_write(&mut self, mem: &OperandMem, val: Value) {
     let addr = self.operand_mem_addr(mem);
+    self.operand_mem_write_at(addr, val)
+  }
+
+  /// Write to a pre-computed effective address. Used when the EA must be
+  /// fixed before a sibling register write changes the register it depends on
+  /// (e.g. `xchg di,[ds:di]`).
+  pub fn operand_mem_write_at(&mut self, addr: SegOff, val: Value) {
     match val {
       Value::U8(val)  => self.mem.write_u8(addr, val),
       Value::U16(val) => self.mem.write_u16(addr, val),
@@ -142,10 +149,9 @@ impl Machine {
     let rhs = self.operand_read(instr, 1);
     let count = match rhs {
       Value::U8(val) => val,
-      Value::U16(val) => {
-        assert!(val as u8 as u16 == val);
-        val as u8
-      }
+      // Counts are only ever the low byte of a sign-extended imm8 (OPER_IMM8_EXT)
+      // or CL; the high byte is discarded here and alu::shift masks to 5 bits.
+      Value::U16(val) => val as u8,
       _ => panic!("Invalid value for count: {:?}", rhs),
     };
     let (result, flags) = alu::shift(op, lhs, count, self.flag_read_all());
@@ -168,6 +174,19 @@ impl Machine {
     let result = result.unwrap_u32();
     self.operand_write(&instr, 0, Value::U16((result>>16) as u16));
     self.operand_write(&instr, 1, Value::U16(result as u16));
+  }
+
+  pub fn op_divide(&mut self, instr: &Instr, op: alu::DivideOp) {
+    let high = self.operand_read(&instr, 0);
+    let low = self.operand_read(&instr, 1);
+    let lhs = Value::join(high, low);
+    let rhs = self.operand_read(&instr, 2);
+
+    let (quotient, remainder, flags) = alu::divmod(op, lhs, rhs, self.flag_read_all());
+    self.flag_write_all(flags);
+
+    self.operand_write(&instr, 1, quotient);
+    self.operand_write(&instr, 0, remainder);
   }
 
   pub fn op_signed_multiply_trunc(&mut self, instr: &Instr) {
@@ -243,6 +262,7 @@ impl Machine {
       Opcode::OP_STOS => return self.opcode_stos(&instr),
       Opcode::OP_MOVS => return self.opcode_movs(&instr),
       Opcode::OP_CMPS => return self.opcode_cmps(&instr),
+      Opcode::OP_LODS => return self.opcode_lods(&instr),
       _ => (),
     }
 
@@ -276,7 +296,7 @@ impl Machine {
         let idx = self.operand_read_u8(&instr, 0);
         let addr_seg = self.operand_read_u16(&instr, 1);
         let addr_off = self.operand_read_u16(&instr, 2);
-        let addr = SegOff::new(addr_seg, addr_off + idx as u16);
+        let addr = SegOff::new(addr_seg, addr_off.wrapping_add(idx as u16));
         let val = self.mem.read_u8(addr);
         self.operand_write(&instr, 0, Value::U8(val));
       }
@@ -326,7 +346,7 @@ impl Machine {
         if instr.operands.len() == 1 {
           // handle stack args removal
           let adj = self.operand_read(&instr, 0).unwrap_u16();
-          self.reg_write_u16(SP, self.reg_read_u16(SP) + adj);
+          self.reg_write_u16(SP, self.reg_read_u16(SP).wrapping_add(adj));
         }
         self.reg_write(IP, off);
       }
@@ -337,7 +357,7 @@ impl Machine {
         if instr.operands.len() == 1 {
           // handle stack args removal
           let adj = self.operand_read(&instr, 0).unwrap_u16();
-          self.reg_write_u16(SP, self.reg_read_u16(SP) + adj);
+          self.reg_write_u16(SP, self.reg_read_u16(SP).wrapping_add(adj));
         }
         self.reg_write(CS, seg);
         self.reg_write(IP, off);
@@ -364,20 +384,6 @@ impl Machine {
       Opcode::OP_STI => self.flag_write(FLAG_IF, true),
       Opcode::OP_CLC => self.flag_write(FLAG_CF, false),
       Opcode::OP_STC => self.flag_write(FLAG_CF, true),
-
-      Opcode::OP_LODS => {
-        let value = self.operand_read(&instr, 1);
-        self.operand_write(&instr, 0, value);
-
-        let idx = self.reg_read_u16(SI);
-        let sz = value.size() as u16;
-        let new_idx = if !self.flag_read(FLAG_DF) {
-          idx.wrapping_add(sz)
-        } else {
-          idx.wrapping_sub(sz)
-        };
-        self.reg_write_u16(SI, new_idx);
-      },
 
       Opcode::OP_IN => {
         let port = self.operand_read_u16(&instr, 1);
@@ -472,24 +478,25 @@ impl Machine {
       Opcode::OP_IMUL => self.op_multiply(&instr, alu::MultiplyOp::Signed),
       Opcode::OP_IMUL_TRUNC => self.op_signed_multiply_trunc(&instr),
 
-      Opcode::OP_DIV => {
-        let high = self.operand_read(&instr, 0);
-        let low = self.operand_read(&instr, 1);
-        let lhs = Value::join(high, low);
-        let rhs = self.operand_read(&instr, 2);
-
-        let (quotient, remainder, flags) = alu::divmod(lhs, rhs, self.flag_read_all());
-        self.flag_write_all(flags);
-
-        self.operand_write(&instr, 1, quotient);
-        self.operand_write(&instr, 0, remainder);
-      }
+      Opcode::OP_DIV  => self.op_divide(&instr, alu::DivideOp::Unsigned),
+      Opcode::OP_IDIV => self.op_divide(&instr, alu::DivideOp::Signed),
 
       Opcode::OP_XCHG => {
+        // Pre-compute the memory operand's EA before the first write: the
+        // swapped register may be one the EA depends on (e.g. `xchg di,[ds:di]`),
+        // and re-deriving it after the write would target a stale address.
+        // SST-D-006: EA must reflect the pre-swap register values.
+        let mem_addr = match instr.operands[1] {
+          Operand::Mem(mem) => Some(self.operand_mem_addr(&mem)),
+          _ => None,
+        };
         let lhs = self.operand_read(&instr, 0);
         let rhs = self.operand_read(&instr, 1);
         self.operand_write(&instr, 0, rhs);
-        self.operand_write(&instr, 1, lhs);
+        match (mem_addr, instr.operands[1]) {
+          (Some(addr), Operand::Mem(_)) => self.operand_mem_write_at(addr, lhs),
+          _ => self.operand_write(&instr, 1, lhs),
+        }
       }
 
       Opcode::OP_CBW => {

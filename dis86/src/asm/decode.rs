@@ -54,10 +54,12 @@ fn operand_src(sz: Size, sreg: Option<Reg>) -> Result<Operand, String> {
   }))
 }
 
-fn operand_dst(sz: Size, sreg: Option<Reg>) -> Result<Operand, String> {
+fn operand_dst(sz: Size, _sreg: Option<Reg>) -> Result<Operand, String> {
+  // String-op destination is always ES:DI; a segment-override prefix applies
+  // only to the source (DS:SI), never to the destination.
   Ok(Operand::Mem(OperandMem {
     sz: sz,
-    sreg: sreg.unwrap_or(Reg::ES),
+    sreg: Reg::ES,
     reg1: Some(Reg::DI),
     reg2: None,
     off: None,
@@ -167,12 +169,14 @@ pub fn decode_one_impl<'a>(bin: &mut RegionIter<'a>) -> Result<Option<(Instr, &'
   // First parse any prefixes
   let mut sreg = None;
   let mut rep = None;
+  let mut lock = false;
   loop {
     match bin.peek_checked()? {
       0x26 => sreg = Some(Reg::ES),
       0x2e => sreg = Some(Reg::CS),
       0x36 => sreg = Some(Reg::SS),
       0x3e => sreg = Some(Reg::DS),
+      0xf0 => lock = true,
       0xf2 => rep = Some(Rep::NE),
       0xf3 => rep = Some(Rep::EQ),
       _ => break,
@@ -205,6 +209,14 @@ pub fn decode_one_impl<'a>(bin: &mut RegionIter<'a>) -> Result<Option<(Instr, &'
 
   if fmt.op == Opcode::OP_INVAL {
     return Err(format!("Unsupported or invalid instruction at {}", start_addr));
+  }
+
+  // SST-D-015 validated LOCK only on the A4-AF string family, where the Harris
+  // 80C286 captures show it is ignored. Preserve the old unsupported behavior
+  // for every other LOCK-prefixed instruction rather than globally discarding
+  // LOCK and silently widening decoder/emulator semantics beyond the evidence.
+  if lock && !matches!(fmt.op, Opcode::OP_MOVS | Opcode::OP_CMPS | Opcode::OP_STOS | Opcode::OP_LODS | Opcode::OP_SCAS) {
+    return Err(format!("LOCK prefix is only supported for validated string ops at {}", start_addr));
   }
 
   // Do we need a modrm?
@@ -599,5 +611,18 @@ mod tests {
         panic!("Failed ({}/{}) | Expected: '{}' | Got: '{}'\n\nRAW:\n{:?}", n, TESTS.len(), test.asm, asm, ins);
       }
     }
+  }
+
+  #[test]
+  fn lock_prefix_is_scoped_to_validated_string_ops() {
+    use crate::segoff::*;
+    let addr = SegOff { seg: Seg::Normal(0), off: Off(0) };
+
+    let mut string_bin = RegionIter::new(&[0xF0, 0xA4], addr);
+    let (ins, _) = decode_one(&mut string_bin).expect("LOCK MOVSB should decode").unwrap();
+    assert_eq!(ins.opcode, Opcode::OP_MOVS);
+
+    let mut non_string_bin = RegionIter::new(&[0xF0, 0x90], addr);
+    assert!(decode_one(&mut non_string_bin).is_err(), "non-string LOCK remains unsupported");
   }
 }
