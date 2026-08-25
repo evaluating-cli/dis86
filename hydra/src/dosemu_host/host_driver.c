@@ -43,6 +43,23 @@ static int host_bp_add(host_bp_entry_t *bps, int index, uint32_t linear,
   return -1;
 }
 
+static int host_bp_ensure(host_ctx_t *ctx, host_bp_entry_t *bps,
+                          uint16_t seg, uint16_t off, int is_stub)
+{
+  uint32_t linear = ((uint32_t)seg << 4) + off;
+  if (host_bp_find(bps, linear))
+    return 0;
+
+  int idx = host_set_bp(ctx, seg, off);
+  if (idx < 0)
+    return -1;
+  if (host_bp_add(bps, idx, linear, is_stub) != 0) {
+    host_clear_bp(ctx, idx);
+    return -1;
+  }
+  return 0;
+}
+
 static void host_bp_clear_all(host_ctx_t *ctx, host_bp_entry_t *bps)
 {
   for (size_t i = 0; i < HOST_RUN_MAX_BPS; i++) {
@@ -81,24 +98,24 @@ static void bp_visitor(const hydra_hook_t *hook, void *user)
 
   u16 seg = (u16)(ins->ctx->code_load_offset + addr_seg(hook->addr));
   u16 off = addr_off(hook->addr);
-  int idx = host_set_bp(ins->ctx, seg, off);
-  if (idx < 0) {
+  if (host_bp_ensure(ins->ctx, ins->bps, seg, off, 0) != 0) {
     fprintf(stderr,
             "host_run: FAILED to plant breakpoint for hook at rel %04x:%04x\n",
             addr_seg(hook->addr), addr_off(hook->addr));
     ins->failed++;
     return;
   }
-  uint32_t linear = ((uint32_t)seg << 4) + off;
-  if (host_bp_add(ins->bps, idx, linear, 0) != 0) {
-    host_clear_bp(ins->ctx, idx);
-    fprintf(stderr,
-            "host_run: breakpoint table full (%d); hook at rel %04x:%04x dropped\n",
-            HOST_RUN_MAX_BPS, addr_seg(hook->addr), addr_off(hook->addr));
-    ins->failed++;
-    return;
-  }
   ins->count++;
+}
+
+static int install_hook_breakpoints(host_ctx_t *ctx, host_bp_entry_t *bps,
+                                    int *count_out)
+{
+  bp_install_t ins = { ctx, bps, 0, 0 };
+  hydra_hook_foreach(bp_visitor, &ins);
+  if (count_out)
+    *count_out = ins.count;
+  return ins.failed ? -1 : 0;
 }
 
 int host_hook_breakpoint_count(host_ctx_t *ctx)
@@ -132,6 +149,27 @@ static void machine_to_regs(const hydra_machine_registers_t *hr,
   dr->si = hr->si;   dr->di = hr->di;   dr->bp = hr->bp;   dr->sp = hr->sp;
   dr->ip = hr->ip;   dr->cs = hr->cs;   dr->ds = hr->ds;   dr->es = hr->es;
   dr->ss = hr->ss;   dr->flags = hr->flags;
+}
+
+static uint32_t regs_linear(const dosdebug_regs_t *dr)
+{
+  return ((uint32_t)dr->cs << 4) + dr->ip;
+}
+
+static int is_capture_stop(const dosdebug_regs_t *dr)
+{
+  if (HYDRA_MODE->mode != HYDRA_MODE_CAPTURE)
+    return 0;
+  uint16_t seg = (uint16_t)(CODE_START_SEG + addr_seg(HYDRA_MODE->capture_addr));
+  return dr->cs == seg && dr->ip == addr_off(HYDRA_MODE->capture_addr);
+}
+
+static int is_restore_stop(const dosdebug_regs_t *dr)
+{
+  if (HYDRA_MODE->mode != HYDRA_MODE_RESTORE)
+    return 0;
+  addr_t entry = hydra_hook_entry_addr();
+  return dr->cs == addr_seg(entry) && dr->ip == addr_off(entry);
 }
 
 #define HOST_RUN_DEFAULT_TRACE_STEPS 10000u
@@ -183,10 +221,9 @@ static host_run_stop_reason_t trace_to_return(run_ctx_t *r, dosdebug_regs_t *dr,
       return HOST_RUN_STOP_NONE;
     }
 
-    uint32_t lin = ((uint32_t)dr->cs << 4) + dr->ip;
-    if (host_bp_find(r->bps, lin)) {
+    if (host_bp_find(r->bps, regs_linear(dr))) {
       if (r->verbose > 1)
-        printf("  nested hook at %04x:%04x (depth %d)\n",
+        printf("  nested hook/special stop at %04x:%04x (depth %d)\n",
                dr->cs, dr->ip, depth + 1);
       host_run_stop_reason_t dn = dispatch_hook(r, dr, depth + 1);
       if (dn != HOST_RUN_STOP_NONE)
@@ -211,8 +248,41 @@ static host_run_stop_reason_t dispatch_hook(run_ctx_t *r, dosdebug_regs_t *dr,
 
   int redirects_this_dispatch = 0;
   for (;;) {
+    const int capture_stop = is_capture_stop(dr);
+    const int restore_stop = is_restore_stop(dr);
+
+    /* Breakpoints are software patches in guest memory. A capture must not
+     * serialize those patches, and a restore must not overwrite live patched
+     * bytes underneath dosdebug's breakpoint table. Remove every tracked bp
+     * before either memory-image operation. */
+    if (capture_stop || restore_stop)
+      host_bp_clear_all(r->ctx, r->bps);
+
     regs_to_machine(dr, r->m->registers);
+    int mode_before = HYDRA_MODE->mode;
     int ret = hydra_machine_exec(r->m, 0);
+
+    /* state_restore() updates the real CPU directly through the host vtable.
+     * The machine struct still contains the pre-restore copy, so pull the
+     * restored CPU back before any generic push can overwrite it. Then re-arm
+     * static hook breakpoints against the restored memory image. */
+    if (restore_stop && mode_before == HYDRA_MODE_RESTORE &&
+        HYDRA_MODE->mode == HYDRA_MODE_NORMAL) {
+      if (host_get_regs(r->ctx, dr) != 0)
+        return HOST_RUN_STOP_ERROR;
+      regs_to_machine(dr, r->m->registers);
+      hydra_machine_notify(r->m);
+
+      int count = 0;
+      if (install_hook_breakpoints(r->ctx, r->bps, &count) != 0) {
+        fprintf(stderr,
+                "host_run: failed to re-arm hook breakpoints after state restore\n");
+        return HOST_RUN_STOP_ERROR;
+      }
+      r->st->hook_breakpoints = (uint64_t)count;
+      return HOST_RUN_STOP_NONE;
+    }
+
     hydra_machine_notify(r->m);
     int rtype = hydra_exec_last_result_type();
 
@@ -258,6 +328,30 @@ static host_run_stop_reason_t dispatch_hook(run_ctx_t *r, dosdebug_regs_t *dr,
   return HOST_RUN_STOP_NONE;
 }
 
+static int install_special_mode_breakpoint(host_ctx_t *ctx,
+                                           host_bp_entry_t *bps)
+{
+  if (HYDRA_MODE->mode == HYDRA_MODE_CAPTURE) {
+    uint16_t seg = (uint16_t)(CODE_START_SEG + addr_seg(HYDRA_MODE->capture_addr));
+    uint16_t off = addr_off(HYDRA_MODE->capture_addr);
+    if (host_bp_ensure(ctx, bps, seg, off, 1) != 0) {
+      fprintf(stderr,
+              "host_run: failed to plant capture breakpoint at %04x:%04x\n",
+              seg, off);
+      return -1;
+    }
+  } else if (HYDRA_MODE->mode == HYDRA_MODE_RESTORE) {
+    addr_t entry = hydra_hook_entry_addr();
+    if (host_bp_ensure(ctx, bps, addr_seg(entry), addr_off(entry), 1) != 0) {
+      fprintf(stderr,
+              "host_run: failed to plant restore-entry breakpoint at %04x:%04x\n",
+              addr_seg(entry), addr_off(entry));
+      return -1;
+    }
+  }
+  return 0;
+}
+
 host_run_stop_reason_t host_run(host_ctx_t *ctx, hydra_machine_t *m,
                                 const host_run_options_t *opts,
                                 host_run_stats_t *stats)
@@ -272,13 +366,13 @@ host_run_stop_reason_t host_run(host_ctx_t *ctx, hydra_machine_t *m,
   size_t step = 0;
   host_run_stop_reason_t reason = HOST_RUN_STOP_NONE;
 
-  /* Fail before releasing the CPU on every known unsupported/resource case. */
   if (!host_raw_code_ready(ctx)) {
     fprintf(stderr,
             "host_run: no guest-owned raw-code region reserved; call host_reserve_raw_code() first\n");
     reason = HOST_RUN_STOP_ERROR;
     goto done;
   }
+
   int requested_bps = host_hook_breakpoint_count(ctx);
   if (requested_bps > HOST_RUN_MAX_BPS) {
     fprintf(stderr,
@@ -289,13 +383,20 @@ host_run_stop_reason_t host_run(host_ctx_t *ctx, hydra_machine_t *m,
   }
 
   {
-    bp_install_t ins = { ctx, bps, 0, 0 };
-    hydra_hook_foreach(bp_visitor, &ins);
-    st.hook_breakpoints = (uint64_t)ins.count;
-    if (ins.failed > 0) {
+    int count = 0;
+    if (install_hook_breakpoints(ctx, bps, &count) != 0) {
       reason = HOST_RUN_STOP_ERROR;
       goto done;
     }
+    st.hook_breakpoints = (uint64_t)count;
+  }
+
+  /* Capture and restore are instruction-boundary modes in the core. The
+   * external host therefore needs explicit breakpoints for those non-hook
+   * addresses; otherwise the special-mode code is unreachable. */
+  if (install_special_mode_breakpoint(ctx, bps) != 0) {
+    reason = HOST_RUN_STOP_ERROR;
+    goto done;
   }
 
   {
@@ -311,16 +412,13 @@ host_run_stop_reason_t host_run(host_ctx_t *ctx, hydra_machine_t *m,
       }
       st.stops++;
 
-      uint32_t stop_linear = ((uint32_t)dr.cs << 4) + dr.ip;
-      if (!host_bp_find(bps, stop_linear)) {
+      if (!host_bp_find(bps, regs_linear(&dr))) {
         fprintf(stderr,
-                "host_run: unexpected debugger stop at %04x:%04x (not a Hydra hook)\n",
+                "host_run: unexpected debugger stop at %04x:%04x (not a tracked Hydra stop)\n",
                 dr.cs, dr.ip);
         reason = HOST_RUN_STOP_ERROR;
         break;
       }
-
-      hydra_impl_raw_code_reset();
 
       host_run_stop_reason_t dn = dispatch_hook(&r, &dr, 0);
       if (dn != HOST_RUN_STOP_NONE) {
