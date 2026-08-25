@@ -8,8 +8,10 @@ void hydra_impl_unknown(const char *func, int line)
 
 #define U32_MAKE(upper, lower) ((u32)(upper) << 16 | (u32)(lower))
 
-/* Raw-code slot counter (see hydra_impl_raw_code). Reset to 0 by the
- * host driver at each hook dispatch boundary. */
+/* Raw-code slot counter (see hydra_impl_raw_code). Slots are process-monotonic:
+ * simx86 caches translated code by guest linear address and external memfd
+ * writes do not invalidate that cache, so an address that has executed raw
+ * code must never be reused by this host process. */
 static u32 raw_code_slot = 0;
 
 u32 hydra_impl_call_far(u16 seg, u16 off)
@@ -108,8 +110,7 @@ void hydra_impl_raw_code(u8 *code, size_t code_sz)
 
   /* External memfd writes do not invalidate simx86 translations. Every snippet
      therefore uses a fresh 128-byte slot within an explicitly guest-reserved
-     region. Never wrap inside one dispatch: doing so can execute stale JIT
-     code. */
+     region. Never reuse or wrap a slot inside this host process. */
   if (HYDRA_CONF->raw_code_size < MAX_RAW_CODE)
     FAIL("No Hydra raw-code region has been reserved by the guest/launcher");
 
@@ -137,7 +138,9 @@ void hydra_impl_raw_code(u8 *code, size_t code_sz)
 
 void hydra_impl_raw_code_reset(void)
 {
-  raw_code_slot = 0;
+  /* Legacy API retained for source compatibility. This is intentionally a
+   * no-op on the dosemu2 external host: resetting would reuse a guest linear
+   * address whose simx86 translation may still be cached. */
 }
 
 void hydra_impl_nop(void)
