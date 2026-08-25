@@ -1,4 +1,4 @@
-/* Host-independent regression for Option E breakpoint accounting. */
+/* Host-independent regressions for Option E metadata/breakpoint accounting. */
 #include <stdio.h>
 
 #include "hydra_machine.h"
@@ -17,6 +17,21 @@ int main(void)
     host_ctx_t ctx = {0};
     hydra_machine_t machine = {0};
     host_run_stats_t stats = {0};
+
+    /* The core has exactly 64 overlay segment slots. Reject invalid metadata
+     * before the host can copy an out-of-range overlay number into its own
+     * reconciliation arrays (including while the stub is still unpaged). */
+    hydra_function_def_t bad_defs[] = {
+        { "F_bad_OVERLAY",
+          ADDR_MAKE_EXT(1, HYDRA_OVERLAY_SEGMENT_COUNT, 0x0000) },
+    };
+    hydra_function_metadata_t bad_md = {
+        sizeof(bad_defs) / sizeof(bad_defs[0]), bad_defs
+    };
+    if (hydra_function_metadata_set(&bad_md) == 0) {
+        fprintf(stderr, "FAIL: out-of-range overlay metadata was accepted\n");
+        return 1;
+    }
 
     /* Satisfy only the precondition ahead of breakpoint preflight. A correct
      * failure must happen before any dosdebug connection or guest operation. */
@@ -55,6 +70,6 @@ int main(void)
         return 1;
     }
 
-    printf("PASS: dynamic overlay site is included in 64-breakpoint preflight\n");
+    printf("PASS: overlay metadata bounds and dynamic breakpoint budget are fail-closed\n");
     return 0;
 }
