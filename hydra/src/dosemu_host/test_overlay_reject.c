@@ -1,7 +1,7 @@
 /*
  * Host-independent negative test for the external dosdebug backend's overlay
- * policy. Overlay hooks have no stable physical breakpoint until paging has
- * resolved them, so this backend must reject the run before guest execution.
+ * policy. Production overlay hooks are physical entry stubs carrying the
+ * OVERLAY flag; without overlays=armed they must still fail before execution.
  */
 
 #include <stdio.h>
@@ -29,13 +29,13 @@ int main(void)
     ctx.raw_code_reserved = 1;
     ctx.raw_code_size = 128;
 
-    /* HYDRA_REGISTER_ADDR() deliberately constructs an ordinary seg:off
-     * address, which is not a valid overlay hook. Register an overlay-typed
-     * address explicitly so the negative test exercises the real contract. */
+    /* Match generated production registration: physical entry-stub address +
+     * HYDRA_HOOK_FLAGS_OVERLAY. Armed mode resolves its separate logical
+     * F_name_OVERLAY metadata; default mode must reject before needing that. */
     hydra_hook_t hook = {
-        NULL,
+        "F_overlay_probe",
         h_overlay_probe,
-        ADDR_MAKE_EXT(1, 0x0010, 0x0100),
+        ADDR_MAKE(0x0010, 0x0100),
         HYDRA_HOOK_FLAGS_OVERLAY,
     };
     hydra_hook_register(hook);
@@ -57,6 +57,6 @@ int main(void)
         return 1;
     }
 
-    printf("PASS: overlay hook rejected before guest execution\n");
+    printf("PASS: production-shaped overlay hook rejected before guest execution\n");
     return 0;
 }
