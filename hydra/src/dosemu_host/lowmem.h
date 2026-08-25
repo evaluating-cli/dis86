@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>
 #include <sys/types.h>
 
 #ifdef __cplusplus
@@ -11,10 +12,22 @@ extern "C" {
 
 typedef struct lowmem lowmem_t;
 
+typedef struct lowmem_probe {
+    uint32_t addr;
+    const uint8_t *bytes;
+    size_t len;
+} lowmem_probe_t;
+
 // Connect to dosemu2's lowmem backing by scanning /proc/<pid>/fd/.
-// pid = the dosemu2 process PID.
-// Returns NULL on failure.
+// This unverified form succeeds only when exactly one distinct candidate exists.
 lowmem_t *lowmem_connect(pid_t pid);
+
+// Verified production form: every candidate is mapped and checked against one
+// or more guest-byte probes obtained through an independent transport (dosdebug).
+// Exactly one distinct backing inode must match; ambiguity fails closed.
+lowmem_t *lowmem_connect_verified(pid_t pid,
+                                  const lowmem_probe_t *probes,
+                                  size_t probe_count);
 
 // Disconnect (unmaps and closes fd).
 void lowmem_disconnect(lowmem_t *lm);
