@@ -47,6 +47,13 @@ test_overlay_reject = executable(
   link_with : [libhydra, libhydra_dosemu],
 )
 
+## Host-independent capacity regression: a dynamic overlay site counts against
+## the same 64-entry dosdebug budget as static hooks.
+test_overlay_budget = executable(
+  'test_overlay_budget', 'test_overlay_budget.c',
+  link_with : [libhydra, libhydra_dosemu],
+)
+
 ## Phase 4/5: guest program (nasm -> .COM) + driver integration test.
 
 testprog_com = custom_target(
