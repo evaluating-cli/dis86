@@ -77,6 +77,14 @@ pub fn constant_folding(ir: &mut IR) {
       ) else { continue; };
 
       let fold_word_arith = matches!(instr.typ, Type::U16 | Type::I16);
+      // KNOWN LIMITATION: `fold_bool` also fires for signed compares (Lt/Leq/Gt/Geq)
+      // whose instr.typ is `Type::U8`. `simplify_branch_conds` / `append_cond_set`
+      // stamp the compare as Type::U8 regardless of the operands' real width
+      // (ir_build.rs:693), so a genuine 8-bit signed comparison between two
+      // constants folds `lhs < rhs` against the i16 const-pool values -- correct
+      // only when those bytes were sign-extended, which the pool does not record.
+      // Fix planned: propagate operand typ into branch-conds, then gate signed
+      // compares on `Type::U16 | Type::I16` rather than `fold_bool`.
       let fold_bool = matches!(instr.typ, Type::U8 | Type::U16);
 
       let result = match instr.opcode {

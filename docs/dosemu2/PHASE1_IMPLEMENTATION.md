@@ -1,5 +1,7 @@
 # Phase 1 Implementation Guide: dosemu2 `simx86` Validator
 
+> **Note (2026-08-17):** SST (SingleStepTests hardware captures) is the validation authority for emu86; the dosemu2 differential validator is no longer the validation method. This guide covers the dosemu2 simx86 validator transport and is now reference for the frozen transport that Track 4 Option D (Hydra hosting via in-process plugin) research reuses. The REP/shadow "comparison boundary" items below describe transport semantics, not validation gates.
+
 **Pinned dosemu2 base:** `604ce0cdd1a71f657e2a2df623d216d5ab289313`  
 **Scope:** 16-bit real-mode MZ executables; one concurrent validator instance  
 **ABI:** version 1, 88-byte structure preserving the legacy 64-byte Hydra prefix in page-sized `/hydra_remote` backing  
@@ -139,7 +141,7 @@ Normal external `CS:IP` redirection does not use `EXCP_EMULEAVE`.
 
 One dosemu2 request/ack exchange produces a raw `StepOutcome` containing at least `decoded_instructions` and `step_flags`. The Rust validator validates the metadata and advances emu86 according to the reported decoded count rather than assuming every node consumes one instruction.
 
-Two semantic cases still need focused runtime proof:
+Two semantic cases still need focused runtime proof in the frozen transport (transport semantics only — SST, not this transport, is the validation gate):
 
 ### REP
 

@@ -1,5 +1,7 @@
 # dosemu2 validator design review
 
+> **Note (2026-08-17):** SST (SingleStepTests hardware captures) is the validation authority for emu86; the dosemu2 differential validator is no longer the validation method. This design review covers the dosemu2 validator transport and is kept as reference for the transport design that Track 4 Option D (Hydra hosting via in-process plugin) research builds on.
+
 This document records the non-obvious design conclusions. Current status and test coverage live in [`README.md`](README.md) and [`TESTING.md`](TESTING.md); the normative requirements live in [`PHASE1_SPEC.md`](PHASE1_SPEC.md).
 
 ## Core instrumentation, not a pure plugin

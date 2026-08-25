@@ -1,5 +1,7 @@
 # Implementation source coordinates
 
+> **Note (2026-08-17):** SST (SingleStepTests hardware captures) is the validation authority for emu86; the dosemu2 differential validator is no longer the validation method. These source coordinates reference the frozen transport/patch carrier kept for Track 4 Option D (Hydra hosting via in-process plugin) research.
+
 The implementation is pinned to dosemu2 commit `604ce0cdd1a71f657e2a2df623d216d5ab289313`. Line numbers in upstream sources may change; the carrier patches are the reviewable record of the exact changes.
 
 ## Authoritative repository paths
@@ -22,9 +24,9 @@ The implementation is pinned to dosemu2 commit `604ce0cdd1a71f657e2a2df623d216d5
 
 ## Related projects
 
-- `xorvoid/dis86` — reference x86-16 interpreter and differential validator.
+- `xorvoid/dis86` — reference x86-16 interpreter; former differential-validator host, now frozen transport reference.
 - `xorvoid/hydra` — consumer of the legacy shared-memory ABI prefix.
 - `xorvoid/dosbox-x` — historical patched DOSBox-X backend, removed from this tree; its CLI is not the dosemu2 launch contract. Retained here for provenance only.
 - `dosemu2/dosemu2` — target DOS runtime.
 
-Performance for normal Hydra hybrid execution and strict validator lockstep must be measured separately. Neither the source review nor focused correctness probes establish a speedup.
+Performance for normal Hydra hybrid execution and strict validator lockstep must be measured separately. Neither the source review nor focused correctness probes establish a speedup. (Emu86 validation itself is handled by SST, not the frozen dosemu2 transport.)

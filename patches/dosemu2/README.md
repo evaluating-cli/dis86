@@ -1,7 +1,9 @@
 # dosemu2 validator patch series
 
-This directory carries the small dosemu2 core patch series required by the
-`dis86` validator while we do not have a writable dosemu2 fork.
+> **Note (2026-08-17):** SST (SingleStepTests hardware captures) is the validation authority for emu86; dosemu2 patching is no longer required for validation. These patches are the reference implementation of the simx86 boundary hook, kept as research reference for Track 4 Option D (Hydra hosting via in-process plugin).
+
+This directory carries the small dosemu2 core patch series serving as the
+reference implementation of the simx86 boundary hook for Option D research.
 
 The patches are ordinary `git am`-applicable mbox patches against one exact
 upstream revision. They are not a vendored dosemu2 source copy and should not
