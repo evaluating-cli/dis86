@@ -102,3 +102,19 @@ test_driver_cap = executable(
   sources : [testprog_exe],
   c_args : ['-DTESTPROG_EXE_PATH="' + testprog_exe.full_path() + '"'],
 )
+
+## Phase 7 Item E: overlay support - VROOMM-style page-in stub guest and
+## the full page-in/decompiled-takeover integration test.
+testprog_ovl_com = custom_target(
+  'testprog_ovl.com',
+  input : 'testprog_ovl.asm',
+  output : 'testprog_ovl.com',
+  command : ['nasm', '-f', 'bin', '-o', '@OUTPUT@', '@INPUT@'],
+)
+
+test_driver_ovl = executable(
+  'test_driver_ovl', 'test_driver_ovl.c',
+  link_with : [libhydra, libhydra_dosemu],
+  sources : [testprog_ovl_com],
+  c_args : ['-DTESTPROG_OVL_PATH="' + testprog_ovl_com.full_path() + '"'],
+)

@@ -15,6 +15,15 @@
  *     the return address, then feeds the post-raw-code state back to the
  *     Hydra exec engine to resume the hook.
  *   - on exit, clears all breakpoints it planted.
+ *
+ * Overlay hooks (HYDRA_HOOK_FLAGS_OVERLAY, Phase 7 Item E) sit on
+ * VROOMM-style page-in stubs. They are armed lazily: the first call runs
+ * the guest's pager natively (no breakpoint is ever planted on an unpaged
+ * stub), and once the stub has been patched to a far jump the next stop
+ * registers the overlay segment with the core (hydra_overlay_segment_set)
+ * and plants the stub's breakpoint — from then on the core's redirect path
+ * dispatches the decompiled hook into the paged body (RETURN_FAR completes
+ * the far-call frame).
  */
 
 #include <stddef.h>

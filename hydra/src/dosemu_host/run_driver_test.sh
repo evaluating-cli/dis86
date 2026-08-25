@@ -5,23 +5,25 @@
 #   - .com: Phase 4/5/6 integration test (twice consecutively)
 #   - cap:  Phase 7 Item D HYDSNAP capture once, then restore the same
 #           snapshot on two fresh instances
-# TESTPROG_FLAVOR=com|exe|cap|both selects the run(s); default both (all).
+# TESTPROG_FLAVOR=com|exe|cap|ovl|both selects the run(s); default both (all).
 set -u
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 BUILD="${HYDRA_DOSEMU_BUILD:-$SCRIPT_DIR/../../build/src/dosemu_host}"
 COM="$BUILD/testprog.com"
 EXE="$BUILD/testprog.exe"
+OVL="$BUILD/testprog_ovl.com"
 LAUNCH="$BUILD/launch.com"
 TEST_COM="$BUILD/test_driver"
 TEST_EXE="$BUILD/test_driver_exe"
 TEST_CAP="$BUILD/test_driver_cap"
+TEST_OVL="$BUILD/test_driver_ovl"
 LOG=/tmp/opencode/driver_test.log
 CONF=/tmp/opencode/dosemu_mshm.conf
 FLAVOR="${TESTPROG_FLAVOR:-both}"
 
 case "$FLAVOR" in
-    com|exe|cap|both) ;;
+    com|exe|cap|ovl|both) ;;
     *) echo "FAIL: TESTPROG_FLAVOR must be com|exe|cap|both (got '$FLAVOR')" >&2; exit 2 ;;
 esac
 
@@ -157,6 +159,17 @@ cap|both)
         CAP_MODE=restore run_flavor "$EXE" "$TEST_CAP" -E launch.com
         record_rc $?
     fi
+    ;;
+esac
+
+case "$FLAVOR" in
+ovl|both)
+    # Phase 7 Item E (OPTION E opt-in): overlay page-in + lazy arming.
+    # test_driver_ovl passes conf overlays=armed itself; default-mode
+    # rejection remains covered by test_overlay_reject (host-independent).
+    echo "===== ovl flavor (overlay page-in) ====="
+    run_flavor "$OVL" "$TEST_OVL" -E testprog_ovl.com
+    record_rc $?
     ;;
 esac
 

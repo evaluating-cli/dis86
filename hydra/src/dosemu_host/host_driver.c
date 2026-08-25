@@ -90,20 +90,41 @@ typedef struct bp_install {
   int failed;
 } bp_install_t;
 
+/*
+ * Plant one debugger breakpoint for a hook at its absolute guest address
+ * and track it locally. Shared by the static installer (bp_visitor) and the
+ * overlay lazy re-arm. Returns 0 / -1 (failure already reported loudly).
+ */
+static int plant_hook_bp(host_ctx_t *ctx, host_bp_entry_t *bps,
+                         u16 seg, uint16_t off)
+{
+  /* Thin wrapper over the hardened ensure-path so the static installer and
+   * the overlay lazy re-arm share one implementation (OPTION E). */
+  if (host_bp_ensure(ctx, bps, seg, off, 0) != 0)
+    return -1;
+  return 0;
+}
+
 static void bp_visitor(const hydra_hook_t *hook, void *user)
 {
   bp_install_t *ins = user;
 
-  /* The external debugger cannot discover a logical overlay hook before the
-   * overlay-to-physical segment mapping exists. Silently skipping such hooks
-   * is incorrect because guest code would execute unhooked. Until dynamic
-   * overlay breakpoint re-arming is implemented, reject the run before any
-   * guest instruction is released. */
+  /* Default contract (#34): overlay-typed hooks fail the run before guest
+   * execution. With the OPTION E opt-in (conf "overlays=armed") they are
+   * deferred instead: an unpaged stub's "int 3f" bytes must execute
+   * natively exactly once so the guest's own pager can page the body in,
+   * and a breakpoint whose int3 has fired and been restored cannot safely
+   * be re-executed natively afterwards — simx86 keeps serving the
+   * translation compiled while the int3 was planted. See overlay_sync()
+   * for the lazy arming that avoids native execution entirely once the
+   * stub is paged in. */
   if (hook->flags & HYDRA_HOOK_FLAGS_OVERLAY) {
-    fprintf(stderr,
-            "host_run: overlay hook %u:%04x is unsupported by the dosdebug host; refusing to run\n",
-            (unsigned)addr_overlay_num(hook->addr), (unsigned)addr_off(hook->addr));
-    ins->failed++;
+    if (!ins->ctx->overlays_armed) {
+      fprintf(stderr,
+              "host_run: overlay hook %u:%04x requires conf overlays=armed; refusing to run\n",
+              (unsigned)addr_overlay_num(hook->addr), (unsigned)addr_off(hook->addr));
+      ins->failed++;
+    }
     return;
   }
 
@@ -143,6 +164,62 @@ static void hook_counter(const hydra_hook_t *hook, void *user)
   if (!(hook->flags & HYDRA_HOOK_FLAGS_OVERLAY))
     (*count)++;
 }
+
+/* ------------------------------------------------------------------ */
+/* overlay registry (Phase 7 Item E)                                   */
+/* ------------------------------------------------------------------ */
+
+/* Registered OVERLAY hooks in registration order; the array index is the
+ * overlay number handed to hydra_overlay_segment_set(). Reset per run. */
+#define HOST_RUN_MAX_OVERLAYS 16
+
+typedef struct overlay_stub_info {
+  u16      phys_seg;   /* absolute guest segment (code_load_offset + rel) */
+  uint16_t off;
+  uint8_t  paged_in;   /* segment registered with the core for this stub */
+} overlay_stub_info_t;
+
+static overlay_stub_info_t overlay_stubs[HOST_RUN_MAX_OVERLAYS];
+static int n_overlay_stubs;
+
+typedef struct overlay_collect {
+  u16 code_load;
+  int overflow;
+} overlay_collect_t;
+
+static void overlay_collect_cb(const hydra_hook_t *hook, void *user)
+{
+  overlay_collect_t *oc = user;
+  if (!(hook->flags & HYDRA_HOOK_FLAGS_OVERLAY))
+    return;
+  if (n_overlay_stubs >= HOST_RUN_MAX_OVERLAYS) {
+    oc->overflow = 1;
+    return;
+  }
+  overlay_stub_info_t *os = &overlay_stubs[n_overlay_stubs++];
+  os->phys_seg = (u16)(oc->code_load + addr_seg(hook->addr));
+  os->off = addr_off(hook->addr);
+  os->paged_in = 0;
+}
+
+/* Reset/rebuild the overlay registry from the registered hooks. Must be
+ * called after code_load_offset is final. Returns 0 / -1 on overflow. */
+static int overlay_registry_reset(host_ctx_t *ctx)
+{
+  overlay_collect_t oc = { ctx->code_load_offset, 0 };
+  n_overlay_stubs = 0;
+  hydra_hook_foreach(overlay_collect_cb, &oc);
+  if (oc.overflow) {
+    fprintf(stderr, "host_run: more than %d overlay hooks registered\n",
+            HOST_RUN_MAX_OVERLAYS);
+    return -1;
+  }
+  return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* register conversion                                                 */
+/* ------------------------------------------------------------------ */
 
 static void regs_to_machine(const dosdebug_regs_t *dr,
                             hydra_machine_registers_t *hr)
@@ -390,6 +467,95 @@ static int install_special_mode_breakpoint(host_ctx_t *ctx,
   return 0;
 }
 /* ------------------------------------------------------------------ */
+/* overlay lazy arming (Phase 7 Item E)                                */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Plant a fresh debugger bp for an overlay stub and reconcile the local
+ * tracking table. The stub's original bp is gone server-side by now: either
+ * we dropped it ourselves so the page-in could run natively, or the pager's
+ * in-place patch overwrote the int3 (dosemu reports "cleared breakpoint ...
+ * INT3 overwritten" at the next trap and invalidates it). The stale local
+ * entry is released WITHOUT issuing 'bc' — the old dosemu index may have
+ * been reused by then.
+ */
+static int overlay_replant_bp(host_ctx_t *ctx, host_bp_entry_t *bps,
+                              const overlay_stub_info_t *os)
+{
+  uint32_t linear = ((uint32_t)os->phys_seg << 4) + os->off;
+  host_bp_entry_t *stale = host_bp_find(bps, linear);
+  if (stale)
+    stale->used = 0; /* best-effort reconciliation; no 'bc' (see above) */
+  return plant_hook_bp(ctx, bps, os->phys_seg, os->off);
+}
+
+/*
+ * Called after every successful stop, before dispatch_hook. Pure-lazy
+ * overlay arming (Phase 7 Item E):
+ *
+ * The page-in stub ("int 3f" until first called) is deliberately NEVER
+ * breakpointed while unpaged: the first far call into it must run the
+ * guest's own VROOMM-style pager natively, and a breakpoint that has fired
+ * at an address cannot be safely re-executed natively there afterwards —
+ * simx86 keeps serving the translation compiled while the int3 was planted
+ * instead of the restored bytes (bisected empirically; regular hooks never
+ * hit this because their hook replaces the breakpointed instruction).
+ *
+ * Once a stub has been paged in (byte 0xEA = "jmp far"), the next stop
+ * registers its overlay segment with the core (once per transition) and
+ * plants its one and only breakpoint. From then on every arrival traps,
+ * run_begin() redirects into the overlay address space, and RETURN_FAR
+ * completes the far-call frame — the real stub bytes never execute again.
+ *
+ * Defense-in-depth: if a stop ever lands on an unpaged stub anyway, drop
+ * that bp so the pager can still run natively under a plain 'g' (issuing
+ * 'g' with IP ON a planted bp would make dosemu TF-step INTO the handler
+ * and resume it with TF=1 — a trap storm).
+ *
+ * Returns 0 / -1 (bp planting failed; loud message already printed).
+ */
+static int overlay_sync(run_ctx_t *r, const dosdebug_regs_t *dr)
+{
+  const uint32_t stop_lin = ((uint32_t)dr->cs << 4) + dr->ip;
+
+  for (int i = 0; i < n_overlay_stubs; i++) {
+    overlay_stub_info_t *os = &overlay_stubs[i];
+    if (os->paged_in)
+      continue;
+    const uint32_t lin = ((uint32_t)os->phys_seg << 4) + os->off;
+    const uint8_t b0 = lowmem_read8(r->ctx->lm, lin);
+
+    if (b0 != 0xEA) {
+      if (b0 == 0xCD && lin == stop_lin) {
+        /* first call into the unpaged stub: unarm so the guest's own
+         * pager runs natively after this stop's RESUME dispatch */
+        host_bp_entry_t *e = host_bp_find(r->bps, lin);
+        if (e) {
+          host_clear_bp(r->ctx, e->index);
+          e->used = 0;
+        }
+        if (r->verbose)
+          printf("host_run: overlay %d not paged in; bp dropped at "
+                 "%04x:%04x, letting the pager run\n", i, dr->cs, dr->ip);
+      }
+      continue;
+    }
+
+    const u16 dest_off = lowmem_read16(r->ctx->lm, lin + 1);
+    const u16 dest_seg = lowmem_read16(r->ctx->lm, lin + 3);
+    hydra_overlay_segment_set((u16)i, dest_seg);
+    os->paged_in = 1;
+    if (r->verbose)
+      printf("host_run: overlay %d armed: stub %04x:%04x paged to "
+             "%04x:%04x (bp replanted)\n", i, os->phys_seg, os->off,
+             dest_seg, dest_off);
+    if (overlay_replant_bp(r->ctx, r->bps, os) != 0)
+      return -1;
+  }
+  return 0;
+}
+
+/* ------------------------------------------------------------------ */
 /* MZ (.exe) guest loading via dosemu2 'bpload' (Phase 7 Item C)       */
 /* ------------------------------------------------------------------ */
 
@@ -585,11 +751,14 @@ host_run_stop_reason_t host_run(host_ctx_t *ctx, hydra_machine_t *m,
              psp, ctx->code_load_offset);
   }
 
-  /* Plant a breakpoint at every registered hook. Every hook MUST get one;
-   * a silent drop means guest code runs unhooked — refuse to start. */
+  /* Plant a breakpoint at every registered non-overlay hook. Every hook
+   * MUST get one; a silent drop means guest code runs unhooked — refuse to
+   * start. OVERLAY stubs are armed lazily by overlay_sync() once paged in;
+   * see the bp_visitor comment for why they must not be planted here. */
   {
     int count = 0;
-    if (install_hook_breakpoints(ctx, bps, &count) != 0) {
+    if (install_hook_breakpoints(ctx, bps, &count) != 0 ||
+        overlay_registry_reset(ctx) != 0) {
       reason = HOST_RUN_STOP_ERROR;
       goto done;
     }
@@ -634,6 +803,18 @@ host_run_stop_reason_t host_run(host_ctx_t *ctx, hydra_machine_t *m,
         break;
       }
 
+      /* Overlay bookkeeping: unarm unpaged stubs that were just called and
+       * lazily arm paged ones (register segment + fresh breakpoint). */
+      if (overlay_sync(&r, &dr) != 0) {
+        reason = HOST_RUN_STOP_ERROR;
+        break;
+      }
+
+      /* Dispatch the hook through the Hydra core. The hook may issue
+       * multiple raw-code requests (CLI, STI, INT, INB, OUTB, ...) or call
+       * through to guest functions before completing. Each produces a
+       * CALL/CALL_NEAR result; we trace the guest on dosemu2 and feed the
+       * result back. */
       host_run_stop_reason_t dn = dispatch_hook(&r, &dr, 0);
       if (dn != HOST_RUN_STOP_NONE) {
         reason = dn;
