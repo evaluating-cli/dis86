@@ -125,7 +125,7 @@ Some specific known limitations:
 - Control-flow synthesis is limited to while-loops, if-stmts, and switch-stmts. If-else is unimplemented.
 - Block scheduling and placement is very unoptimal for more complicated control-flow.
 - emu86 implements only the instruction/device subset exercised by the project's target binaries; the SST hardware-anchor ledger validates emu86 against real 80C286 captures.
-- emu86's real-mode instruction behavior is hardware-anchored against the SingleStepTests 80286 corpus (V1 conservative family: ~1.01M hardware executions, 81.6% PASS; 11 classified emu86-bug clusters documented in [`docs/emu86/sst.md`](docs/emu86/sst.md)); a hermetic checked-in micro-corpus guards the `just check` harness lane.
+- emu86's in-scope V1 real-mode instruction behavior is hardware-anchored against the pinned SingleStepTests 80286 corpus: the hardened stride-1 run executed 1,064,157 tests across 268 forms with 1,050,652 PASS, 0 FAIL, 0 DECODE_ERR, and 0 PANIC (see [`docs/emu86/sst.md`](docs/emu86/sst.md)); a hermetic checked-in micro-corpus guards the `just check` harness lane.
 - Constant folding of signed comparisons assumes the 16-bit const-pool domain and can mis-fold an 8-bit signed compare whose operands are both constants (see the known-limitation comment in `constant_folding`, `dis86/src/decompile/opt.rs`).
 - ... and many more ...
 
