@@ -23,9 +23,13 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include <ctype.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 #include "host.h"
 #include "hydra_machine.h"
@@ -38,6 +42,23 @@
 
 /* Set by hydra_machine_init() (api_impl.c) before hydra_user_init() runs. */
 extern char *HYDRA_CMDLINE_CONF;
+
+/* Capture/restore is process-persistent: the capture process exits immediately
+ * after state_save(), so an in-memory register table cannot satisfy restore.
+ * Store the architectural registers plus the complete real-mode lowmem+HMA
+ * window. The file is written through a sibling temporary file and renamed so
+ * a failed capture never leaves a partially valid snapshot behind. */
+#define HOST_SNAPSHOT_MAGIC "HYDSNP1"
+#define HOST_SNAPSHOT_VERSION 1u
+#define HOST_SNAPSHOT_MEM_SIZE 0x110000u
+#define HOST_FLAGS_VERIFY_MASK ((uint16_t)~(0x3000u | 0x0002u))
+
+typedef struct host_snapshot_file_header {
+    char magic[8];
+    uint32_t version;
+    uint32_t memory_size;
+    dosdebug_regs_t regs;
+} host_snapshot_file_header_t;
 
 /* ------------------------------------------------------------------ */
 /* conf string parsing                                                 */
@@ -167,55 +188,153 @@ static void host_update_registers(hydra_machine_ctx_t *_ctx,
 }
 
 /* ------------------------------------------------------------------ */
-/* vtable: state save / restore (register snapshots keyed by label)    */
+/* exact register push                                                 */
 /* ------------------------------------------------------------------ */
 
-static host_snapshot_t *host_snapshot_find(host_ctx_t *ctx, const char *label,
-                                           int alloc)
+int host_set_regs(host_ctx_t *ctx, const dosdebug_regs_t *regs)
 {
-    host_snapshot_t *free_slot = NULL;
+    if (!ctx || !regs)
+        return -1;
 
-    for (size_t i = 0; i < HOST_MAX_SNAPSHOTS; i++) {
-        host_snapshot_t *s = &ctx->snapshots[i];
-        if (s->used && strcmp(s->label, label) == 0)
-            return s;
-        if (!s->used && !free_slot)
-            free_slot = s;
+    /* dosdebug_write_regs() deliberately works around the debugger's misleading
+     * FL command verdict by OR-ing host-managed bits before its read-back. That
+     * used to destroy guest IF=0. Re-apply the caller's unmodified FLAGS value:
+     * dosemu set_FLAGS() keeps physical IF set for vm86 but records guest IF in
+     * VIF/set_IF()/clear_IF(), and mhp_getreg(_FLr) returns get_FLAGS(), so the
+     * guest-visible IF bit is both writable and observable. IOPL and reserved
+     * bit 1 remain host-managed and are excluded from the architectural check. */
+    if (dosdebug_write_regs(ctx->db, regs) != 0)
+        return -1;
+    (void)dosdebug_write_reg(ctx->db, "FL", regs->flags);
+
+    dosdebug_regs_t now;
+    if (dosdebug_read_regs(ctx->db, &now) != 0)
+        return -1;
+    if ((now.flags & HOST_FLAGS_VERIFY_MASK) !=
+        (regs->flags & HOST_FLAGS_VERIFY_MASK)) {
+        fprintf(stderr, "dosemu host: guest FLAGS restore failed: wanted %04x got %04x\n",
+                (unsigned)regs->flags, (unsigned)now.flags);
+        return -1;
+    }
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* vtable: persistent state save / restore                             */
+/* ------------------------------------------------------------------ */
+
+static int host_write_snapshot(host_ctx_t *ctx, const char *path,
+                               const dosdebug_regs_t *regs)
+{
+    if (!path || !path[0] || lowmem_size(ctx->lm) < HOST_SNAPSHOT_MEM_SIZE)
+        return -1;
+
+    char tmp[PATH_MAX];
+    int n = snprintf(tmp, sizeof(tmp), "%s.tmp.%ld", path, (long)getpid());
+    if (n < 0 || (size_t)n >= sizeof(tmp))
+        return -1;
+
+    FILE *f = fopen(tmp, "wb");
+    if (!f) {
+        fprintf(stderr, "dosemu host: snapshot open %s failed: %s\n",
+                tmp, strerror(errno));
+        return -1;
     }
 
-    if (!alloc)
-        return NULL;
+    host_snapshot_file_header_t h;
+    memset(&h, 0, sizeof(h));
+    memcpy(h.magic, HOST_SNAPSHOT_MAGIC, sizeof(HOST_SNAPSHOT_MAGIC));
+    h.version = HOST_SNAPSHOT_VERSION;
+    h.memory_size = HOST_SNAPSHOT_MEM_SIZE;
+    h.regs = *regs;
 
-    /* No existing slot: reuse the first (oldest) if none are free. */
-    if (!free_slot)
-        free_slot = &ctx->snapshots[0];
+    uint8_t *mem = lowmem_base(ctx->lm);
+    int ok = fwrite(&h, 1, sizeof(h), f) == sizeof(h) &&
+             fwrite(mem, 1, HOST_SNAPSHOT_MEM_SIZE, f) == HOST_SNAPSHOT_MEM_SIZE &&
+             fflush(f) == 0 && fsync(fileno(f)) == 0;
+    int saved_errno = errno;
+    if (fclose(f) != 0)
+        ok = 0;
+    if (!ok) {
+        unlink(tmp);
+        errno = saved_errno;
+        fprintf(stderr, "dosemu host: snapshot write %s failed: %s\n",
+                tmp, strerror(errno));
+        return -1;
+    }
+    if (rename(tmp, path) != 0) {
+        saved_errno = errno;
+        unlink(tmp);
+        errno = saved_errno;
+        fprintf(stderr, "dosemu host: snapshot rename %s -> %s failed: %s\n",
+                tmp, path, strerror(errno));
+        return -1;
+    }
+    return 0;
+}
 
-    strncpy(free_slot->label, label, HOST_SNAPSHOT_LABEL_MAX - 1);
-    free_slot->label[HOST_SNAPSHOT_LABEL_MAX - 1] = '\0';
-    free_slot->used = 1;
-    return free_slot;
+static int host_read_snapshot(host_ctx_t *ctx, const char *path,
+                              dosdebug_regs_t *regs)
+{
+    if (!path || !path[0] || lowmem_size(ctx->lm) < HOST_SNAPSHOT_MEM_SIZE)
+        return -1;
+
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        fprintf(stderr, "dosemu host: snapshot open %s failed: %s\n",
+                path, strerror(errno));
+        return -1;
+    }
+
+    host_snapshot_file_header_t h;
+    uint8_t *mem = malloc(HOST_SNAPSHOT_MEM_SIZE);
+    if (!mem) {
+        fclose(f);
+        return -1;
+    }
+
+    int ok = fread(&h, 1, sizeof(h), f) == sizeof(h) &&
+             memcmp(h.magic, HOST_SNAPSHOT_MAGIC, sizeof(HOST_SNAPSHOT_MAGIC)) == 0 &&
+             h.version == HOST_SNAPSHOT_VERSION &&
+             h.memory_size == HOST_SNAPSHOT_MEM_SIZE &&
+             fread(mem, 1, HOST_SNAPSHOT_MEM_SIZE, f) == HOST_SNAPSHOT_MEM_SIZE;
+    if (fclose(f) != 0)
+        ok = 0;
+    if (!ok) {
+        fprintf(stderr, "dosemu host: invalid or truncated snapshot: %s\n", path);
+        free(mem);
+        return -1;
+    }
+
+    /* Restore memory first. Register restoration may redirect CS:IP into that
+     * memory; publishing the CPU state before the bytes are back creates a race
+     * with the next debugger resume. */
+    memcpy(lowmem_base(ctx->lm), mem, HOST_SNAPSHOT_MEM_SIZE);
+    free(mem);
+    *regs = h.regs;
+    return 0;
 }
 
 static void host_state_save(hydra_machine_ctx_t *_ctx, const char *label)
 {
     host_ctx_t *ctx = (host_ctx_t *)_ctx;
     dosdebug_regs_t dr;
-    if (dosdebug_read_regs(ctx->db, &dr) != 0)
-        return;
-
-    host_snapshot_t *s = host_snapshot_find(ctx, label, 1);
-    if (s)
-        s->regs = dr;
+    if (dosdebug_read_regs(ctx->db, &dr) != 0 ||
+        host_write_snapshot(ctx, label, &dr) != 0) {
+        fprintf(stderr, "dosemu host: state_save failed for %s\n",
+                label ? label : "(null)");
+    }
 }
 
 static void host_state_restore(hydra_machine_ctx_t *_ctx, const char *label)
 {
     host_ctx_t *ctx = (host_ctx_t *)_ctx;
-    host_snapshot_t *s = host_snapshot_find(ctx, label, 0);
-    if (!s)
-        return;
-
-    dosdebug_write_regs(ctx->db, &s->regs);
+    dosdebug_regs_t dr;
+    if (host_read_snapshot(ctx, label, &dr) != 0 ||
+        host_set_regs(ctx, &dr) != 0) {
+        fprintf(stderr, "dosemu host: state_restore failed for %s\n",
+                label ? label : "(null)");
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -230,11 +349,6 @@ int host_get_regs(host_ctx_t *ctx, dosdebug_regs_t *regs)
 int host_set_reg(host_ctx_t *ctx, const char *name, uint16_t val)
 {
     return dosdebug_write_reg(ctx->db, name, val);
-}
-
-int host_set_regs(host_ctx_t *ctx, const dosdebug_regs_t *regs)
-{
-    return dosdebug_write_regs(ctx->db, regs);
 }
 
 int host_set_bp(host_ctx_t *ctx, uint16_t seg, uint16_t off)
