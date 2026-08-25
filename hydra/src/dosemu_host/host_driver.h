@@ -46,6 +46,10 @@ typedef struct host_run_stats {
   uint64_t hook_breakpoints;  /* hook bps installed by host_run */
 } host_run_stats_t;
 
+/* Called once after all run-owned breakpoints are armed and before the first
+ * guest GO. Return nonzero to abort the run while the CPU is still stopped. */
+typedef int (*host_run_before_go_fn_t)(host_ctx_t *ctx, void *user);
+
 /* Called after each dispatch/continue; return nonzero to stop the loop. */
 typedef int (*host_run_stop_fn_t)(host_ctx_t *ctx, const dosdebug_regs_t *regs,
                                   const host_run_stats_t *stats, void *user);
@@ -56,6 +60,8 @@ typedef struct host_run_options {
   int timeout_ms;             /* per go_and_wait; 0 = default (3000), <0 = wait
                                  forever (rely on stop_fn / dosemu exit) */
   int verbose;                /* print each stop to stdout */
+  host_run_before_go_fn_t before_go_fn; /* one-shot, after bp install */
+  void *before_go_user;
   host_run_stop_fn_t stop_fn; /* called after each dispatch; nonzero stops */
   void *stop_user;
 } host_run_options_t;
