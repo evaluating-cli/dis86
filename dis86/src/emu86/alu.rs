@@ -381,13 +381,12 @@ pub fn shift(op: ShiftOp, a: Value, n: u8, mut f: Flags) -> (Value, Flags) {
       if n != 0 {
         // CF = the last bit rotated out: the original bit at position
         // (width - n_mod) mod width. A full-circle rotate (n_mod == 0, n != 0)
-        // therefore sets CF = original LSB; the 80C286 leaves CF unchanged for
-        // count == 0 (no-op). OF is defined only when n_mod == 1: OF = CF XOR
-        // new MSB (i.e. MSB changed). ZF/SF/PF/AF are undefined for ROL and
-        // left unchanged, matching the 80C286 captures.
+        // therefore sets CF = original LSB. Count 0 is a complete no-op and
+        // preserves every flag. ROL preserves ZF/SF/PF/AF for non-zero counts;
+        // OF is defined only for the actual effective count == 1.
         let cf = ((a >> ((width - n_mod) % width)) & 1) != 0;
         f.set(FLAG_CF, cf);
-        if n_mod == 1 {
+        if n == 1 {
           let new_msb = ((result >> (width - 1)) & 1) != 0;
           f.set(FLAG_OF, cf ^ new_msb);
         }
