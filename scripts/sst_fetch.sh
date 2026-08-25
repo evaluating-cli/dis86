@@ -41,9 +41,15 @@ fetch_one() {
   fi
   local tmp
   tmp=$(mktemp)
-  trap 'rm -f "$tmp"' RETURN
-  curl -fsSL "${RAW_BASE}/${name}.MOO.gz" -o "$tmp"
-  gzip -dc "$tmp" > "$out"
+  if ! curl -fsSL "${RAW_BASE}/${name}.MOO.gz" -o "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  if ! gzip -dc "$tmp" > "$out"; then
+    rm -f "$tmp" "$out"
+    return 1
+  fi
+  rm -f "$tmp"
   local got
   got=$(sha256sum "$out" | awk '{print $1}')
   if [[ "$got" != "$want" ]]; then
@@ -64,7 +70,10 @@ fetch_auxiliary() {
   for name in revocation_list.txt CHANGELOG.md; do
     out="$target_dir/$name"
     tmp=$(mktemp)
-    curl -fsSL "${RAW_ROOT}/${name}" -o "$tmp"
+    if ! curl -fsSL "${RAW_ROOT}/${name}" -o "$tmp"; then
+      rm -f "$tmp"
+      return 1
+    fi
     mv "$tmp" "$out"
     echo "fetched: $name ($(stat -c%s "$out") bytes, pinned commit)"
   done
