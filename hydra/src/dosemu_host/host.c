@@ -294,7 +294,7 @@ static int host_read_snapshot(host_ctx_t *ctx, const char *path,
 /*   0x2E  2   reserved (0)                                           */
 /*   0x30  4   reserved (0)                                           */
 /*   0x34  4   guest_size (u32, must equal the guest-addressable window) */
-/*   0x38  4   crc32 of the blob (poly 0xEDB88320, init 0xFFFFFFFF)   */
+/*   0x38  4   crc32 of header (this field zeroed) + lowmem blob      */
 /*   0x3C  4   reserved (0)                                           */
 /*   0x40 ...  lowmem blob (lowmem_size bytes)                        */
 /*                                                                    */
@@ -310,14 +310,26 @@ static int host_read_snapshot(host_ctx_t *ctx, const char *path,
 #define HYDSNAP_VERSION 1u
 #define HYDSNAP_HDR_LEN 0x40u
 
-static uint32_t hydsnap_crc32(const uint8_t *data, size_t len)
+static uint32_t hydsnap_crc32_update(uint32_t crc, const uint8_t *data, size_t len)
 {
-    uint32_t crc = 0xffffffffu;
     for (size_t i = 0; i < len; i++) {
         crc ^= data[i];
         for (int b = 0; b < 8; b++)
             crc = (crc >> 1) ^ (crc & 1 ? 0xedb88320u : 0);
     }
+    return crc;
+}
+
+static uint32_t hydsnap_crc32_snapshot(const uint8_t hdr[HYDSNAP_HDR_LEN],
+                                       const uint8_t *data, size_t len)
+{
+    uint8_t hdr_copy[HYDSNAP_HDR_LEN];
+    memcpy(hdr_copy, hdr, sizeof(hdr_copy));
+    memset(hdr_copy + 0x38, 0, 4);
+
+    uint32_t crc = 0xffffffffu;
+    crc = hydsnap_crc32_update(crc, hdr_copy, sizeof(hdr_copy));
+    crc = hydsnap_crc32_update(crc, data, len);
     return ~crc;
 }
 
@@ -384,15 +396,14 @@ static int host_snapshot_write_file(host_ctx_t *ctx, const char *path,
     hydsnap_put16(hdr + 0x2C, ctx->data_section_seg);
     hydsnap_put32(hdr + 0x34, (uint32_t)blob);
 
-    /* Copy the guest window once and compute the CRC over the private
-     * copy: the live mapping is shared with dosemu2 and keeps mutating
-     * (BDA ticks et al.), so CRC-then-write in two passes over the live
-     * mapping can produce a self-invalid snapshot (TOCTOU). */
+    /* Copy the guest window once and compute the CRC over the exact header
+     * and private memory image that will be written. The live mapping keeps
+     * mutating (BDA ticks et al.), so no second pass over it is allowed. */
     uint8_t *snap = malloc(blob);
     if (!snap)
         return -1;
     memcpy(snap, lowmem_base(ctx->lm), blob);
-    hydsnap_put32(hdr + 0x38, hydsnap_crc32(snap, blob));
+    hydsnap_put32(hdr + 0x38, hydsnap_crc32_snapshot(hdr, snap, blob));
 
     FILE *f = fopen(path, "wb");
     if (!f) {
@@ -435,7 +446,8 @@ static int host_snapshot_read_file(const char *path, uint8_t hdr[HYDSNAP_HDR_LEN
     }
     int ok = fread(mem, 1, blob, f) == blob;
     fclose(f);
-    if (ok && hydsnap_crc32(mem, blob) == hydsnap_get32(hdr + 0x38)) {
+    if (ok && hydsnap_crc32_snapshot(hdr, mem, blob) ==
+                  hydsnap_get32(hdr + 0x38)) {
         *blob_out = mem;
         *blob_size_out = blob;
         return 0;
@@ -532,8 +544,14 @@ static void host_state_restore(hydra_machine_ctx_t *_ctx, const char *label)
         if (snap_psp && dr.ds != snap_psp)
             fprintf(stderr, "dosemu host: WARNING: HYDSNAP psp=%04x but "
                     "restored DS=%04x\n", snap_psp, dr.ds);
-        host_set_code_load(ctx, hydsnap_get16(hdr + 0x2A));
+
+        /* data_section_seg is part of the snapshot layout. Restore it before
+         * code_load_offset so host_set_code_load() recomputes the datasection
+         * base pointer using the captured value, and synchronize the core
+         * configuration at the same time. */
         ctx->data_section_seg = hydsnap_get16(hdr + 0x2C);
+        HYDRA_CONF->data_section_seg = ctx->data_section_seg;
+        host_set_code_load(ctx, hydsnap_get16(hdr + 0x2A));
         return;
     }
 
@@ -626,10 +644,10 @@ void host_set_code_load(host_ctx_t *ctx, uint16_t seg)
 {
     ctx->code_load_offset = seg;
     HYDRA_CONF->code_load_offset = seg;
+    HYDRA_CONF->data_section_seg = ctx->data_section_seg;
 
-    /* Keep the datasection basepointer (initialized from code_load_offset
-     * by api_impl.c) coherent with the new load segment. */
-    u16 dseg = (u16)(seg + HYDRA_CONF->data_section_seg);
+    /* Keep the datasection basepointer coherent with the host-owned layout. */
+    u16 dseg = (u16)(seg + ctx->data_section_seg);
     hydra_datasection_baseptr_set(lowmem_hostaddr(ctx->lm,
                                                  (uint32_t)dseg << 4));
 }
