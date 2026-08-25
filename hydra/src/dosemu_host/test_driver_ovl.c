@@ -1,10 +1,10 @@
 /*
  * test_driver_ovl.c - Phase 7 Item E integration test: overlay support.
  *
- * This fixture intentionally removes the two crutches that previously made
- * lazy arming look reliable: there is no ordinary hook between repeated
- * overlay calls and the guest never rewrites the stub merely to invalidate
- * simx86 translations. The host must observe INT 3F page-in itself.
+ * The fixture removes the two historical crutches: there is no ordinary hook
+ * between repeated overlay calls and the guest never rewrites the stub merely
+ * to invalidate simx86 translations. OVL_MODE additionally drives HYDSNAP
+ * capture/restore in both unpaged (CD 3F) and paged (EA) states.
  */
 
 #include <stdio.h>
@@ -26,17 +26,20 @@
 #define HOOKRES_OFF  0x103
 #define OVLCNT_OFF   0x105
 #define OVLRES_OFF   0x107
-#define CODE_LOAD    0x0080
 #define RAW_CODE_LINEAR 0xF000
 #define OVSEG_EXPECTED 0x3000
 #define OVL_LOGICAL_NUM 3
 #define BODY_OFF 0
 
-static const uint8_t myfunc_sig[] = { 0xB8, 0x11, 0x11, 0xC3 };
-static const uint8_t stub_sig[]   = { 0xCD, 0x3F, 0x00, 0x00, 0x90, 0x90, 0x90 };
-
 #define TARGET_OVLCALLS 4
 #define RUN_TARGET (TARGET_OVLCALLS + 1)
+#define RESTORE_ADVANCE 4
+
+#define SNAP_UNPAGED "/tmp/opencode/ovl_unpaged.snap"
+#define SNAP_PAGED   "/tmp/opencode/ovl_paged.snap"
+
+static const uint8_t myfunc_sig[] = { 0xB8, 0x11, 0x11, 0xC3 };
+static const uint8_t stub_sig[]   = { 0xCD, 0x3F, 0x00, 0x00, 0x90, 0x90, 0x90 };
 
 static uint32_t g_ovlcnt_phys;
 static uint16_t g_hookedfn_off;
@@ -99,6 +102,16 @@ static int read_file(const char *path, uint8_t **out, size_t *out_len)
   return 0;
 }
 
+static long file_size(const char *path)
+{
+  FILE *f = fopen(path, "rb");
+  if (!f) return -1;
+  if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return -1; }
+  long sz = ftell(f);
+  fclose(f);
+  return sz;
+}
+
 static int go_sleep_stop(host_ctx_t *ctx, int ms)
 {
   if (dosdebug_go(ctx->db) != 0) return -1;
@@ -139,6 +152,22 @@ static size_t find_sig(const uint8_t *file, size_t file_len,
   return (size_t)-1;
 }
 
+static void save_hydsnap(hydra_machine_t *m, const char *path)
+{
+  HYDRA_MODE->mode = HYDRA_MODE_CAPTURE;
+  HYDRA_MODE->state_path = path;
+  m->hardware->state_save(m->hardware->ctx, path);
+  HYDRA_MODE->mode = HYDRA_MODE_NORMAL;
+}
+
+static void restore_hydsnap(hydra_machine_t *m, const char *path)
+{
+  HYDRA_MODE->mode = HYDRA_MODE_RESTORE;
+  HYDRA_MODE->state_path = path;
+  m->hardware->state_restore(m->hardware->ctx, path);
+  HYDRA_MODE->mode = HYDRA_MODE_NORMAL;
+}
+
 int main(int argc, char **argv)
 {
   setvbuf(stdout, NULL, _IOLBF, 0);
@@ -147,8 +176,17 @@ int main(int argc, char **argv)
   pid_t pid = 0;
   if (argc > 1) pid = (pid_t)strtol(argv[1], NULL, 0);
   const char *com_path = (argc > 2) ? argv[2] : TESTPROG_OVL_PATH;
+  const char *mode = getenv("OVL_MODE");
+  if (!mode || !mode[0]) mode = "normal";
 
-  printf("=== Phase 7 Item E integration test (overlay) ===\n");
+  if (strcmp(mode, "normal") != 0 && strcmp(mode, "cap-unpaged") != 0 &&
+      strcmp(mode, "restore-unpaged") != 0 && strcmp(mode, "cap-paged") != 0 &&
+      strcmp(mode, "restore-paged") != 0) {
+    fprintf(stderr, "invalid OVL_MODE: %s\n", mode);
+    return 2;
+  }
+
+  printf("=== Phase 7 Item E integration test (overlay, %s) ===\n", mode);
 
   uint8_t *file = NULL;
   size_t file_len = 0;
@@ -205,8 +243,7 @@ int main(int argc, char **argv)
          OVL_LOGICAL_NUM, BODY_OFF);
 
   /* Production generator contract: F_ovlhook is the physical entry stub;
-   * F_ovlhook_OVERLAY is the logical paged body. HYDRA_REGISTER(name) resolves
-   * the former and carries the OVERLAY flag. Build the same metadata shape. */
+   * F_ovlhook_OVERLAY is the logical paged body. */
   hydra_function_def_t defs[] = {
     { "F_ovlhook",         ADDR_MAKE(0, g_stub_off) },
     { "F_ovlhook_OVERLAY", ADDR_MAKE_EXT(1, OVL_LOGICAL_NUM, BODY_OFF) },
@@ -226,10 +263,8 @@ int main(int argc, char **argv)
         lowmem_read8(ctx->lm, stub_phys + 1) == 0x3F,
         "stub starts exactly CD 3F");
 
-  /* Fail-closed regression: corrupt the unexecuted stub, invoke host_run, and
-   * prove classification rejects it before the guest advances. Restore CD3F
-   * afterwards and run the real scenario on the same connection. */
-  {
+  /* Normal mode carries the fail-closed malformed-state regression. */
+  if (strcmp(mode, "normal") == 0) {
     host_run_stats_t bad_stats = {0};
     uint8_t saved = lowmem_read8(ctx->lm, stub_phys);
     lowmem_write8(ctx->lm, stub_phys, 0x90);
@@ -245,13 +280,55 @@ int main(int argc, char **argv)
           "stub restored to exact CD 3F after negative probe");
   }
 
+  if (strcmp(mode, "cap-unpaged") == 0) {
+    unlink(SNAP_UNPAGED);
+    save_hydsnap(&m, SNAP_UNPAGED);
+    CHECK(file_size(SNAP_UNPAGED) > 0x40,
+          "unpaged HYDSNAP written with clean CD 3F stub");
+    CHECK(lowmem_read8(ctx->lm, stub_phys) == 0xCD &&
+          lowmem_read8(ctx->lm, stub_phys + 1) == 0x3F,
+          "unpaged capture leaves stub clean");
+    host_disconnect(ctx);
+    free(file);
+    printf("=== %s ===\n", g_fails ? "TEST FAILED" : "TEST PASSED");
+    return g_fails ? 1 : 0;
+  }
+
+  int restored_paged = 0;
+  if (strcmp(mode, "restore-unpaged") == 0 ||
+      strcmp(mode, "restore-paged") == 0) {
+    const char *snap = strcmp(mode, "restore-paged") == 0
+                     ? SNAP_PAGED : SNAP_UNPAGED;
+    CHECK(file_size(snap) > 0x40, "restore snapshot exists: %s", snap);
+    restore_hydsnap(&m, snap);
+    com_seg = ctx->code_load_offset;
+    com_phys = (uint32_t)com_seg << 4;
+    stub_phys = com_phys + g_stub_off;
+    restored_paged = strcmp(mode, "restore-paged") == 0;
+    CHECK(com_seg != 0, "snapshot restored code_load_offset (%04x)", com_seg);
+    if (restored_paged) {
+      CHECK(lowmem_read8(ctx->lm, stub_phys) == 0xEA,
+            "paged snapshot restores clean EA stub");
+    } else {
+      CHECK(lowmem_read8(ctx->lm, stub_phys) == 0xCD &&
+            lowmem_read8(ctx->lm, stub_phys + 1) == 0x3F,
+            "unpaged snapshot restores exact CD 3F stub");
+    }
+  }
+
   g_ovlcnt_phys = com_phys + OVLCNT_OFF;
-  lowmem_write8(ctx->lm, com_phys + GOFLAG_OFF, 1);
-  printf("go flag set; running the guest...\n");
+  uint16_t start_count = lowmem_read16(ctx->lm, g_ovlcnt_phys);
+
+  /* A paged snapshot is already mid-loop with goflag set. All other run modes
+   * start from the parked wait loop and need the explicit release. */
+  if (!restored_paged)
+    lowmem_write8(ctx->lm, com_phys + GOFLAG_OFF, 1);
+  printf("running guest from overlay count %u...\n", start_count);
 
   host_run_stats_t stats;
   host_run_options_t opts = {0};
-  size_t target = RUN_TARGET;
+  size_t target = restored_paged ? (size_t)start_count + RESTORE_ADVANCE
+                                 : RUN_TARGET;
   opts.timeout_ms = 3000;
   opts.stop_fn = stop_when_ovlcount;
   opts.stop_user = &target;
@@ -264,50 +341,81 @@ int main(int argc, char **argv)
          (unsigned long)stats.raw_code_runs, (unsigned long)stats.raw_code_returns,
          (unsigned long)stats.redirects);
 
-  uint16_t ovlres[TARGET_OVLCALLS];
-  for (int i = 0; i < TARGET_OVLCALLS; i++)
-    ovlres[i] = lowmem_read16(ctx->lm,
-                              com_phys + OVLRES_OFF + 2 * (uint32_t)i);
   uint16_t ovlcnt  = lowmem_read16(ctx->lm, g_ovlcnt_phys);
   uint16_t hookres = lowmem_read16(ctx->lm, com_phys + HOOKRES_OFF);
 
   CHECK(reason == HOST_RUN_STOP_CALLBACK, "driver stopped via callback");
-  CHECK(ovlcnt >= RUN_TARGET,
-        "guest overlay-call counter >= %d (got %u)", RUN_TARGET, ovlcnt);
-  CHECK(ovlres[0] == 0x0A77,
-        "first overlay body executed natively (ovlres[0]=%04x)", ovlres[0]);
-  CHECK(ovlres[1] == 0xBEEF && ovlres[2] == 0xBEEF && ovlres[3] == 0xBEEF,
-        "calls 2..4 dispatch decompiled hook (%04x %04x %04x)",
-        ovlres[1], ovlres[2], ovlres[3]);
+  CHECK(ovlcnt >= target,
+        "guest overlay-call counter >= %zu (got %u)", target, ovlcnt);
   CHECK(hookres == 0x600D,
-        "one regular hook observed before overlay loop (hookres=%04x)", hookres);
-
+        "regular-hook result remains visible (hookres=%04x)", hookres);
   CHECK(hydra_overlay_segment_lookup(OVL_LOGICAL_NUM) == OVSEG_EXPECTED,
         "logical overlay %u maps to %04x (got %04x)",
         OVL_LOGICAL_NUM, OVSEG_EXPECTED,
         hydra_overlay_segment_lookup(OVL_LOGICAL_NUM));
 
-  CHECK(g_myfunc_runs == 1,
-        "no ordinary hook is used as a repeated overlay synchronization point (myfunc=%u)",
-        g_myfunc_runs);
-  CHECK(g_ovlhook_runs >= TARGET_OVLCALLS,
-        "decompiled overlay hook handled later calls (runs=%u >= %d)",
-        g_ovlhook_runs, TARGET_OVLCALLS);
-  CHECK(stats.hook_dispatches >= 1 + TARGET_OVLCALLS,
-        "dispatch accounting includes one static + later overlay hooks (got %lu)",
-        (unsigned long)stats.hook_dispatches);
+  if (!restored_paged) {
+    uint16_t ovlres[TARGET_OVLCALLS];
+    for (int i = 0; i < TARGET_OVLCALLS; i++)
+      ovlres[i] = lowmem_read16(ctx->lm,
+                                com_phys + OVLRES_OFF + 2 * (uint32_t)i);
+    CHECK(ovlres[0] == 0x0A77,
+          "first overlay body executed natively (ovlres[0]=%04x)", ovlres[0]);
+    CHECK(ovlres[1] == 0xBEEF && ovlres[2] == 0xBEEF && ovlres[3] == 0xBEEF,
+          "calls 2..4 dispatch decompiled hook (%04x %04x %04x)",
+          ovlres[1], ovlres[2], ovlres[3]);
+    CHECK(g_myfunc_runs == 1,
+          "regular hook executes once, never as overlay synchronization (runs=%u)",
+          g_myfunc_runs);
+    CHECK(g_ovlhook_runs >= TARGET_OVLCALLS,
+          "decompiled overlay hook handled later calls (runs=%u >= %d)",
+          g_ovlhook_runs, TARGET_OVLCALLS);
+    CHECK(stats.hook_dispatches >= 1 + TARGET_OVLCALLS,
+          "dispatch accounting includes one static + later overlay hooks (got %lu)",
+          (unsigned long)stats.hook_dispatches);
+  } else {
+    /* Snapshot count N was captured after hook dispatch for N but before its
+     * guest-side store. After restore, slots N-1 through N+2 are therefore
+     * the four newly committed results before the target N+4 callback. */
+    uint16_t post[RESTORE_ADVANCE];
+    for (int i = 0; i < RESTORE_ADVANCE; i++) {
+      unsigned slot = ((unsigned)start_count - 1u + (unsigned)i) & 7u;
+      post[i] = lowmem_read16(ctx->lm,
+                              com_phys + OVLRES_OFF + 2u * slot);
+    }
+    CHECK(post[0] == 0xBEEF && post[1] == 0xBEEF &&
+          post[2] == 0xBEEF && post[3] == 0xBEEF,
+          "paged restore resumes with overlay breakpoint already reconstructed "
+          "(%04x %04x %04x %04x)",
+          post[0], post[1], post[2], post[3]);
+    CHECK(g_myfunc_runs == 0,
+          "paged restore does not replay pre-snapshot regular hook (runs=%u)",
+          g_myfunc_runs);
+    CHECK(g_ovlhook_runs >= RESTORE_ADVANCE,
+          "fresh process dispatches post-restore overlay calls (runs=%u >= %d)",
+          g_ovlhook_runs, RESTORE_ADVANCE);
+    CHECK(stats.hook_dispatches >= RESTORE_ADVANCE,
+          "post-restore dispatch accounting is fresh and active (got %lu)",
+          (unsigned long)stats.hook_dispatches);
+  }
 
-  /* host_run cleanup clears the debugger bp, so the shared mapping must expose
-   * the pager's clean EA bytes again. No guest self-write was used to get here. */
   CHECK(lowmem_read8(ctx->lm, stub_phys) == 0xEA,
         "stub is clean EA after breakpoint cleanup (byte=%02x)",
         lowmem_read8(ctx->lm, stub_phys));
-
   CHECK(stats.raw_code_runs == stats.raw_code_returns,
         "every raw code / guest call returned via trace (raw=%lu ret=%lu)",
         (unsigned long)stats.raw_code_runs,
         (unsigned long)stats.raw_code_returns);
   CHECK(host_pid(ctx) != 0, "dosemu2 still alive");
+
+  if (strcmp(mode, "cap-paged") == 0) {
+    unlink(SNAP_PAGED);
+    save_hydsnap(&m, SNAP_PAGED);
+    CHECK(file_size(SNAP_PAGED) > 0x40,
+          "paged HYDSNAP written after breakpoint cleanup");
+    CHECK(lowmem_read8(ctx->lm, stub_phys) == 0xEA,
+          "paged capture contains clean EA stub");
+  }
 
   host_disconnect(ctx);
   free(file);
