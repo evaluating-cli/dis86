@@ -3,6 +3,11 @@ name: dosemu host runtime
 on:
   push:
     branches: [pr/3-hydra-dosemu2-host]
+  pull_request:
+    paths:
+      - 'hydra/src/dosemu_host/**'
+      - 'hydra/meson.build'
+      - '.github/workflows/dosemu-host-runtime.yml'
   workflow_dispatch:
 
 permissions:

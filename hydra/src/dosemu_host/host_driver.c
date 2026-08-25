@@ -413,6 +413,16 @@ host_run_stop_reason_t host_run(host_ctx_t *ctx, hydra_machine_t *m,
     goto done;
   }
 
+  /* Some guests use a memory flag or equivalent handoff to leave a parked
+   * wait loop. Perform that release only after every run-owned breakpoint is
+   * armed, while dosdebug still has the CPU stopped. */
+  if (opts && opts->before_go_fn &&
+      opts->before_go_fn(ctx, opts->before_go_user) != 0) {
+    fprintf(stderr, "host_run: before_go callback failed; guest not released\n");
+    reason = HOST_RUN_STOP_ERROR;
+    goto done;
+  }
+
   {
     run_ctx_t r = { ctx, m, bps, &st, opts, timeout_ms, verbose };
 
