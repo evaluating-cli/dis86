@@ -6,30 +6,34 @@ SST (SingleStepTests hardware captures) is the validation authority for emu86; t
 
 ### Merge gate: exact-head real-dosemu verification
 
-**Status: PENDING.**
+**Status: PASS for the final behavioral candidate.**
 
-The branch records a real-dosemu host verification at `d4cf069` for the guest-owned
-scratch and guest-IF hardening. That run predates two correctness changes that affect
-runtime behavior:
+The hardened host was verified on commit
+`3beac7989b1a982f1645ee597192d0c8a40d8080` in GitHub Actions runtime run #10
+(`32875595772`) on Ubuntu 24.04 using the stock dosemu2 PPA package:
 
-- raw-code slot addresses are now never reused during the host process; and
-- capture/restore now uses explicit special-mode breakpoints and clears/re-arms software
-  breakpoints around snapshot memory replacement.
+```text
+dosemu2  2.0~pre9-10260-31cd1289e+202608231532~ubuntu24.04.1
+dosemu   dosemu2-2.0pre9, Revision 7076
+fdpp     1.10-10002-1671-9282d8c+202605091902~ubuntu24.04.1
+```
 
-Therefore the `d4cf069` result is historical evidence, **not** merge evidence for the
-current implementation. Before merging PR #34, run the tests below on the exact merge
-candidate and replace this `PENDING` block with a recorded result containing:
+The same commit also passed the host-independent `test` workflow (run #193). Runtime
+results on `3beac798...` were:
 
-- tested commit SHA;
-- dosemu2 executable/version or commit/package identity;
-- command lines used;
-- PASS/FAIL for `test_host` and `run_driver_test.sh`;
-- the driver counters (`hook_dispatches`, `raw_code_runs`, `raw_code_returns`,
-  `redirects`);
-- confirmation that IF=0, lowmem provenance, persistent snapshot restore, and the
-  byte-for-byte raw scratch check passed.
+- `test_overlay_reject`: **PASS** — a real overlay-typed hook is rejected before guest execution in the default backend mode;
+- `test_host`: **PASS** — verified lowmem provenance, complete register transport, guest-visible IF=0 round-trip, persistent register+memory snapshot restore, and breakpoint smoke;
+- `run_driver_test.sh`: **PASS** — three static hooks, nested native→guest callthrough, CF preservation, IF=0 preservation, and byte-for-byte raw scratch restoration;
+- driver counters: `hook_dispatches=21`, `raw_code_runs=45`, `raw_code_returns=45`, `redirects=66`.
 
-A host-independent CI pass does **not** satisfy this gate.
+Observed architectural regression samples included `FLAGS=3203` for the CF-preservation
+check and `FLAGS=3003` for the IF=0 round-trip check. The guest-owned 8 KiB raw-code
+reservation was restored byte-for-byte and dosemu2 remained alive at test completion.
+
+Any commits after `3beac798...` that only update this verification record or PR text do
+not change executable behavior. They must still clear the repository's normal CI and
+stock-dosemu runtime workflow before merge; the PR discussion records that final-head
+check so the merge itself remains exact-head gated.
 
 ### Build
 
@@ -139,9 +143,10 @@ A passing run ends with:
 
 The external dosdebug backend does **not** claim overlay-hook support. Registering a
 `HYDRA_HOOK_FLAGS_OVERLAY` hook causes breakpoint installation to fail and `host_run()`
-to refuse execution. This replaces the old silent overlay skip. A merge candidate must
-not document or report an `.ovl` success path for this backend unless dynamic overlay
-breakpoint discovery/re-arming is implemented and tested separately.
+to refuse execution. This replaces the old silent overlay skip. The negative
+`test_overlay_reject` fixture is a permanent default-mode contract: a future overlay
+implementation must preserve this behavior unless an explicit opt-in mode is enabled.
+No `.ovl` success path is claimed by PR #34.
 
 ### dosdebug protocol lessons retained by the current host
 
@@ -150,9 +155,13 @@ breakpoint discovery/re-arming is implemented and tested separately.
 - Read back the register state after a complete push.
 - Drain stale debugger output around trace operations to avoid one-block response-stream
   desynchronization.
-- The `FL` command verdict is not authoritative because dosemu normalizes physical
-  EFLAGS/IOPL. `host_set_regs()` re-applies the exact guest FL value and verifies the
-  guest-visible flags, including IF.
+- `r0` reports raw EFLAGS with physical IF forced by dosemu's vm86 machinery. The client
+  reconstructs guest-visible IF from VIF before exposing 16-bit FLAGS to Hydra.
+- A direct `r FL value` can apply the requested guest IF correctly but still emit the
+  debugger text `failed to set register 'FL'` because its immediate verifier compares
+  against raw/normalized flags. The client tolerates only that known FL textual false
+  verdict; FIFO/transport failures remain fatal, and `host_set_regs()` verifies the
+  resulting guest-visible FLAGS by architectural readback.
 - A traced callee that blocks inside DOS I/O can stall a step; the driver bounds each
   individual step to 10 seconds.
 - `DOSDEBUG_STREAM_LOG=<path>` records the raw protocol stream for diagnostics.
@@ -164,9 +173,9 @@ just check
 ```
 
 These checks are useful regression coverage but are not the real-dosemu merge gate.
-The CI recipe must compile the `hydra/src/dosemu_host/*.c` implementation in addition
-to the top-level Hydra sources; otherwise a green workflow can miss host-driver compile
-errors.
+The CI recipe compiles the `hydra/src/dosemu_host/*.c` implementation/test sources in
+addition to the top-level Hydra sources so a green workflow cannot miss host-driver
+compile errors.
 
 emu86 validation authority remains independent:
 
