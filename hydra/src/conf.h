@@ -4,11 +4,11 @@ struct hydra_conf
 {
   u16 code_load_offset;
   u16 data_section_seg;
-  /* Absolute linear address of the raw-code scratch region. Each snippet of
-   * guest opcode (hydra_impl_raw_code) is placed in a fresh 128-byte slot
-   * here (monotonically increasing within one hook dispatch, reset at each
-   * hook boundary via hydra_impl_raw_code_reset) so the simx86 JIT never
-   * serves a stale cached translation. Must be 16-byte aligned RAM not used
-   * by the guest. */
+  /* Absolute linear address + byte size of a scratch region explicitly
+   * reserved by the guest/launcher for Hydra raw-code execution. The dosemu2
+   * host does not guess or commandeer a low-memory address. Each snippet uses
+   * a fresh 128-byte slot within this reservation so simx86 cannot serve a
+   * stale translation after external memfd writes. */
   u32 raw_code_offset;
+  u32 raw_code_size;
 };
