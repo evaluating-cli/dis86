@@ -2,30 +2,50 @@
 
 SST (SingleStepTests hardware captures) is the validation authority for emu86; this document covers the **current Hydra-on-dosemu2 hosting tests** (first section) and the reference-only frozen dosemu2 transport evidence (remaining sections, historical).
 
-## Current: Hydra-on-dosemu2 hosting (external client, shipped 2026-08-20)
+## Current: Hydra-on-dosemu2 hosting (external client)
 
-Build:
+### Merge gate: exact-head real-dosemu verification
+
+**Status: PENDING.**
+
+The branch records a real-dosemu host verification at `d4cf069` for the guest-owned
+scratch and guest-IF hardening. That run predates two correctness changes that affect
+runtime behavior:
+
+- raw-code slot addresses are now never reused during the host process; and
+- capture/restore now uses explicit special-mode breakpoints and clears/re-arms software
+  breakpoints around snapshot memory replacement.
+
+Therefore the `d4cf069` result is historical evidence, **not** merge evidence for the
+current implementation. Before merging PR #34, run the tests below on the exact merge
+candidate and replace this `PENDING` block with a recorded result containing:
+
+- tested commit SHA;
+- dosemu2 executable/version or commit/package identity;
+- command lines used;
+- PASS/FAIL for `test_host` and `run_driver_test.sh`;
+- the driver counters (`hook_dispatches`, `raw_code_runs`, `raw_code_returns`,
+  `redirects`);
+- confirmation that IF=0, lowmem provenance, persistent snapshot restore, and the
+  byte-for-byte raw scratch check passed.
+
+A host-independent CI pass does **not** satisfy this gate.
+
+### Build
 
 ```sh
 meson setup /home/p/dis86/hydra/build /home/p/dis86/hydra   # once
 ninja -C /home/p/dis86/hydra/build
 ```
 
-Integration test (launches a fresh headless dosemu2, runs the guest COM, hooks
-three functions, drives 5 loop iterations — 17 hook dispatches, 41 traced
-raw-code/guest-call executions — and verifies dispatch counts, native→guest
-callthrough, last-iteration partial accounting, and flag preservation).
-Takes ~2.5 minutes:
+The dosemu-dependent executables are built under
+`hydra/build/src/dosemu_host/`.
 
-```sh
-pkill -9 -x dosemu2.bin 2>/dev/null; sleep 1
-cd /home/p/dis86/hydra/src/dosemu_host
-timeout 300 bash run_driver_test.sh
-```
+### Reference dosemu2 configuration
 
-Reference dosemu2 config (`/tmp/opencode/dosemu_mshm.conf` — create if absent):
+`run_driver_test.sh` uses `/tmp/opencode/dosemu_mshm.conf` and creates it if absent:
 
-```
+```text
 $_cpu_vm = "emulated"
 $_cpuemu = (1)
 $_sound = (off)
@@ -37,44 +57,122 @@ $_hdimage = "+1"
 $_mapping = "mapmshm"
 ```
 
-Required keys: `$_mapping = "mapmshm"` (memfd lowmem backing, so
-`/proc/<pid>/fd/` mmap works), `$_hdimage = "+1"` (FreeDOS boot off the working
-directory, which must contain `testprog.com`). The test script sets
-`XDG_RUNTIME_DIR=/tmp/opencode/runtime` so the dosdebug FIFOs land predictably;
-it kills dosemu2 on exit. Expected output ends with:
+Required properties for this host are `$_mapping = "mapmshm"` (procfs-visible memfd
+backings) and a boot/runtime setup that launches the test COM. The test script uses
+`XDG_RUNTIME_DIR=/tmp/opencode/runtime` so the dosdebug FIFOs are predictable.
 
+### Test 1: host/transport state checks
+
+`test_host` exercises the host against a running dosemu2 process. It verifies:
+
+- connection to stock dosemu2 and initial register read;
+- lowmem mapping selected by the independent dosdebug-probe provenance check;
+- complete register read/write;
+- guest-visible IF=0 write/read round-trip;
+- process-persistent snapshot file containing registers plus the complete
+  `0x110000` lowmem+HMA window;
+- restoration of both a mutated register and mutated guest memory;
+- debugger breakpoint plant/continue/clear smoke behavior.
+
+Launch dosemu2 with the configuration above, obtain the `dosemu2.bin` PID, then run:
+
+```sh
+/home/p/dis86/hydra/build/src/dosemu_host/test_host "$DOPID"
 ```
-stops=13 hook_dispatches=17 raw_code_runs=41 raw_code_returns=41 redirects=58
-...
+
+A passing run ends with:
+
+```text
+ALL TESTS PASSED
+```
+
+### Test 2: current function-hook driver fixture
+
+Run:
+
+```sh
+pkill -9 -x dosemu2.bin 2>/dev/null; sleep 1
+cd /home/p/dis86/hydra/src/dosemu_host
+timeout 300 bash run_driver_test.sh
+```
+
+`run_driver_test.sh` launches a fresh dosemu2, copies the built COM fixture into its
+working directory, waits for `dosemu2.bin`, then runs `test_driver` against that PID.
+
+The current fixture is intentionally larger than the original ~95-byte guest because it
+contains an aligned **8 KiB guest-owned raw-code reservation**. There is no implicit
+`0x1c00` scratch address. `test_driver` locates the reservation marker in the loaded COM
+and calls `host_reserve_raw_code()` only after verifying that the entire reservation is
+inside the guest image and paragraph aligned.
+
+The five-iteration fixture covers:
+
+- three simultaneous static hooks;
+- CLI/STI/INT/INB/OUTB guest-opcode execution;
+- native→guest `CALL_FAR` callthrough to unhooked guest code;
+- a nested hooked call encountered while tracing that guest callthrough;
+- CF preservation across hook return;
+- **IF=0 preservation across a complete hook round-trip**;
+- every raw/native→guest call reaching its magic return;
+- exact redirect accounting; and
+- byte-for-byte restoration of the full 8 KiB raw-code reservation after all snippets.
+
+For `target=5`, the current test code requires:
+
+```text
+hook_dispatches = 21
+raw_code_runs = 45
+raw_code_returns = 45
+redirects = 66
+```
+
+It also requires the driver to stop via its callback, the expected guest results to be
+observed, the nested hook to return `0xCAFE`, CF to remain set where expected, IF to
+remain clear in the IF regression sample, and dosemu2 to still be alive at the end.
+A passing run ends with:
+
+```text
 === TEST PASSED ===
 ```
 
-The test guest (`testprog.asm`, ~95 bytes) exercises:
-- 3 simultaneous hooks (raw-code opcodes, bare NOP hook, native→guest calls),
-- native→guest `CALL_FAR` callthroughs into unhooked guest functions
-  (helper2: 13 instructions — beyond the original 6-step trace limit),
-- a hooked function called from inside such a guest call — the breakpoint
-  fires mid-trace and dispatches as a nested hook,
-- guest flags (CF) surviving a full hook dispatch.
+### Unsupported overlay behavior
 
-dosdebug protocol hard-won lessons (raw stream logs verified these):
-- Send register writes PACED (per-command round-trips). Bursts of set-register
-  commands get some commands silently dropped by dosemu2's debugger, and at
-  high cadence the CPU occasionally executed while the debugger believed it
-  stopped. The writes are followed by an `r0` read-back verify that fails
-  hard on mismatch.
-- The response stream can desynchronize by one block when a step produces
-  extra unsolicited text; `dosdebug_drain()` resynchronizes before/after steps.
-- `r FL` reports "failed to set register 'FL'" even on success (dosemu
-  forces IF/IOPL/bit-1 then verifies the full EFLAGS); the low 16 bits do
-  land — always verify flags by read-back (`| 0x3202`).
-- `DOSDEBUG_STREAM_LOG=<path>` records the raw protocol stream for debugging.
+The external dosdebug backend does **not** claim overlay-hook support. Registering a
+`HYDRA_HOOK_FLAGS_OVERLAY` hook causes breakpoint installation to fail and `host_run()`
+to refuse execution. This replaces the old silent overlay skip. A merge candidate must
+not document or report an `.ovl` success path for this backend unless dynamic overlay
+breakpoint discovery/re-arming is implemented and tested separately.
 
-emu86 validation authority (unchanged, host-independent):
+### dosdebug protocol lessons retained by the current host
+
+- Send register writes paced, with per-command round-trips; bursts were observed to drop
+  commands on the tested runtime.
+- Read back the register state after a complete push.
+- Drain stale debugger output around trace operations to avoid one-block response-stream
+  desynchronization.
+- The `FL` command verdict is not authoritative because dosemu normalizes physical
+  EFLAGS/IOPL. `host_set_regs()` re-applies the exact guest FL value and verifies the
+  guest-visible flags, including IF.
+- A traced callee that blocks inside DOS I/O can stall a step; the driver bounds each
+  individual step to 10 seconds.
+- `DOSDEBUG_STREAM_LOG=<path>` records the raw protocol stream for diagnostics.
+
+### Host-independent checks
 
 ```sh
-cargo test --locked --all-targets   # 277 passed
-# emu86_sst audit --probe           # 0 PROBE-MISMATCH
+just check
+```
+
+These checks are useful regression coverage but are not the real-dosemu merge gate.
+The CI recipe must compile the `hydra/src/dosemu_host/*.c` implementation in addition
+to the top-level Hydra sources; otherwise a green workflow can miss host-driver compile
+errors.
+
+emu86 validation authority remains independent:
+
+```sh
+cargo test --locked --all-targets
+# emu86_sst audit --probe           # hardware-corpus authority where applicable
 ```
 
 ---
@@ -95,30 +193,21 @@ Testing claims use these levels; passing a lower level must not be reported as p
 4. **Pinned-runtime tested:** the patches are applied to dosemu2 commit `604ce0cdd1a71f657e2a2df623d216d5ab289313` and exercised with the pinned runtime stack. The shared-memory contract is ABI version **1**.
 5. **Still-unverified E2E:** the expanded pinned-runtime differential corpus has not yet proved the behavior.
 
-## Host-independent checks
+## Host-independent checks (historical transport)
 
-```sh
-just check
-```
-
-This covers Rust/reference CPU tests and local ABI/state/comparison logic. PR #23 specifically covers the exact host command, MZ-derived identity, canonical target path, page-sized mapping with its 88-byte ABI prefix, and launcher/descendant PID ownership without making normal repository checks depend on a dosemu2 checkout or graphical stack. Passing it is unit-test evidence, not dosemu2 integration evidence.
-
-The emu86-only fixture corpora (`dis86/src/emu86/validator/fixture.rs` — the REP matrix, the seeded register/segment mutation corpus, and the fixture builder plus host-side memory-window comparison logic) were archived when the differential validator was deleted and are no longer part of `just check` coverage.
+The old frozen-transport checks covered the retired validator's host command, target identity, shared-memory ABI, lifecycle, and comparison plumbing. They are retained as transport provenance, not as evidence for the current external Hydra host.
 
 ### Hardware-anchored emu86 coverage (validation authority)
 
 SST is the replacement validation authority for the dosemu2 differential validator:
-emu86 is validated against real 80C286 hardware captures, and the dosemu2
-differential corpus is no longer a validation gate.
+emu86 is validated against real 80C286 hardware captures, and the dosemu2 differential
+corpus is no longer a validation gate.
 
-`just check` also runs a hermetic checked-in micro-corpus of real SingleStepTests
-80286 hardware captures through the emu86 SST harness. The authoritative hardened
-full-corpus run executed 1,064,157 tests across all 268 V1 forms with 1,050,652
-PASS, 0 FAIL, 0 DECODE_ERR, and 0 PANIC; see `docs/emu86/sst.md` for the complete
-aggregate, filtering/revocation counts, and pinned runner/corpus SHAs. This is the
-*hardware*-anchoring validation axis (emu86 vs a real Harris 80C286); the dosemu2
-simx86 transport is kept only as reference for Hydra hosting (Option D), not as a
-validation axis.
+The authoritative hardened full-corpus run recorded elsewhere in this repository
+executed 1,064,157 tests across all 268 V1 forms with 1,050,652 PASS, 0 FAIL,
+0 DECODE_ERR, and 0 PANIC; see `docs/emu86/sst.md` for aggregate, filtering/revocation
+counts, and pinned runner/corpus SHAs. This is the hardware-validation axis, not a
+Hydra-on-dosemu2 hosting result.
 
 The optional SDL frontend remains separate:
 
@@ -128,36 +217,29 @@ cargo build --manifest-path dis86/Cargo.toml --features sdl --bin emu86
 
 ## Pinned-runtime coverage
 
-The `dosemu2 frozen feature patches` workflow uses `patches/dosemu2/` as the implementation carrier. It applies the two-patch squashed frozen carrier to the exact pinned commit, checks the resulting diff, builds/links the runtime, and provisions pinned FDPP plus the exact digest-verified comcom32 artifact from PR #22.
-
-Current focused runtime evidence includes:
+The `dosemu2 frozen feature patches` workflow uses `patches/dosemu2/` as the historical
+implementation carrier. It applied the frozen patch series to the pinned dosemu2
+commit and exercised the validator transport. Focused historical evidence included:
 
 - patch-series apply/compile/link success;
 - ABI-v1 initialization;
-- a basic request/step acknowledgement;
-- external bidirectional visibility of the live `/dosemu_mem` backing;
-- the zero-more-controlled-nodes end barrier;
-- cooperative/clean shutdown behavior;
-- one small terminating MZ fixture driven through the dosemu2 backend/validator path;
-- PR #21 target-exit and architectural-fault publication;
-- PR #25/patch 0010 nonterminating unprefixed `INT 21h/AH=30h`, acknowledged at the post-service target PC with DOS-returned state that the next target instruction consumes; and
-- (archived) the validator corpus mode (`emu86_validator --corpus`), which ran the Rust-side declarative fixture set on the pinned runtime with per-boundary register comparison plus a memory-window comparison over each fixture's deterministic region (`dis86/src/emu86/validator/`) — proven before the validator binary and fixture corpus were deleted.
+- request/step acknowledgement;
+- bidirectional visibility of the live low-memory backing;
+- end-barrier and shutdown behavior;
+- a small terminating MZ fixture through the retired backend;
+- target-exit and architectural-fault publication;
+- host-service normalization cases; and
+- the archived differential fixture corpus before that validator path was removed.
 
-These proved that the hook, transport, live low-memory alias, basic adapter path, terminal/fault outcomes, the standalone unprefixed host-service normalization path, and the corpus/memory-comparison plumbing executed on the pinned runtime. Host-service normalization is distinct from application-handler lockstep: unchanged eligible vectors are deferred to their saved return, whereas application-installed handlers must remain controller-stepped. They are not a substitute for a representative differential corpus.
+These results are not substitutes for the current Hydra host's real-dosemu tests above.
 
-## Expanded pinned-runtime corpus still required
+## Expanded pinned-runtime differential corpus
 
-**SUPERSEDED:** this differential corpus is no longer a validation gate. SST validates REP and the other in-scope V1 instruction forms against real 80C286 hardware captures (`docs/emu86/sst.md`); the dosemu2 differential corpus below is retained as frozen transport evidence only, relevant for the Hydra-on-dosemu2 hosting work (Track 4 Option D).
+**SUPERSEDED:** this differential corpus is no longer a validation gate. SST validates
+emu86 against real hardware captures. The old dosemu2 boundary-alignment work remains
+reference-only, including historical open questions around REP boundary mapping,
+interrupt shadows, application-installed handlers, lifecycle transitions, broad
+register/control-flow mutation, and representative per-boundary memory comparison.
 
-Do **not** mark the following integration-tested until checked-in fixtures exercise them against the pinned runtime:
-
-- REP MOVS/STOS/CMPS/SCAS differential alignment. The matrix was captured host-side on emu86, but the differential stepping models differ: emu86 completes a REP string op inside one `step()` (whole-REP-per-step) while dosemu2 publishes one SAME_PC node per REP iteration. Reconciling these (classification and possibly an expected-boundary-mapping convention) would still be required to establish differential equivalence; SST establishes emu86's REP behavior against hardware, not emu86/dosemu2 boundary equivalence. This differential mismatch is no longer a validation gate;
-- differential (pinned-runtime) coverage of the register/segment mutation corpus. It was host-side model-tested on emu86; the differential variants — particularly segment-override memory writes and PUSH/POP stack effects inside a compared window — remain pending;
-- interrupt-shadow behavior for STI, MOV SS, and POP SS, including shadow + REP composition;
-- prefixed host-service encodings, application-installed handler lockstep (including outside the target MCB), and broader BIOS coverage;
-- descendant child/helper exclusion;
-- helper/lifecycle transitions, including target -> child -> target and target -> parent / stale-PSP;
-- external register/segment/control-flow mutation across a broad instruction corpus; and
-- a representative per-boundary memory corpus. The memory-window comparison harness is wired and runs on the pinned runtime with smoke fixtures; the compared windows so far are the fixtures' own deterministic regions, not broad relevant-memory coverage.
-
-Keep the runtime job separate from `just check` so emulator/toolchain failures do not obscure host-independent regressions.
+Keep historical runtime evidence conceptually separate from the current external Hydra
+host so an old validator pass is never reported as a current hosting pass.
