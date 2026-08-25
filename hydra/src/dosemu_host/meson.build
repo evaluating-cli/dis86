@@ -34,6 +34,13 @@ test_host = executable(
   link_with : [libhydra, libhydra_dosemu],
 )
 
+## Negative policy fixture: no dosemu process is required. It proves that the
+## external backend rejects overlay hooks before releasing guest execution.
+test_overlay_reject = executable(
+  'test_overlay_reject', 'test_overlay_reject.c',
+  link_with : [libhydra, libhydra_dosemu],
+)
+
 ## Phase 4/5: guest program (nasm -> .COM) + driver integration test.
 
 testprog_com = custom_target(
