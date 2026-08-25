@@ -46,6 +46,23 @@ The dosemu-dependent executables are built under
 `hydra/build/src/dosemu_host/`.
 
 ### Reference dosemu2 configuration
+Integration suite (`run_driver_test.sh`, `TESTPROG_FLAVOR=com|exe|cap|both`,
+default = all) launches fresh headless dosemu2 instances per stage:
+
+| Stage | What it proves | Guest / driver |
+|---|---|---|
+| `.com` | hook dispatch, raw-code traces, nested hooks, flags preservation (13 stops / 17 dispatches / 41 raw / 58 redirects, flagres=3203) | `testprog.com` / `test_driver` |
+| `.exe` | MZ loading: launcher handshake, entry validation (PSP/MCB/CD 20/entry CS:IP), dynamic `code_load_offset=PSP+0x10`; identical hook counts | `testprog.exe` + `launch.com` / `test_driver_exe` |
+| capture | HYDSNAP full-state snapshot (regs + 1MB+HMA lowmem + CRC32) at a deterministic mid-run point | `testprog.exe` / `test_driver_cap cap` |
+| restore | same boot on a FRESH instance, snapshot restored byte-exact (memory before registers), execution continues from the capture point and counters advance exactly | `test_driver_cap restore` |
+
+Takes ~4 minutes for all stages:
+
+```sh
+pkill -9 -x dosemu2.bin 2>/dev/null; sleep 1
+cd /home/p/dis86/hydra/src/dosemu_host
+timeout 600 bash run_driver_test.sh
+```
 
 `run_driver_test.sh` uses `/tmp/opencode/dosemu_mshm.conf` and creates it if absent:
 

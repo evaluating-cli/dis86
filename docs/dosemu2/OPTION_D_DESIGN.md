@@ -1,6 +1,6 @@
 # Hydra hosting on dosemu2: external client via dosdebug + /proc/pid/fd
 
-> **Status (2026-08-25): implementation hardened and runtime verified for the supported static-hook scope.**
+> **Status (2026-08-25): implementation hardened and runtime verified for the supported static-hook scope; Phase 7 real-target enablement (Items A–D) layered on top.**
 > The external stock-dosemu2 host implements function-level hooks, independently
 > verified lowmem mapping, exact guest-visible IF restoration, persistent
 > register+lowmem snapshots, explicit guest-owned raw-code scratch, and
@@ -11,11 +11,18 @@
 > Final behavioral candidate `3beac7989b1a982f1645ee597192d0c8a40d8080`
 > passed both host-independent CI and the stock-dosemu2 runtime workflow on
 > dosemu2 2.0pre9 / Revision 7076. See `TESTING.md` for the recorded commands,
-> package identity, counters, FLAGS samples, and PASS evidence. Any later commits
-> in PR #34 are documentation/verification-record changes only and must still clear
-> both workflows before merge.
+> package identity, counters, FLAGS samples, and PASS evidence.
 >
-> Implementation: `hydra/src/dosemu_host/`.
+> Phase 7 additions (this PR): diff-write register pushes (2.8× faster), user
+> metadata via `lib=` dlopen, MZ/.exe loading with dynamic load-segment discovery,
+> HYDSNAP full-state capture/restore across instances. VROOMM-style overlay
+> page-in (Phase 7 Item E) is **deferred to an explicit opt-in follow-up**: the
+> default rejection contract above is unchanged, and any future opt-in design
+> must preserve it. Integration suite stages in this PR: .com / .exe / capture /
+> restore — see `TESTING.md`.
+> Implementation: `hydra/src/dosemu_host/`. Where this doc and the shipped code
+> differ (raw-code execution is single-step-trace-based, not return-stub-based),
+> §6/§8 note the as-built behavior.
 
 **Scope:** design doc for hosting Hydra on the **stock, unmodified** dosemu2 binary.
 No rebuild, no patching, no fork, no plugin. Hydra runs as an external process that
@@ -179,6 +186,60 @@ refuses to release the guest unless a reservation is present. The integration fi
 reserves an aligned 8 KiB region embedded in its own COM image and checks it is restored
 byte-for-byte.
 
+## Implementation phases (as built)
+
+- **Phase 0 — empirical verification:** launch stock dosemu2 headless with simx86
+  (`$_cpu_vm = "emulated"`, `$_cpuemu = (1)`); connect dosdebug FIFO; find and mmap
+  lowmem via `/proc/pid/fd`; set a breakpoint and verify it fires. **Done** — also
+  established that `$_mapping = "mapmshm"` (memfd lowmem) and `$_hdimage = "+1"`
+  (FreeDOS boot off a bare working dir) are required.
+- **Phase 1 — dosdebug client:** C client in `hydra/src/dosemu_host/dosdebug.c`:
+  FIFO connection, PID discovery, command encoding, response parsing, register
+  read/write, breakpoints, go/stop, single-step. **Commit `5a575ec`.**
+- **Phase 2 — lowmem mmap bridge:** `lowmem.c` finds and mmaps the lowmem
+  backing via `/proc/<pid>/fd/`. Provides `mem_hostaddr`, `mem_read8/16`,
+  `mem_write8/16`. **Commit `5a575ec`.**
+- **Phase 3 — Hydra bridge:** full `hydra_machine_hardware_t` vtable (14
+  callbacks) in `host.c`: `mem_hostaddr` from mmap, `update_registers` /
+  `state_save` / `state_restore` via dosdebug, emulated `DOS_REAL` hardware
+  context for test mode, I/O via guest opcode execution. **Commit `c188fb7`.**
+- **Phase 4 — function-level hooking:** `host_driver.c` run loop — plant INT3 at
+  every registered hook (cleared on exit), dispatch through
+  `hydra_machine_exec` + `hydra_machine_notify`, trace-based raw-code execution
+  per §6. **Commit `079d1fc`** (+ review fixes `a8af5f2`).
+- **Phase 5 — integration testing:** `test_driver.c` + `run_driver_test.sh`:
+  26-byte NASM COM guest loops 5× calling a hooked function
+  (CLI/STI/INT/INB/OUTB/ret); hook returns 0xBE00 in AX. Result: 5 hook
+  dispatches, 25 raw-code runs, all returned via trace, guest observed the
+  result — **PASSED. Commit `079d1fc`.**
+- **Phase 6 — real-workload hardening:** trace-until-magic-return call
+  completion, nested hooks mid-trace, loud bp failures, SS:SP strictness,
+  per-step timeout clamp, FL non-forced-bit verify. **Commits `e6981bf`,
+  `a2053a2`.**
+- **Phase 7 — real-target enablement (all complete):**
+  - *A: write-path performance* (`5547669`) — diff-writes skip registers
+    unchanged since the last verified CPU dump; FL always written; r0 verify
+    kept. Suite 2m24s → 51s.
+  - *B: user metadata* (`a0c299e`) — conf key `lib=/path/user.so`; dlopen by
+    handle (RTLD_DEFAULT would hit the host's own stubs); injection setters
+    `hydra_function_metadata_set` / `hydra_callstack_metadata_set`; enables
+    name-based registration on this host.
+  - *C: MZ loading* (`a0c299e`) — launcher-driven load (`launch.com` EXECs the
+    guest AH=4B01 and parks; dosemu's own bpload/DBGload cannot be used
+    against stock fdpp because the shell boot consumes it), entry validation
+    (MCB self-ownership, PSP `CD 20`, image-vs-file bytes, entry CS:IP),
+    dynamic `code_load_offset = PSP+0x10`. Hand-rolled MZ header in NASM
+    (no linker); assembled `org 0` so `[data-HDR_SIZE]` operands are module
+    offsets.
+  - *D: capture/restore* (`5ddc34e`) — HYDSNAP file (64-B header + full lowmem
+    guest window + CRC32); restore into a fresh instance: blob memcpy BEFORE
+    full paced register push, offsets adopted from snapshot;
+    `restore|<path>|<seg:off>` un-hardcodes the restore entry (navigator
+    literal remains fallback); dispatch_hook handles RESTORE-applied returns
+    without clobbering restored regs. `lowmem_guest_size()` added — the memfd
+    mapping is far larger than guest memory.
+  - *E: overlays* (`66c7cc6`) — see §10.
+
 Raw-code JIT discipline:
 
 - each snippet uses a fresh 128-byte slot inside the reservation;
@@ -271,7 +332,16 @@ translates x86 instructions into internal nodes and executes them. The debugger'
 single-step path supplies the instruction-boundary behavior used only during Hydra's
 trace operations; there is no generic stock simx86 observer registration API.
 
-The dosdebug protocol was traced from the stock debugger sources. The dosemu2
-low-memory backing is created by its mapping layer as memfd/shm objects and exposed to
-this external host only through procfs. The frozen patches under `patches/dosemu2/`
-remain reference material for the retired validator and are not applied by Option D.
+The dosdebug protocol was traced from `src/plugin/debugger/mhpdbg.c` (transport +
+dispatch) and `mhpdbgc.c` (command handlers). The dosdebug client is `dosdebug.c`. All
+three are compiled into the stock binary. Transport is FIFOs in
+`$XDG_RUNTIME_DIR/dosemu2/`.
+
+The dosemu2 low-memory backing is `uint8_t *lowmem_base` (`mapping.c:83`, declared
+`memory.h:231`), covering `LOWMEM_SIZE` (1MB) + `HMASIZE` (64KB). Stock mapping drivers
+(`mapfile.c`) create the backing as a `memfd_create` or `shm_open`+`shm_unlink` —
+anonymous, but accessible via `/proc/<pid>/fd/`.
+
+The frozen patches (`patches/dosemu2/0001`, `0002`) are the reference implementation of
+the boundary hook and low-memory-backing query. They are not applied. The ABI-v1
+contract they implement is described in `FREEZE_ABI_V1.md` (reference-only).
