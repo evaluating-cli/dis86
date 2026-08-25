@@ -671,7 +671,16 @@ int dosdebug_read_regs(dosdebug_t *db, dosdebug_regs_t *regs)
     return 0;
 }
 
-int dosdebug_write_reg(dosdebug_t *db, const char *reg_name, uint16_t val)
+/* Execute a register-set command and validate that the debugger got as far as
+ * applying the setter. For normal registers, only "changed to" is accepted.
+ * FL is different on stock dosemu2: when guest IF=1, mhp_setreg() stores that
+ * state in high-bit VIF, then the command's immediate equality check compares
+ * the 16-bit request against a full-width get_FLAGS() value retaining VIF and
+ * can print "failed to set register 'FL'" even though the setter executed.
+ * That one known false verdict is accepted only for FL; dosdebug_write_regs()
+ * immediately follows it with a VIF-aware architectural read-back. */
+static int dosdebug_write_reg_command(dosdebug_t *db, const char *reg_name,
+                                      uint16_t val, bool allow_fl_false_failure)
 {
     if (!db || !db->connected || !reg_name)
         return -1;
@@ -687,10 +696,20 @@ int dosdebug_write_reg(dosdebug_t *db, const char *reg_name, uint16_t val)
         return -1;
 
     size_t n = db->blen - db->bpos;
-    int ok = txt_has(db->buf + db->bpos, n, "changed to");
+    const char *response = db->buf + db->bpos;
+    int ok = txt_has(response, n, "changed to");
+    if (!ok && allow_fl_false_failure && strcmp(reg_name, "FL") == 0 &&
+        txt_has(response, n, "failed to set register 'FL'"))
+        ok = 1;
+
     db->bpos = db->blen = 0;
     buf_nul_terminate(db);
     return ok ? 0 : -1;
+}
+
+int dosdebug_write_reg(dosdebug_t *db, const char *reg_name, uint16_t val)
+{
+    return dosdebug_write_reg_command(db, reg_name, val, false);
 }
 
 int dosdebug_write_regs(dosdebug_t *db, const dosdebug_regs_t *regs)
@@ -716,11 +735,11 @@ int dosdebug_write_regs(dosdebug_t *db, const dosdebug_regs_t *regs)
     }
 
     /* FL is special under vm86. dosemu forces physical IF and IOPL=3, but
-     * set_FLAGS() records the requested guest IF in VIF. Keep the requested
-     * IF untouched; normalize only host-managed IOPL and reserved bit 1 so
-     * the debugger's own set/read-back comparison succeeds. */
+     * set_FLAGS() records requested guest IF in VIF. Normalize only IOPL and
+     * reserved bit 1; allow the known IF=1 textual false-failure described in
+     * dosdebug_write_reg_command(), then verify the architectural result. */
     uint16_t want_fl = (uint16_t)(regs->flags | 0x3002u);
-    if (dosdebug_write_reg(db, "FL", want_fl) != 0)
+    if (dosdebug_write_reg_command(db, "FL", want_fl, true) != 0)
         return -1;
 
     /* Verify with a full read-back dump. parse_regs_from_buffer reconstructs
