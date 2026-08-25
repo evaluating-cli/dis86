@@ -154,7 +154,7 @@ static int read_file(const char *path, uint8_t **out, size_t *out_len)
   if (!f) return -1;
   if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return -1; }
   long sz = ftell(f);
-  if (sz < 0 || sz > 4096) { fclose(f); return -1; }
+  if (sz < 0 || sz > 32768) { fclose(f); return -1; }
   rewind(f);
   uint8_t *buf = malloc((size_t)sz);
   if (!buf || fread(buf, 1, (size_t)sz, f) != (size_t)sz) {
