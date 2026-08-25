@@ -1,30 +1,14 @@
 /*
  * host.c - dosemu2 host for Hydra's hydra_machine_hardware_t vtable.
  *
- * This is Phase 3: the concrete emulator host behind Hydra's
- * emulator-independent core. hydra_user_init() is discovered by Hydra's
- * api_impl.c (dlsym(RTLD_DEFAULT, "hydra_user_init")) and is responsible for
- * filling the vtable with the callbacks below.
- *
- * Memory          -> lowmem memfd mapping (raw shared guest memory).
+ * Memory          -> verified lowmem memfd mapping (raw shared guest memory).
  * Registers/exec  -> dosdebug FIFO protocol (register get/set, breakpoints).
- * I/O             -> guest IN/OUT opcodes via hydra_impl_raw_code (traced by
- *                    the driver); the vtable io_* callbacks remain unused stubs.
- *
- * Register direction note: the current Hydra core has NO call sites for
- * update_registers() (checked machine.c, exec.c, callstack.c, api_impl.c).
- * The vtable slot exists (hydra_machine.h:24) but nothing invokes it yet, so
- * its semantics are defined here. We implement update_registers() as a PULL:
- * it refreshes the hydra_machine_registers_t struct from the real CPU. The
- * complementary PUSH path (host -> CPU) is exposed as host_set_regs() and is
- * what state_restore() uses.
+ * I/O             -> guest IN/OUT opcodes via hydra_impl_raw_code.
  */
 
 #define _POSIX_C_SOURCE 200809L
 
-#include <ctype.h>
 #include <errno.h>
-#include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -40,14 +24,8 @@
 #include "callstack.h"
 #include "header.h"
 
-/* Set by hydra_machine_init() (api_impl.c) before hydra_user_init() runs. */
 extern char *HYDRA_CMDLINE_CONF;
 
-/* Capture/restore is process-persistent: the capture process exits immediately
- * after state_save(), so an in-memory register table cannot satisfy restore.
- * Store the architectural registers plus the complete real-mode lowmem+HMA
- * window. The file is written through a sibling temporary file and renamed so
- * a failed capture never leaves a partially valid snapshot behind. */
 #define HOST_SNAPSHOT_MAGIC "HYDSNP1"
 #define HOST_SNAPSHOT_VERSION 1u
 #define HOST_SNAPSHOT_MEM_SIZE 0x110000u
@@ -60,17 +38,8 @@ typedef struct host_snapshot_file_header {
     dosdebug_regs_t regs;
 } host_snapshot_file_header_t;
 
-/* ------------------------------------------------------------------ */
-/* conf string parsing                                                 */
-/*                                                                    */
-/* Format: "dosemu|pid=<dec>|code_load=<hex>|data_seg=<hex>"           */
-/* Any field may be omitted; if pid is absent, $DOSEMU_PID is tried,   */
-/* then auto-discovery (pid 0).                                        */
-/* ------------------------------------------------------------------ */
-
 static long host_conf_pid(const char *conf)
 {
-    /* e.g. "dosemu|pid=1234" -> 1234 */
     const char *p = conf ? strstr(conf, "pid=") : NULL;
     if (p) {
         p += strlen("pid=");
@@ -87,8 +56,7 @@ static long host_conf_pid(const char *conf)
         if (end && end != env && v >= 0)
             return v;
     }
-
-    return 0; /* auto-discover */
+    return 0;
 }
 
 static uint16_t host_conf_u16(const char *conf, const char *key, uint16_t dflt)
@@ -103,10 +71,6 @@ static uint16_t host_conf_u16(const char *conf, const char *key, uint16_t dflt)
     }
     return dflt;
 }
-
-/* ------------------------------------------------------------------ */
-/* vtable: memory (delegate to lowmem)                                 */
-/* ------------------------------------------------------------------ */
 
 static uint8_t *host_mem_hostaddr(hydra_machine_ctx_t *_ctx, uint32_t addr)
 {
@@ -138,37 +102,27 @@ static void host_mem_write16(hydra_machine_ctx_t *_ctx, uint32_t addr, uint16_t 
     lowmem_write16(ctx->lm, addr, val);
 }
 
-/* ------------------------------------------------------------------ */
-/* vtable: I/O (stubs for now; Phase 4 routes through guest opcodes)   */
-/* ------------------------------------------------------------------ */
-
 static uint8_t host_io_in8(hydra_machine_ctx_t *ctx, uint16_t port)
 {
     (void)ctx; (void)port;
-    return 0xff; /* stub */
+    return 0xff;
 }
 
 static uint16_t host_io_in16(hydra_machine_ctx_t *ctx, uint16_t port)
 {
     (void)ctx; (void)port;
-    return 0xffff; /* stub */
+    return 0xffff;
 }
 
 static void host_io_out8(hydra_machine_ctx_t *ctx, uint16_t port, uint8_t val)
 {
-    (void)ctx; (void)port; (void)val; /* stub */
+    (void)ctx; (void)port; (void)val;
 }
 
 static void host_io_out16(hydra_machine_ctx_t *ctx, uint16_t port, uint16_t val)
 {
-    (void)ctx; (void)port; (void)val; /* stub */
+    (void)ctx; (void)port; (void)val;
 }
-
-/* ------------------------------------------------------------------ */
-/* vtable: register synchronization                                    */
-/*                                                                    */
-/* update_registers() is a PULL: read the CPU state into regs.         */
-/* ------------------------------------------------------------------ */
 
 static void host_update_registers(hydra_machine_ctx_t *_ctx,
                                   hydra_machine_registers_t *regs)
@@ -176,7 +130,7 @@ static void host_update_registers(hydra_machine_ctx_t *_ctx,
     host_ctx_t *ctx = (host_ctx_t *)_ctx;
     dosdebug_regs_t dr;
     if (dosdebug_read_regs(ctx->db, &dr) != 0)
-        return; /* leave the struct untouched on failure */
+        return;
 
     regs->ax = dr.ax;   regs->bx = dr.bx;
     regs->cx = dr.cx;   regs->dx = dr.dx;
@@ -187,24 +141,18 @@ static void host_update_registers(hydra_machine_ctx_t *_ctx,
     regs->ss = dr.ss;   regs->flags = dr.flags;
 }
 
-/* ------------------------------------------------------------------ */
-/* exact register push                                                 */
-/* ------------------------------------------------------------------ */
-
 int host_set_regs(host_ctx_t *ctx, const dosdebug_regs_t *regs)
 {
     if (!ctx || !regs)
         return -1;
 
-    /* dosdebug_write_regs() deliberately works around the debugger's misleading
-     * FL command verdict by OR-ing host-managed bits before its read-back. That
-     * used to destroy guest IF=0. Re-apply the caller's unmodified FLAGS value:
-     * dosemu set_FLAGS() keeps physical IF set for vm86 but records guest IF in
-     * VIF/set_IF()/clear_IF(), and mhp_getreg(_FLr) returns get_FLAGS(), so the
-     * guest-visible IF bit is both writable and observable. IOPL and reserved
-     * bit 1 remain host-managed and are excluded from the architectural check. */
     if (dosdebug_write_regs(ctx->db, regs) != 0)
         return -1;
+
+    /* dosdebug_write_regs historically ORed IF/IOPL before invoking the FL
+     * setter. Re-apply the exact requested guest FLAGS. dosemu's set_FLAGS()
+     * stores guest IF through VIF/set_IF()/clear_IF(); get_FLAGS() exposes it
+     * again even though the physical vm86 IF remains forced on. */
     (void)dosdebug_write_reg(ctx->db, "FL", regs->flags);
 
     dosdebug_regs_t now;
@@ -212,16 +160,13 @@ int host_set_regs(host_ctx_t *ctx, const dosdebug_regs_t *regs)
         return -1;
     if ((now.flags & HOST_FLAGS_VERIFY_MASK) !=
         (regs->flags & HOST_FLAGS_VERIFY_MASK)) {
-        fprintf(stderr, "dosemu host: guest FLAGS restore failed: wanted %04x got %04x\n",
+        fprintf(stderr,
+                "dosemu host: guest FLAGS restore failed: wanted %04x got %04x\n",
                 (unsigned)regs->flags, (unsigned)now.flags);
         return -1;
     }
     return 0;
 }
-
-/* ------------------------------------------------------------------ */
-/* vtable: persistent state save / restore                             */
-/* ------------------------------------------------------------------ */
 
 static int host_write_snapshot(host_ctx_t *ctx, const char *path,
                                const dosdebug_regs_t *regs)
@@ -306,9 +251,6 @@ static int host_read_snapshot(host_ctx_t *ctx, const char *path,
         return -1;
     }
 
-    /* Restore memory first. Register restoration may redirect CS:IP into that
-     * memory; publishing the CPU state before the bytes are back creates a race
-     * with the next debugger resume. */
     memcpy(lowmem_base(ctx->lm), mem, HOST_SNAPSHOT_MEM_SIZE);
     free(mem);
     *regs = h.regs;
@@ -336,10 +278,6 @@ static void host_state_restore(hydra_machine_ctx_t *_ctx, const char *label)
                 label ? label : "(null)");
     }
 }
-
-/* ------------------------------------------------------------------ */
-/* host driver helpers (host.h)                                        */
-/* ------------------------------------------------------------------ */
 
 int host_get_regs(host_ctx_t *ctx, dosdebug_regs_t *regs)
 {
@@ -375,8 +313,6 @@ int host_stop(host_ctx_t *ctx)
 
 int host_clear_breakpoints(host_ctx_t *ctx)
 {
-    /* The dosdebug protocol has no "clear all"; nothing to do here.
-     * Drivers track and clear individual breakpoints via host_clear_bp(). */
     (void)ctx;
     return 0;
 }
@@ -399,10 +335,6 @@ void host_disconnect(host_ctx_t *ctx)
     free(ctx);
 }
 
-/* ------------------------------------------------------------------ */
-/* Hydra user metadata (required by functions.c / callstack.c)         */
-/* ------------------------------------------------------------------ */
-
 const hydra_function_metadata_t *hydra_user_functions(void)
 {
     static const hydra_function_metadata_t md = { 0, NULL };
@@ -415,28 +347,13 @@ const hydra_callstack_metadata_t *hydra_user_callstack(void)
     return &md;
 }
 
-/* ------------------------------------------------------------------ */
-/* hydra_user_init: the entry point Hydra discovers via dlsym.         */
-/*                                                                    */
-/* Note: this codebase's signature is                                 */
-/*   void hydra_user_init(hydra_conf_t *conf,                         */
-/*                        hydra_machine_hardware_t *hw,               */
-/*                        hydra_machine_audio_t *audio)               */
-/* (api_impl.c:18) - not the (hw, audio, conf) order.                 */
-/* ------------------------------------------------------------------ */
-
 void hydra_user_init(hydra_conf_t *conf,
                      hydra_machine_hardware_t *hw,
                      hydra_machine_audio_t *audio)
 {
     (void)audio;
 
-    /* The config string was passed to hydra_machine_init(); it is stashed in
-     * HYDRA_CMDLINE_CONF before this function is invoked (api_impl.c:11,25). */
-    const char *confstr = HYDRA_CMDLINE_CONF;
-    if (!confstr)
-        confstr = "";
-
+    const char *confstr = HYDRA_CMDLINE_CONF ? HYDRA_CMDLINE_CONF : "";
     host_ctx_t *ctx = calloc(1, sizeof(*ctx));
     if (!ctx)
         FAIL("dosemu host: out of memory");
@@ -446,31 +363,41 @@ void hydra_user_init(hydra_conf_t *conf,
     conf->raw_code_offset = (uint32_t)host_conf_u16(confstr, "raw_code=", 0x1c00);
 
     long pid = host_conf_pid(confstr);
-
     ctx->db = dosdebug_connect((pid_t)pid);
     if (!ctx->db)
-        FAIL("dosemu host: failed to connect to dosemu2 (pid=%ld). Is a "
-             "dosemu2 instance running with the debugger enabled?", pid);
-
+        FAIL("dosemu host: failed to connect to dosemu2 (pid=%ld)", pid);
     ctx->pid = dosdebug_get_pid(ctx->db);
 
-    ctx->lm = lowmem_connect(ctx->pid);
+    /* The memfd name is not unique: mapmshm may create several dosemu_<pid>
+     * objects. Read two stable low-memory regions independently through
+     * dosdebug, then require exactly one candidate backing to match both. */
+    uint8_t ivt_probe[16];
+    uint8_t bda_probe[16];
+    if (dosdebug_read_mem(ctx->db, 0, 0x0000, ivt_probe, sizeof(ivt_probe)) !=
+            (int)sizeof(ivt_probe) ||
+        dosdebug_read_mem(ctx->db, 0, 0x0400, bda_probe, sizeof(bda_probe)) !=
+            (int)sizeof(bda_probe)) {
+        FAIL("dosemu host: unable to read independent lowmem verification probes");
+    }
+    const lowmem_probe_t probes[] = {
+        {0x0000u, ivt_probe, sizeof(ivt_probe)},
+        {0x0400u, bda_probe, sizeof(bda_probe)},
+    };
+    ctx->lm = lowmem_connect_verified(ctx->pid, probes,
+                                      sizeof(probes) / sizeof(probes[0]));
     if (!ctx->lm)
-        FAIL("dosemu host: failed to map lowmem for pid %ld "
-             "(is $_mapping = \"mapmshm\" set?)", (long)ctx->pid);
+        FAIL("dosemu host: failed to identify a unique lowmem backing for pid %ld",
+             (long)ctx->pid);
 
-    /* Read the initial register state; this also verifies the connection. */
     ctx->have_initial_regs =
         (dosdebug_read_regs(ctx->db, &ctx->initial_regs) == 0);
     if (!ctx->have_initial_regs)
-        FAIL("dosemu host: connection to pid %ld is not alive "
-             "(register read failed)", (long)ctx->pid);
+        FAIL("dosemu host: initial register read failed for pid %ld",
+             (long)ctx->pid);
 
-    /* Mandatory config (api_impl.c:27-28 asserts these were set). */
     conf->code_load_offset = ctx->code_load_offset;
     conf->data_section_seg = ctx->data_section_seg;
 
-    /* Fill the vtable. */
     hw->ctx = (hydra_machine_ctx_t *)ctx;
     hw->mem_hostaddr = host_mem_hostaddr;
     hw->mem_read8    = host_mem_read8;
