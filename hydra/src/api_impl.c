@@ -48,6 +48,15 @@ HYDRA_MACHINE_INIT_FUNC(hydra_machine_init)
     char *rest = HYDRA_CMDLINE_CONF+strlen("restore|");
     HYDRA_MODE->mode = HYDRA_MODE_RESTORE;
     HYDRA_MODE->state_path = rest;
+    /* Optional entry-point selector: "restore|<path>|<seg:off>". When given,
+     * hydra_hook_entry() matches this address instead of the legacy
+     * navigator literal. */
+    char *sep = strchr(rest, '|');
+    if (sep) {
+      *sep = '\0';
+      HYDRA_MODE->restore_entry = parse_addr(sep+1);
+      HYDRA_MODE->has_restore_entry = 1;
+    }
   } else {
     // assume "normal"
   }

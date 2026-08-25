@@ -431,6 +431,13 @@ int main(int argc, char **argv)
   opts.mz_entry_ip = e_ip;
   opts.mz_timeout_ms = 60000;
 
+  /* Hardened host: raw-code execution requires an explicit guest-owned
+   * reservation (16-byte aligned, segment >= code_load_offset, >= one
+   * 128-byte slot). RAW_CODE_LINEAR=0xF000 sits above the MZ load seg. */
+  CHECK(host_reserve_raw_code(ctx, RAW_CODE_LINEAR, 8192) == 0,
+        "raw-code reservation registered (linear %x)", RAW_CODE_LINEAR);
+  CHECK(host_raw_code_ready(ctx), "raw-code reservation ready");
+
   host_run_stop_reason_t reason = host_run(ctx, &m, &opts, &stats);
 
   printf("host_run ended: %s\n", reason_name(reason));

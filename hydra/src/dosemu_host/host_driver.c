@@ -304,6 +304,18 @@ static host_run_stop_reason_t dispatch_hook(run_ctx_t *r, dosdebug_regs_t *dr,
     if (ret == 0)
       break;
 
+    if (ret == 2) {
+      /* RESTORE special mode: the state_restore vtable already pushed the
+       * snapshot's memory and registers to the CPU and switched the core
+       * back to NORMAL. Refresh machine+dr from the CPU so the final push
+       * below (and any subsequent dispatch) sees the restored state instead
+       * of clobbering it with the stale stop-time registers. */
+      if (host_get_regs(r->ctx, dr) != 0)
+        return HOST_RUN_STOP_ERROR;
+      regs_to_machine(dr, r->m->registers);
+      return HOST_RUN_STOP_NONE;
+    }
+
     r->st->redirects++;
     if (++redirects_this_dispatch > HOST_RUN_MAX_REDIRECTS) {
       fprintf(stderr, "host_run: redirect cap (%d) exceeded at %04x:%04x\n",
@@ -564,6 +576,7 @@ host_run_stop_reason_t host_run(host_ctx_t *ctx, hydra_machine_t *m,
       goto done;
     }
     st.mz_psp = psp;
+    ctx->mz_psp = psp;   /* recorded into HYDSNAP snapshots on capture */
     /* The image lives at PSP+0x10; all core logic now works with
      * image-relative (CODE_START_SEG-relative) addresses unchanged. */
     host_set_code_load(ctx, (u16)(psp + 0x10u));
@@ -580,7 +593,6 @@ host_run_stop_reason_t host_run(host_ctx_t *ctx, hydra_machine_t *m,
       reason = HOST_RUN_STOP_ERROR;
       goto done;
     }
-    st.hook_breakpoints = (uint64_t)count;
   }
 
   /* Capture and restore are instruction-boundary modes in the core. The

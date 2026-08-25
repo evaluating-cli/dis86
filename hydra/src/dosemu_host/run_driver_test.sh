@@ -4,7 +4,9 @@
 #   - .com  flavor: Phase 4/5/6 test (testprog.com, test_driver)
 #   - .exe  flavor: Phase 7 Item C MZ/bpload test (testprog.exe,
 #                   test_driver_exe)
-# TESTPROG_FLAVOR=com|exe|both selects the run(s); default both.
+#   - cap   stage:  Phase 7 Item D HYDSNAP capture/restore (test_driver_cap
+#                   runs twice: cap on one instance, restore on a fresh one)
+# TESTPROG_FLAVOR=com|exe|cap|both selects the run(s); default both (all).
 set -u
 
 BUILD=/home/p/dis86/hydra/build/src/dosemu_host
@@ -13,6 +15,7 @@ EXE="$BUILD/testprog.exe"
 LAUNCH="$BUILD/launch.com"
 TEST_COM="$BUILD/test_driver"
 TEST_EXE="$BUILD/test_driver_exe"
+TEST_CAP="$BUILD/test_driver_cap"
 LOG=/tmp/opencode/driver_test.log
 CONF=/tmp/opencode/dosemu_mshm.conf
 FLAVOR="${TESTPROG_FLAVOR:-both}"
@@ -99,6 +102,27 @@ exe|both)
     run_flavor "$EXE" "$TEST_EXE" -E launch.com
     rc2=$?
     [ $rc -eq 0 ] && rc=$rc2
+    ;;
+esac
+
+case "$FLAVOR" in
+cap|both)
+    # Phase 7 Item D: capture on one instance, restore on a FRESH instance.
+    # The launcher load sequence is boot-deterministic, so the captured
+    # state (counters >= 3) restored over a just-loaded (counters == 0)
+    # instance must line up exactly.
+    echo "===== capture stage (HYDSNAP) ====="
+    rm -f /tmp/opencode/cap_state.snap /tmp/opencode/cap_probes.txt
+    CAP_MODE=cap run_flavor "$EXE" "$TEST_CAP" -E launch.com
+    rc3=$?
+    [ -s /tmp/opencode/cap_state.snap ] || { echo "FAIL: no snapshot written"; rc3=1; }
+    [ $rc -eq 0 ] && rc=$rc3
+    echo "===== restore stage (HYDSNAP) ====="
+    if [ $rc3 -eq 0 ]; then
+        CAP_MODE=restore run_flavor "$EXE" "$TEST_CAP" -E launch.com
+        rc3=$?
+        [ $rc -eq 0 ] && rc=$rc3
+    fi
     ;;
 esac
 

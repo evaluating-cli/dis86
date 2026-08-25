@@ -8,6 +8,15 @@
 #include "dosdebug.h"
 #include "lowmem.h"
 
+#define HOST_MAX_SNAPSHOTS 8
+#define HOST_SNAPSHOT_LABEL_MAX 64
+
+typedef struct host_snapshot {
+    char label[HOST_SNAPSHOT_LABEL_MAX];
+    int  used;
+    dosdebug_regs_t regs;
+} host_snapshot_t;
+
 typedef struct host_ctx {
     pid_t           pid;
     dosdebug_t     *db;
@@ -15,6 +24,12 @@ typedef struct host_ctx {
 
     dosdebug_regs_t initial_regs;
     int             have_initial_regs;
+
+    /* state_save / state_restore snapshots, keyed by label */
+    host_snapshot_t snapshots[HOST_MAX_SNAPSHOTS];
+
+    /* PSP segment of the last MZ guest loaded via host_run (0 = none). */
+    uint16_t mz_psp;
 
     uint16_t code_load_offset;
     uint16_t data_section_seg;

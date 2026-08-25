@@ -280,24 +280,251 @@ static int host_read_snapshot(host_ctx_t *ctx, const char *path,
     return 0;
 }
 
+/* ------------------------------------------------------------------ */
+/* HYDSNAP v1: full-memory + register state snapshots (Phase 7 Item D) */
+/*                                                                    */
+/* Layout (little-endian, byte-exact):                                */
+/*   0x00  8   magic "HYDSNAP\0"                                      */
+/*   0x08  4   version (u32, =1)                                      */
+/*   0x0C 28   regs[14] u16: ax bx cx dx si di bp sp ip cs ds es ss   */
+/*             flags                                                  */
+/*   0x28  2   psp (informational; 0 = unknown)                       */
+/*   0x2A  2   code_load_offset (CODE_START_SEG at capture time)      */
+/*   0x2C  2   data_section_seg                                       */
+/*   0x2E  2   reserved (0)                                           */
+/*   0x30  4   reserved (0)                                           */
+/*   0x34  4   guest_size (u32, must equal the guest-addressable window) */
+/*   0x38  4   crc32 of the blob (poly 0xEDB88320, init 0xFFFFFFFF)   */
+/*   0x3C  4   reserved (0)                                           */
+/*   0x40 ...  lowmem blob (lowmem_size bytes)                        */
+/*                                                                    */
+/* NOT captured (documented limitation): simx86 JIT state (harmless   */
+/* after a full reload), device/IRQ/PIT state, DOS handles/SFT/JFT    */
+/* backing host fds/latches (the guest bytes are restored but the     */
+/* underlying host-side file state isn't; acceptable for CI-style     */
+/* restore-into-fresh-instance use), memory above the lowmem window   */
+/* (HMA top), dosemu debugger breakpoints (replanted by host_run).    */
+/* ------------------------------------------------------------------ */
+
+#define HYDSNAP_MAGIC   "HYDSNAP\0"
+#define HYDSNAP_VERSION 1u
+#define HYDSNAP_HDR_LEN 0x40u
+
+static uint32_t hydsnap_crc32(const uint8_t *data, size_t len)
+{
+    uint32_t crc = 0xffffffffu;
+    for (size_t i = 0; i < len; i++) {
+        crc ^= data[i];
+        for (int b = 0; b < 8; b++)
+            crc = (crc >> 1) ^ (crc & 1 ? 0xedb88320u : 0);
+    }
+    return ~crc;
+}
+
+static void hydsnap_put16(uint8_t *p, uint16_t v)
+{
+    p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
+}
+
+static void hydsnap_put32(uint8_t *p, uint32_t v)
+{
+    p[0] = (uint8_t)v;         p[1] = (uint8_t)(v >> 8);
+    p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
+}
+
+static uint16_t hydsnap_get16(const uint8_t *p)
+{
+    return (uint16_t)(p[0] | (p[1] << 8));
+}
+
+static uint32_t hydsnap_get32(const uint8_t *p)
+{
+    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
+           ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+static void hydsnap_fill_regrange(uint8_t *hdr, const dosdebug_regs_t *dr)
+{
+    uint16_t vals[14] = { dr->ax, dr->bx, dr->cx, dr->dx,
+                          dr->si, dr->di, dr->bp, dr->sp,
+                          dr->ip, dr->cs, dr->ds, dr->es, dr->ss,
+                          dr->flags };
+    for (int i = 0; i < 14; i++)
+        hydsnap_put16(hdr + 0x0C + 2 * i, vals[i]);
+}
+
+static void hydsnap_read_regrange(const uint8_t *hdr, dosdebug_regs_t *dr)
+{
+    dr->ax = hydsnap_get16(hdr + 0x0C);      dr->bx = hydsnap_get16(hdr + 0x0E);
+    dr->cx = hydsnap_get16(hdr + 0x10);      dr->dx = hydsnap_get16(hdr + 0x12);
+    dr->si = hydsnap_get16(hdr + 0x14);      dr->di = hydsnap_get16(hdr + 0x16);
+    dr->bp = hydsnap_get16(hdr + 0x18);      dr->sp = hydsnap_get16(hdr + 0x1A);
+    dr->ip = hydsnap_get16(hdr + 0x1C);      dr->cs = hydsnap_get16(hdr + 0x1E);
+    dr->ds = hydsnap_get16(hdr + 0x20);      dr->es = hydsnap_get16(hdr + 0x22);
+    dr->ss = hydsnap_get16(hdr + 0x24);      dr->flags = hydsnap_get16(hdr + 0x26);
+}
+
+/* Write a full snapshot (regs + the whole guest-addressable window) to
+ * path. NOTE: lowmem_size() is the raw memfd mapping length, which dosemu
+ * pads to hundreds of MB; only lowmem_guest_size() (lowmem + HMA) holds
+ * guest-visible state and must be captured. */
+static int host_snapshot_write_file(host_ctx_t *ctx, const char *path,
+                                    const dosdebug_regs_t *dr)
+{
+    size_t blob = lowmem_guest_size();
+    if (blob > lowmem_size(ctx->lm))
+        return -1; /* mapping smaller than the guest window: cannot capture */
+    uint8_t hdr[HYDSNAP_HDR_LEN] = {0};
+
+    memcpy(hdr, HYDSNAP_MAGIC, 8);
+    hydsnap_put32(hdr + 0x08, HYDSNAP_VERSION);
+    hydsnap_fill_regrange(hdr, dr);
+    hydsnap_put16(hdr + 0x28, ctx->mz_psp);
+    hydsnap_put16(hdr + 0x2A, ctx->code_load_offset);
+    hydsnap_put16(hdr + 0x2C, ctx->data_section_seg);
+    hydsnap_put32(hdr + 0x34, (uint32_t)blob);
+    hydsnap_put32(hdr + 0x38, hydsnap_crc32(lowmem_base(ctx->lm), blob));
+
+    FILE *f = fopen(path, "wb");
+    if (!f)
+        return -1;
+    int ok = fwrite(hdr, 1, sizeof(hdr), f) == sizeof(hdr) &&
+             fwrite(lowmem_base(ctx->lm), 1, blob, f) == blob;
+    if (fclose(f) != 0)
+        ok = 0;
+    return ok ? 0 : -1;
+}
+
+/* Read + validate a snapshot file. Allocates the blob; caller frees. */
+static int host_snapshot_read_file(const char *path, uint8_t hdr[HYDSNAP_HDR_LEN],
+                                   uint8_t **blob_out, size_t *blob_size_out)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f)
+        return -1;
+    if (fread(hdr, 1, HYDSNAP_HDR_LEN, f) != HYDSNAP_HDR_LEN) {
+        fclose(f);
+        return -1;
+    }
+    if (memcmp(hdr, HYDSNAP_MAGIC, 8) != 0 ||
+        hydsnap_get32(hdr + 0x08) != HYDSNAP_VERSION) {
+        fclose(f);
+        return -1;
+    }
+    uint32_t blob = hydsnap_get32(hdr + 0x34);
+    if (blob == 0 || blob > 2u * 1024u * 1024u) {   /* sanity bound */
+        fclose(f);
+        return -1;
+    }
+    uint8_t *mem = malloc(blob);
+    if (!mem) {
+        fclose(f);
+        return -1;
+    }
+    int ok = fread(mem, 1, blob, f) == blob;
+    fclose(f);
+    if (ok && hydsnap_crc32(mem, blob) == hydsnap_get32(hdr + 0x38)) {
+        *blob_out = mem;
+        *blob_size_out = blob;
+        return 0;
+    }
+    free(mem);
+    return -1;
+}
+
+static host_snapshot_t *host_snapshot_find(host_ctx_t *ctx, const char *label,
+                                           int alloc)
+{
+    host_snapshot_t *free_slot = NULL;
+
+    for (size_t i = 0; i < HOST_MAX_SNAPSHOTS; i++) {
+        host_snapshot_t *s = &ctx->snapshots[i];
+        if (s->used && strcmp(s->label, label) == 0)
+            return s;
+        if (!s->used && !free_slot)
+            free_slot = s;
+    }
+
+    if (!alloc)
+        return NULL;
+
+    /* No existing slot: reuse the first (oldest) if none are free. */
+    if (!free_slot)
+        free_slot = &ctx->snapshots[0];
+
+    strncpy(free_slot->label, label, HOST_SNAPSHOT_LABEL_MAX - 1);
+    free_slot->label[HOST_SNAPSHOT_LABEL_MAX - 1] = '\0';
+    free_slot->used = 1;
+
+    return free_slot;
+}
+
 static void host_state_save(hydra_machine_ctx_t *_ctx, const char *label)
 {
     host_ctx_t *ctx = (host_ctx_t *)_ctx;
     dosdebug_regs_t dr;
-    if (dosdebug_read_regs(ctx->db, &dr) != 0 ||
-        host_write_snapshot(ctx, label, &dr) != 0) {
+    if (dosdebug_read_regs(ctx->db, &dr) != 0)
+        FAIL("dosemu host: failed to read CPU state for %s",
+             label ? label : "(null)");
+
+    /* CAPTURE mode (HYDRA core): persist a full-memory HYDSNAP snapshot to
+     * state_path (passed as label). NOTE: the xhost core then exit(0)s; on
+     * this external host the caller drives the shutdown. */
+    if (HYDRA_MODE->mode == HYDRA_MODE_CAPTURE) {
+        if (host_snapshot_write_file(ctx, label, &dr) != 0)
+            FAIL("dosemu host: failed to write HYDSNAP state '%s'", label);
+        return;
+    }
+
+    if (host_write_snapshot(ctx, label, &dr) != 0) {
         /* The hardware vtable callback is void and capture exits immediately
          * after it returns. Logging and returning would therefore turn a
          * failed checkpoint into exit(0). Fail hard instead. */
         FAIL("dosemu host: state_save failed for %s",
              label ? label : "(null)");
     }
+
+    host_snapshot_t *s = host_snapshot_find(ctx, label, 1);
+    if (s)
+        s->regs = dr;
 }
 
 static void host_state_restore(hydra_machine_ctx_t *_ctx, const char *label)
 {
-    host_ctx_t *ctx = (host_ctx_t *)_ctx;
     dosdebug_regs_t dr;
+
+    host_ctx_t *ctx = (host_ctx_t *)_ctx;
+    /* RESTORE mode (HYDRA core): load a HYDSNAP file. Memory FIRST, then the
+     * register state (full paced write with read-back verify; diff-writes
+     * are unsafe here because the live CPU state is unknown). Also adopt the
+     * snapshot's code/data offsets so image-relative hooks stay valid. */
+    if (HYDRA_MODE->mode == HYDRA_MODE_RESTORE) {
+        uint8_t hdr[HYDSNAP_HDR_LEN];
+        uint8_t *blob = NULL;
+        size_t blob_size = 0;
+        if (host_snapshot_read_file(label, hdr, &blob, &blob_size) != 0)
+            FAIL("dosemu host: failed to load HYDSNAP state '%s'", label);
+        if (blob_size != lowmem_guest_size())
+            FAIL("dosemu host: HYDSNAP blob size %zu != guest window %zu",
+                 blob_size, lowmem_guest_size());
+
+        memcpy(lowmem_base(ctx->lm), blob, blob_size);
+        free(blob);
+
+        hydsnap_read_regrange(hdr, &dr);
+        if (dosdebug_write_regs(ctx->db, &dr) != 0)
+            FAIL("dosemu host: failed to write restored registers");
+
+        uint16_t snap_psp = hydsnap_get16(hdr + 0x28);
+        ctx->mz_psp = snap_psp;
+        if (snap_psp && dr.ds != snap_psp)
+            fprintf(stderr, "dosemu host: WARNING: HYDSNAP psp=%04x but "
+                    "restored DS=%04x\n", snap_psp, dr.ds);
+        host_set_code_load(ctx, hydsnap_get16(hdr + 0x2A));
+        ctx->data_section_seg = hydsnap_get16(hdr + 0x2C);
+        return;
+    }
+
     if (host_read_snapshot(ctx, label, &dr) != 0 ||
         host_set_regs(ctx, &dr) != 0) {
         /* A failed restore must not let the core switch back to NORMAL with
@@ -306,6 +533,12 @@ static void host_state_restore(hydra_machine_ctx_t *_ctx, const char *label)
         FAIL("dosemu host: state_restore failed for %s",
              label ? label : "(null)");
     }
+
+    host_snapshot_t *s = host_snapshot_find(ctx, label, 0);
+    if (!s)
+        return;
+
+    host_set_regs(ctx, &s->regs);
 }
 
 int host_get_regs(host_ctx_t *ctx, dosdebug_regs_t *regs)

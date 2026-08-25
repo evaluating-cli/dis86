@@ -727,20 +727,6 @@ int dosdebug_write_reg(dosdebug_t *db, const char *reg_name, uint16_t val)
  * the flags write must not depend on base.
  */
 static int write_regs_impl(dosdebug_t *db, const dosdebug_regs_t *regs,
-                           const dosdebug_regs_t *base);
-
-int dosdebug_write_regs(dosdebug_t *db, const dosdebug_regs_t *regs)
-{
-    return write_regs_impl(db, regs, NULL);
-}
-
-int dosdebug_write_regs_diff(dosdebug_t *db, const dosdebug_regs_t *regs,
-                             const dosdebug_regs_t *base)
-{
-    return write_regs_impl(db, regs, base);
-}
-
-static int write_regs_impl(dosdebug_t *db, const dosdebug_regs_t *regs,
                            const dosdebug_regs_t *base)
 {
     if (!db || !regs)

@@ -20,6 +20,12 @@ addr_t hydra_hook_entry_addr(void)
 
 bool hydra_hook_entry(addr_t addr)
 {
+  /* RESTORE mode: an optional "restore|<path>|<seg:off>" config entry
+   * selects the guest entry point that triggers the snapshot restore. */
+  if (HYDRA_MODE->mode == HYDRA_MODE_RESTORE && HYDRA_MODE->has_restore_entry) {
+    return addr_seg(addr) == addr_seg(HYDRA_MODE->restore_entry) + CODE_START_SEG &&
+           addr_off(addr) == addr_off(HYDRA_MODE->restore_entry);
+  }
   return addr_equal(addr, hydra_hook_entry_addr());
 }
 

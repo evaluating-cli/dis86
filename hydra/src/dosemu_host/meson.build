@@ -93,3 +93,11 @@ test_driver_exe = executable(
   sources : [testprog_exe],
   c_args : ['-DTESTPROG_EXE_PATH="' + testprog_exe.full_path() + '"'],
 )
+
+## Phase 7 Item D: HYDSNAP capture/restore across two dosemu instances.
+test_driver_cap = executable(
+  'test_driver_cap', 'test_driver_cap.c',
+  link_with : [libhydra, libhydra_dosemu],
+  sources : [testprog_exe],
+  c_args : ['-DTESTPROG_EXE_PATH="' + testprog_exe.full_path() + '"'],
+)
