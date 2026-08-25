@@ -3,12 +3,21 @@
 ## library is loaded into the test executable so dlsym(RTLD_DEFAULT) finds
 ## hydra_user_init / hydra_user_functions / hydra_user_callstack.
 
-dosemu_host_src = files([
-  'host.c',
-  'host_driver.c',
-  'dosdebug.c',
-  'lowmem.c',
-])
+## Keep the hardened FIFO client in dosdebug.c unchanged and append the tiny
+## Option-E command wrappers in the same translation unit so they can reuse
+## its private protocol helpers without widening that internal API.
+dosdebug_combined = custom_target(
+  'dosdebug_combined.c',
+  input : ['dosdebug.c', 'dosdebug_commands.inc'],
+  output : 'dosdebug_combined.c',
+  command : ['cat', '@INPUT@'],
+  capture : true,
+)
+
+dosemu_host_src = [
+  files('host.c', 'host_driver.c', 'lowmem.c'),
+  dosdebug_combined,
+]
 
 libhydra_dosemu = shared_library(
   'hydra_dosemu',
