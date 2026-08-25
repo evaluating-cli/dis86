@@ -85,6 +85,7 @@ launch_com = custom_target(
   input : 'launch.asm',
   output : 'launch.com',
   command : ['nasm', '-f', 'bin', '-o', '@OUTPUT@', '@INPUT@'],
+  build_by_default : true,
 )
 
 test_driver_exe = executable(
