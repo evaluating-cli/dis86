@@ -14,10 +14,7 @@ dosdebug_combined = custom_target(
   capture : true,
 )
 
-dosemu_host_src = [
-  files('host.c', 'host_driver.c', 'lowmem.c'),
-  dosdebug_combined,
-]
+dosemu_host_src = files('host.c', 'host_driver.c', 'lowmem.c') + [dosdebug_combined]
 
 libhydra_dosemu = shared_library(
   'hydra_dosemu',
