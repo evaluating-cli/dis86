@@ -12,6 +12,17 @@ void hydra_function_metadata_init(void)
   md = user_fn();
 }
 
+// Inject a metadata provider at runtime (takes precedence over the
+// dlsym-cached one). Used by hosts that load user metadata dynamically
+// (e.g. the dosemu host loading a user library via dlopen).
+int hydra_function_metadata_set(const hydra_function_metadata_t *_md)
+{
+  if (!_md) FAIL("hydra_function_metadata_set(NULL)");
+  if (_md->n_defs && !_md->defs) FAIL("hydra_function_metadata_set: n_defs != 0 but defs is NULL");
+  md = _md;
+  return 0;
+}
+
 
 const hydra_function_def_t * hydra_function_find(const char *name)
 {

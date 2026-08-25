@@ -8,6 +8,8 @@
 
 #define _POSIX_C_SOURCE 200809L
 
+#include <ctype.h>
+#include <dlfcn.h>
 #include <errno.h>
 #include <limits.h>
 #include <stdio.h>
@@ -17,12 +19,7 @@
 
 #include "host.h"
 #include "hydra_machine.h"
-#include "typedefs.h"
-#include "addr.h"
-#include "conf.h"
-#include "functions.h"
-#include "callstack.h"
-#include "header.h"
+#include "internal.h"
 
 extern char *HYDRA_CMDLINE_CONF;
 extern hydra_conf_t HYDRA_CONF[1];
@@ -39,6 +36,13 @@ typedef struct host_snapshot_file_header {
     uint32_t memory_size;
     dosdebug_regs_t regs;
 } host_snapshot_file_header_t;
+/* ------------------------------------------------------------------ */
+/* conf string parsing                                                 */
+/*                                                                    */
+/* Format: "dosemu|pid=<dec>|code_load=<hex>|data_seg=<hex>|lib=<path>" */
+/* Any field may be omitted; if pid is absent, $DOSEMU_PID is tried,   */
+/* then auto-discovery (pid 0).                                        */
+/* ------------------------------------------------------------------ */
 
 static long host_conf_pid(const char *conf)
 {
@@ -59,6 +63,24 @@ static long host_conf_pid(const char *conf)
             return v;
     }
     return 0;
+}
+
+/* Copy the value of a string-valued conf key ("key=value", up to the next
+ * '|' or end of string). Returns 1 if present, 0 if absent. */
+static int host_conf_string(const char *conf, const char *key,
+                            char *out, size_t out_len)
+{
+    const char *p = conf ? strstr(conf, key) : NULL;
+    if (!p)
+        return 0;
+    p += strlen(key);
+    const char *end = strchr(p, '|');
+    size_t len = end ? (size_t)(end - p) : strlen(p);
+    if (len == 0 || len >= out_len)
+        return 0;
+    memcpy(out, p, len);
+    out[len] = '\0';
+    return 1;
 }
 
 static uint16_t host_conf_u16(const char *conf, const char *key, uint16_t dflt)
@@ -355,6 +377,18 @@ int host_clear_breakpoints(host_ctx_t *ctx)
     return 0;
 }
 
+void host_set_code_load(host_ctx_t *ctx, uint16_t seg)
+{
+    ctx->code_load_offset = seg;
+    HYDRA_CONF->code_load_offset = seg;
+
+    /* Keep the datasection basepointer (initialized from code_load_offset
+     * by api_impl.c) coherent with the new load segment. */
+    u16 dseg = (u16)(seg + HYDRA_CONF->data_section_seg);
+    hydra_datasection_baseptr_set(lowmem_hostaddr(ctx->lm,
+                                                 (uint32_t)dseg << 4));
+}
+
 pid_t host_pid(host_ctx_t *ctx)
 {
     return ctx->pid;
@@ -377,6 +411,29 @@ void host_disconnect(host_ctx_t *ctx)
     free(ctx);
 }
 
+/* ------------------------------------------------------------------ */
+/* Hydra user metadata (required by functions.c / callstack.c)         */
+/*                                                                    */
+/* Without a user library these are empty stubs: they exist so that    */
+/* api_impl.c's dlsym(RTLD_DEFAULT) binding of hydra_user_functions/   */
+/* hydra_user_callstack always succeeds on this platform. When the     */
+/* conf string carries lib=/path/user.so (see user_init), the real     */
+/* providers are resolved from that library BY HANDLE and pushed into  */
+/* the core via hydra_function_metadata_set()/                         */
+/* hydra_callstack_metadata_set(), which take precedence over the      */
+/* stubs cached at core init time.                                     */
+/*                                                                    */
+/* WHY BY-HANDLE RESOLUTION IS MANDATORY: dlsym(RTLD_DEFAULT, ...)     */
+/* searches the default lookup scope, where this host object's own     */
+/* stub symbols sit ahead of anything dlopened later — a user library  */
+/* exporting the same names would ALWAYS be shadowed.                  */
+/*                                                                    */
+/* RULE: the user .so must NOT export hydra_user_init. The host owns   */
+/* that symbol on this platform; api_impl binds THIS object's copy, so */
+/* a hydra_user_init inside the user .so would never run (and any      */
+/* one-time setup it attempted would silently not happen).             */
+/* ------------------------------------------------------------------ */
+
 const hydra_function_metadata_t *hydra_user_functions(void)
 {
     static const hydra_function_metadata_t md = { 0, NULL };
@@ -388,6 +445,61 @@ const hydra_callstack_metadata_t *hydra_user_callstack(void)
     static const hydra_callstack_metadata_t md = { 0, NULL };
     return &md;
 }
+
+typedef const hydra_function_metadata_t *(*user_functions_fn_t)(void);
+typedef const hydra_callstack_metadata_t *(*user_callstack_fn_t)(void);
+
+/* Load the user metadata library (conf key "lib=<path>") and inject its
+ * provider tables into the core. Both providers MUST be present: a library
+ * that loads but is missing either symbol is a hard failure, never a
+ * silent fallback to the empty stubs above.
+ *
+ * The dlopen handle is kept for the process lifetime (stored in ctx): the
+ * injected tables point into the loaded object, so dlclose() would leave
+ * the core holding dangling pointers. Leaking one handle at exit is the
+ * deliberate trade. */
+static void host_load_user_library(host_ctx_t *ctx, const char *path)
+{
+    ctx->user_lib = dlopen(path, RTLD_NOW | RTLD_GLOBAL);
+    if (!ctx->user_lib)
+        FAIL("dosemu host: failed to load user metadata library '%s': %s",
+             path, dlerror());
+
+    user_functions_fn_t ufunctions = NULL;
+    *(void **)&ufunctions = dlsym(ctx->user_lib, "hydra_user_functions");
+    if (!ufunctions)
+        FAIL("dosemu host: user library '%s' does not export "
+             "hydra_user_functions(): %s", path, dlerror());
+
+    user_callstack_fn_t ucallstack = NULL;
+    *(void **)&ucallstack = dlsym(ctx->user_lib, "hydra_user_callstack");
+    if (!ucallstack)
+        FAIL("dosemu host: user library '%s' does not export "
+             "hydra_user_callstack(): %s", path, dlerror());
+
+    const hydra_function_metadata_t *fmd = ufunctions();
+    if (!fmd)
+        FAIL("dosemu host: hydra_user_functions() from '%s' returned NULL",
+             path);
+
+    const hydra_callstack_metadata_t *cmd = ucallstack();
+    if (!cmd)
+        FAIL("dosemu host: hydra_user_callstack() from '%s' returned NULL",
+             path);
+
+    hydra_function_metadata_set(fmd);
+    hydra_callstack_metadata_set(cmd);
+}
+
+/* ------------------------------------------------------------------ */
+/* hydra_user_init: the entry point Hydra discovers via dlsym.         */
+/*                                                                    */
+/* Note: this codebase's signature is                                 */
+/*   void hydra_user_init(hydra_conf_t *conf,                         */
+/*                        hydra_machine_hardware_t *hw,               */
+/*                        hydra_machine_audio_t *audio)               */
+/* (api_impl.c:18) - not the (hw, audio, conf) order.                 */
+/* ------------------------------------------------------------------ */
 
 void hydra_user_init(hydra_conf_t *conf,
                      hydra_machine_hardware_t *hw,
@@ -406,6 +518,16 @@ void hydra_user_init(hydra_conf_t *conf,
      * supplied with host_reserve_raw_code() after the target is loaded. */
     conf->raw_code_offset = 0;
     conf->raw_code_size = 0;
+
+    /* Optional user metadata library ("lib=/path/user.so"). Loaded before
+     * the emulator connection so a broken library fails fast. See the
+     * metadata block above for by-handle resolution + the no-hydra_user_init
+     * rule. */
+    {
+        char lib_path[4096];
+        if (host_conf_string(confstr, "lib=", lib_path, sizeof(lib_path)))
+            host_load_user_library(ctx, lib_path);
+    }
 
     long pid = host_conf_pid(confstr);
     ctx->db = dosdebug_connect((pid_t)pid);

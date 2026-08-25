@@ -44,6 +44,7 @@ typedef struct host_run_stats {
   uint64_t raw_code_returns;  /* trace-detected returns (CALL/CALL_NEAR completed) */
   uint64_t redirects;         /* hydra_exec_run() returned redirect (1) */
   uint64_t hook_breakpoints;  /* hook bps installed by host_run */
+  uint64_t mz_psp;            /* MZ load: PSP segment of the guest (0 = n/a) */
 } host_run_stats_t;
 
 /* Called once after all run-owned breakpoints are armed and before the first
@@ -58,12 +59,33 @@ typedef struct host_run_options {
   size_t max_steps;           /* 0 = unlimited */
   size_t max_trace_steps;     /* per CALL/CALL_NEAR trace; 0 = default (10000) */
   int timeout_ms;             /* per go_and_wait; 0 = default (3000), <0 = wait
-                                 forever (rely on stop_fn / dosemu exit) */
+                                  forever (rely on stop_fn / dosemu exit) */
   int verbose;                /* print each stop to stdout */
   host_run_before_go_fn_t before_go_fn; /* one-shot, after bp install */
   void *before_go_user;
   host_run_stop_fn_t stop_fn; /* called after each dispatch; nonzero stops */
   void *stop_user;
+
+  /* MZ (.exe) guest loading (Phase 7 Item C). When mz_load is nonzero,
+   * host_run() releases the harness's parked launcher .COM, which loads
+   * the guest via INT21 AH=4B01 and hands off at its relocated entry
+   * (see launch.asm for why dosemu2's own bpload/DBGload stub cannot be
+   * used against stock fdpp). host_run() waits for that entry stop and
+   * validates it against the expectations below (parsed from the MZ
+   * header): CS == PSP+0x10+e_cs, IP == e_ip, DS == ES, PSP:0 == CD 20,
+   * MCB owner word == PSP. On success it points code_load_offset at
+   * PSP+0x10 dynamically and only then plants the hook breakpoints and
+   * enters the normal run loop. */
+  int      mz_load;
+  /* When set, the harness has already parked the machine at the guest's
+   * entry (see launch.asm: it loads the child via INT21 AH=4B01, publishes
+   * its PSP and idles; the driver-side test validates the image and pushes
+   * the entry registers). mz_load_and_wait then only validates the current
+   * register state instead of releasing and waiting for a stop. */
+  int      mz_parked_at_entry;
+  uint16_t mz_entry_cs;       /* expected entry segment (paras past load seg) */
+  uint16_t mz_entry_ip;       /* expected entry offset */
+  int      mz_timeout_ms;     /* load-phase budget; 0 = default (60 s) */
 } host_run_options_t;
 
 /* Number of currently registered hydra hooks (breakpoints to install). */

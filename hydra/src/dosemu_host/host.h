@@ -24,6 +24,12 @@ typedef struct host_ctx {
     uint32_t raw_code_addr;
     size_t   raw_code_size;
     int      raw_code_reserved;
+
+    /* dlopen handle of the user metadata library (conf key "lib=...").
+     * NULL when no lib= was given. Ownership note in host.c: the handle is
+     * intentionally kept mapped for the process lifetime because the core
+     * holds metadata pointers that live inside the loaded object. */
+    void *user_lib;
 } host_ctx_t;
 
 int host_get_regs(host_ctx_t *ctx, dosdebug_regs_t *regs);
@@ -42,12 +48,20 @@ int host_set_regs_diff(host_ctx_t *ctx, const dosdebug_regs_t *regs,
                        const dosdebug_regs_t *base);
 
 /* Set a breakpoint at seg:off; returns index >= 0 or -1. */
->>>>>>> b0a5a94 (dosemu_host: diff-writes for register pushes (2.8x test speedup))
 int host_set_bp(host_ctx_t *ctx, uint16_t seg, uint16_t off);
 int host_clear_bp(host_ctx_t *ctx, int bp_index);
 int host_go_and_wait(host_ctx_t *ctx, dosdebug_regs_t *regs, int timeout_ms);
 int host_stop(host_ctx_t *ctx);
 int host_clear_breakpoints(host_ctx_t *ctx);
+
+/* Point code_load_offset (CODE_START_SEG) at a newly discovered load
+ * segment at runtime — e.g. PSP+0x10 after an MZ bpload. Updates the host
+ * ctx, the Hydra core conf (HYDRA_CONF->code_load_offset, i.e. everything
+ * that resolves image-relative hook addresses) and the datasection
+ * baseptr derived from it. */
+void host_set_code_load(host_ctx_t *ctx, uint16_t seg);
+
+/* Connected pid, or 0. */
 pid_t host_pid(host_ctx_t *ctx);
 void host_disconnect(host_ctx_t *ctx);
 

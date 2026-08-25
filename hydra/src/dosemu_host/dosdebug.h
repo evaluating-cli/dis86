@@ -65,6 +65,12 @@ void dosdebug_drain(dosdebug_t *db);
 // Stop execution. Returns immediately.
 int dosdebug_stop(dosdebug_t *db);
 
+// Arm dosemu2's 'bpload' load breakpoint: hijacks the next INT21 EXEC
+// (AH=4B00) into a load-don't-execute and stops the machine AT the loaded
+// program's relocated entry (DS=ES=PSP, GP regs zeroed, TF set).
+// Must be issued while stopped, before the EXEC runs. Returns 0 on success.
+int dosdebug_bpload(dosdebug_t *db);
+
 // Wait for the machine to stop (breakpoint/exception). Reads the stop
 // notification and parses registers. Returns 0 on success, -1 on timeout.
 // Timeout in milliseconds; 0 = default (5 seconds).

@@ -50,9 +50,46 @@ testprog_com = custom_target(
   command : ['nasm', '-f', 'bin', '-o', '@OUTPUT@', '@INPUT@'],
 )
 
+## Phase 7 Item B: synthetic user-metadata library, loaded by the dosemu
+## host via the conf key lib=<path> (dlopen by handle; headers only, no
+## link dependency on libhydra).
+test_userlib = shared_library(
+  'test_hydra_user', 'test_userlib' / 'hydra_user.c',
+)
+
 test_driver = executable(
   'test_driver', 'test_driver.c',
   link_with : [libhydra, libhydra_dosemu],
   sources : [testprog_com],
-  c_args : ['-DTESTPROG_COM_PATH="' + testprog_com.full_path() + '"'],
+  c_args : [
+    '-DTESTPROG_COM_PATH="' + testprog_com.full_path() + '"',
+    '-DTEST_USERLIB_PATH="' + test_userlib.full_path() + '"',
+  ],
+)
+
+## Phase 7 Item C: MZ variant of the guest program (hand-rolled header in
+## nasm, no linker), the real-mode EXEC launcher (keeps bpload's trampoline
+## out of JIT-hot RVC stub code — see launch.asm) and the bpload-driven
+## integration test.
+
+testprog_exe = custom_target(
+  'testprog.exe',
+  input : 'testprog_exe.asm',
+  output : 'testprog.exe',
+  command : ['nasm', '-f', 'bin', '-w-zeroing', '-o', '@OUTPUT@',
+             '@INPUT@'],
+)
+
+launch_com = custom_target(
+  'launch.com',
+  input : 'launch.asm',
+  output : 'launch.com',
+  command : ['nasm', '-f', 'bin', '-o', '@OUTPUT@', '@INPUT@'],
+)
+
+test_driver_exe = executable(
+  'test_driver_exe', 'test_driver_exe.c',
+  link_with : [libhydra, libhydra_dosemu],
+  sources : [testprog_exe],
+  c_args : ['-DTESTPROG_EXE_PATH="' + testprog_exe.full_path() + '"'],
 )

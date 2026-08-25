@@ -6,6 +6,7 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 
 #include "host_driver.h"
 #include "internal.h"
@@ -376,6 +377,152 @@ static int install_special_mode_breakpoint(host_ctx_t *ctx,
   }
   return 0;
 }
+/* ------------------------------------------------------------------ */
+/* MZ (.exe) guest loading via dosemu2 'bpload' (Phase 7 Item C)       */
+/* ------------------------------------------------------------------ */
+
+/* Default budget for the whole bpload phase (arm → EXEC interception →
+ * load → entry stop). Headless dosemu boots in seconds; keep margin. */
+#define HOST_MZ_DEFAULT_TIMEOUT_MS 60000
+
+/*
+ * Validate one debugger stop dump as "the loaded program's entry":
+ *   - CS == PSP+0x10+e_cs and IP == e_ip   (relocated entry, PSP = DS)
+ *   - DS == ES                             (DOS gives both = PSP)
+ *   - PSP:0 holds 'INT 20h' (CD 20)        (PSP signature)
+ *   - word at ((PSP-1)<<4)+1 == PSP        (MCB immediately before the
+ *                                           PSP owned by the program)
+ */
+static int mz_entry_validate(host_ctx_t *ctx, const dosdebug_regs_t *dr,
+                             uint16_t e_cs, uint16_t e_ip, uint16_t *psp_out)
+{
+  uint16_t psp = dr->ds;
+  uint16_t want_cs = (uint16_t)(psp + 0x10u + e_cs);
+
+  if (((dr->cs & 0xffffu) != want_cs || dr->ip != e_ip))
+    return 0;
+  if (dr->es != dr->ds)
+    return 0;
+
+  uint8_t sig0 = lowmem_read8(ctx->lm, ((uint32_t)psp << 4));
+  uint8_t sig1 = lowmem_read8(ctx->lm, ((uint32_t)psp << 4) + 1);
+  if (sig0 != 0xCD || sig1 != 0x20)
+    return 0;
+
+  uint16_t owner = lowmem_read16(ctx->lm, (((uint32_t)(psp - 1)) << 4) + 1);
+  if (owner != psp)
+    return 0;
+
+  *psp_out = psp;
+  return 1;
+}
+
+/*
+ * Wait for — and validate — the MZ guest's entry stop.
+ *
+ * The guest is loaded by a real-mode launcher .COM (see launch.asm): the
+ * harness parks the machine inside the launcher's spin loop, then calls
+ * into host_run, which releases it. The launcher issues INT21 AH=4B01
+ * (load-don't-execute) for TESTPROG.EXE and performs the handoff to the
+ * child itself: switch to the child's initial stack, DS=ES=child PSP,
+ * zeroed GP registers, TF set, far-jump to the relocated entry. The
+ * single-step trap stops the debugger AT the entry with no executed image
+ * byte; this loop validates that stop against the parsed MZ header.
+ *
+ * Why not dosemu2's own bpload/DBGload machinery: stock fdpp never
+ * publishes the 4B01 results (initial SS:SP / entry CS:IP, RBIL EXEC-
+ * paramblock offsets 0Eh/12h) back into guest memory — neither into the
+ * caller's parameter block nor into dosemu's DBGload block in the BIOS —
+ * so dosemu's stub jumps to 0000:0000 and kills dosemu with SIGILL.
+ * Verified against dosemu2 2.0pre9 + libfdpp 1.11 (2026-08); see
+ * dosdebug_bpload() for the arming wrapper kept for future DOS versions.
+ *
+ * Everything seen on the way (register dumps mid-run, RVC door traps from
+ * other simulated int21s) is resumed transparently; only a dump passing
+ * every identity check in mz_entry_validate ends the loop. Registers must
+ * NEVER be written between an RVC trap and its resume: that corrupts
+ * dosemu's reflection handshake; plain 'g' resumes cleanly.
+ *
+ * On success *psp_out holds the guest's PSP segment.
+ */
+static int mz_load_and_wait(host_ctx_t *ctx, const host_run_options_t *opts,
+                            uint16_t *psp_out)
+{
+  const int timeout_ms = (opts->mz_timeout_ms > 0) ? opts->mz_timeout_ms
+                                                   : HOST_MZ_DEFAULT_TIMEOUT_MS;
+  struct timespec t0;
+  clock_gettime(CLOCK_MONOTONIC, &t0);
+  uint16_t psp = 0;
+
+  /* Harness-parked variant: the machine already sits at the entry; only
+   * validate. (See launch.asm / the harness for how this state is
+   * produced without relying on fdpp's broken 4B01 result publishing.) */
+  if (opts->mz_parked_at_entry) {
+    dosdebug_regs_t dr;
+    if (dosdebug_read_regs(ctx->db, &dr) != 0 ||
+        !mz_entry_validate(ctx, &dr, opts->mz_entry_cs, opts->mz_entry_ip,
+                           &psp)) {
+      fprintf(stderr, "host_run: parked state is not a validated MZ "
+              "entry stop\n");
+      return -1;
+    }
+    if (opts->verbose)
+      printf("host_run: MZ guest loaded, PSP=%04x, load seg=%04x\n",
+             psp, (uint16_t)(psp + 0x10u));
+    *psp_out = psp;
+    return 0;
+  }
+
+  /* The harness left the machine parked inside the launcher's spin loop
+   * after setting the go flag; release it now. */
+  if (dosdebug_go(ctx->db) != 0) {
+    fprintf(stderr, "host_run: go after launcher release failed\n");
+    return -1;
+  }
+
+  for (;;) {
+    struct timespec now;
+    clock_gettime(CLOCK_MONOTONIC, &now);
+    long elapsed = (long)(now.tv_sec - t0.tv_sec) * 1000
+                 + (now.tv_nsec - t0.tv_nsec) / 1000000;
+    long remaining = (long)timeout_ms - elapsed;
+    if (remaining <= 0) {
+      fprintf(stderr, "host_run: no MZ entry stop within %dms "
+              "(did the loader issue its EXEC?)\n", timeout_ms);
+      return -1;
+    }
+    if (!dosdebug_is_alive(ctx->db)) {
+      fprintf(stderr, "host_run: dosemu2 died while waiting for the "
+              "MZ entry stop\n");
+      return -1;
+    }
+
+    /* Bound each individual wait so stream hiccups cannot eat the whole
+     * budget unnoticed. */
+    long slice = remaining > 8000 ? 8000 : remaining;
+    dosdebug_regs_t dr;
+    if (dosdebug_wait_stop(ctx->db, &dr, (int)slice) != 0)
+      continue;
+
+    if (mz_entry_validate(ctx, &dr, opts->mz_entry_cs, opts->mz_entry_ip,
+                          &psp)) {
+      if (opts->verbose)
+        printf("host_run: MZ guest loaded, PSP=%04x, load seg=%04x\n",
+               psp, (uint16_t)(psp + 0x10u));
+      *psp_out = psp;
+      return 0;
+    }
+
+    fprintf(stderr, "host_run: skipping non-entry stop at %04x:%04x "
+            "(ds=%04x es=%04x ax=%04x) during MZ load\n",
+            dr.cs, dr.ip, dr.ds, dr.es, dr.ax);
+    dosdebug_drain(ctx->db);
+    dosdebug_go(ctx->db);
+  }
+}
+/* ------------------------------------------------------------------ */
+/* the run loop                                                        */
+/* ------------------------------------------------------------------ */
 
 host_run_stop_reason_t host_run(host_ctx_t *ctx, hydra_machine_t *m,
                                 const host_run_options_t *opts,
@@ -407,6 +554,26 @@ host_run_stop_reason_t host_run(host_ctx_t *ctx, hydra_machine_t *m,
     goto done;
   }
 
+  /* MZ (.exe) guests: load via bpload and validate the entry BEFORE the
+   * hook breakpoints are planted (bp_visitor resolves image-relative hook
+   * addresses against code_load_offset, which only becomes known here). */
+  if (opts && opts->mz_load) {
+    uint16_t psp = 0;
+    if (mz_load_and_wait(ctx, opts, &psp) != 0) {
+      reason = HOST_RUN_STOP_ERROR;
+      goto done;
+    }
+    st.mz_psp = psp;
+    /* The image lives at PSP+0x10; all core logic now works with
+     * image-relative (CODE_START_SEG-relative) addresses unchanged. */
+    host_set_code_load(ctx, (u16)(psp + 0x10u));
+    if (verbose)
+      printf("host_run: MZ guest loaded, PSP=%04x, load seg=%04x\n",
+             psp, ctx->code_load_offset);
+  }
+
+  /* Plant a breakpoint at every registered hook. Every hook MUST get one;
+   * a silent drop means guest code runs unhooked — refuse to start. */
   {
     int count = 0;
     if (install_hook_breakpoints(ctx, bps, &count) != 0) {

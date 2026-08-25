@@ -948,6 +948,26 @@ int dosdebug_stop(dosdebug_t *db)
     return 0;
 }
 
+/*
+ * Arm dosemu2's bpload (mhp_bpload, mhpdbgc.c): revector INT21 so the next
+ * EXEC AH=4B00 is turned into AH=4B01 and the machine stops at the loaded
+ * program's relocated entry. Prints nothing on success; a failed arm
+ * ("need to be in 'stopped' state...") is caught later by the load phase
+ * timing out. Must be issued while the machine is stopped.
+ */
+int dosdebug_bpload(dosdebug_t *db)
+{
+    if (!db || !db->connected)
+        return -1;
+    if (send_cmd(db, "bpload\n") != 0)
+        return -1;
+    if (read_until_quiet(db, 800) != 0)
+        return -1;
+    db->bpos = db->blen = 0;
+    buf_nul_terminate(db);
+    return 0;
+}
+
 int dosdebug_wait_stop(dosdebug_t *db, dosdebug_regs_t *regs, int timeout_ms)
 {
     if (!db || !db->connected)
