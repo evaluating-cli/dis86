@@ -29,8 +29,16 @@ int main(void)
     ctx.raw_code_reserved = 1;
     ctx.raw_code_size = 128;
 
-    HYDRA_REGISTER_ADDR(h_overlay_probe, 0x0010, 0x0100,
-                        HYDRA_HOOK_FLAGS_OVERLAY);
+    /* HYDRA_REGISTER_ADDR() deliberately constructs an ordinary seg:off
+     * address, which is not a valid overlay hook. Register an overlay-typed
+     * address explicitly so the negative test exercises the real contract. */
+    hydra_hook_t hook = {
+        NULL,
+        h_overlay_probe,
+        ADDR_MAKE_EXT(1, 0x0010, 0x0100),
+        HYDRA_HOOK_FLAGS_OVERLAY,
+    };
+    hydra_hook_register(hook);
 
     if (host_hook_breakpoint_count(&ctx) != 0) {
         fprintf(stderr, "FAIL: overlay hook counted as a static breakpoint\n");
