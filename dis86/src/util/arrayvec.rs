@@ -25,6 +25,10 @@ impl<T: Copy, const N: usize> ArrayVec<T, N> {
     self.len
   }
 
+  pub fn get(&self, idx: usize) -> Option<&T> {
+    self.as_slice().get(idx)
+  }
+
   pub fn push(&mut self, obj: T) {
     if self.len >= N {
       panic!("ArrayVec capacity overflow");
