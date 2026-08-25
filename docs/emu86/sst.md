@@ -32,9 +32,16 @@ no architectural exception machinery), and decode-only/not-implemented forms
 such as DAA/DAS/AAA/AAS, PUSHA/POPA, BOUND, WAIT, LAHF/SAHF, ROR/RCL/RCR,
 8-bit MUL/DIV/IMUL, CMC, AAM/AAD, ESC, LES/LDS, and ENTER/LEAVE.
 
-## Historical full-corpus result
+## Authoritative hardened full-corpus result (2026-08-25)
 
-The final pre-review full 268-form sweep recorded:
+The review-hardened runner was rerun at stride 1 over every manifest-pinned V1
+file with count-sensitive FLAGS refinement and undeclared-final-write checking
+left enabled at their defaults.
+
+- Runner/head SHA: `d7ab2bd137cfe94a652ec0c69c947ec0483d9baa` (PR #30 hardened head).
+- Pinned SST commit: `37c73caf53dcd22d3dd369ff09305d13d117a4fe`.
+- V1 audit scope: 268 forms.
+- Files run: 268 at `--stride 1`.
 
 | metric | count |
 |---|---:|
@@ -49,11 +56,13 @@ The final pre-review full 268-form sweep recorded:
 | FILTERED | 147,841 |
 | REVOKED | 2 |
 
-These numbers remain useful historical evidence for the CPU fixes and the
-268-form scope, but they were produced before the review hardening described
-below. They must **not** be interpreted as a fresh proof that the stricter
-runner also yields zero failures. A new stride-1 full-corpus run is required
-before publishing a new zero-failure total for the hardened runner.
+The aggregate independently reproduces the numerical zero-failure result of the
+pre-review sweep, now under the stricter comparison mechanics. No FAIL bucket
+was produced to investigate or justify away. In particular, all 30 in-scope
+C0/C1/D0/D1/D2/D3 shift/rotate forms completed with 0 FAIL, 0 DECODE_ERR, and
+0 PANIC, so the hardened count-sensitive OF/AF/preserved-flag path introduced no
+full-corpus regression. Undeclared-final-write checking was enabled for the
+entire run and produced no failure anywhere in the 268-form scope.
 
 The complete per-form history, divergence samples, and resolution notes for
 SST-D-001 through SST-D-015 are in `sst-historical.md`.
@@ -136,7 +145,7 @@ count-1 shift/rotate behavior.
 
 ## Reproduce
 
-Fetch the pinned corpus:
+From the repository root, fetch the pinned corpus:
 
 ```sh
 ./scripts/sst_fetch.sh dis86/data/sst/full
@@ -145,22 +154,22 @@ Fetch the pinned corpus:
 Audit policy/decode coverage:
 
 ```sh
-cargo run --locked --bin emu86_sst -- audit --probe
+cargo run --locked --manifest-path dis86/Cargo.toml --bin emu86_sst -- audit --probe
 ```
 
-Run forms with the hardened defaults (count-sensitive flags and undeclared
-write checking enabled):
+Run all 268 forms with the hardened defaults (count-sensitive flags and
+undeclared write checking enabled):
 
 ```sh
-cargo run --locked --release --bin emu86_sst -- run \
+cargo run --locked --release --manifest-path dis86/Cargo.toml --bin emu86_sst -- run \
+  --stride 1 \
   --revocations dis86/data/sst/full/revocation_list.txt \
-  dis86/data/sst/full/<STEM>.MOO ...
+  $(awk '!/^#/ && NF >= 2 { print "dis86/data/sst/full/" $1 ".MOO" }' \
+      dis86/data/sst/manifest.txt)
 ```
 
-For a new authoritative aggregate, run all 268 files at stride 1 and record the
-result here. Until that rerun is performed, the aggregate table above is
-explicitly **historical**, while CI/micro tests validate the hardened harness
-mechanics and pinned representative cases.
+The runner is report-mode, so inspect the printed aggregate rather than relying
+on process exit status alone.
 
 ## Hermetic CI evidence
 
