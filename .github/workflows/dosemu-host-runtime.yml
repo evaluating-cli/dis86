@@ -22,7 +22,24 @@ jobs:
           set -euo pipefail
           sudo apt-get update -q
           sudo apt-get install -y software-properties-common
-          sudo add-apt-repository -y ppa:dosemu2/ppa
+
+          # Launchpad occasionally returns a transient signing-key 500 while
+          # resolving the PPA. Retry the repository setup so an infrastructure
+          # blip does not masquerade as a Hydra runtime failure.
+          added=0
+          for attempt in 1 2 3; do
+            if sudo add-apt-repository -y ppa:dosemu2/ppa; then
+              added=1
+              break
+            fi
+            echo "dosemu2 PPA setup attempt $attempt failed" >&2
+            sleep $((attempt * 5))
+          done
+          if [ "$added" -ne 1 ]; then
+            echo "dosemu2 PPA setup failed after retries" >&2
+            exit 1
+          fi
+
           sudo apt-get update -q
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
             dosemu2 fdpp nasm meson ninja-build
@@ -102,6 +119,8 @@ jobs:
       - name: Run function-hook driver integration
         run: |
           set -euo pipefail
+          export DOSDEBUG_STREAM_LOG=/tmp/opencode/dosdebug_driver_stream.log
+          rm -f "$DOSDEBUG_STREAM_LOG"
           timeout 300 bash hydra/src/dosemu_host/run_driver_test.sh \
             "$GITHUB_WORKSPACE/hydra/build/src/dosemu_host/testprog.com" \
             "$GITHUB_WORKSPACE/hydra/build/src/dosemu_host/test_driver"
@@ -114,3 +133,5 @@ jobs:
           tail -200 /tmp/opencode/host_test_dosemu.log 2>/dev/null || true
           echo "--- /tmp/opencode/driver_test.log ---"
           tail -200 /tmp/opencode/driver_test.log 2>/dev/null || true
+          echo "--- /tmp/opencode/dosdebug_driver_stream.log ---"
+          tail -600 /tmp/opencode/dosdebug_driver_stream.log 2>/dev/null || true
