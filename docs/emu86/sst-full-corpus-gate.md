@@ -1,17 +1,17 @@
 # Hardened SST full-corpus validation gate
 
-Status: **OPEN — do not promote the historical zero-failure aggregate to a hardened-runner result until this gate is closed.**
+Status: **CLOSED — the hardened runner was validated stride-1 over the full pinned 268-form V1 corpus on 2026-08-25.**
 
-This file is repository-tracked because GitHub Issues are disabled for this repository. It is the persistent follow-up for PR #30's review-hardening boundary.
+This file remains repository-tracked as the persistent checklist for PR #30's review-hardening boundary; GitHub Issue #31 is the durable issue tracker for the same gate.
 
-## Why this is a merge-quality gate
+## Why this was a merge-quality gate
 
 PR #30 hardened the SST comparison path in two areas that can create false confidence if implemented incorrectly:
 
-1. shift/rotate FLAGS masks are now refined from the effective per-test count, so defined count-1 OF and preserved ROL flags cannot be hidden by a form-wide mask;
+1. shift/rotate FLAGS masks are refined from the effective per-test count, so defined count-1 OF and preserved ROL flags cannot be hidden by a form-wide mask;
 2. undeclared final memory changes are checked by default using address-level write tracking.
 
-Unit tests and the checked-in micro-corpus exercise these mechanics, but the hardened runner has not yet been run stride-1 over the full pinned Harris 80C286 corpus. The historical 268-form aggregate predates these changes and is not evidence that the stricter runner also produces zero failures.
+Unit tests and the checked-in micro-corpus exercise these mechanics. The full pinned Harris 80C286 corpus has now also been rerun with the hardened defaults enabled.
 
 ## Pinned evidence source
 
@@ -33,9 +33,9 @@ From the repository root:
 ```sh
 ./scripts/sst_fetch.sh dis86/data/sst/full
 
-cargo run --locked --bin emu86_sst -- audit --probe
+cargo run --locked --manifest-path dis86/Cargo.toml --bin emu86_sst -- audit --probe
 
-cargo run --locked --release --bin emu86_sst -- run \
+cargo run --locked --release --manifest-path dis86/Cargo.toml --bin emu86_sst -- run \
   --stride 1 \
   --revocations dis86/data/sst/full/revocation_list.txt \
   $(awk '!/^#/ && NF >= 2 { print "dis86/data/sst/full/" $1 ".MOO" }' \
@@ -46,23 +46,35 @@ The runner is report-mode: a `FAIL` bucket does not make the process exit non-ze
 
 ## Acceptance criteria
 
-- [ ] `audit --probe` agrees with the intended 268-form V1 scope.
-- [ ] The full run uses PR #30's final hardened head (record exact commit SHA below).
-- [ ] All 268 V1 files are included at `--stride 1`.
-- [ ] `DECODE_ERR = 0` for executed V1 tests.
-- [ ] `PANIC = 0` for executed V1 tests.
-- [ ] Every `FAIL` is investigated; no failure is removed by broadening a mask without architecture/hardware justification.
-- [ ] Variable/immediate shift/rotate failures are checked specifically for count-sensitive OF/AF/preserved-flag handling.
-- [ ] Memory-writing failures are checked specifically for undeclared final writes.
-- [ ] The authoritative aggregate is copied into `docs/emu86/sst.md` with the exact runner/head SHA and date.
-- [ ] Only after the above is complete may `docs/emu86/sst.md` describe the hardened runner as full-corpus zero-failure, if the observed result actually supports that claim.
+- [x] `audit --probe` agrees with the intended 268-form V1 scope.
+- [x] The full run uses PR #30's final hardened head (exact commit recorded below).
+- [x] All 268 V1 files are included at `--stride 1`.
+- [x] `DECODE_ERR = 0` for executed V1 tests.
+- [x] `PANIC = 0` for executed V1 tests.
+- [x] Every `FAIL` is investigated; no failure is removed by broadening a mask without architecture/hardware justification. The authoritative run produced zero FAILs.
+- [x] Variable/immediate shift/rotate failures are checked specifically for count-sensitive OF/AF/preserved-flag handling. The 30 in-scope C0/C1/D0/D1/D2/D3 forms produced 0 FAIL / 0 DECODE_ERR / 0 PANIC.
+- [x] Memory-writing failures are checked specifically for undeclared final writes. Undeclared-write checking remained enabled by default for the entire run and produced no failures.
+- [x] The authoritative aggregate is copied into `docs/emu86/sst.md` with the exact runner/head SHA and date.
+- [x] `docs/emu86/sst.md` may now describe the hardened runner as full-corpus zero-failure within the documented V1 scope.
 
 ## Result
 
-Hardened runner/head SHA: **pending**
+Hardened runner/head SHA: **`d7ab2bd137cfe94a652ec0c69c947ec0483d9baa`**
 
-Run date: **pending**
+Run date: **2026-08-25 (UTC)**
 
-Aggregate: **pending**
+Files: **268 / 268 at stride 1**
 
-Investigation notes: **pending**
+Aggregate:
+
+```text
+== AGGREGATE ==
+total=1212000 visited=1212000 (stride 1) executed=1064157 flags_umask=0x0FD7
+  PASS=1050652 FAIL=0 DECODE_ERR=0 PANIC=0 SKIP_EXCEPTION=13505 SKIP_32BIT=0 FILTERED=147841 REVOKED=2
+```
+
+Investigation notes:
+
+- The first repository-side run used the default pull-request checkout and therefore tested GitHub's synthetic merge SHA. Its aggregate was also zero-failure, but it was not accepted for this gate because the requested PR #30 head identity was not literal.
+- The authoritative rerun explicitly checked out `d7ab2bd137cfe94a652ec0c69c947ec0483d9baa` before fetching or running the corpus.
+- The documented root-level reproducer previously omitted `--manifest-path dis86/Cargo.toml`; because the repository has no root `Cargo.toml`, this gate and `docs/emu86/sst.md` now carry the corrected commands.
