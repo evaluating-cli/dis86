@@ -1,10 +1,16 @@
 use crate::emu86::dos_structs::ProgramSegmentPrefix;
 pub use crate::segoff::{Seg, SegOff};
+use std::collections::HashMap;
 
 // Large enough to allow address ffff:ffff
 pub const MEM_SIZE: usize = 0x10fff0;
 
-pub struct Memory(pub Vec<u8>);
+/// Flat emu86 memory plus optional lightweight write tracking.
+///
+/// The tracker stores the value that each address had before its first write
+/// after tracking was enabled. This lets the SST runner detect undeclared final
+/// memory changes without cloning the entire ~1.1 MiB memory image per test.
+pub struct Memory(pub Vec<u8>, Option<HashMap<usize, u8>>);
 
 impl Default for Memory {
   fn default() -> Self { Self::new() }
@@ -14,7 +20,27 @@ impl Memory {
   pub fn new() -> Memory {
     let mut raw = vec![];
     raw.resize(MEM_SIZE, 0);
-    Memory(raw)
+    Memory(raw, None)
+  }
+
+  /// Start recording the pre-write value of each address touched from now on.
+  pub fn begin_write_tracking(&mut self) {
+    self.1 = Some(HashMap::new());
+  }
+
+  /// Addresses touched since [`begin_write_tracking`], mapped to the value they
+  /// held before their first write. Callers compare those originals with the
+  /// current memory image so write-then-restore sequences are not false positives.
+  pub fn tracked_write_originals(&self) -> Option<&HashMap<usize, u8>> {
+    self.1.as_ref()
+  }
+
+  fn write_abs_u8(&mut self, idx: usize, val: u8) {
+    let before = self.0[idx];
+    if let Some(writes) = self.1.as_mut() {
+      writes.entry(idx).or_insert(before);
+    }
+    self.0[idx] = val;
   }
 
   pub fn asciiz(&self, addr: SegOff) -> &str {
@@ -54,25 +80,25 @@ impl Memory {
   }
 
   pub fn write_u8(&mut self, addr: SegOff, val: u8) {
-    self.0[addr.abs_normal()] = val;
+    self.write_abs_u8(addr.abs_normal(), val);
   }
 
   pub fn write_u16(&mut self, addr: SegOff, val: u16) {
     let base = addr.seg.unwrap_normal() as usize * 16;
     let off = addr.off.0 as usize;
     let bytes = val.to_le_bytes();
-    self.0[base + off] = bytes[0];
-    self.0[base + ((off + 1) & 0xffff)] = bytes[1];
+    self.write_abs_u8(base + off, bytes[0]);
+    self.write_abs_u8(base + ((off + 1) & 0xffff), bytes[1]);
   }
 
   pub fn write_u32(&mut self, addr: SegOff, val: u32) {
     let base = addr.seg.unwrap_normal() as usize * 16;
     let off = addr.off.0 as usize;
     let bytes = val.to_le_bytes();
-    self.0[base + off] = bytes[0];
-    self.0[base + ((off + 1) & 0xffff)] = bytes[1];
-    self.0[base + ((off + 2) & 0xffff)] = bytes[2];
-    self.0[base + ((off + 3) & 0xffff)] = bytes[3];
+    self.write_abs_u8(base + off, bytes[0]);
+    self.write_abs_u8(base + ((off + 1) & 0xffff), bytes[1]);
+    self.write_abs_u8(base + ((off + 2) & 0xffff), bytes[2]);
+    self.write_abs_u8(base + ((off + 3) & 0xffff), bytes[3]);
   }
 
   pub fn slice_starting_at(&self, addr: SegOff) -> &[u8] {
