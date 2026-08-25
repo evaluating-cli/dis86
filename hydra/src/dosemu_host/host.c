@@ -148,13 +148,12 @@ int host_set_regs(host_ctx_t *ctx, const dosdebug_regs_t *regs)
     if (!ctx || !regs)
         return -1;
 
+    /* dosdebug_write_regs() owns the vm86 IF/VIF translation and performs an
+     * architectural read-back. Keep one outer read-back here as a host-vtable
+     * invariant check, but do not issue a second FL write with different
+     * normalization semantics. */
     if (dosdebug_write_regs(ctx->db, regs) != 0)
         return -1;
-
-    /* dosemu's physical IF remains forced for vm86, but set_FLAGS() keeps the
-     * requested guest IF in VIF and get_FLAGS() exposes it. Re-apply the exact
-     * guest value because dosdebug_write_regs() historically ORed IF/IOPL. */
-    (void)dosdebug_write_reg(ctx->db, "FL", regs->flags);
 
     dosdebug_regs_t now;
     if (dosdebug_read_regs(ctx->db, &now) != 0)
@@ -265,8 +264,11 @@ static void host_state_save(hydra_machine_ctx_t *_ctx, const char *label)
     dosdebug_regs_t dr;
     if (dosdebug_read_regs(ctx->db, &dr) != 0 ||
         host_write_snapshot(ctx, label, &dr) != 0) {
-        fprintf(stderr, "dosemu host: state_save failed for %s\n",
-                label ? label : "(null)");
+        /* The hardware vtable callback is void and capture exits immediately
+         * after it returns. Logging and returning would therefore turn a
+         * failed checkpoint into exit(0). Fail hard instead. */
+        FAIL("dosemu host: state_save failed for %s",
+             label ? label : "(null)");
     }
 }
 
@@ -276,8 +278,11 @@ static void host_state_restore(hydra_machine_ctx_t *_ctx, const char *label)
     dosdebug_regs_t dr;
     if (host_read_snapshot(ctx, label, &dr) != 0 ||
         host_set_regs(ctx, &dr) != 0) {
-        fprintf(stderr, "dosemu host: state_restore failed for %s\n",
-                label ? label : "(null)");
+        /* A failed restore must not let the core switch back to NORMAL with
+         * partially replaced memory/registers. The callback cannot return an
+         * error, so terminate rather than report a false successful restore. */
+        FAIL("dosemu host: state_restore failed for %s",
+             label ? label : "(null)");
     }
 }
 
