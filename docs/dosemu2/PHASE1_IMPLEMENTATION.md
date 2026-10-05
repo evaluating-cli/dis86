@@ -1,6 +1,6 @@
 # Phase 1 Implementation Guide: dosemu2 `simx86` Validator
 
-> **Note (2026-08-17, updated 2026-08-20):** SST (SingleStepTests hardware captures) is the validation authority for emu86; the dosemu2 differential validator is no longer the validation method. Track 4 Option D research concluded: the in-process plugin approach was superseded by an **external dosdebug client** on the stock binary, shipped 2026-08-20 (see `OPTION_D_DESIGN.md`). This guide is reference-only for the frozen transport. The REP/shadow "comparison boundary" items below describe transport semantics, not validation gates.
+> **Note (2026-08-17, updated 2026-10-05):** SST (SingleStepTests hardware captures) is the validation authority for emu86. This guide records the retired differential validator transport and is reference-only. The current Hydra host is the external dosdebug client on stock dosemu2, documented in `OPTION_D_DESIGN.md`. The REP/shadow "comparison boundary" items below describe transport semantics, not validation gates.
 
 **Pinned dosemu2 base:** `604ce0cdd1a71f657e2a2df623d216d5ab289313`  
 **Scope:** 16-bit real-mode MZ executables; one concurrent validator instance  

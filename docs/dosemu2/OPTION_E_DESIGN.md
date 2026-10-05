@@ -1,21 +1,18 @@
 # OPTION E DESIGN — Opt-in overlay-hook support (external dosdebug host)
 
-Status: design draft for the Phase 7 follow-up PR ("overlay PR"). This document
-is the contract for that work, per the review agreement on PR #34/#36: overlays
-stay **fail-closed by default**, and any dynamic-arming implementation must be
-**explicitly opted in** and independently verified before it changes that
-default.
+Status: implementation and test reference for the shipped Phase 7 overlay support.
+Overlay hooks stay **fail-closed by default** and require the explicit
+`overlays=armed` opt-in.
 
 ## 1. Problem statement
 
 A logical overlay hook (`HYDRA_HOOK_FLAGS_OVERLAY`, address built via
 `ADDR_MAKE_EXT(ovl#, seg, off)`) has no stable physical breakpoint location
 until the overlay manager has mapped the containing segment into the guest
-window. The stock dosdebug breakpoint table is physical-only, so today the
-backend refuses such runs outright (`host_driver.c`: "overlay hook … is
-unsupported"), enforced as a regression contract by `test_overlay_reject`.
+window. The stock dosdebug breakpoint table is physical-only, so the host lazily
+arms hooks after page-in. `test_overlay_reject` preserves the default-mode contract.
 
-This PR adds *lazy, dynamic arming*: overlay hooks are planted when their
+The implementation provides *lazy, dynamic arming*: overlay hooks are planted when their
 physical location materializes during a run, and re-armed after events that
 invalidate the mapping or the planted byte.
 

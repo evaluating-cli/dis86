@@ -83,3 +83,52 @@ impl Exe {
     decode_exe(data)
   }
 }
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn synthetic_fbov_exe() -> Vec<u8> {
+    let mut data = vec![0u8; 116];
+    // MZ header: 32-byte header followed by a 64-byte load image.
+    data[0..2].copy_from_slice(b"MZ");
+    data[2..4].copy_from_slice(&96u16.to_le_bytes());
+    data[4..6].copy_from_slice(&1u16.to_le_bytes());
+    data[8..10].copy_from_slice(&2u16.to_le_bytes());
+    data[24..26].copy_from_slice(&28u16.to_le_bytes());
+
+    // FBOV record follows the MZ image; its seginfo points inside the image.
+    data[96..100].copy_from_slice(b"FBOV");
+    data[100..104].copy_from_slice(&4u32.to_le_bytes());
+    data[104..108].copy_from_slice(&88u32.to_le_bytes());
+    data[108..112].copy_from_slice(&1i32.to_le_bytes());
+
+    // Overlay stub-segment header and one five-byte dispatch stub.
+    data[32..36].copy_from_slice(&[0xcd, 0x3f, 0, 0]);
+    data[36..40].copy_from_slice(&0u32.to_le_bytes());
+    data[40..42].copy_from_slice(&4u16.to_le_bytes());
+    data[88..90].copy_from_slice(&0u16.to_le_bytes()); // segment
+    data[90..92].copy_from_slice(&37u16.to_le_bytes()); // header + one stub
+    data[92..94].copy_from_slice(&SegInfoType::STUB.to_le_bytes());
+    data[94..96].copy_from_slice(&0u16.to_le_bytes());
+    data[64..66].copy_from_slice(&[0xcd, 0x3f]);
+    data[66..68].copy_from_slice(&0u16.to_le_bytes());
+    data[112..116].copy_from_slice(&[0xb8, 0x77, 0x0a, 0xcb]);
+    data
+  }
+
+  #[test]
+  fn decodes_synthetic_mz_fbov_stub_and_overlay_payload() {
+    let exe = Exe::decode(&synthetic_fbov_exe()).expect("valid synthetic MZ/FBOV fixture");
+    assert_eq!(exe.exe_start, 32);
+    assert_eq!(exe.exe_end, 96);
+    assert_eq!(exe.num_overlay_segments(), 1);
+    assert_eq!(exe.overlay_data(0), &[0xb8, 0x77, 0x0a, 0xcb]);
+
+    let stub = &exe.ovr.as_ref().unwrap().stubs[0];
+    assert_eq!(stub.stub_addr().seg, crate::segoff::Seg::Normal(0));
+    assert_eq!(stub.stub_addr().off.0, 32);
+    assert_eq!(stub.dest_addr().off.0, 0);
+    assert!(matches!(stub.dest_addr().seg, crate::segoff::Seg::Overlay(0)));
+  }
+}

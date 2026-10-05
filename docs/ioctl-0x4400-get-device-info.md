@@ -1,9 +1,8 @@
 # INT 21h AH=44h AL=00h — IOCTL Get Device Information
 
-> **Note:** The source paths cited below (`include/dos_inc.h`,
-> `src/dos/dos_ioctl.cpp`, `EXT_DEVICE_BIT`) refer to the historical DOSBox-X
-> backend, which has been removed from this tree. The document is retained as
-> DOS-behavior reference background.
+This note summarizes observed DOS IOCTL return values. Device-driver-specific
+bits can vary by DOS implementation; the table describes the values relevant
+to the tested environment, not a universal driver ABI.
 
 **Input:** BX = file handle
 **Output:** CF clear → DX = AX = device info word; CF set → AX = error code
@@ -13,8 +12,6 @@
 Bit 7 is the discriminator: 1 = character device, 0 = file/block device.
 
 ### Character Device (bit 7 = 1)
-
-Source: `DeviceInfoFlags` namespace, `include/dos_inc.h:175`
 
 | Bit | Hex    | Name              | Meaning                                    |
 |-----|--------|-------------------|--------------------------------------------|
@@ -33,8 +30,6 @@ Source: `DeviceInfoFlags` namespace, `include/dos_inc.h:175`
 
 ### File / Block Device (bit 7 = 0)
 
-Source: `DeviceInfoFlags` namespace, `include/dos_inc.h:190`
-
 | Bit  | Hex    | Name           | Meaning                                  |
 |------|--------|----------------|------------------------------------------|
 | 0-4  | 0x001F | —              | **Drive number** (0=A:, 1=B:, 2=C: …)  |
@@ -42,26 +37,6 @@ Source: `DeviceInfoFlags` namespace, `include/dos_inc.h:190`
 | 11   | 0x0800 | `NotRemovable` | Drive is not removable                   |
 | 14   | 0x4000 | `NoTimeUpdate` | Don't update timestamp on close          |
 | 15   | 0x8000 | `Remote`       | File is on remote/network drive          |
-
-## IOCTL Handler Logic
-
-Source: `src/dos/dos_ioctl.cpp:626`
-
-```cpp
-case 0x00:  /* Get Device Information */
-    if (Files[handle]->GetInformation() & DeviceInfoFlags::Device) {
-        reg_dx = Files[handle]->GetInformation() & ~EXT_DEVICE_BIT; // strip 0x0200
-        reg_dx |= DeviceAttributeFlags::CharacterDevice;            // force bit 15
-    } else {
-        uint8_t hdrive = Files[handle]->GetDrive();
-        if (hdrive == 0xff) hdrive = 2;  // default C:
-        reg_dx = (Files[handle]->GetInformation() & 0xffe0) | (hdrive & 0x1f);
-    }
-    reg_ax = reg_dx;  // AX destroyed / also set
-```
-
-`EXT_DEVICE_BIT` (0x0200) is a DOSBox-X internal flag used to identify external/TSR
-devices; it is stripped before returning to the program.
 
 ## Common Return Values
 
@@ -83,5 +58,3 @@ devices; it is stripped before returning to the program.
   cleared when data is ready. Programs poll this for non-blocking input checks.
 - **`reg_ax = reg_dx`** — AX is officially clobbered/set to the same value; programs
   should read DX.
-- For external (TSR) devices, `EXT_DEVICE_BIT` (0x0200) is used internally in
-  DOSBox-X to distinguish them but is never visible to DOS programs.

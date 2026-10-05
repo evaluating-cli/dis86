@@ -1,6 +1,6 @@
 # Phase 1 specification: dosemu2 validator hook and lockstep transport
 
-> **Note (2026-08-17, updated 2026-08-20):** SST (SingleStepTests hardware captures) is the validation authority for emu86; the dosemu2 differential validator is no longer the validation method. Track 4 Option D research concluded: the in-process plugin approach was superseded by an **external dosdebug client** on the stock binary, shipped 2026-08-20 (see `OPTION_D_DESIGN.md`). This spec is reference-only for the frozen transport/ABI. Section 9 (Required expanded corpus) is SUPERSEDED — SST validates the in-scope V1 forms against hardware.
+> **Note (2026-08-17, updated 2026-10-05):** SST (SingleStepTests hardware captures) is the validation authority for emu86. This spec is reference-only for the retired validator transport/ABI. Section 9 (Required expanded corpus) is superseded; SST validates the in-scope V1 forms against hardware. Hydra hosting uses the external dosdebug client documented in `OPTION_D_DESIGN.md`.
 
 **Scope:** 16-bit real-mode `simx86` (the transport); the `emu86_validator` differential binary is archived  
 **Pinned dosemu2:** `604ce0cdd1a71f657e2a2df623d216d5ab289313`  
@@ -101,7 +101,7 @@ DIIS_DOSEMU_TARGET_DOS_PATH=?:\<exe>
 
 The `?` is permitted only in the configured path's drive-letter position because `-K` may receive a different redirected DOS drive depending on boot-stack state.
 
-DOSBox-X `-hydra` / `-hydra-conf` arguments are not part of this contract.
+The launch arguments in this historical validator contract do not define the current Hydra host launch path.
 
 ## 5. Low-memory contract
 

@@ -1,6 +1,6 @@
 # dosemu2 validator design review
 
-> **Note (2026-08-17, updated 2026-08-20):** SST (SingleStepTests hardware captures) is the validation authority for emu86; the dosemu2 differential validator is no longer the validation method. Track 4 Option D research concluded: the in-process plugin approach was superseded by an **external dosdebug client** on the stock binary, shipped 2026-08-20 (see `OPTION_D_DESIGN.md`). This design review is reference-only for the frozen validator transport.
+> **Note (2026-08-17, updated 2026-10-05):** SST (SingleStepTests hardware captures) is the validation authority for emu86. This design review is reference-only for the frozen validator transport; current Hydra hosting uses the external dosdebug client described in `OPTION_D_DESIGN.md`.
 
 This document records the non-obvious design conclusions. Current status and test coverage live in [`README.md`](README.md) and [`TESTING.md`](TESTING.md); the normative requirements live in [`PHASE1_SPEC.md`](PHASE1_SPEC.md).
 

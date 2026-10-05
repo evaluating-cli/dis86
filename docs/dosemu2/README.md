@@ -5,17 +5,21 @@ fork. Hydra runs as an external process that drives dosemu2 through its built-in
 debugger protocol (dosdebug FIFOs) and maps guest memory via `/proc/<pid>/fd/`. The
 design is in [`OPTION_D_DESIGN.md`](OPTION_D_DESIGN.md).
 
-> **Status (2026-08-25): VERIFIED for the supported static-hook scope.** Phases 0–6
-> are complete. The final behavioral candidate `3beac798...` passed host-independent
-> CI and the stock-dosemu2 runtime workflow on dosemu2 2.0pre9 / Revision 7076,
-> including verified lowmem selection, guest-visible IF=0 restoration, persistent
+> **Status:** Hydra's stock-dosemu2 host and opt-in overlay path are implemented.
+> The historical exact-runtime PASS below covers static hooks on candidate
+> `3beac798...`. During the current implementation worktree (based on refreshed
+> `origin/main` `4ab7eb0c09254356fd9ae5d21da1da6ae8b8f7f8`), the full stock-dosemu2
+> `run_driver_test.sh` acceptance matrix passed locally, including MZ loading, repeated COM runs,
+> HYDSNAP capture/restore, and overlay page-in with paged/unpaged capture/restore.
+> This working-tree result is not an exact committed-revision result; rerun the
+> workflow after the changes are committed. The run also covered verified lowmem
+> selection, guest-visible IF=0 restoration, persistent
 > register+lowmem snapshots, three-hook/nested-callthrough integration, guest-owned
 > raw-code scratch, and default-mode overlay rejection. Code lives in
 > `hydra/src/dosemu_host/`; see [`TESTING.md`](TESTING.md) for the recorded evidence.
 >
-> Overlay hooks remain **unsupported by default** in PR #34 and fail closed before
-> guest execution. Any future overlay implementation is separate follow-up work and
-> must preserve this default contract unless explicitly opted in.
+> Overlay hooks are available with the explicit `overlays=armed` host option.
+> Without that option, the host still fails closed before guest execution.
 
 SST (SingleStepTests hardware captures) is the validation authority for emu86. dosemu2's
 role is Hydra hosting only — not validation.

@@ -66,6 +66,7 @@ pub struct If {
   pub exit: ElemId,
   pub inverted: bool,
   pub then_body: Body,
+  pub else_body: Option<Body>,
 }
 
 #[derive(Debug)]
@@ -230,6 +231,7 @@ impl Body {
     // Step 0: Save some data
     let ifstmt_entry = ifstmt.entry;
     let ifstmt_then = ifstmt.then_body.clone();
+    let ifstmt_else = ifstmt.else_body.clone();
 
     // Step 1: Wrap up into a proper elem
     let new_elem = Elem {
@@ -244,6 +246,9 @@ impl Body {
 
     // Step 3: Remove any captured elems
     self.remove_elems(&ifstmt_then.elems);
+    if let Some(else_body) = ifstmt_else {
+      self.remove_elems(&else_body.elems);
+    }
     self.remove_elem(ifstmt_entry);
     self.elems.insert(ifstmt_id);
     self.remap.insert(ifstmt_entry, ifstmt_id);
@@ -411,7 +416,7 @@ impl ControlFlow {
 
 pub struct ControlFlowIter<'a> {
   cf: &'a ControlFlow,
-  state: Vec<(&'a Body, usize)>,
+  state: Vec<(&'a Body, usize, usize)>,
 }
 
 pub struct ControlFlowIterElem<'a> {
@@ -423,7 +428,7 @@ pub struct ControlFlowIterElem<'a> {
 
 impl<'a> ControlFlowIter<'a> {
   fn new(cf: &'a ControlFlow) -> Self {
-    Self { cf, state: vec![(&cf.func.body, 0)] }
+    Self { cf, state: vec![(&cf.func.body, 0, 0)] }
   }
 }
 
@@ -435,21 +440,27 @@ impl<'a> Iterator for ControlFlowIter<'a> {
       if self.state.len() == 0 {
         return None;
       }
-      let (body, idx) = self.state.as_mut_slice().last_mut().unwrap();
+      let (body, idx, depth) = self.state.as_mut_slice().last_mut().unwrap();
       let Some(id) = body.layout.get(*idx) else {
         self.state.pop();
         continue;
       };
       *idx += 1;
       let elem = self.cf.data.get(*id);
-      let depth = self.state.len() - 1;
+      let elem_depth = *depth;
+      let child_depth = elem_depth + 1;
       match &elem.detail {
         Detail::BasicBlock(_) => (),
         Detail::Goto(_) => (),
-        Detail::ElemBlock(blk) => self.state.push((&blk.body, 0)),
-        Detail::Loop(lp) => self.state.push((&lp.body, 0)),
-        Detail::If(ifstmt) => self.state.push((&ifstmt.then_body, 0)),
-        Detail::Switch(sw) => self.state.push((&sw.body, 0)),
+        Detail::ElemBlock(blk) => self.state.push((&blk.body, 0, child_depth)),
+        Detail::Loop(lp) => self.state.push((&lp.body, 0, child_depth)),
+        Detail::If(ifstmt) => {
+          if let Some(else_body) = &ifstmt.else_body {
+            self.state.push((else_body, 0, child_depth));
+          }
+          self.state.push((&ifstmt.then_body, 0, child_depth));
+        }
+        Detail::Switch(sw) => self.state.push((&sw.body, 0, child_depth)),
         // _ => panic!("Unknown detail type: {:?}", elem.detail),
       }
 
@@ -457,7 +468,7 @@ impl<'a> Iterator for ControlFlowIter<'a> {
         id: *id,
         cfdata: &self.cf.data,
         elem,
-        depth,
+        depth: elem_depth,
       });
     }
   }
@@ -621,7 +632,9 @@ fn infer_loop(body: &mut Body, exclude: Option<&HashSet<ElemId>>, data: &mut Con
 fn sequentially_reaching(src: ElemId, dst: ElemId, body: &Body, data: &ControlFlowData) -> Option<Vec<ElemId>> {
   let mut cur = src;
   let mut blks = vec![];
+  let mut visited = HashSet::new();
   loop {
+    if !visited.insert(cur) { return None; }
     blks.push(cur);
     let exits = body.exits(cur, data)?;
     if exits.len() != 1 { return None; }
@@ -630,9 +643,27 @@ fn sequentially_reaching(src: ElemId, dst: ElemId, body: &Body, data: &ControlFl
   }
 }
 
+fn normalize_if_arms(arm_a: Vec<ElemId>, arm_b: Vec<ElemId>) -> Option<(Vec<ElemId>, Option<Vec<ElemId>>, bool)> {
+  if arm_a.is_empty() && arm_b.is_empty() { return None; }
+  let arm_a_set: HashSet<_> = arm_a.iter().copied().collect();
+  if arm_b.iter().any(|arm| arm_a_set.contains(arm)) { return None; }
+
+  // An arm that reaches the join immediately has no body. Represent that as
+  // a one-arm if instead of constructing a Body from an empty block list.
+  // The first successor is the then arm, so if it is empty the populated
+  // second arm requires an inverted condition.
+  if arm_a.is_empty() {
+    Some((arm_b, None, true))
+  } else if arm_b.is_empty() {
+    Some((arm_a, None, false))
+  } else {
+    Some((arm_a, Some(arm_b), false))
+  }
+}
+
 fn infer_if(body: &mut Body, data: &mut ControlFlowData) -> bool {
-  // Consider each basic block as an if-stmt header
-  let mut found: Option<(ElemId, Vec<ElemId>, ElemId, bool)> = None;
+  // Consider each basic block as an if-stmt header.
+  let mut found: Option<(ElemId, Vec<ElemId>, Option<Vec<ElemId>>, ElemId, bool)> = None;
   for id in itertools::sorted(body.elems.iter()) {
     let elem = data.get(*id);
 
@@ -645,11 +676,12 @@ fn infer_if(body: &mut Body, data: &mut ControlFlowData) -> bool {
 
     //println!("Candidate Block: {} => {:?}", id.0, exits);
 
-    // Check for: {A, B}, A -> ... -> B
+    // Preserve the existing one-arm cases first: {A, B}, A -> ... -> B,
+    // or {A, B}, B -> ... -> A.
     {
       let (a, b) = (exits[0], exits[1]);
       if let Some(blks) = sequentially_reaching(a, b, body, data) {
-        found = Some((*id, blks, b, false));
+        found = Some((*id, blks, None, b, false));
         break;
       }
     }
@@ -658,13 +690,34 @@ fn infer_if(body: &mut Body, data: &mut ControlFlowData) -> bool {
     {
       let (a, b) = (exits[0], exits[1]);
       if let Some(blks) = sequentially_reaching(b, a, body, data) {
-        found = Some((*id, blks, a, true));
+        found = Some((*id, blks, None, a, true));
         break;
       }
     }
   }
 
-  let Some((entry, then_blks, join, inverted)) = found else { return false };
+  if found.is_none() {
+    // A reducible if/else has two disjoint single-exit arms that converge on
+    // the same join. Restrict inference to that shape; more complex control
+    // flow remains represented by explicit branches/gotos.
+    'headers: for id in itertools::sorted(body.elems.iter()) {
+      let elem = data.get(*id);
+      if !matches!(elem.detail, Detail::BasicBlock(_)) { continue; }
+      let Some(exits) = body.exits(*id, data) else { continue };
+      if exits.len() != 2 { continue; }
+
+      for join in itertools::sorted(body.elems.iter()) {
+        if *join == *id { continue; }
+        let Some(arm_a) = sequentially_reaching(exits[0], *join, body, data) else { continue };
+        let Some(arm_b) = sequentially_reaching(exits[1], *join, body, data) else { continue };
+        let Some((then_blks, else_blks, inverted)) = normalize_if_arms(arm_a, arm_b) else { continue };
+        found = Some((*id, then_blks, else_blks, *join, inverted));
+        break 'headers;
+      }
+    }
+  }
+
+  let Some((entry, then_blks, else_blks, join, inverted)) = found else { return false };
 
   // Successfully inferred an if-stmt, we just need to finalize it up into
   // a proper elem and then insert it into the structure.
@@ -675,12 +728,22 @@ fn infer_if(body: &mut Body, data: &mut ControlFlowData) -> bool {
     exit: join,
     inverted,
     then_body: Body::new(then_blks[0]),
+    else_body: else_blks.as_ref().map(|blks| Body::new(blks[0])),
   };
   for id in then_blks {
     ifstmt.then_body.elems.insert(id);
     let elem = data.get(id);
     if elem.entry != id {
       ifstmt.then_body.remap.insert(elem.entry, id);
+    }
+  }
+  if let (Some(else_body), Some(else_blks)) = (&mut ifstmt.else_body, else_blks) {
+    for id in else_blks {
+      else_body.elems.insert(id);
+      let elem = data.get(id);
+      if elem.entry != id {
+        else_body.remap.insert(elem.entry, id);
+      }
     }
   }
 
@@ -808,7 +871,12 @@ fn infer_structure(body: &mut Body, exclude: Option<&HashSet<ElemId>>, data: &mu
       Detail::Goto(_) => (),
       Detail::ElemBlock(blk) => infer_structure(&mut blk.body, None, data),
       Detail::Loop(lp) => infer_structure(&mut lp.body, Some(&lp.backedges), data),
-      Detail::If(_ifstmt) => (), // TODO!!!
+      Detail::If(ifstmt) => {
+        infer_structure(&mut ifstmt.then_body, None, data);
+        if let Some(else_body) = &mut ifstmt.else_body {
+          infer_structure(else_body, None, data);
+        }
+      }
       Detail::Switch(sw) => infer_structure(&mut sw.body, None, data),
       //_ => panic!("Unknown detail type: {:?}", elem.detail),
     }
@@ -912,8 +980,13 @@ fn schedule_layout_loop(elem: &mut Elem, parent: &Parent, data: &mut ControlFlow
 fn schedule_layout_ifstmt(elem: &mut Elem, parent: &Parent, data: &mut ControlFlowData) -> Option<ElemId> {
   let Detail::If(ifstmt) = &mut elem.detail else { panic!("Expected ifstmt") };
 
-  // schedule then-body
+  // Schedule both arms independently against the same parent/join.
   let then_next = schedule_layout_body(&mut ifstmt.then_body, Some(parent), data);
+  let else_next = if let Some(else_body) = &mut ifstmt.else_body {
+    schedule_layout_body(else_body, Some(parent), data)
+  } else {
+    parent.elem_avail(ifstmt.exit)
+  };
 
   // figure out next for the exit/join-block
   let (next, jump) = if let Some(exit) = parent.elem_avail(ifstmt.exit) {
@@ -924,6 +997,7 @@ fn schedule_layout_ifstmt(elem: &mut Elem, parent: &Parent, data: &mut ControlFl
 
   // By construction.. then-body and ifstmt should have made the same conclusion on "next"
   assert!(then_next == next);
+  assert!(else_next == next);
 
   elem.jump = Some(jump);
   next
@@ -1072,6 +1146,10 @@ pub fn debug_dump_elem_impl(f: &mut dyn Write, id: ElemId, elem: &Elem, data: &C
     Detail::If(ifstmt) => {
       writeln!(f, "If [entry={}, exits={:?}]", elem.entry.0, exits)?;
       if recurse { debug_dump_elem_body(f, &ifstmt.then_body, data, indent, recurse)?; }
+      if let Some(else_body) = &ifstmt.else_body {
+        writeln!(f, "{:indent$}Else", "", indent=2*(indent+1))?;
+        if recurse { debug_dump_elem_body(f, else_body, data, indent, recurse)?; }
+      }
     }
     Detail::Switch(sw) => {
       writeln!(f, "Switch [entry={}, exits={:?}]", elem.entry.0, exits)?;
@@ -1087,4 +1165,75 @@ pub fn debug_dump_elem_impl(f: &mut dyn Write, id: ElemId, elem: &Elem, data: &C
     //_ => panic!("Unknown detail type: {:?}", elem.detail),
   }
   Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  fn bb(data: &mut ControlFlowData, id: usize, exits: &[usize]) {
+    let id = ElemId(id);
+    data.append_with_id(id, Elem {
+      entry: id,
+      exits: exits.iter().copied().map(ElemId).collect(),
+      jump: None,
+      detail: Detail::BasicBlock(BasicBlock {
+        labeled: false,
+        jump_table: false,
+        preds: vec![],
+        blkref: ir::BlockRef(id.0),
+      }),
+    });
+  }
+
+  #[test]
+  fn infer_if_captures_two_disjoint_arms_to_common_join() {
+    let mut data = ControlFlowData::new();
+    bb(&mut data, 0, &[1, 2]);
+    bb(&mut data, 1, &[3]);
+    bb(&mut data, 2, &[3]);
+    bb(&mut data, 3, &[]);
+    let mut body = Body::new(ElemId(0));
+    body.elems.extend((0..4).map(ElemId));
+
+    assert!(infer_if(&mut body, &mut data));
+    let if_id = body.lookup_from_id(ElemId(0)).unwrap();
+    let Detail::If(ifstmt) = &data.get(if_id).detail else { panic!("expected if/else") };
+    assert_eq!(ifstmt.exit, ElemId(3));
+    assert_eq!(ifstmt.then_body.elems, HashSet::from([ElemId(1)]));
+    assert_eq!(ifstmt.else_body.as_ref().unwrap().elems, HashSet::from([ElemId(2)]));
+    assert!(body.elems.contains(&ElemId(3)));
+
+    let Detail::If(ifstmt) = &mut data.get_mut(if_id).detail else { unreachable!() };
+    ifstmt.then_body.layout = vec![ElemId(1)];
+    ifstmt.else_body.as_mut().unwrap().layout = vec![ElemId(2)];
+    body.layout = vec![if_id, ElemId(3)];
+    let cf = ControlFlow { data, func: Function { entry: ElemId(0), body } };
+    let visited: Vec<_> = cf.iter().map(|elt| (elt.id, elt.depth)).collect();
+    assert_eq!(visited, vec![(if_id, 0), (ElemId(1), 1), (ElemId(2), 1), (ElemId(3), 0)]);
+  }
+
+  #[test]
+  fn normalize_if_arms_handles_an_empty_arm() {
+    assert_eq!(
+      normalize_if_arms(vec![], vec![ElemId(2), ElemId(3)]),
+      Some((vec![ElemId(2), ElemId(3)], None, true)),
+    );
+    assert_eq!(
+      normalize_if_arms(vec![ElemId(2)], vec![]),
+      Some((vec![ElemId(2)], None, false)),
+    );
+    assert_eq!(normalize_if_arms(vec![], vec![]), None);
+  }
+
+  #[test]
+  fn sequentially_reaching_rejects_cycles() {
+    let mut data = ControlFlowData::new();
+    bb(&mut data, 0, &[1]);
+    bb(&mut data, 1, &[1]);
+    let mut body = Body::new(ElemId(0));
+    body.elems.extend([ElemId(0), ElemId(1)]);
+
+    assert!(sequentially_reaching(ElemId(1), ElemId(0), &body, &data).is_none());
+  }
 }

@@ -6,7 +6,8 @@
 #   - cap:  Phase 7 Item D HYDSNAP capture once, then restore the same
 #           snapshot on two fresh instances
 #   - ovl:  Option E normal page-in plus unpaged/paged HYDSNAP round-trips
-# TESTPROG_FLAVOR=com|exe|cap|ovl|both selects the run(s); default both (all).
+#   - mz-ovl: focused MZ/FBOV metadata-generated live overlay dispatch smoke
+# TESTPROG_FLAVOR=com|exe|cap|ovl|mz-ovl|both selects the run(s); default both (all).
 set -u
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -19,16 +20,18 @@ TEST_COM="$BUILD/test_driver"
 TEST_EXE="$BUILD/test_driver_exe"
 TEST_CAP="$BUILD/test_driver_cap"
 TEST_OVL="$BUILD/test_driver_ovl"
+MZOVL="$BUILD/testprog_mz_ovl.exe"
+TEST_MZ_OVL="$BUILD/test_driver_mz_ovl"
 LOG=/tmp/opencode/driver_test.log
 CONF=/tmp/opencode/dosemu_mshm.conf
 FLAVOR="${TESTPROG_FLAVOR:-both}"
 
 case "$FLAVOR" in
-    com|exe|cap|ovl|both) ;;
-    *) echo "FAIL: TESTPROG_FLAVOR must be com|exe|cap|ovl|both (got '$FLAVOR')" >&2; exit 2 ;;
+    com|exe|cap|ovl|mz-ovl|both) ;;
+    *) echo "FAIL: TESTPROG_FLAVOR must be com|exe|cap|ovl|mz-ovl|both (got '$FLAVOR')" >&2; exit 2 ;;
 esac
 
-for artifact in "$COM" "$EXE" "$OVL" "$LAUNCH" "$TEST_COM" "$TEST_EXE" "$TEST_CAP" "$TEST_OVL"; do
+for artifact in "$COM" "$EXE" "$OVL" "$MZOVL" "$LAUNCH" "$TEST_COM" "$TEST_EXE" "$TEST_CAP" "$TEST_OVL" "$TEST_MZ_OVL"; do
     if [ ! -e "$artifact" ]; then
         echo "FAIL: missing build artifact: $artifact" >&2
         exit 2
@@ -54,9 +57,29 @@ fi
 export XDG_RUNTIME_DIR=/tmp/opencode/runtime
 mkdir -p "$XDG_RUNTIME_DIR/dosemu2"
 
+DOSEMU_SESSION_PID=""
+DOSEMU_PID=""
 cleanup() {
-    pkill -9 -x dosemu2.bin 2>/dev/null || true
-    pkill -9 -x dosemu 2>/dev/null || true
+    if [ -n "${DOSEMU_SESSION_PID:-}" ]; then
+        # Each instance is started in its own session above. Tear down only
+        # that process group; never kill unrelated dosemu processes owned by
+        # the user running this test suite.
+        kill -TERM -- "-$DOSEMU_SESSION_PID" 2>/dev/null || true
+        if [ -n "${DOSEMU_PID:-}" ]; then
+            kill -TERM "$DOSEMU_PID" 2>/dev/null || true
+        fi
+        for _ in $(seq 1 20); do
+            kill -0 -- "-$DOSEMU_SESSION_PID" 2>/dev/null || break
+            sleep 0.1
+        done
+        kill -KILL -- "-$DOSEMU_SESSION_PID" 2>/dev/null || true
+        if [ -n "${DOSEMU_PID:-}" ]; then
+            kill -KILL "$DOSEMU_PID" 2>/dev/null || true
+        fi
+        wait "$DOSEMU_SESSION_PID" 2>/dev/null || true
+        DOSEMU_SESSION_PID=""
+        DOSEMU_PID=""
+    fi
 }
 trap cleanup EXIT
 
@@ -72,18 +95,33 @@ run_flavor() {
     local gname
     gname=$(basename "$guest")
     cp "$guest" "/tmp/opencode/$gname"
+    if [ "$testbin" = "$TEST_MZ_OVL" ]; then
+        # launch.com requests TESTPROG.EXE; normalize case/name so a stale
+        # testprog.exe from another flavor cannot shadow this fixture.
+        cp "$guest" /tmp/opencode/testprog.exe
+    fi
     cp "$LAUNCH" /tmp/opencode/launch.com
 
     rm -f "$LOG"
     setsid bash -c \
         "tail -f /dev/null | timeout 180 /usr/bin/dosemu -p -f '$CONF' -dumb -H1 ${launch_args[*]} -K /tmp/opencode </dev/null >'$LOG' 2>&1" \
         </dev/null >/dev/null 2>&1 &
-    echo "launcher pid: $!"
+    DOSEMU_SESSION_PID=$!
+    echo "launcher pid: $DOSEMU_SESSION_PID"
 
     local DOPID=""
     local i
     for i in $(seq 1 60); do
-        DOPID=$(pgrep -x dosemu2.bin | head -1 || true)
+        for candidate in $(pgrep -x dosemu2.bin 2>/dev/null || true); do
+            # Session membership, rather than a before/after global PID
+            # snapshot, ties this process to the setsid-launched test job.
+            # An unrelated dosemu started during polling is never adopted.
+            candidate_sid=$(ps -o sid= -p "$candidate" 2>/dev/null | tr -d ' ')
+            if [ "$candidate_sid" = "$DOSEMU_SESSION_PID" ]; then
+                DOPID=$candidate
+                break
+            fi
+        done
         [ -n "$DOPID" ] && break
         sleep 0.5
     done
@@ -92,6 +130,7 @@ run_flavor() {
         tail -20 "$LOG" 2>/dev/null || true
         return 2
     fi
+    DOSEMU_PID=$DOPID
     echo "=== dosemu2 pid: $DOPID ==="
 
     "$testbin" "$DOPID" "/tmp/opencode/$gname"
@@ -108,6 +147,14 @@ record_rc() {
         rc="$got"
     fi
 }
+
+case "$FLAVOR" in
+mz-ovl|both)
+    echo "===== MZ/FBOV generated-metadata overlay smoke ====="
+    run_flavor "$MZOVL" "$TEST_MZ_OVL" -E launch.com
+    record_rc $?
+    ;;
+esac
 
 case "$FLAVOR" in
 exe|both)

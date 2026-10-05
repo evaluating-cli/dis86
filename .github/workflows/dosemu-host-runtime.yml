@@ -2,11 +2,12 @@ name: dosemu host runtime
 
 on:
   push:
-    branches: [pr/3-hydra-dosemu2-host]
+    branches: [main]
   pull_request:
     paths:
       - 'hydra/src/dosemu_host/**'
       - 'hydra/meson.build'
+      - 'confgen/**'
       - '.github/workflows/dosemu-host-runtime.yml'
   workflow_dispatch:
 
@@ -136,7 +137,7 @@ jobs:
           rm -f "$DOSDEBUG_STREAM_LOG"
           TESTPROG_FLAVOR=both timeout 600 \
             bash hydra/src/dosemu_host/run_driver_test.sh
-          echo "Phase 7 matrix: exe x1 / com x2 / capture x1 / restore x2 / overlay x1 PASS" \
+          echo "Phase 7 matrix: exe x1 / MZ-FBOV generated-metadata overlay x1 / com x2 / capture x1 / restore x2 / COM overlay page-in and paged/unpaged restore PASS" \
             >> "$GITHUB_STEP_SUMMARY"
 
       - name: Show dosemu log on failure

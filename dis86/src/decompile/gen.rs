@@ -324,6 +324,13 @@ impl<'a> Gen<'a> {
         self.endline()?;
         self.block(&ifstmt.then_body, imp)?;
         self.leave_block()?;
+        if let Some(else_body) = &ifstmt.else_body {
+          self.text(" else ")?;
+          self.enter_block()?;
+          self.endline()?;
+          self.block(else_body, imp)?;
+          self.leave_block()?;
+        }
         self.endline()?;
       }
       Stmt::Switch(sw) => {

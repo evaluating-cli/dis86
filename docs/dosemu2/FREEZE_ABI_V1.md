@@ -1,6 +1,6 @@
 # dosemu2 validator ABI-v1 (reference)
 
-> **Note (2026-08-17):** SST (SingleStepTests hardware captures) is the validation authority for emu86; the dosemu2 differential validator is no longer the validation method. This ABI-v1 freeze is the change-control authority for the dosemu2 transport and remains the frozen transport/contract reference for Track 4 Option D (Hydra hosting via in-process plugin) research — not the validation authority.
+> **Note (2026-08-17):** SST (SingleStepTests hardware captures) is the validation authority for emu86. This ABI-v1 freeze records the historical dosemu2 validator transport; it is not the current Hydra host interface or an emu86 validation authority.
 
 **Freeze version:** 1  
 **Status:** Frozen  
