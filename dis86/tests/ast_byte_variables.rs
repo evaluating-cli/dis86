@@ -174,3 +174,54 @@ fn reducible_diamond_generates_if_else_code() {
   assert!(source.contains("if ("), "missing if in generated source:\n{source}");
   assert!(source.contains(" else "), "missing else in generated source:\n{source}");
 }
+
+#[test]
+fn reducible_if_with_empty_then_arm_generates_one_arm_if() {
+  let types = Rc::new(TypeDatabase::new());
+  let cfg = empty_config(types.clone());
+  let mut ir = ir::IR::new(types);
+  let entry = ir.add_block("entry");
+  let arm_a = ir.add_block("arm_a");
+  let arm_b = ir.add_block("arm_b");
+  let join = ir.add_block("join");
+
+  let cond = ir.const_new(1);
+  ir.block_mut(join).preds.push(entry);
+  ir.block_mut(arm_a).preds.push(entry);
+  ir.block_mut(arm_b).preds.push(arm_a);
+  append(
+    &mut ir,
+    entry,
+    Type::Void,
+    Opcode::Jne,
+    vec![cond, Ref::Block(join), Ref::Block(arm_a)],
+  );
+  let first_effect = ir.const_new(0x31);
+  append(&mut ir, arm_a, Type::Void, Opcode::Int, vec![first_effect]);
+  let second_effect = ir.const_new(0x32);
+  append(&mut ir, arm_b, Type::Void, Opcode::Int, vec![second_effect]);
+  ir.block_mut(join).preds.push(arm_b);
+  append(&mut ir, arm_a, Type::Void, Opcode::Jmp, vec![Ref::Block(arm_b)]);
+  append(&mut ir, arm_b, Type::Void, Opcode::Jmp, vec![Ref::Block(join)]);
+  append(&mut ir, join, Type::Void, Opcode::RetNear, vec![]);
+
+  let cf = ControlFlow::from_ir(&ir);
+  let func = Function::from_ir(&cfg, "empty_then_arm", None, &ir, &cf);
+  let if_stmt = func.body.0.iter().find_map(|stmt| match stmt {
+    Stmt::If(if_stmt) => Some(if_stmt),
+    _ => None,
+  }).expect("expected a structured if statement");
+  assert!(if_stmt.else_body.is_none(), "direct-to-join arm should not become an else body");
+  let int_operands = if_stmt.then_body.0.iter().filter_map(|stmt| match stmt {
+    Stmt::Expr(Expr::Abstract("INT", args)) => match args.as_slice() {
+      [Expr::HexConst(value)] => Some(*value),
+      [Expr::DecimalConst(value)] => Some(*value as u16),
+      _ => None,
+    },
+    _ => None,
+  }).collect::<Vec<_>>();
+  assert_eq!(int_operands, vec![0x31, 0x32]);
+
+  let source = gen::generate(&func, Flavor::Standard).unwrap();
+  assert!(source.contains("if ("), "missing if in generated source:\n{source}");
+}

@@ -643,6 +643,24 @@ fn sequentially_reaching(src: ElemId, dst: ElemId, body: &Body, data: &ControlFl
   }
 }
 
+fn normalize_if_arms(arm_a: Vec<ElemId>, arm_b: Vec<ElemId>) -> Option<(Vec<ElemId>, Option<Vec<ElemId>>, bool)> {
+  if arm_a.is_empty() && arm_b.is_empty() { return None; }
+  let arm_a_set: HashSet<_> = arm_a.iter().copied().collect();
+  if arm_b.iter().any(|arm| arm_a_set.contains(arm)) { return None; }
+
+  // An arm that reaches the join immediately has no body. Represent that as
+  // a one-arm if instead of constructing a Body from an empty block list.
+  // The first successor is the then arm, so if it is empty the populated
+  // second arm requires an inverted condition.
+  if arm_a.is_empty() {
+    Some((arm_b, None, true))
+  } else if arm_b.is_empty() {
+    Some((arm_a, None, false))
+  } else {
+    Some((arm_a, Some(arm_b), false))
+  }
+}
+
 fn infer_if(body: &mut Body, data: &mut ControlFlowData) -> bool {
   // Consider each basic block as an if-stmt header.
   let mut found: Option<(ElemId, Vec<ElemId>, Option<Vec<ElemId>>, ElemId, bool)> = None;
@@ -692,11 +710,8 @@ fn infer_if(body: &mut Body, data: &mut ControlFlowData) -> bool {
         if *join == *id { continue; }
         let Some(arm_a) = sequentially_reaching(exits[0], *join, body, data) else { continue };
         let Some(arm_b) = sequentially_reaching(exits[1], *join, body, data) else { continue };
-        if arm_a.is_empty() && arm_b.is_empty() { continue; }
-        let arm_a_set: HashSet<_> = arm_a.iter().copied().collect();
-        if arm_b.iter().any(|arm| arm_a_set.contains(arm)) { continue; }
-
-        found = Some((*id, arm_a, Some(arm_b), *join, false));
+        let Some((then_blks, else_blks, inverted)) = normalize_if_arms(arm_a, arm_b) else { continue };
+        found = Some((*id, then_blks, else_blks, *join, inverted));
         break 'headers;
       }
     }
@@ -1196,6 +1211,19 @@ mod tests {
     let cf = ControlFlow { data, func: Function { entry: ElemId(0), body } };
     let visited: Vec<_> = cf.iter().map(|elt| (elt.id, elt.depth)).collect();
     assert_eq!(visited, vec![(if_id, 0), (ElemId(1), 1), (ElemId(2), 1), (ElemId(3), 0)]);
+  }
+
+  #[test]
+  fn normalize_if_arms_handles_an_empty_arm() {
+    assert_eq!(
+      normalize_if_arms(vec![], vec![ElemId(2), ElemId(3)]),
+      Some((vec![ElemId(2), ElemId(3)], None, true)),
+    );
+    assert_eq!(
+      normalize_if_arms(vec![ElemId(2)], vec![]),
+      Some((vec![ElemId(2)], None, false)),
+    );
+    assert_eq!(normalize_if_arms(vec![], vec![]), None);
   }
 
   #[test]
