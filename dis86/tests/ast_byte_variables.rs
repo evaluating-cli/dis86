@@ -1,7 +1,8 @@
 use dis86::asm::instr::Reg;
 use dis86::config::{Config, Global};
-use dis86::decompile::ast::{Expr, Function, Stmt};
+use dis86::decompile::ast::{Block, Expr, Function, Stmt};
 use dis86::decompile::control_flow::ControlFlow;
+use dis86::decompile::gen::{self, Flavor};
 use dis86::decompile::ir::{self, Attribute, Instr, Opcode, Ref};
 use dis86::decompile::sym;
 use dis86::types::{Type, TypeDatabase};
@@ -119,4 +120,57 @@ fn byte_global_store_emits_symbol_assignment() {
     Expr::Name(name) => assert_eq!(name, "g_byte"),
     other => panic!("expected global symbol lhs, got {:?}", other),
   }
+}
+
+#[test]
+fn reducible_diamond_generates_if_else_code() {
+  let types = Rc::new(TypeDatabase::new());
+  let cfg = empty_config(types.clone());
+  let mut ir = ir::IR::new(types);
+  let entry = ir.add_block("entry");
+  let then_blk = ir.add_block("then");
+  let else_blk = ir.add_block("else");
+  let join = ir.add_block("join");
+
+  let cond = ir.const_new(1);
+  ir.block_mut(then_blk).preds.push(entry);
+  ir.block_mut(else_blk).preds.push(entry);
+  append(
+    &mut ir,
+    entry,
+    Type::Void,
+    Opcode::Jne,
+    vec![cond, Ref::Block(then_blk), Ref::Block(else_blk)],
+  );
+  let then_effect = ir.const_new(0x21);
+  append(&mut ir, then_blk, Type::Void, Opcode::Int, vec![then_effect]);
+  let else_effect = ir.const_new(0x22);
+  append(&mut ir, else_blk, Type::Void, Opcode::Int, vec![else_effect]);
+  ir.block_mut(join).preds.extend([then_blk, else_blk]);
+  append(&mut ir, then_blk, Type::Void, Opcode::Jmp, vec![Ref::Block(join)]);
+  append(&mut ir, else_blk, Type::Void, Opcode::Jmp, vec![Ref::Block(join)]);
+  append(&mut ir, join, Type::Void, Opcode::RetNear, vec![]);
+
+  let cf = ControlFlow::from_ir(&ir);
+  let func = Function::from_ir(&cfg, "diamond", None, &ir, &cf);
+  let if_stmt = func.body.0.iter().find_map(|stmt| match stmt {
+    Stmt::If(if_stmt) => Some(if_stmt),
+    _ => None,
+  }).expect("expected a structured if statement");
+  fn int_operands(body: &Block) -> Vec<u16> {
+    body.0.iter().filter_map(|stmt| match stmt {
+      Stmt::Expr(Expr::Abstract("INT", args)) => match args.as_slice() {
+        [Expr::HexConst(value)] => Some(*value),
+        [Expr::DecimalConst(value)] => Some(*value as u16),
+        _ => None,
+      },
+      _ => None,
+    }).collect()
+  }
+  assert_eq!(int_operands(&if_stmt.then_body), vec![0x21]);
+  assert_eq!(int_operands(if_stmt.else_body.as_ref().unwrap()), vec![0x22]);
+
+  let source = gen::generate(&func, Flavor::Standard).unwrap();
+  assert!(source.contains("if ("), "missing if in generated source:\n{source}");
+  assert!(source.contains(" else "), "missing else in generated source:\n{source}");
 }

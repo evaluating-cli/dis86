@@ -151,6 +151,7 @@ pub struct Loop {
 pub struct If {
   pub cond: Expr,
   pub then_body: Block,
+  pub else_body: Option<Block>,
 }
 
 #[derive(Debug, Clone)]
@@ -808,7 +809,7 @@ impl<'a> Builder<'a> {
         let label = self.make_label(tgt);
         let goto = Stmt::Goto(Goto{label});
         let then_body = Block(vec![goto]);
-        blk.push_stmt(Stmt::If(If {cond, then_body }));
+        blk.push_stmt(Stmt::If(If {cond, then_body, else_body: None }));
       }
       control_flow::Jump::CondTargetFalse(tgt) => {
         let cond = cond.unwrap();
@@ -816,7 +817,7 @@ impl<'a> Builder<'a> {
         let goto = Stmt::Goto(Goto{label});
         let then_body = Block(vec![goto]);
         // NOTE: cond already inverted before call!
-        blk.push_stmt(Stmt::If(If {cond: cond, then_body }));
+        blk.push_stmt(Stmt::If(If {cond: cond, then_body, else_body: None }));
       }
       control_flow::Jump::CondTargetBoth(tgt_true, tgt_false) => {
         let cond = cond.unwrap();
@@ -867,8 +868,19 @@ impl<'a> Builder<'a> {
       panic!("expected ifstmt entry to end in a conditional jump");
     };
 
-    let then_body = self.convert_body(iter, depth+1);
-    blk.push_stmt(Stmt::If(If { cond, then_body }));
+    let has_else = ifstmt.else_body.is_some();
+    // The iterator gives sibling if arms the same depth. Stop the then-arm
+    // explicitly at the first element laid out in the else-arm, otherwise
+    // convert_body consumes both streams as one body.
+    let else_start = ifstmt.else_body.as_ref()
+      .and_then(|else_body| else_body.layout.first().copied());
+    let then_body = self.convert_body_until(iter, depth+1, else_start);
+    let else_body = if has_else {
+      Some(self.convert_body(iter, depth+1))
+    } else {
+      None
+    };
+    blk.push_stmt(Stmt::If(If { cond, then_body, else_body }));
     self.emit_jump(blk, ifstmt_elt.elem.jump.clone().unwrap(), None);
   }
 
@@ -936,9 +948,17 @@ impl<'a> Builder<'a> {
   }
 
   fn convert_body(&mut self, iter: &mut FlowIter, depth: usize) -> Block {
+    self.convert_body_until(iter, depth, None)
+  }
+
+  fn convert_body_until(&mut self, iter: &mut FlowIter, depth: usize,
+                        stop_at: Option<ElemId>) -> Block {
     let mut blk = Block::default();
 
     while let Some(elt) = iter.peek() {
+      if elt.depth == depth && Some(elt.id) == stop_at {
+        break;
+      }
       assert!(elt.depth <= depth);
       if elt.depth < depth {
         break;
