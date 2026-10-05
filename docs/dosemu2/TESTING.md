@@ -6,7 +6,15 @@ SST (SingleStepTests hardware captures) is the validation authority for emu86; t
 
 ### Merge gate: exact-head real-dosemu verification
 
-**Status: PASS for the final behavioral candidate.**
+**Recorded status:** the historical PASS below is for a static-hook behavioral
+candidate. In the current implementation worktree, based on refreshed
+`origin/main` `4ab7eb0c09254356fd9ae5d21da1da6ae8b8f7f8`, the
+`run_driver_test.sh` stock-dosemu2 matrix passed locally: MZ loader, two consecutive COM runs, HYDSNAP capture and
+two fresh-instance restores, plus overlay page-in and unpaged/paged capture/restore.
+The focused `mz-ovl` smoke and existing `ovl` page-in/snapshot matrix also passed
+locally after adding the MZ/FBOV fixture.
+This result is for the uncommitted working tree, not an exact committed revision;
+the stock-dosemu2 workflow must be rerun after commit to establish that gate.
 
 The hardened host was verified on commit
 `3beac7989b1a982f1645ee597192d0c8a40d8080` in GitHub Actions runtime run #10
@@ -46,20 +54,21 @@ The dosemu-dependent executables are built under
 `hydra/build/src/dosemu_host/`.
 
 ### Reference dosemu2 configuration
-Integration suite (`run_driver_test.sh`, `TESTPROG_FLAVOR=com|exe|cap|both`,
+Integration suite (`run_driver_test.sh`, `TESTPROG_FLAVOR=com|exe|cap|ovl|mz-ovl|both`,
 default = all) launches fresh headless dosemu2 instances per stage:
 
 | Stage | What it proves | Guest / driver |
 |---|---|---|
 | `.com` | hook dispatch, raw-code traces, nested hooks, flags preservation (13 stops / 17 dispatches / 41 raw / 58 redirects, flagres=3203) | `testprog.com` / `test_driver` |
-| `.exe` | MZ loading: launcher handshake, entry validation (PSP/MCB/CD 20/entry CS:IP), dynamic `code_load_offset=PSP+0x10`; identical hook counts | `testprog.exe` + `launch.com` / `test_driver_exe` |
+| `.exe` | MZ loading: launcher handshake, entry validation (PSP/MCB/CD 20/entry CS:IP), dynamic `code_load_offset=PSP+0x10`; hook dispatch | `testprog.exe` + `launch.com` / `test_driver_exe` |
 | capture | HYDSNAP full-state snapshot (regs + 1MB+HMA lowmem + CRC32) at a deterministic mid-run point | `testprog.exe` / `test_driver_cap cap` |
 | restore | same boot on a FRESH instance, snapshot restored byte-exact (memory before registers), execution continues from the capture point and counters advance exactly | `test_driver_cap restore` |
+| overlay | lazy `CD 3F` page-in, native first call, dynamic hook dispatch, plus paged/unpaged HYDSNAP restore | `testprog_ovl.com` / `test_driver_ovl` |
+| `mz-ovl` | MZ/FBOV fixture metadata generated from annotations, loaded through `lib=`, native first page-in then generated-metadata Hydra overlay dispatch | `testprog_mz_ovl.exe` + `launch.com` / `test_driver_mz_ovl` |
 
-Takes ~4 minutes for all stages:
+Takes several minutes for all stages:
 
 ```sh
-pkill -9 -x dosemu2.bin 2>/dev/null; sleep 1
 cd /home/p/dis86/hydra/src/dosemu_host
 timeout 600 bash run_driver_test.sh
 ```
@@ -117,8 +126,10 @@ cd /home/p/dis86/hydra/src/dosemu_host
 timeout 300 bash run_driver_test.sh
 ```
 
-`run_driver_test.sh` launches a fresh dosemu2, copies the built COM fixture into its
-working directory, waits for `dosemu2.bin`, then runs `test_driver` against that PID.
+`run_driver_test.sh` launches a fresh dosemu2 instance per stage, copies the relevant
+fixture into its working directory, waits for that newly started `dosemu2.bin`, then
+runs its driver. Cleanup is scoped to that instance; unrelated dosemu processes are
+left alone.
 
 The current fixture is intentionally larger than the original ~95-byte guest because it
 contains an aligned **8 KiB guest-owned raw-code reservation**. There is no implicit
@@ -156,14 +167,13 @@ A passing run ends with:
 === TEST PASSED ===
 ```
 
-### Unsupported overlay behavior
+### Overlay behavior
 
-The external dosdebug backend does **not** claim overlay-hook support. Registering a
-`HYDRA_HOOK_FLAGS_OVERLAY` hook causes breakpoint installation to fail and `host_run()`
-to refuse execution. This replaces the old silent overlay skip. The negative
-`test_overlay_reject` fixture is a permanent default-mode contract: a future overlay
-implementation must preserve this behavior unless an explicit opt-in mode is enabled.
-No `.ovl` success path is claimed by PR #34.
+With `overlays=armed`, overlay hooks are lazily armed after the guest pager changes a
+stub from `CD 3F` to `EA`. The `ovl` matrix covers first-call native execution,
+subsequent Hydra hook dispatch, malformed-stub rejection, and clean paged/unpaged
+HYDSNAP capture and restore. Without the opt-in, `test_overlay_reject` requires the
+host to refuse execution before the guest runs.
 
 ### dosdebug protocol lessons retained by the current host
 

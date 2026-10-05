@@ -11,3 +11,8 @@ SRC = [
 
 hydra_gen = find_program('generate.py')
 hydra_gen_deps = files(SRC)
+
+python = find_program('python3')
+test('overlay-metadata-generation', python,
+  args : files('test_overlay_metadata.py'),
+  env : ['PYTHONPATH=' + meson.current_source_dir()])

@@ -108,6 +108,48 @@ test_driver_exe = executable(
   c_args : ['-DTESTPROG_EXE_PATH="' + testprog_exe.full_path() + '"'],
 )
 
+## Focused MZ/FBOV end-to-end smoke: metadata is generated from the same
+## annotation fixture covered by confgen's generator regression, then loaded
+## by host.c through the normal lib=<path> path during live dispatch.
+confgen_dir = meson.project_source_root() / '../confgen'
+python3 = find_program('python3')
+mz_ovl_annotations = confgen_dir / 'mz_overlay_fixture.py'
+mz_ovl_metadata_hdr = custom_target(
+  'mz_overlay_metadata_header',
+  input : mz_ovl_annotations,
+  output : 'hydra_user_appdata.h',
+  command : [python3, confgen_dir / 'generate.py', '@INPUT@',
+             '--appdata-hdr', '--output-path', '@OUTPUT@'],
+)
+mz_ovl_metadata_src = custom_target(
+  'mz_overlay_metadata_source',
+  input : mz_ovl_annotations,
+  output : 'mz_overlay_user.c',
+  command : [python3, confgen_dir / 'generate.py', '@INPUT@',
+             '--appdata-src', '--output-path', '@OUTPUT@'],
+)
+test_mz_ovl_user = shared_library(
+  'test_mz_overlay_user', [mz_ovl_metadata_src, mz_ovl_metadata_hdr],
+  link_with : libhydra,
+  include_directories : include_directories('../../include'),
+)
+
+testprog_mz_ovl = custom_target(
+  'testprog_mz_ovl.exe',
+  input : 'testprog_mz_ovl.asm',
+  output : 'testprog_mz_ovl.exe',
+  command : ['nasm', '-f', 'bin', '-w-zeroing', '-o', '@OUTPUT@', '@INPUT@'],
+)
+test_driver_mz_ovl = executable(
+  'test_driver_mz_ovl', 'test_driver_mz_ovl.c',
+  link_with : [libhydra, libhydra_dosemu],
+  sources : [testprog_mz_ovl],
+  c_args : [
+    '-DTESTPROG_MZ_OVL_PATH="' + testprog_mz_ovl.full_path() + '"',
+    '-DTEST_MZ_OVL_USERLIB_PATH="' + test_mz_ovl_user.full_path() + '"',
+  ],
+)
+
 ## Phase 7 Item D: HYDSNAP capture/restore across two dosemu instances.
 test_driver_cap = executable(
   'test_driver_cap', 'test_driver_cap.c',
