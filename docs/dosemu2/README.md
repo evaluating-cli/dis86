@@ -6,17 +6,17 @@ debugger protocol (dosdebug FIFOs) and maps guest memory via `/proc/<pid>/fd/`. 
 design is in [`OPTION_D_DESIGN.md`](OPTION_D_DESIGN.md).
 
 > **Status:** Hydra's stock-dosemu2 host and opt-in overlay path are implemented.
-> The historical exact-runtime PASS below covers static hooks on candidate
-> `3beac798...`. During the current implementation worktree (based on refreshed
-> `origin/main` `4ab7eb0c09254356fd9ae5d21da1da6ae8b8f7f8`), the full stock-dosemu2
-> `run_driver_test.sh` acceptance matrix passed locally, including MZ loading, repeated COM runs,
-> HYDSNAP capture/restore, and overlay page-in with paged/unpaged capture/restore.
-> This working-tree result is not an exact committed-revision result; rerun the
-> workflow after the changes are committed. The run also covered verified lowmem
-> selection, guest-visible IF=0 restoration, persistent
-> register+lowmem snapshots, three-hook/nested-callthrough integration, guest-owned
-> raw-code scratch, and default-mode overlay rejection. Code lives in
-> `hydra/src/dosemu_host/`; see [`TESTING.md`](TESTING.md) for the recorded evidence.
+> PR [#39](https://github.com/evaluating-cli/dis86/pull/39) was merged as
+> `5eb5567`; its exact PR head, `b7ee70d`, passed both the
+> [stock dosemu2 host integration](https://github.com/evaluating-cli/dis86/actions/runs/37386457601)
+> and [Rust/shared-memory checks](https://github.com/evaluating-cli/dis86/actions/runs/37386457675)
+> before merge. The runtime matrix covered MZ loading, repeated COM runs,
+> HYDSNAP capture/restore, COM overlay page-in and paged/unpaged restore, and
+> generated-metadata MZ/FBOV overlay dispatch. It also covered verified lowmem
+> selection, guest-visible IF=0 restoration, persistent register+lowmem
+> snapshots, nested callthrough, guest-owned raw-code scratch, and default-mode
+> overlay rejection. Code lives in `hydra/src/dosemu_host/`; see
+> [`TESTING.md`](TESTING.md) for the test inventory and historical evidence.
 >
 > Overlay hooks are available with the explicit `overlays=armed` host option.
 > Without that option, the host still fails closed before guest execution.

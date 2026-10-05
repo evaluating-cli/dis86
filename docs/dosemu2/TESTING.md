@@ -4,17 +4,18 @@ SST (SingleStepTests hardware captures) is the validation authority for emu86; t
 
 ## Current: Hydra-on-dosemu2 hosting (external client)
 
-### Merge gate: exact-head real-dosemu verification
+### Merged exact-head verification
 
-**Recorded status:** the historical PASS below is for a static-hook behavioral
-candidate. In the current implementation worktree, based on refreshed
-`origin/main` `4ab7eb0c09254356fd9ae5d21da1da6ae8b8f7f8`, the
-`run_driver_test.sh` stock-dosemu2 matrix passed locally: MZ loader, two consecutive COM runs, HYDSNAP capture and
-two fresh-instance restores, plus overlay page-in and unpaged/paged capture/restore.
-The focused `mz-ovl` smoke and existing `ovl` page-in/snapshot matrix also passed
-locally after adding the MZ/FBOV fixture.
-This result is for the uncommitted working tree, not an exact committed revision;
-the stock-dosemu2 workflow must be rerun after commit to establish that gate.
+PR [#39](https://github.com/evaluating-cli/dis86/pull/39) was merged as
+`5eb5567` on 2026-10-05. Its exact PR head, `b7ee70d`, passed both checks before
+merge:
+
+- [Stock dosemu2 host integration](https://github.com/evaluating-cli/dis86/actions/runs/37386457601): **PASS** — the Phase 7 acceptance matrix, including the generated-metadata MZ/FBOV overlay smoke and COM overlay page-in/capture/restore cases.
+- [Rust and shared-memory checks](https://github.com/evaluating-cli/dis86/actions/runs/37386457675): **PASS**.
+
+This exact-head result supersedes the earlier local-worktree-only status. The
+historical static-hook candidate evidence below remains useful context but is
+not the current implementation result.
 
 The hardened host was verified on commit
 `3beac7989b1a982f1645ee597192d0c8a40d8080` in GitHub Actions runtime run #10
@@ -38,10 +39,9 @@ Observed architectural regression samples included `FLAGS=3203` for the CF-prese
 check and `FLAGS=3003` for the IF=0 round-trip check. The guest-owned 8 KiB raw-code
 reservation was restored byte-for-byte and dosemu2 remained alive at test completion.
 
-Any commits after `3beac798...` that only update this verification record or PR text do
-not change executable behavior. They must still clear the repository's normal CI and
-stock-dosemu runtime workflow before merge; the PR discussion records that final-head
-check so the merge itself remains exact-head gated.
+Future behavior changes must pass the repository's normal CI and stock-dosemu
+runtime workflow. The checks above record the successful exact-head gate for the
+currently merged implementation.
 
 ### Build
 
