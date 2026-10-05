@@ -1,10 +1,8 @@
-# DIV Instruction Flag Behavior in core_normal
+# DIV Instruction Flag Behavior
 
-Source: `src/cpu/instructions.h` lines 635–782 (DOSBox-X, `core_normal` path)
-
-> **Note:** The file/line coordinates in this document refer to the historical
-> DOSBox-X backend, which has been removed from this tree. The behavioral
-> analysis is retained as reference background.
+This note records observed emulator behavior for DIV/IDIV flags. These flag
+values are not an architectural guarantee: Intel documents the status flags as
+undefined after divide instructions.
 
 ## Execution Flow
 
@@ -29,8 +27,8 @@ All DIV/IDIV variants (DIVB/DIVW/DIVD, IDIVB/IDIVW/IDIVD) follow this pattern:
 
 For 16-bit and 32-bit, parity is computed over the full width:
 
-```c
-// instructions.h:591-592
+```
+# Illustrative parity calculation:
 #define PARITY16(x)  (parity_lookup[((x)>>8)&0xff] ^ parity_lookup[(x)&0xff] ^ FLAG_PF)
 #define PARITY32(x)  (PARITY16((x)&0xffff) ^ PARITY16(((x)>>16)&0xffff) ^ FLAG_PF)
 ```
@@ -39,35 +37,17 @@ For 16-bit and 32-bit, parity is computed over the full width:
 
 ## Example: DIVB (8-bit)
 
-```c
-// instructions.h:635-652
-#define DIVB(op1,load,save)
-{
-    Bitu val=load(op1);
-    if (val==0) EXCEPTION(0);
-    Bitu quo=reg_ax / val;
-    uint8_t rem=(uint8_t)(reg_ax % val);
-    uint8_t quo8=(uint8_t)(quo&0xff);
-    if (quo>0xff) EXCEPTION(0);
-    reg_ah=rem;
-    reg_al=quo8;
-    FillFlags();
-    SETFLAGBIT(AF,0);/*FIXME*/
-    SETFLAGBIT(SF,0);/*FIXME*/
-    SETFLAGBIT(OF,0);/*FIXME*/
-    SETFLAGBIT(ZF,(rem==0)&&((quo8&1)!=0));
-    SETFLAGBIT(CF,((rem&3) >= 1 && (rem&3) <= 2));
-    SETFLAGBIT(PF,parity_lookup[rem&0xff]^parity_lookup[quo8&0xff]^FLAG_PF);
-}
-```
+For the 8-bit divide observation, the quotient is stored in AL and remainder in
+AH. The sampled implementation cleared AF/SF/OF, set ZF when the remainder was
+zero and quotient odd, set CF when the low two remainder bits were 1 or 2, and
+derived PF from the parity of remainder and quotient.
 
 ## Notes
 
 - All flags after DIV are officially **undefined** on real x86 hardware. The `/*FIXME*/`
   comments on AF, SF, OF indicate the author knows these are uncertain approximations.
 - The ZF and CF formulas are non-standard approximations of observed real-hardware behavior.
-- `FillFlags()` has a `case t_DIV: break;` — it does nothing for DIV-type lazy flags.
-  It only serves to commit any previous instruction's pending lazy flags before the
-  `SETFLAGBIT` calls overwrite them.
+- The sampled implementation committed pending flags from the prior instruction
+  before setting the divide result flags.
 - IDIV variants use identical flag-setting logic, just with signed arithmetic for the
   quotient/remainder computation.

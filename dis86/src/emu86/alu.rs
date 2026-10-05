@@ -163,7 +163,7 @@ pub fn divmod(op: DivideOp, a: Value, b: Value, mut f: Flags) -> (Value, Value, 
     }
   }
 
-  // Mirroring the behaviour of dosbox-x
+  // Preserve the emulator's established result/flag behavior for this operation.
   f.set(FLAG_CF, (remainder&3) >= 1 && (remainder&3) <= 2);  // Set iff low 2 bits of remainder are 01 or 10 )
   f.set(FLAG_ZF, remainder == 0 && (quotient&1) != 0);       // Set iff remainder is zero AND quotient is odd
   f.set(FLAG_SF, false);
