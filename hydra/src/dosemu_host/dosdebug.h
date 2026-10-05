@@ -50,6 +50,11 @@ int dosdebug_set_bp(dosdebug_t *db, uint16_t seg, uint16_t off);
 // Clear breakpoint by index.
 int dosdebug_clear_bp(dosdebug_t *db, int bp_index);
 
+// Set/clear dosemu's non-patching breakpoint on a software interrupt. Unlike
+// an INT3 code breakpoint this does not modify guest RAM or simx86 code bytes.
+int dosdebug_set_bpint(dosdebug_t *db, uint8_t intno);
+int dosdebug_clear_bpint(dosdebug_t *db, uint8_t intno);
+
 // Continue execution (g). Returns immediately.
 int dosdebug_go(dosdebug_t *db);
 
@@ -57,6 +62,11 @@ int dosdebug_go(dosdebug_t *db);
 // Drains pending output first, so the step's dump stays in sync with the
 // command stream. Returns immediately; use dosdebug_wait_stop to read the result.
 int dosdebug_step(dosdebug_t *db);
+
+// Single-step into an INT (ti). For an INT instruction dosemu performs the
+// real interrupt entry and stops at the handler, preserving the guest's
+// stacked CS:IP/FLAGS frame. Returns immediately; use dosdebug_wait_stop.
+int dosdebug_step_into(dosdebug_t *db);
 
 // Discard everything pending on the dbgout stream (user buffer + kernel fd),
 // without blocking. Used to keep the response stream synchronized.

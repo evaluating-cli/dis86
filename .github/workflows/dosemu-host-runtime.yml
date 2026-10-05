@@ -62,11 +62,13 @@ jobs:
           meson setup hydra/build hydra
           ninja -C hydra/build
 
-      - name: Verify overlay hooks fail closed
+      - name: Verify overlay policy and capacity fail closed
         run: |
           set -euo pipefail
           hydra/build/src/dosemu_host/test_overlay_reject
+          hydra/build/src/dosemu_host/test_overlay_budget
           echo "test_overlay_reject: PASS" >> "$GITHUB_STEP_SUMMARY"
+          echo "test_overlay_budget: PASS" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Run host state/transport test
         run: |
@@ -134,7 +136,7 @@ jobs:
           rm -f "$DOSDEBUG_STREAM_LOG"
           TESTPROG_FLAVOR=both timeout 600 \
             bash hydra/src/dosemu_host/run_driver_test.sh
-          echo "Phase 7 matrix: exe x1 / com x2 / capture x1 / restore x2 PASS" \
+          echo "Phase 7 matrix: exe x1 / com x2 / capture x1 / restore x2 / overlay x1 PASS" \
             >> "$GITHUB_STEP_SUMMARY"
 
       - name: Show dosemu log on failure

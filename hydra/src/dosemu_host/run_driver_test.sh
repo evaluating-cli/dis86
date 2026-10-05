@@ -5,27 +5,30 @@
 #   - .com: Phase 4/5/6 integration test (twice consecutively)
 #   - cap:  Phase 7 Item D HYDSNAP capture once, then restore the same
 #           snapshot on two fresh instances
-# TESTPROG_FLAVOR=com|exe|cap|both selects the run(s); default both (all).
+#   - ovl:  Option E normal page-in plus unpaged/paged HYDSNAP round-trips
+# TESTPROG_FLAVOR=com|exe|cap|ovl|both selects the run(s); default both (all).
 set -u
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 BUILD="${HYDRA_DOSEMU_BUILD:-$SCRIPT_DIR/../../build/src/dosemu_host}"
 COM="$BUILD/testprog.com"
 EXE="$BUILD/testprog.exe"
+OVL="$BUILD/testprog_ovl.com"
 LAUNCH="$BUILD/launch.com"
 TEST_COM="$BUILD/test_driver"
 TEST_EXE="$BUILD/test_driver_exe"
 TEST_CAP="$BUILD/test_driver_cap"
+TEST_OVL="$BUILD/test_driver_ovl"
 LOG=/tmp/opencode/driver_test.log
 CONF=/tmp/opencode/dosemu_mshm.conf
 FLAVOR="${TESTPROG_FLAVOR:-both}"
 
 case "$FLAVOR" in
-    com|exe|cap|both) ;;
-    *) echo "FAIL: TESTPROG_FLAVOR must be com|exe|cap|both (got '$FLAVOR')" >&2; exit 2 ;;
+    com|exe|cap|ovl|both) ;;
+    *) echo "FAIL: TESTPROG_FLAVOR must be com|exe|cap|ovl|both (got '$FLAVOR')" >&2; exit 2 ;;
 esac
 
-for artifact in "$COM" "$EXE" "$LAUNCH" "$TEST_COM" "$TEST_EXE" "$TEST_CAP"; do
+for artifact in "$COM" "$EXE" "$OVL" "$LAUNCH" "$TEST_COM" "$TEST_EXE" "$TEST_CAP" "$TEST_OVL"; do
     if [ ! -e "$artifact" ]; then
         echo "FAIL: missing build artifact: $artifact" >&2
         exit 2
@@ -34,7 +37,6 @@ done
 
 mkdir -p /tmp/opencode
 
-# /tmp may be wiped between sessions; regenerate the config if absent.
 if [ ! -f "$CONF" ]; then
     cat > "$CONF" <<'EOF'
 $_cpu_vm = "emulated"
@@ -64,8 +66,6 @@ run_flavor() {
 
     cleanup
     sleep 1
-    # Stale debugger FIFOs from crashed instances can make the driver's
-    # pid discovery latch onto a dead endpoint.
     rm -f "$XDG_RUNTIME_DIR"/dosemu2/dosemu.dbgin.* \
           "$XDG_RUNTIME_DIR"/dosemu2/dosemu.dbgout.* 2>/dev/null || true
 
@@ -112,8 +112,6 @@ record_rc() {
 case "$FLAVOR" in
 exe|both)
     echo "===== .exe flavor (1/1) ====="
-    # -E launch.com: dosemu autoexec-EXECs the launcher, which parks after
-    # loading the MZ child; test_driver_exe validates and drives the entry.
     run_flavor "$EXE" "$TEST_EXE" -E launch.com
     record_rc $?
     ;;
@@ -121,9 +119,6 @@ esac
 
 case "$FLAVOR" in
 com|both)
-    # The guest is launched by dosemu's autoexec (-E testprog.com); the
-    # driver discovers it via its signature scan. Two consecutive fresh
-    # instances are required to catch the historical release/breakpoint race.
     echo "===== .com flavor (1/2) ====="
     run_flavor "$COM" "$TEST_COM" -E testprog.com
     record_rc $?
@@ -136,8 +131,6 @@ esac
 
 case "$FLAVOR" in
 cap|both)
-    # Capture once. Both restores below use this exact snapshot and each
-    # run_flavor call starts a fresh dosemu2 instance.
     echo "===== capture stage (1/1, HYDSNAP) ====="
     rm -f /tmp/opencode/cap_state.snap /tmp/opencode/cap_probes.txt
     CAP_MODE=cap run_flavor "$EXE" "$TEST_CAP" -E launch.com
@@ -155,6 +148,46 @@ cap|both)
 
         echo "===== restore stage (2/2, fresh instance, same snapshot) ====="
         CAP_MODE=restore run_flavor "$EXE" "$TEST_CAP" -E launch.com
+        record_rc $?
+    fi
+    ;;
+esac
+
+case "$FLAVOR" in
+ovl|both)
+    echo "===== ovl normal: no sync-stop/self-write crutches ====="
+    OVL_MODE=normal run_flavor "$OVL" "$TEST_OVL" -E testprog_ovl.com
+    record_rc $?
+
+    echo "===== ovl capture: unpaged CD 3F ====="
+    rm -f /tmp/opencode/ovl_unpaged.snap
+    OVL_MODE=cap-unpaged run_flavor "$OVL" "$TEST_OVL" -E testprog_ovl.com
+    ovl_unpaged_cap_rc=$?
+    if [ ! -s /tmp/opencode/ovl_unpaged.snap ]; then
+        echo "FAIL: no unpaged overlay snapshot written"
+        ovl_unpaged_cap_rc=1
+    fi
+    record_rc "$ovl_unpaged_cap_rc"
+
+    if [ "$ovl_unpaged_cap_rc" -eq 0 ]; then
+        echo "===== ovl restore: unpaged CD 3F, fresh instance ====="
+        OVL_MODE=restore-unpaged run_flavor "$OVL" "$TEST_OVL" -E testprog_ovl.com
+        record_rc $?
+    fi
+
+    echo "===== ovl capture: paged clean EA ====="
+    rm -f /tmp/opencode/ovl_paged.snap
+    OVL_MODE=cap-paged run_flavor "$OVL" "$TEST_OVL" -E testprog_ovl.com
+    ovl_paged_cap_rc=$?
+    if [ ! -s /tmp/opencode/ovl_paged.snap ]; then
+        echo "FAIL: no paged overlay snapshot written"
+        ovl_paged_cap_rc=1
+    fi
+    record_rc "$ovl_paged_cap_rc"
+
+    if [ "$ovl_paged_cap_rc" -eq 0 ]; then
+        echo "===== ovl restore: paged EA, fresh instance ====="
+        OVL_MODE=restore-paged run_flavor "$OVL" "$TEST_OVL" -E testprog_ovl.com
         record_rc $?
     fi
     ;;

@@ -45,6 +45,12 @@ typedef struct host_ctx {
      * intentionally kept mapped for the process lifetime because the core
      * holds metadata pointers that live inside the loaded object. */
     void *user_lib;
+
+    /* OPTION E opt-in (conf key "overlays=armed"). When zero, overlay-typed
+     * hooks fail host_run() before guest execution exactly as #34 shipped;
+     * when set, overlay stubs arm lazily once paged in — see
+     * docs/dosemu2/OPTION_E_DESIGN.md. */
+    int overlays_armed;
 } host_ctx_t;
 
 int host_get_regs(host_ctx_t *ctx, dosdebug_regs_t *regs);
