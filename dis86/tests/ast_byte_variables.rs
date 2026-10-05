@@ -23,6 +23,7 @@ fn empty_config(types: Rc<TypeDatabase>) -> Config {
 fn append(ir: &mut ir::IR, blk: ir::BlockRef, typ: Type, opcode: Opcode, operands: Vec<Ref>) -> Ref {
   ir.block_instr_append(blk, Instr {
     typ,
+    compare_width: None,
     attrs: Attribute::NONE,
     opcode,
     operands,

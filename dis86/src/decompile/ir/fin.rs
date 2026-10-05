@@ -56,6 +56,7 @@ impl Finalizer {
     // have the new block jump to the original destination
     ir.block_instr_append(new_blkref, Instr {
       typ: crate::types::Type::Void,
+      compare_width: None,
       attrs: Attribute::NONE,
       opcode: Opcode::Jmp,
       operands: vec![dest_blkref],

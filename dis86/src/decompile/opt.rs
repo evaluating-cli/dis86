@@ -77,15 +77,12 @@ pub fn constant_folding(ir: &mut IR) {
       ) else { continue; };
 
       let fold_word_arith = matches!(instr.typ, Type::U16 | Type::I16);
-      // KNOWN LIMITATION: `fold_bool` also fires for signed compares (Lt/Leq/Gt/Geq)
-      // whose instr.typ is `Type::U8`. `simplify_branch_conds` / `append_cond_set`
-      // stamp the compare as Type::U8 regardless of the operands' real width
-      // (ir_build.rs:693), so a genuine 8-bit signed comparison between two
-      // constants folds `lhs < rhs` against the i16 const-pool values -- correct
-      // only when those bytes were sign-extended, which the pool does not record.
-      // Fix planned: propagate operand typ into branch-conds, then gate signed
-      // compares on `Type::U16 | Type::I16` rather than `fold_bool`.
       let fold_bool = matches!(instr.typ, Type::U8 | Type::U16);
+      let signed_values = match instr.compare_width {
+        Some(CompareWidth::Byte) => Some((lhs as u8 as i8 as i16, rhs as u8 as i8 as i16)),
+        Some(CompareWidth::Word) => Some((lhs, rhs)),
+        None => None,
+      };
 
       let result = match instr.opcode {
         Opcode::Add if fold_word_arith => lhs.wrapping_add(rhs),
@@ -96,10 +93,22 @@ pub fn constant_folding(ir: &mut IR) {
 
         Opcode::Eq   if fold_bool => if lhs == rhs { 1 } else { 0 },
         Opcode::Neq  if fold_bool => if lhs != rhs { 1 } else { 0 },
-        Opcode::Lt   if fold_bool => if lhs < rhs { 1 } else { 0 },
-        Opcode::Leq  if fold_bool => if lhs <= rhs { 1 } else { 0 },
-        Opcode::Gt   if fold_bool => if lhs > rhs { 1 } else { 0 },
-        Opcode::Geq  if fold_bool => if lhs >= rhs { 1 } else { 0 },
+        Opcode::Lt if fold_bool => {
+          let Some((lhs, rhs)) = signed_values else { continue };
+          if lhs < rhs { 1 } else { 0 }
+        }
+        Opcode::Leq if fold_bool => {
+          let Some((lhs, rhs)) = signed_values else { continue };
+          if lhs <= rhs { 1 } else { 0 }
+        }
+        Opcode::Gt if fold_bool => {
+          let Some((lhs, rhs)) = signed_values else { continue };
+          if lhs > rhs { 1 } else { 0 }
+        }
+        Opcode::Geq if fold_bool => {
+          let Some((lhs, rhs)) = signed_values else { continue };
+          if lhs >= rhs { 1 } else { 0 }
+        }
         Opcode::ULt  if fold_bool => if (lhs as u16) < (rhs as u16) { 1 } else { 0 },
         Opcode::ULeq if fold_bool => if (lhs as u16) <= (rhs as u16) { 1 } else { 0 },
         Opcode::UGt  if fold_bool => if (lhs as u16) > (rhs as u16) { 1 } else { 0 },
@@ -681,10 +690,16 @@ pub fn simplify_branch_conds(ir: &mut IR) {
         // jg <tgt>
         let lhs = pred_instr.operands[0];
         let rhs = pred_instr.operands[1];
+        let compare_width = match pred_instr.typ {
+          Type::U8 | Type::I8 => Some(CompareWidth::Byte),
+          Type::U16 | Type::I16 => Some(CompareWidth::Word),
+          _ => None,
+        };
 
         let instr = ir.instr_mut(r).unwrap();
         instr.opcode = opcode_new;
         instr.operands = vec![lhs, rhs];
+        instr.compare_width = compare_width;
       }
 
       else if pred_instr.opcode == Opcode::And && opcode_eq {
@@ -837,9 +852,28 @@ mod tests {
   fn append_typed(ir: &mut IR, blk: BlockRef, typ: Type, opcode: Opcode, operands: Vec<Ref>) -> Ref {
     ir.block_instr_append(blk, Instr {
       typ,
+      compare_width: None,
       attrs: Attribute::NONE,
       opcode,
       operands,
+    })
+  }
+
+  fn append_comparison(
+    ir: &mut IR,
+    blk: BlockRef,
+    result_type: Type,
+    compare_width: Option<CompareWidth>,
+    opcode: Opcode,
+    lhs: Ref,
+    rhs: Ref,
+  ) -> Ref {
+    ir.block_instr_append(blk, Instr {
+      typ: result_type,
+      compare_width,
+      attrs: Attribute::NONE,
+      opcode,
+      operands: vec![lhs, rhs],
     })
   }
 
@@ -945,13 +979,9 @@ mod tests {
 
   #[test]
   fn constant_folding_folds_signed_and_unsigned_comparisons() {
-    let cases = [
+    let equality_cases = [
       (Opcode::Eq,   -1, -1, 1),
       (Opcode::Neq,  -1,  0, 1),
-      (Opcode::Lt,   -1,  0, 1),
-      (Opcode::Leq,   0,  0, 1),
-      (Opcode::Gt,   -1,  0, 0),
-      (Opcode::Geq,   0, -1, 1),
       (Opcode::ULt,  -1,  0, 0),
       (Opcode::ULeq,  0,  0, 1),
       (Opcode::UGt,  -1,  0, 1),
@@ -959,7 +989,7 @@ mod tests {
     ];
 
     for typ in [Type::U8, Type::U16] {
-      for (opcode, lhs_val, rhs_val, expected) in cases {
+      for (opcode, lhs_val, rhs_val, expected) in equality_cases {
         let (mut ir, blk) = test_ir();
         let lhs = ir.const_new(lhs_val);
         let rhs = ir.const_new(rhs_val);
@@ -973,6 +1003,112 @@ mod tests {
         assert_eq!(instr.typ, typ);
       }
     }
+
+    let signed_byte_cases = [
+      (Opcode::Lt, 0x80, 0x7f, 1),
+      (Opcode::Leq, -1, 0, 1),
+      (Opcode::Gt, 0x7f, 0xff, 1),
+      (Opcode::Geq, -128, 0xff, 0),
+    ];
+    for (opcode, lhs_val, rhs_val, expected) in signed_byte_cases {
+      let (mut ir, blk) = test_ir();
+      let lhs = ir.const_new(lhs_val);
+      let rhs = ir.const_new(rhs_val);
+      let folded = append_comparison(
+        &mut ir, blk, Type::U8, Some(CompareWidth::Byte), opcode, lhs, rhs,
+      );
+
+      constant_folding(&mut ir);
+
+      let instr = ir.instr(folded).unwrap();
+      assert_eq!(instr.opcode, Opcode::Ref);
+      assert_eq!(ir.const_lookup(instr.operands[0]), Some(expected));
+      assert_eq!(instr.typ, Type::U8);
+    }
+
+    let signed_word_cases = [
+      (Opcode::Lt, -1, 0, 1),
+      (Opcode::Leq, 0, 0, 1),
+      (Opcode::Gt, -1, 0, 0),
+      (Opcode::Geq, 0, -1, 1),
+    ];
+    for result_type in [Type::U8, Type::U16] {
+      for (opcode, lhs_val, rhs_val, expected) in signed_word_cases {
+        let (mut ir, blk) = test_ir();
+        let lhs = ir.const_new(lhs_val);
+        let rhs = ir.const_new(rhs_val);
+        let folded = append_comparison(
+          &mut ir,
+          blk,
+          result_type.clone(),
+          Some(CompareWidth::Word),
+          opcode,
+          lhs,
+          rhs,
+        );
+
+        constant_folding(&mut ir);
+
+        let instr = ir.instr(folded).unwrap();
+        assert_eq!(instr.opcode, Opcode::Ref);
+        assert_eq!(ir.const_lookup(instr.operands[0]), Some(expected));
+        assert_eq!(instr.typ, result_type);
+      }
+    }
+  }
+
+  #[test]
+  fn constant_folding_leaves_signed_comparisons_with_unknown_width_unfolded() {
+    let (mut ir, blk) = test_ir();
+    let lhs = ir.const_new(-1);
+    let rhs = ir.const_new(0);
+    let cmp = append_comparison(&mut ir, blk, Type::U16, None, Opcode::Lt, lhs, rhs);
+
+    constant_folding(&mut ir);
+
+    let instr = ir.instr(cmp).unwrap();
+    assert_eq!(instr.opcode, Opcode::Lt);
+    assert_eq!(instr.operands, vec![lhs, rhs]);
+  }
+
+  #[test]
+  fn simplify_branch_conditions_preserves_compare_operand_width() {
+    for (operand_type, expected_width) in [
+      (Type::U8, CompareWidth::Byte),
+      (Type::I8, CompareWidth::Byte),
+      (Type::U16, CompareWidth::Word),
+      (Type::I16, CompareWidth::Word),
+    ] {
+      for result_type in [Type::U8, Type::U16] {
+        let (mut ir, blk) = test_ir();
+        let lhs = ir.const_new(0x80);
+        let rhs = ir.const_new(0x7f);
+        let sub = append_typed(&mut ir, blk, operand_type.clone(), Opcode::Sub, vec![lhs, rhs]);
+        let flags = Ref::Init(crate::asm::instr::Reg::FLAGS);
+        let update = append_typed(&mut ir, blk, Type::U16, Opcode::UpdateFlags, vec![flags, sub]);
+        let condition = append_typed(&mut ir, blk, result_type.clone(), Opcode::LtFlags, vec![update]);
+
+        simplify_branch_conds(&mut ir);
+
+        let instr = ir.instr(condition).unwrap();
+        assert_eq!(instr.opcode, Opcode::Lt);
+        assert_eq!(instr.compare_width, Some(expected_width));
+        assert_eq!(instr.typ, result_type);
+        assert_eq!(instr.operands, vec![lhs, rhs]);
+      }
+    }
+
+    let (mut ir, blk) = test_ir();
+    let lhs = ir.const_new(1);
+    let rhs = ir.const_new(2);
+    let sub = append_typed(&mut ir, blk, Type::Unknown, Opcode::Sub, vec![lhs, rhs]);
+    let flags = Ref::Init(crate::asm::instr::Reg::FLAGS);
+    let update = append_typed(&mut ir, blk, Type::U16, Opcode::UpdateFlags, vec![flags, sub]);
+    let condition = append_typed(&mut ir, blk, Type::U16, Opcode::LtFlags, vec![update]);
+
+    simplify_branch_conds(&mut ir);
+
+    assert_eq!(ir.instr(condition).unwrap().compare_width, None);
   }
 
   #[test]
