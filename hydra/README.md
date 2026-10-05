@@ -19,19 +19,15 @@ bridge for guest memory, I/O, register synchronization, state save/restore,
 audio, execution notification, and step hooks. An emulator integration supplies
 those callbacks and calls Hydra's exported `hydra_machine_*` entrypoints.
 
-The repository no longer carries or builds the historical patched DOSBox-X
-fork; dosemu2 has replaced it as the project's DOS runtime of choice. The
-dosemu2-backed differential validator (see `../docs/dosemu2/`) is the first
-delivered piece of that port, and is not, by itself, a Hydra native-function
-host. Hydra-on-dosemu2 is the intended end state: porting Hydra's
-arbitrary-address function interception and native/guest control transfer onto
-the dosemu2 hosting target is the remaining integration step on the
-roadmap.
+The supported host connects to the stock dosemu2 process through its dosdebug
+FIFOs and maps guest memory only after verifying the shared backing. It
+implements function hooks, native-to-guest calls, guest register and memory
+access, and capture/restore. The implementation and runtime evidence are
+documented in [`../docs/dosemu2/`](../docs/dosemu2/README.md).
 
-Validation of emu86 is handled by SST (SingleStepTests hardware captures), not
-the dosemu2 differential validator. dosemu2's role is Hydra hosting via an
-in-process plugin (Track 4 Option D); emu86 is validated by SST. The frozen
-simx86 transport/ABI is kept as reference for the plugin research.
+SST (SingleStepTests hardware captures) validates emu86. The dosemu2 host
+provides the execution environment for Hydra and is a separate integration
+track.
 
 ## Function hooks
 
@@ -69,7 +65,5 @@ No git submodule is required for the Hydra core:
 just build
 ```
 
-`just test` builds the local runtime and runs its Meson tests. Supplying an
-emulator host is required to execute a hybrid DOS program; the historical
-DOSBox-X launch scripts and configuration are intentionally no longer part of
-this repository.
+`just test` builds the local runtime and runs its Meson tests. A running
+dosemu2 instance is required to execute a hybrid DOS program through the host.

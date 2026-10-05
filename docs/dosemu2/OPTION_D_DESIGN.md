@@ -1,25 +1,23 @@
 # Hydra hosting on dosemu2: external client via dosdebug + /proc/pid/fd
 
-> **Status (2026-08-25): implementation hardened and runtime verified for the supported static-hook scope; Phase 7 real-target enablement (Items A–D) layered on top.**
+> **Status:** The external dosdebug host implements static and MZ loading paths; overlay hooks are supported when explicitly enabled with `overlays=armed`.
 > The external stock-dosemu2 host implements function-level hooks, independently
 > verified lowmem mapping, exact guest-visible IF restoration, persistent
 > register+lowmem snapshots, explicit guest-owned raw-code scratch, and
-> capture/restore special-mode breakpoints. Overlay hooks are **not supported by
-> default** in this backend and are rejected before guest execution instead of being
-> silently skipped.
+> capture/restore special-mode breakpoints. Overlay hooks remain fail-closed by
+> default and can be enabled with `overlays=armed`.
 >
 > Final behavioral candidate `3beac7989b1a982f1645ee597192d0c8a40d8080`
 > passed both host-independent CI and the stock-dosemu2 runtime workflow on
 > dosemu2 2.0pre9 / Revision 7076. See `TESTING.md` for the recorded commands,
 > package identity, counters, FLAGS samples, and PASS evidence.
 >
-> Phase 7 additions (this PR): diff-write register pushes (2.8× faster), user
+> Phase 7 additions: diff-write register pushes (2.8× faster), user
 > metadata via `lib=` dlopen, MZ/.exe loading with dynamic load-segment discovery,
-> HYDSNAP full-state capture/restore across instances. VROOMM-style overlay
-> page-in (Phase 7 Item E) is **deferred to an explicit opt-in follow-up**: the
-> default rejection contract above is unchanged, and any future opt-in design
-> must preserve it. Integration suite stages in this PR: .com / .exe / capture /
-> restore — see `TESTING.md`.
+> HYDSNAP full-state capture/restore across instances, plus opt-in VROOMM-style
+> overlay page-in with paged and unpaged snapshot reconstruction. See `TESTING.md`
+> for the test matrix and the distinction between recorded runtime evidence and
+> the current merged code.
 > Implementation: `hydra/src/dosemu_host/`. Where this doc and the shipped code
 > differ (raw-code execution is single-step-trace-based, not return-stub-based),
 > §6/§8 note the as-built behavior.
@@ -267,14 +265,11 @@ limit as a hard resource boundary: if the number of static hooks exceeds 64, or 
 required breakpoint cannot be installed, `host_run()` fails before guest execution.
 Capture/restore special-mode breakpoints also consume debugger entries when active.
 
-**Overlay hooks are currently unsupported by the external dosdebug backend.** A logical
-overlay hook cannot be translated to a stable physical breakpoint before the overlay
-mapping exists. Silently omitting those hooks is semantically wrong, so
-`HYDRA_HOOK_FLAGS_OVERLAY` causes breakpoint installation to fail and `host_run()`
-refuses to run. `test_overlay_reject` makes that default-mode behavior a regression
-contract. Dynamic/lazy overlay discovery and arming remains follow-up work and is not
-claimed by PR #34; any future implementation must be explicitly opted in if it changes
-this default behavior.
+Overlay hooks require a runtime segment mapping, so the host supports them only when
+configured with `overlays=armed`. In that mode it leaves unpaged `CD 3F` stubs intact,
+then arms hooks against the guest pager's `EA` far-jump stubs. Invalid stubs and
+breakpoint-budget exhaustion fail closed. Without the opt-in, `test_overlay_reject`
+continues to verify rejection before guest execution.
 
 ## 8. Hydra bridge mapping
 
@@ -290,7 +285,7 @@ this default behavior.
 | `hydra_machine_init` | connect dosdebug + independently verify/select lowmem backing; raw scratch remains unconfigured |
 | hook execution | static INT3 breakpoints + `g`; trace only for raw/native→guest calls |
 | capture/restore execution | explicit special-mode breakpoints with checked breakpoint cleanup |
-| overlay hooks | unsupported by default; fail closed before guest execution |
+| overlay hooks | lazy `CD 3F`/`EA` reconciliation with `overlays=armed`; otherwise fail closed |
 
 ## 9. Phased implementation and verification state
 
@@ -319,13 +314,11 @@ samples are recorded in `TESTING.md`. Documentation-only commits after the behav
 candidate still have to clear both workflows on their final PR head before merge; that
 final-head result is recorded in the PR discussion.
 
-## 10. Reference: prior in-process plugin research (appendix)
+## 10. Host boundary
 
-A prior design phase investigated an in-process `src/plugin/hydra/` plugin with a
-minimal simx86 core callback (function-pointer registration slot in `FindExecCode`).
-That approach required a dosemu2 fork and a small core edit. The current external client
-approach supersedes it for the supported static-hook scope — no dosemu2 rebuild is
-needed.
+Hydra runs as an external client of the stock dosemu2 process. The host communicates
+through dosdebug and the verified shared low-memory mapping; no emulator rebuild or
+private host-side emulator interface is required.
 
 **simx86** is dosemu2's software CPU emulator (`src/base/emu-i386/simx86/`). It
 translates x86 instructions into internal nodes and executes them. The debugger's
