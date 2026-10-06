@@ -801,6 +801,7 @@ pub fn simplify_chained_comparisons(ir: &mut IR) {
 
       let inner_lhs = inner_instr.operands[0];
       let inner_rhs = inner_instr.operands[1];
+      let compare_width = inner_instr.compare_width;
       let Some(0) = ir.const_lookup(inner_rhs) else { continue; };
 
       let Some(&(_, flipped)) = cmp_ops.iter().find(|&&(op, _)| op == inner_instr.opcode) else { continue };
@@ -809,6 +810,7 @@ pub fn simplify_chained_comparisons(ir: &mut IR) {
       let instr = ir.instr_mut(r).unwrap();
       instr.opcode = new_op;
       instr.operands = vec![inner_lhs, inner_rhs];
+      instr.compare_width = compare_width;
     }
   }
 }
@@ -911,6 +913,30 @@ mod tests {
         assert_eq!(instr.operands, vec![x, zero]);
       }
     }
+  }
+
+  #[test]
+  fn chained_signed_byte_comparison_preserves_width_for_constant_folding() {
+    let (mut ir, blk) = test_ir();
+    let lhs = ir.const_new(0x80);
+    let zero = ir.const_new(0);
+    let inner = append_comparison(
+      &mut ir, blk, Type::U8, Some(CompareWidth::Byte), Opcode::Lt, lhs, zero,
+    );
+    let outer = append(&mut ir, blk, Opcode::Eq, vec![inner, zero]);
+
+    simplify_chained_comparisons(&mut ir);
+
+    let rewritten = ir.instr(outer).unwrap();
+    assert_eq!(rewritten.opcode, Opcode::Geq);
+    assert_eq!(rewritten.compare_width, Some(CompareWidth::Byte));
+    assert_eq!(rewritten.operands, vec![lhs, zero]);
+
+    constant_folding(&mut ir);
+
+    let folded = ir.instr(outer).unwrap();
+    assert_eq!(folded.opcode, Opcode::Ref);
+    assert_eq!(ir.const_lookup(folded.operands[0]), Some(0));
   }
 
   #[test]
