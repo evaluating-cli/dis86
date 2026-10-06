@@ -175,16 +175,20 @@ impl TypeDatabase {
       let mut dims = vec![];
       let mut rest = &s[open..];
       while !rest.is_empty() {
-        if !rest.starts_with('[') { return Err(format!("Failed to parse type: '{}'", s)); }
-        let end = rest.find(']').ok_or_else(|| format!("Failed to parse type: '{}'", s))?;
-        let dim = &rest[1..end];
+        let after_open = rest.strip_prefix('[')
+          .ok_or_else(|| format!("Invalid suffix after array dimension in type: '{}'", s))?;
+        let end = after_open.find(']').ok_or_else(|| format!("Failed to parse type: '{}'", s))?;
+        let dim = &after_open[..end];
         let size = if dim.is_empty() { ArraySize::Unknown } else {
           let n: usize = dim.parse().map_err(|_| format!("Invalid array bound '{}' in type '{}'", dim, s))?;
           if n == 0 { return Err(format!("Array bound must be positive in type '{}'", s)); }
           ArraySize::Known(n)
         };
         dims.push(size);
-        rest = &rest[end+1..];
+        rest = &after_open[end+1..];
+        if !rest.is_empty() && !rest.starts_with('[') {
+          return Err(format!("Invalid suffix after array dimension in type: '{}'", s));
+        }
       }
       let mut typ = base;
       for size in dims.into_iter().rev() { typ = Type::Array(Box::new(typ), size); }
@@ -217,5 +221,6 @@ mod tests {
     assert_eq!(db.parse_type("far<u16>").unwrap().size_in_bytes(), Some(4));
     assert!(db.parse_type("near<>" ).is_err());
     assert!(db.parse_type("u16[2][x]").is_err());
+    assert!(db.parse_type("u16[2]junk[3]").is_err());
   }
 }

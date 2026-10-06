@@ -31,6 +31,18 @@ class AnnotationTypeTests(unittest.TestCase):
         self.assertIn('typedef u16 dis86_near_es_ptr_u16;', text)
         self.assertIn('dis86_near_es_ptr_u16 ptr;', text)
 
+    def test_generated_array_of_guest_pointers_declares_alias(self):
+        layout = Struct('annotation_test_ptr_array_t', 6, [
+            Member('ptrs', 'near<u16>[3]', 0),
+        ])
+        output = io.StringIO()
+        gen_hdr({
+            'functions': [], 'structures': [layout], 'data_section': [], 'callstack': [],
+        }, out=output)
+        text = output.getvalue()
+        self.assertIn('typedef u16 dis86_near_ptr_u16;', text)
+        self.assertIn('dis86_near_ptr_u16 ptrs[3];', text)
+
     def test_struct_layout_requires_explicit_padding(self):
         name = 'annotation_test_layout_t'
         Struct(name, 4, [Member('first', 'u16', 0), Member('second', 'u16', 2)])
