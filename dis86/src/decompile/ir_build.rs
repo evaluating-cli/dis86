@@ -216,6 +216,7 @@ impl<'a> IRBuilder<'a> {
   fn append_instr_with_attrs(&mut self, typ: Type, attrs: u8, opcode: Opcode, operands: Vec<Ref>) -> Ref {
     let instr = Instr {
       typ,
+      compare_width: None,
       attrs,
       opcode,
       operands,

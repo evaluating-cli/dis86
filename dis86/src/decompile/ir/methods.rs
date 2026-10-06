@@ -253,6 +253,7 @@ impl IR {
 
     let vref = self.block_instr_prepend(blk, Instr {
       typ: Type::U16, // TODO: SANITY CHECK THAT NO OTHER SIZES CAN GO THROUGH A PHI!!
+      compare_width: None,
       attrs: Attribute::NONE,
       opcode: Opcode::Phi,
       operands: vec![],

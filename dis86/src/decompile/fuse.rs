@@ -65,12 +65,14 @@ pub fn fuse_adjacent_writevar16_to_writevar32(ir: &mut IR) {
       // New sequence: Make32 and WriteVar32
       *ir.instr_mut(ref2).unwrap() = Instr {
         typ: Type::U32,
+        compare_width: None,
         attrs: Attribute::NONE,
         opcode: Opcode::Make32,
         operands: vec![high_val, low_val],
       };
       *ir.instr_mut(ref1).unwrap() = Instr {
         typ: Type::Void,
+        compare_width: None,
         attrs: Attribute::MAY_ESCAPE,
         opcode: Opcode::WriteVar32,
         operands: vec![Ref::Symbol(symref), ref2],
@@ -120,6 +122,7 @@ pub fn fuse_adjacent_readvar16_to_readvar32(ir: &mut IR) {
 
       let loadval = ir.block_instr_insert_before(b, low_ref, Instr {
         typ: Type::U32,
+        compare_width: None,
         attrs: Attribute::NONE,
         opcode: Opcode::ReadVar32,
         operands: vec![Ref::Symbol(symref)],
@@ -127,6 +130,7 @@ pub fn fuse_adjacent_readvar16_to_readvar32(ir: &mut IR) {
 
       *ir.instr_mut(low_ref).unwrap() = Instr {
         typ: Type::U16,
+        compare_width: None,
         attrs: Attribute::NONE,
         opcode: Opcode::Lower16,
         operands: vec![loadval],
@@ -134,6 +138,7 @@ pub fn fuse_adjacent_readvar16_to_readvar32(ir: &mut IR) {
 
       *ir.instr_mut(high_ref).unwrap() = Instr {
         typ: Type::U16,
+        compare_width: None,
         attrs: Attribute::NONE,
         opcode: Opcode::Upper16,
         operands: vec![loadval],
@@ -217,6 +222,7 @@ pub fn fuse_make32_load16_to_load32(ir: &mut IR) {
       let (seg, off) = (low_instr.operands[0], low_instr.operands[1]);
       *ir.instr_mut(make32_ref).unwrap() = Instr {
         typ: Type::U32,
+        compare_width: None,
         attrs: Attribute::MAY_ESCAPE,
         opcode: Opcode::Load32,
         operands: vec![seg, off],

@@ -39,9 +39,16 @@ pub mod Attribute {
   pub const PIN: u8 = 1<<2;
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum CompareWidth {
+  Byte,
+  Word,
+}
+
 #[derive(Debug, PartialEq, Eq, Clone, Hash)]
 pub struct Instr {
   pub typ: Type,
+  pub compare_width: Option<CompareWidth>,
   pub attrs: u8,
   pub opcode: Opcode,
   pub operands: Vec<Ref>,

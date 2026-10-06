@@ -126,7 +126,7 @@ Some specific known limitations:
 - Block scheduling and placement is very unoptimal for more complicated control-flow.
 - emu86 implements only the instruction/device subset exercised by the project's target binaries; the SST hardware-anchor ledger validates emu86 against real 80C286 captures.
 - emu86's in-scope V1 real-mode instruction behavior is hardware-anchored against the pinned SingleStepTests 80286 corpus: the hardened stride-1 run executed 1,064,157 tests across 268 forms with 1,050,652 PASS, 0 FAIL, 0 DECODE_ERR, and 0 PANIC (see [`docs/emu86/sst.md`](docs/emu86/sst.md)); a hermetic checked-in micro-corpus guards the `just check` harness lane.
-- Constant folding of signed comparisons assumes the 16-bit const-pool domain and can mis-fold an 8-bit signed compare whose operands are both constants (see the known-limitation comment in `constant_folding`, `dis86/src/decompile/opt.rs`).
+- Signed comparison constant folding uses the source operand width when known, including signed 8-bit normalization; comparisons with unknown width are left unfolded.
 - ... and many more ...
 
 ## Future Plans / Wishlist
