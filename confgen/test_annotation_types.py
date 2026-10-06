@@ -1,5 +1,8 @@
 import unittest
 import io
+import subprocess
+import tempfile
+from pathlib import Path
 
 from hydra.annotations import Global, Member, Struct, Type, validate_data_section
 from hydra.gen.appdata import gen_hdr
@@ -64,6 +67,13 @@ class AnnotationTypeTests(unittest.TestCase):
         with self.assertRaisesRegex(Exception, 'exceeds the 64 KiB'):
             validate_data_section([Global('past_end', 'u16[2]', 0xffff)])
 
+    def test_segmented_guest_memory_fixture(self):
+        source = Path(__file__).with_name('test_guest_memory_fixture.c')
+        with tempfile.TemporaryDirectory(prefix='dis86-guest-memory-') as tmp:
+            exe = Path(tmp) / 'guest-memory-fixture'
+            subprocess.run(['cc', '-std=c11', '-Wall', '-Werror', str(source), '-o', str(exe)], check=True)
+            result = subprocess.run([str(exe)], check=True, capture_output=True, text=True)
+            self.assertIn('guest memory fixture passed', result.stdout)
 
 
 if __name__ == '__main__':
