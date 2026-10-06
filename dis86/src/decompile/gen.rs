@@ -228,6 +228,13 @@ impl<'a> Gen<'a> {
         self.text("*")?;
         self.expr(expr, level+1, imp)?;
       }
+      Expr::GuestMem(seg, off, width) => {
+        self.text(&format!("LOAD_{}(", width * 8))?;
+        self.expr(seg, 0, imp)?;
+        self.text(", ")?;
+        self.expr(off, 0, imp)?;
+        self.text(")")?;
+      }
       Expr::Call(name, args) => {
         imp.call(self, name, args, level)?;
       }
@@ -281,6 +288,17 @@ impl<'a> Gen<'a> {
         self.endline()?;
       }
       Stmt::Assign(s) => {
+        if let Expr::GuestMem(seg, off, width) = &s.lhs {
+          self.text(&format!("STORE_{}(", width * 8))?;
+          self.expr(seg, 0, imp)?;
+          self.text(", ")?;
+          self.expr(off, 0, imp)?;
+          self.text(", ")?;
+          self.expr(&s.rhs, 0, imp)?;
+          self.text(");")?;
+          self.endline()?;
+          return Ok(());
+        }
         if let Some(typ) = &s.decltype {
           self.text(&format!("{} ", typ))?;
         }

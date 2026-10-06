@@ -34,6 +34,7 @@ pub enum Expr {
   ArrayAccess(Box<Expr>, Box<Expr>),
   StructAccess(Box<Expr>, Box<Expr>),
   Deref(Box<Expr>),
+  GuestMem(Box<Expr>, Box<Expr>, u8),
   Cast(Type, Box<Expr>),
   UnimplPhi,
   UnimplPin,
@@ -211,6 +212,12 @@ struct Builder<'a> {
   layout_error: Option<String>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct GuestPointerOrigin {
+  symbol: sym::SymbolRef,
+  kind: GuestPtrKind,
+  pointer_value: Option<ir::Ref>,
+}
 
 fn unary_expr(op: UnaryOperator, rhs: Expr) -> Expr {
   Expr::Unary(Box::new(UnaryExpr { op, rhs }))
@@ -397,16 +404,31 @@ impl<'a> Builder<'a> {
         self.ref_to_expr(instr.operands[0], depth+1)
       }
       ir::Opcode::Load8 => {
+        if let Some(origin) = self.guest_pointer_origin(instr.operands[1], 0)
+          .filter(|origin| self.guest_pointer_pair_matches(*origin, instr.operands[0])) {
+          let (seg, off) = self.guest_pointer_address(origin, instr.operands[0], instr.operands[1], depth);
+          return Expr::GuestMem(Box::new(seg), Box::new(off), 1);
+        }
         let seg = self.ref_to_expr_hex(instr.operands[0], depth+1, true);
         let off = self.ref_to_expr_hex(instr.operands[1], depth+1, true);
         Expr::Deref(Box::new(Expr::Abstract("PTR_8", vec![seg, off])))
       }
       ir::Opcode::Load16 => {
+        if let Some(origin) = self.guest_pointer_origin(instr.operands[1], 0)
+          .filter(|origin| self.guest_pointer_pair_matches(*origin, instr.operands[0])) {
+          let (seg, off) = self.guest_pointer_address(origin, instr.operands[0], instr.operands[1], depth);
+          return Expr::GuestMem(Box::new(seg), Box::new(off), 2);
+        }
         let seg = self.ref_to_expr_hex(instr.operands[0], depth+1, true);
         let off = self.ref_to_expr_hex(instr.operands[1], depth+1, true);
         Expr::Deref(Box::new(Expr::Abstract("PTR_16", vec![seg, off])))
       }
       ir::Opcode::Load32 => {
+        if let Some(origin) = self.guest_pointer_origin(instr.operands[1], 0)
+          .filter(|origin| self.guest_pointer_pair_matches(*origin, instr.operands[0])) {
+          let (seg, off) = self.guest_pointer_address(origin, instr.operands[0], instr.operands[1], depth);
+          return Expr::GuestMem(Box::new(seg), Box::new(off), 4);
+        }
         let seg = self.ref_to_expr_hex(instr.operands[0], depth+1, true);
         let off = self.ref_to_expr_hex(instr.operands[1], depth+1, true);
         Expr::Deref(Box::new(Expr::Abstract("PTR_32", vec![seg, off])))
@@ -492,6 +514,101 @@ impl<'a> Builder<'a> {
       }
       opcode @ _ => {
         panic!("Unimplemented {:?} in ast converter", opcode);
+      }
+    }
+  }
+
+  fn guest_pointer_origin(&self, r: ir::Ref, depth: usize) -> Option<GuestPointerOrigin> {
+    let mut found = HashSet::new();
+    self.collect_guest_pointer_origins(r, depth, &mut found);
+    if found.len() == 1 { found.into_iter().next() } else { None }
+  }
+
+  fn collect_guest_pointer_origins(&self, r: ir::Ref, depth: usize, found: &mut HashSet<GuestPointerOrigin>) {
+    if depth > 24 { return; }
+    match r {
+      ir::Ref::Symbol(symref) => if let Type::GuestPtr(_, kind) = symref.get_type(&self.ir.symbols) {
+        found.insert(GuestPointerOrigin { symbol: symref, kind: *kind, pointer_value: None });
+      } else if let Some(kind) = self.annotated_pointer_kind(symref) {
+        found.insert(GuestPointerOrigin { symbol: symref, kind, pointer_value: None });
+      },
+      ir::Ref::Instr(_, _) => {
+        let Some(i) = self.ir.instr(r) else { return; };
+        if matches!(i.opcode, ir::Opcode::ReadVar8 | ir::Opcode::ReadVar16 | ir::Opcode::ReadVar32) {
+          if let Some(ir::Ref::Symbol(symref)) = i.operands.first().copied() {
+            let kind = match symref.get_type(&self.ir.symbols) {
+              Type::GuestPtr(_, kind) => Some(*kind),
+              _ => self.annotated_pointer_kind(symref),
+            };
+            if let Some(kind) = kind {
+              found.insert(GuestPointerOrigin { symbol: symref, kind, pointer_value: Some(r) });
+            }
+          }
+          return;
+        }
+        if matches!(i.opcode, ir::Opcode::Ref | ir::Opcode::Lower16 | ir::Opcode::Upper16) {
+          if let Some(operand) = i.operands.first() { self.collect_guest_pointer_origins(*operand, depth+1, found); }
+          return;
+        }
+        for operand in &i.operands {
+          self.collect_guest_pointer_origins(*operand, depth+1, found);
+        }
+      }
+      _ => (),
+    }
+  }
+
+  fn annotated_pointer_kind(&self, symref: sym::SymbolRef) -> Option<GuestPtrKind> {
+    if symref.region.off < 0 { return None; }
+    self.find_pointer_kind(
+      symref.get_type(&self.ir.symbols),
+      symref.region.off as usize,
+      symref.region.sz as usize,
+      0,
+    )
+  }
+
+  fn find_pointer_kind(&self, typ: &Type, off: usize, size: usize, depth: usize) -> Option<GuestPtrKind> {
+    if depth > 24 { return None; }
+    match typ {
+      Type::GuestPtr(_, kind) if off == 0 && typ.size_in_bytes() == Some(size) => Some(*kind),
+      Type::Array(base, ArraySize::Known(len)) => {
+        let base_size = base.size_in_bytes()?;
+        if base_size == 0 { return None; }
+        let index = off / base_size;
+        let inner_off = off % base_size;
+        if index >= *len || inner_off + size > base_size { return None; }
+        self.find_pointer_kind(base, inner_off, size, depth+1)
+      }
+      Type::Struct(struct_ref) => {
+        let layout = self.cfg.types.lookup_struct(*struct_ref)?;
+        let end = off.checked_add(size)?;
+        for member in &layout.members {
+          let member_start = member.off as usize;
+          let member_end = member_start.checked_add(member.typ.size_in_bytes()?)?;
+          if member_start <= off && end <= member_end {
+            return self.find_pointer_kind(&member.typ, off-member_start, size, depth+1);
+          }
+        }
+        None
+      }
+      _ => None,
+    }
+  }
+
+  fn guest_pointer_pair_matches(&self, origin: GuestPointerOrigin, seg_ref: ir::Ref) -> bool {
+    if origin.kind != GuestPtrKind::Far { return true; }
+    self.guest_pointer_origin(seg_ref, 0).map(|seg_origin| seg_origin == origin && seg_origin.kind == GuestPtrKind::Far).unwrap_or(false)
+  }
+
+  fn guest_pointer_address(&mut self, origin: GuestPointerOrigin, seg_ref: ir::Ref, off_ref: ir::Ref, depth: usize) -> (Expr, Expr) {
+    let off_expr = self.ref_to_expr_hex(off_ref, depth+1, true);
+    match origin.kind {
+      GuestPtrKind::Near => (Expr::Name("DS".into()), off_expr),
+      GuestPtrKind::NearSs => (Expr::Name("SS".into()), off_expr),
+      GuestPtrKind::NearEs => (Expr::Name("ES".into()), off_expr),
+      GuestPtrKind::Far => {
+        (self.ref_to_expr_hex(seg_ref, depth+1, true), off_expr)
       }
     }
   }
@@ -779,16 +896,28 @@ impl<'a> Builder<'a> {
           blk.push_stmt(Stmt::Assign(Assign { decltype: None, lhs, rhs }));
         }
         ir::Opcode::Store8 => {
-          let seg = self.ref_to_expr_hex(instr.operands[0], 1, true);
-          let off = self.ref_to_expr_hex(instr.operands[1], 1, true);
-          let lhs = Expr::Deref(Box::new(Expr::Abstract("PTR_8", vec![seg, off])));
+          let lhs = if let Some(origin) = self.guest_pointer_origin(instr.operands[1], 0)
+            .filter(|origin| self.guest_pointer_pair_matches(*origin, instr.operands[0])) {
+            let (seg, off) = self.guest_pointer_address(origin, instr.operands[0], instr.operands[1], 1);
+            Expr::GuestMem(Box::new(seg), Box::new(off), 1)
+          } else {
+            let seg = self.ref_to_expr_hex(instr.operands[0], 1, true);
+            let off = self.ref_to_expr_hex(instr.operands[1], 1, true);
+            Expr::Deref(Box::new(Expr::Abstract("PTR_8", vec![seg, off])))
+          };
           let rhs = self.ref_to_expr(instr.operands[2], 1);
           blk.push_stmt(Stmt::Assign(Assign { decltype: None, lhs, rhs }));
         }
         ir::Opcode::Store16 => {
-          let seg = self.ref_to_expr_hex(instr.operands[0], 1, true);
-          let off = self.ref_to_expr_hex(instr.operands[1], 1, true);
-          let lhs = Expr::Deref(Box::new(Expr::Abstract("PTR_16", vec![seg, off])));
+          let lhs = if let Some(origin) = self.guest_pointer_origin(instr.operands[1], 0)
+            .filter(|origin| self.guest_pointer_pair_matches(*origin, instr.operands[0])) {
+            let (seg, off) = self.guest_pointer_address(origin, instr.operands[0], instr.operands[1], 1);
+            Expr::GuestMem(Box::new(seg), Box::new(off), 2)
+          } else {
+            let seg = self.ref_to_expr_hex(instr.operands[0], 1, true);
+            let off = self.ref_to_expr_hex(instr.operands[1], 1, true);
+            Expr::Deref(Box::new(Expr::Abstract("PTR_16", vec![seg, off])))
+          };
           let rhs = self.ref_to_expr(instr.operands[2], 1);
           blk.push_stmt(Stmt::Assign(Assign { decltype: None, lhs, rhs }));
         }

@@ -1,6 +1,6 @@
 use dis86::asm::instr::Reg;
 use dis86::config::{Config, Global};
-use dis86::decompile::ast::{Block, Expr, Function, Stmt};
+use dis86::decompile::ast::{Assign, Block, Expr, Function, Stmt};
 use dis86::decompile::control_flow::ControlFlow;
 use dis86::decompile::gen::{self, Flavor};
 use dis86::decompile::ir::{self, Attribute, Instr, Opcode, Ref};
@@ -18,6 +18,150 @@ fn empty_config(types: Rc<TypeDatabase>) -> Config {
     globals: vec![],
     text_section: vec![],
   }
+}
+
+#[test]
+fn guest_pointer_expressions_emit_segmented_loads_and_stores() {
+  let func = Function {
+    name: "guest_pointer".into(),
+    ret: None,
+    vardecls: vec![],
+    varmaps: vec![],
+    frame_size: 0,
+    body: Block(vec![
+      Stmt::Assign(Assign {
+        decltype: None,
+        lhs: Expr::GuestMem(Box::new(Expr::Name("ES".into())), Box::new(Expr::Name("off".into())), 2),
+        rhs: Expr::HexConst(0x1234),
+      }),
+      Stmt::Expr(Expr::GuestMem(Box::new(Expr::Name("SS".into())), Box::new(Expr::Name("off".into())), 2)),
+    ]),
+  };
+  let source = gen::generate(&func, Flavor::Hydra).unwrap();
+  assert!(source.contains("STORE_16(ES, off, 0x1234);"), "missing segmented pointer store:\n{source}");
+  assert!(source.contains("LOAD_16(SS, off)"), "missing segmented pointer read:\n{source}");
+}
+
+#[test]
+fn annotated_near_es_pointer_reads_and_writes_use_segmented_memory() {
+  use dis86::types::GuestPtrKind;
+
+  let types = Rc::new(TypeDatabase::new());
+  let mut cfg = empty_config(types.clone());
+  cfg.globals.push(Global {
+    name: "g_pointer".into(),
+    offset: 0x0100,
+    typ: Type::GuestPtr(Box::new(Type::U16), GuestPtrKind::NearEs),
+  });
+  let mut ir = ir::IR::new(types);
+  let blk = ir.add_block("entry");
+  let p_off = ir.const_new(0x0100);
+  let pointer = append(&mut ir, blk, Type::U16, Opcode::Load16, vec![Ref::Init(Reg::DS), p_off]);
+  let value = ir.const_new(0x1234);
+  append(&mut ir, blk, Type::Void, Opcode::Store16, vec![Ref::Init(Reg::DS), pointer, value]);
+  let loaded = append(&mut ir, blk, Type::U16, Opcode::Load16, vec![Ref::Init(Reg::DS), pointer]);
+  append(&mut ir, blk, Type::Void, Opcode::RetNear, vec![loaded]);
+
+  sym::symbolize_globals(&mut ir, &cfg);
+  let cf = ControlFlow::from_ir(&ir);
+  let func = Function::from_ir(&cfg, "near_es_access", None, &ir, &cf).unwrap();
+  let source = gen::generate(&func, Flavor::Hydra).unwrap();
+  assert!(source.contains("tmp_0 = g_pointer;"), "pointer field should be read as its guest-width value:\n{source}");
+  assert!(source.contains("STORE_16(ES, tmp_0, 0x1234);"), "missing ES pointer store:\n{source}");
+  assert!(source.contains("LOAD_16(ES, tmp_0)"), "missing ES pointer read:\n{source}");
+}
+
+#[test]
+fn pointer_annotation_on_struct_member_reaches_indirect_accesses() {
+  use dis86::config::{Struct as ConfigStruct, StructMember};
+  use dis86::types::GuestPtrKind;
+
+  let mut type_db = TypeDatabase::new();
+  let layout = ConfigStruct {
+    name: "pointer_holder_t".into(),
+    size: 2,
+    members: vec![StructMember {
+      name: "ptr".into(),
+      typ: Type::GuestPtr(Box::new(Type::U16), GuestPtrKind::NearEs),
+      off: 0,
+    }],
+  };
+  type_db.append_struct(&layout);
+  let typ = type_db.parse_type("pointer_holder_t").unwrap();
+  let types = Rc::new(type_db);
+  let mut cfg = empty_config(types.clone());
+  cfg.structs.push(layout);
+  cfg.globals.push(Global { name: "g_holder".into(), offset: 0x0100, typ });
+
+  let mut ir = ir::IR::new(types);
+  let blk = ir.add_block("entry");
+  let pointer_slot = ir.const_new(0x0100);
+  let pointer = append(&mut ir, blk, Type::U16, Opcode::Load16, vec![Ref::Init(Reg::DS), pointer_slot]);
+  let value = append(&mut ir, blk, Type::U16, Opcode::Load16, vec![Ref::Init(Reg::DS), pointer]);
+  append(&mut ir, blk, Type::Void, Opcode::RetNear, vec![value]);
+
+  sym::symbolize_globals(&mut ir, &cfg);
+  let cf = ControlFlow::from_ir(&ir);
+  let func = Function::from_ir(&cfg, "struct_pointer_access", None, &ir, &cf).unwrap();
+  let source = gen::generate(&func, Flavor::Hydra).unwrap();
+  assert!(source.contains("g_holder.ptr"), "expected annotated struct pointer field read:\n{source}");
+  assert!(source.contains("LOAD_16(ES,"), "struct pointer annotation must select ES for dereference:\n{source}");
+}
+
+#[test]
+fn annotated_far_pointer_splits_segment_and_offset_for_memory_access() {
+  use dis86::types::GuestPtrKind;
+
+  let types = Rc::new(TypeDatabase::new());
+  let mut cfg = empty_config(types.clone());
+  cfg.globals.push(Global {
+    name: "g_far_pointer".into(),
+    offset: 0x0100,
+    typ: Type::GuestPtr(Box::new(Type::U16), GuestPtrKind::Far),
+  });
+  let mut ir = ir::IR::new(types);
+  let blk = ir.add_block("entry");
+  let p_off = ir.const_new(0x0100);
+  let pointer = append(&mut ir, blk, Type::U32, Opcode::Load32, vec![Ref::Init(Reg::DS), p_off]);
+  let seg = append(&mut ir, blk, Type::U16, Opcode::Upper16, vec![pointer]);
+  let off = append(&mut ir, blk, Type::U16, Opcode::Lower16, vec![pointer]);
+  let loaded = append(&mut ir, blk, Type::U16, Opcode::Load16, vec![seg, off]);
+  append(&mut ir, blk, Type::Void, Opcode::RetNear, vec![loaded]);
+
+  sym::symbolize_globals(&mut ir, &cfg);
+  let cf = ControlFlow::from_ir(&ir);
+  let func = Function::from_ir(&cfg, "far_access", None, &ir, &cf).unwrap();
+  let source = gen::generate(&func, Flavor::Hydra).unwrap();
+  assert!(source.contains("LOAD_16("), "missing segmented far-pointer load:\n{source}");
+  assert!(source.contains("g_far_pointer"), "far pointer must remain a guest-width field:\n{source}");
+  assert!(!source.contains("g_far_pointer->"), "far pointer must not become a host pointer:\n{source}");
+}
+
+#[test]
+fn far_pointer_offset_with_unrelated_segment_keeps_raw_memory_path() {
+  use dis86::types::GuestPtrKind;
+
+  let types = Rc::new(TypeDatabase::new());
+  let mut cfg = empty_config(types.clone());
+  cfg.globals.push(Global {
+    name: "g_far_pointer_mismatch".into(),
+    offset: 0x0100,
+    typ: Type::GuestPtr(Box::new(Type::U16), GuestPtrKind::Far),
+  });
+  let mut ir = ir::IR::new(types);
+  let blk = ir.add_block("entry");
+  let p_off = ir.const_new(0x0100);
+  let pointer = append(&mut ir, blk, Type::U32, Opcode::Load32, vec![Ref::Init(Reg::DS), p_off]);
+  let off = append(&mut ir, blk, Type::U16, Opcode::Lower16, vec![pointer]);
+  let loaded = append(&mut ir, blk, Type::U16, Opcode::Load16, vec![Ref::Init(Reg::DS), off]);
+  append(&mut ir, blk, Type::Void, Opcode::RetNear, vec![loaded]);
+
+  sym::symbolize_globals(&mut ir, &cfg);
+  let cf = ControlFlow::from_ir(&ir);
+  let func = Function::from_ir(&cfg, "far_segment_mismatch", None, &ir, &cf).unwrap();
+  let source = gen::generate(&func, Flavor::Hydra).unwrap();
+  assert!(source.contains("PTR_16(DS,"), "unpaired far-pointer segment must keep the original address path:\n{source}");
+  assert!(!source.contains("LOAD_16("), "mismatched far pointer must not substitute its segment:\n{source}");
 }
 
 #[test]
