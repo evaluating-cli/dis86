@@ -165,6 +165,11 @@ impl TypeDatabase {
       if s.starts_with(prefix) && s.ends_with('>') {
         let inner = &s[prefix.len()..s.len()-1];
         if inner.is_empty() { break; }
+        // Pointees are plain type names; pointer-to-array and nested-pointer
+        // forms are rejected to match the Python annotation parser.
+        if inner.contains(['[', ']', '<', '>']) {
+          return Err(format!("Invalid guest pointer pointee '{}' in type '{}'", inner, s));
+        }
         return Ok(Type::GuestPtr(Box::new(self.parse_type(inner)?), kind));
       }
     }
@@ -222,5 +227,13 @@ mod tests {
     assert!(db.parse_type("near<>" ).is_err());
     assert!(db.parse_type("u16[2][x]").is_err());
     assert!(db.parse_type("u16[2]junk[3]").is_err());
+  }
+
+  #[test]
+  fn guest_pointer_parsing_matches_python_parser() {
+    let db = TypeDatabase::new();
+    assert_eq!(db.parse_type("u16 ").unwrap(), Type::U16);
+    assert!(db.parse_type("near<u16[3]>").is_err());
+    assert!(db.parse_type("far<near<u16>>").is_err());
   }
 }

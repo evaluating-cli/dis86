@@ -45,6 +45,7 @@ class Type:
     @staticmethod
     def from_str(s):
         import re
+        s = s.strip()
         m = re.fullmatch(r'([^\[\]]+)((?:\[[0-9]*\])*)', s)
         if not m:
             raise Exception(f'Invalid type: "{s}"')

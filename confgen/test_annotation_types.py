@@ -67,6 +67,13 @@ class AnnotationTypeTests(unittest.TestCase):
         with self.assertRaisesRegex(Exception, 'exceeds the 64 KiB'):
             validate_data_section([Global('past_end', 'u16[2]', 0xffff)])
 
+    def test_type_parsing_matches_rust_parser(self):
+        self.assertEqual(Type.from_str('u16 ').basetype, 'u16')
+        with self.assertRaisesRegex(Exception, 'Invalid'):
+            Type.from_str('near<u16[3]>')
+        with self.assertRaisesRegex(Exception, 'Invalid'):
+            Type.from_str('far<near<u16>>')
+
     def test_segmented_guest_memory_fixture(self):
         source = Path(__file__).with_name('test_guest_memory_fixture.c')
         with tempfile.TemporaryDirectory(prefix='dis86-guest-memory-') as tmp:
