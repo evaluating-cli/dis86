@@ -1,3 +1,5 @@
+import re
+
 _TypeSizes = {
     'u8':  1,
     'i8':  1,
@@ -14,7 +16,6 @@ def _pointer_width(typename):
     return 4 if spec[0] == 'far' else 2
 
 def _pointer_spec(typename):
-    import re
     match = re.fullmatch(r'(near|near_ss|near_es|far)<([A-Za-z_]\w*)>', typename)
     if match:
         return match.groups()
@@ -44,7 +45,7 @@ class Type:
 
     @staticmethod
     def from_str(s):
-        import re
+        s = s.strip()
         m = re.fullmatch(r'([^\[\]]+)((?:\[[0-9]*\])*)', s)
         if not m:
             raise Exception(f'Invalid type: "{s}"')
