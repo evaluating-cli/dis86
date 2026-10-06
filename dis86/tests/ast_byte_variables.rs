@@ -20,6 +20,60 @@ fn empty_config(types: Rc<TypeDatabase>) -> Config {
   }
 }
 
+#[test]
+fn nested_array_annotation_generates_c_dimension_order() {
+  let types = Rc::new(TypeDatabase::new());
+  let mut cfg = empty_config(types.clone());
+  cfg.globals.push(Global {
+    name: "g_grid".into(),
+    offset: 0x0100,
+    typ: Type::Array(Box::new(Type::Array(Box::new(Type::U16), dis86::types::ArraySize::Known(4))), dis86::types::ArraySize::Known(3)),
+  });
+  let mut ir = ir::IR::new(types);
+  let blk = ir.add_block("entry");
+  let cell = ir.const_new(0x010c); // ((1 * 4) + 2) * sizeof(u16)
+  let loaded = append(&mut ir, blk, Type::U16, Opcode::Load16, vec![Ref::Init(Reg::DS), cell]);
+  append(&mut ir, blk, Type::Void, Opcode::RetNear, vec![loaded]);
+
+  sym::symbolize_globals(&mut ir, &cfg);
+  let cf = ControlFlow::from_ir(&ir);
+  let func = Function::from_ir(&cfg, "grid_access", None, &ir, &cf).unwrap();
+  let source = gen::generate(&func, Flavor::Hydra).unwrap();
+  assert!(source.contains("g_grid[1][2]"), "expected row/column C indexing:\n{source}");
+}
+
+#[test]
+fn annotated_member_layout_failure_returns_contextual_error() {
+  use dis86::config::{Struct as ConfigStruct, StructMember};
+
+  let mut type_db = TypeDatabase::new();
+  let layout = ConfigStruct {
+    name: "byte_pair_t".into(),
+    size: 2,
+    members: vec![
+      StructMember { name: "lo".into(), typ: Type::U8, off: 0 },
+      StructMember { name: "hi".into(), typ: Type::U8, off: 1 },
+    ],
+  };
+  type_db.append_struct(&layout);
+  let typ = type_db.parse_type("byte_pair_t").unwrap();
+  let types = Rc::new(type_db);
+  let mut cfg = empty_config(types.clone());
+  cfg.structs.push(layout);
+  cfg.globals.push(Global { name: "g_pair".into(), offset: 0x0100, typ });
+
+  let mut ir = ir::IR::new(types);
+  let blk = ir.add_block("entry");
+  let off = ir.const_new(0x0100);
+  let loaded = append(&mut ir, blk, Type::U16, Opcode::Load16, vec![Ref::Init(Reg::DS), off]);
+  append(&mut ir, blk, Type::Void, Opcode::RetNear, vec![loaded]);
+  sym::symbolize_globals(&mut ir, &cfg);
+  let cf = ControlFlow::from_ir(&ir);
+  let err = Function::from_ir(&cfg, "bad_member_access", None, &ir, &cf).unwrap_err();
+  assert!(err.contains("g_pair"), "missing symbol context in error: {err}");
+  assert!(err.contains("member"), "missing layout context in error: {err}");
+}
+
 fn append(ir: &mut ir::IR, blk: ir::BlockRef, typ: Type, opcode: Opcode, operands: Vec<Ref>) -> Ref {
   ir.block_instr_append(blk, Instr {
     typ,
@@ -67,7 +121,7 @@ fn byte_stack_symbol_reads_and_writes_emit_ptr8_mapping() {
   assert_eq!(ir.instr(load).unwrap().opcode, Opcode::ReadVar8);
 
   let cf = ControlFlow::from_ir(&ir);
-  let func = Function::from_ir(&cfg, "byte_stack", None, &ir, &cf);
+  let func = Function::from_ir(&cfg, "byte_stack", None, &ir, &cf).unwrap();
 
   assert_eq!(func.varmaps.len(), 1);
   assert_eq!(func.varmaps[0].typ, Type::U8);
@@ -110,7 +164,7 @@ fn byte_global_store_emits_symbol_assignment() {
   assert_eq!(ir.instr(store).unwrap().opcode, Opcode::WriteVar8);
 
   let cf = ControlFlow::from_ir(&ir);
-  let func = Function::from_ir(&cfg, "byte_global", None, &ir, &cf);
+  let func = Function::from_ir(&cfg, "byte_global", None, &ir, &cf).unwrap();
 
   let assignment = func.body.0.iter().find_map(|stmt| match stmt {
     Stmt::Assign(assign) => Some(assign),
@@ -153,7 +207,7 @@ fn reducible_diamond_generates_if_else_code() {
   append(&mut ir, join, Type::Void, Opcode::RetNear, vec![]);
 
   let cf = ControlFlow::from_ir(&ir);
-  let func = Function::from_ir(&cfg, "diamond", None, &ir, &cf);
+  let func = Function::from_ir(&cfg, "diamond", None, &ir, &cf).unwrap();
   let if_stmt = func.body.0.iter().find_map(|stmt| match stmt {
     Stmt::If(if_stmt) => Some(if_stmt),
     _ => None,
@@ -207,7 +261,7 @@ fn reducible_if_with_empty_then_arm_generates_one_arm_if() {
   append(&mut ir, join, Type::Void, Opcode::RetNear, vec![]);
 
   let cf = ControlFlow::from_ir(&ir);
-  let func = Function::from_ir(&cfg, "empty_then_arm", None, &ir, &cf);
+  let func = Function::from_ir(&cfg, "empty_then_arm", None, &ir, &cf).unwrap();
   let if_stmt = func.body.0.iter().find_map(|stmt| match stmt {
     Stmt::If(if_stmt) => Some(if_stmt),
     _ => None,

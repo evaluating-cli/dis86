@@ -85,10 +85,10 @@ impl SymbolRef {
 
 /////////////////////////////////////////////////////////////////
 
-pub fn determine_access_path(types: &TypeDatabase, map: &SymbolMap, sym: &SymbolRef) -> access::Access {
+pub fn determine_access_path(types: &TypeDatabase, map: &SymbolMap, sym: &SymbolRef) -> Result<access::Access, String> {
   let typ = sym.get_type(map);
   let off = sym.region.off;
-  assert!(off >= 0);
+  if off < 0 { return Err(format!("Negative offset {} in annotated access", off)); }
   access::from_type_and_offset(types, typ, off as usize, sym.region.sz as usize)
 }
 

@@ -34,8 +34,10 @@ pub fn fuse_adjacent_writevar16_to_writevar32(ir: &mut IR) {
       if sym1 as *const _ != sym2 as *const _ { continue; }
 
       // Compute the access paths to figure out the actual access element size
-      let access1 = sym::determine_access_path(&ir.types, &ir.symbols, symref1);
-      let access2 = sym::determine_access_path(&ir.types, &ir.symbols, symref2);
+      let (Ok(access1), Ok(access2)) = (
+        sym::determine_access_path(&ir.types, &ir.symbols, symref1),
+        sym::determine_access_path(&ir.types, &ir.symbols, symref2),
+      ) else { continue };
       if &access1.path != &access2.path { continue; }
       if &access1.typ != &access2.typ { continue; }
 
