@@ -597,8 +597,17 @@ impl<'a> Builder<'a> {
   }
 
   fn guest_pointer_pair_matches(&self, origin: GuestPointerOrigin, seg_ref: ir::Ref) -> bool {
-    if origin.kind != GuestPtrKind::Far { return true; }
-    self.guest_pointer_origin(seg_ref, 0).map(|seg_origin| seg_origin == origin && seg_origin.kind == GuestPtrKind::Far).unwrap_or(false)
+    // Near pointers carry an implicit segment, so the IR segment must be the
+    // register the annotation selects for. A mismatch (wrong annotation,
+    // segment override, or reused offset expression) keeps the raw address
+    // path instead of silently substituting a segment.
+    use crate::asm::instr::Reg;
+    match origin.kind {
+      GuestPtrKind::Near => seg_ref == ir::Ref::Init(Reg::DS),
+      GuestPtrKind::NearSs => seg_ref == ir::Ref::Init(Reg::SS),
+      GuestPtrKind::NearEs => seg_ref == ir::Ref::Init(Reg::ES),
+      GuestPtrKind::Far => self.guest_pointer_origin(seg_ref, 0).map(|seg_origin| seg_origin == origin && seg_origin.kind == GuestPtrKind::Far).unwrap_or(false),
+    }
   }
 
   fn guest_pointer_address(&mut self, origin: GuestPointerOrigin, seg_ref: ir::Ref, off_ref: ir::Ref, depth: usize) -> (Expr, Expr) {

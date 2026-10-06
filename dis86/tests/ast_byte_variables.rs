@@ -58,8 +58,8 @@ fn annotated_near_es_pointer_reads_and_writes_use_segmented_memory() {
   let p_off = ir.const_new(0x0100);
   let pointer = append(&mut ir, blk, Type::U16, Opcode::Load16, vec![Ref::Init(Reg::DS), p_off]);
   let value = ir.const_new(0x1234);
-  append(&mut ir, blk, Type::Void, Opcode::Store16, vec![Ref::Init(Reg::DS), pointer, value]);
-  let loaded = append(&mut ir, blk, Type::U16, Opcode::Load16, vec![Ref::Init(Reg::DS), pointer]);
+  append(&mut ir, blk, Type::Void, Opcode::Store16, vec![Ref::Init(Reg::ES), pointer, value]);
+  let loaded = append(&mut ir, blk, Type::U16, Opcode::Load16, vec![Ref::Init(Reg::ES), pointer]);
   append(&mut ir, blk, Type::Void, Opcode::RetNear, vec![loaded]);
 
   sym::symbolize_globals(&mut ir, &cfg);
@@ -97,7 +97,7 @@ fn pointer_annotation_on_struct_member_reaches_indirect_accesses() {
   let blk = ir.add_block("entry");
   let pointer_slot = ir.const_new(0x0100);
   let pointer = append(&mut ir, blk, Type::U16, Opcode::Load16, vec![Ref::Init(Reg::DS), pointer_slot]);
-  let value = append(&mut ir, blk, Type::U16, Opcode::Load16, vec![Ref::Init(Reg::DS), pointer]);
+  let value = append(&mut ir, blk, Type::U16, Opcode::Load16, vec![Ref::Init(Reg::ES), pointer]);
   append(&mut ir, blk, Type::Void, Opcode::RetNear, vec![value]);
 
   sym::symbolize_globals(&mut ir, &cfg);
@@ -162,6 +162,32 @@ fn far_pointer_offset_with_unrelated_segment_keeps_raw_memory_path() {
   let source = gen::generate(&func, Flavor::Hydra).unwrap();
   assert!(source.contains("PTR_16(DS,"), "unpaired far-pointer segment must keep the original address path:\n{source}");
   assert!(!source.contains("LOAD_16("), "mismatched far pointer must not substitute its segment:\n{source}");
+}
+
+#[test]
+fn near_es_pointer_with_unrelated_segment_keeps_raw_memory_path() {
+  use dis86::types::GuestPtrKind;
+
+  let types = Rc::new(TypeDatabase::new());
+  let mut cfg = empty_config(types.clone());
+  cfg.globals.push(Global {
+    name: "g_near_es_pointer_mismatch".into(),
+    offset: 0x0100,
+    typ: Type::GuestPtr(Box::new(Type::U16), GuestPtrKind::NearEs),
+  });
+  let mut ir = ir::IR::new(types);
+  let blk = ir.add_block("entry");
+  let p_off = ir.const_new(0x0100);
+  let pointer = append(&mut ir, blk, Type::U16, Opcode::Load16, vec![Ref::Init(Reg::DS), p_off]);
+  let loaded = append(&mut ir, blk, Type::U16, Opcode::Load16, vec![Ref::Init(Reg::DS), pointer]);
+  append(&mut ir, blk, Type::Void, Opcode::RetNear, vec![loaded]);
+
+  sym::symbolize_globals(&mut ir, &cfg);
+  let cf = ControlFlow::from_ir(&ir);
+  let func = Function::from_ir(&cfg, "near_es_segment_mismatch", None, &ir, &cf).unwrap();
+  let source = gen::generate(&func, Flavor::Hydra).unwrap();
+  assert!(source.contains("PTR_16(DS,"), "unpaired near-pointer segment must keep the original address path:\n{source}");
+  assert!(!source.contains("LOAD_16("), "mismatched near pointer must not substitute its segment:\n{source}");
 }
 
 #[test]
