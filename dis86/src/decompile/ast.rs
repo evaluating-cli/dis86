@@ -724,8 +724,10 @@ impl<'a> Builder<'a> {
           return self.symbol_to_expr_recurse(expr, basetype, access, symbol);
         }
         Type::Struct(struct_ref) => {
-          let access_start = access.off as usize;
-          let access_end = access_start + access.sz as usize;
+          let Some((access_start, access_end)) = checked_byte_range(access.off, access.sz) else {
+            self.layout_error.get_or_insert_with(|| format!("Invalid byte offset {} for annotated access to {} ({})", access.off, symbol, typ));
+            return expr;
+          };
           let Some(s) = self.cfg.types.lookup_struct(*struct_ref) else {
             self.layout_error.get_or_insert_with(|| format!("Missing struct layout for annotated access to {} ({})", symbol, typ));
             return expr;
@@ -1231,5 +1233,44 @@ impl<'a> Builder<'a> {
 impl Function {
   pub fn from_ir(cfg: &Config, name: &str, ret: Option<Type>, ir: &ir::IR, ctrlflow: &ControlFlow) -> Result<Self, String> {
     Builder::new(cfg, ir, ctrlflow).build(name, ret)
+  }
+}
+
+/// Converts a signed byte offset plus access size into a checked `start..end`
+/// byte range. Returns `None` for negative offsets or on overflow, so callers
+/// never perform a wrapping `as usize` cast on untrusted offsets.
+fn checked_byte_range(off: i32, sz: u16) -> Option<(usize, usize)> {
+  if off < 0 { return None; }
+  let start = off as usize;
+  Some((start, start.checked_add(sz as usize)?))
+}
+
+#[cfg(test)]
+mod tests {
+  use super::checked_byte_range;
+
+  #[test]
+  fn negative_offsets_are_rejected() {
+    assert_eq!(checked_byte_range(-1, 2), None);
+    assert_eq!(checked_byte_range(i32::MIN, u16::MAX), None);
+  }
+
+  #[test]
+  fn valid_ranges_pass_through() {
+    assert_eq!(checked_byte_range(0, 2), Some((0, 2)));
+    assert_eq!(checked_byte_range(4, 2), Some((4, 6)));
+  }
+
+  #[test]
+  fn overflowing_ranges_are_rejected() {
+    // i32::MAX + u16::MAX only overflows usize on 32-bit targets; elsewhere it
+    // must pass through with the exact sum.
+    #[cfg(target_pointer_width = "32")]
+    assert_eq!(checked_byte_range(i32::MAX, u16::MAX), None);
+    #[cfg(not(target_pointer_width = "32"))]
+    assert_eq!(
+      checked_byte_range(i32::MAX, u16::MAX),
+      Some((i32::MAX as usize, i32::MAX as usize + u16::MAX as usize))
+    );
   }
 }
