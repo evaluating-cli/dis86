@@ -720,6 +720,7 @@ mod tests {
   fn dynamic_drive_uses_canonical_directory_and_stable_dos_identity() {
     let path = mz_file("canonical/real", 0, 0);
     let alias = temp("canonical").join("alias");
+    let _ = std::fs::remove_file(&alias); // A prior run with the same PID may have left this symlink behind.
     std::os::unix::fs::symlink(path.parent().unwrap(), &alias).unwrap();
     let through_alias = alias.join("target.exe");
     let direct = target_command(&path, "dosemu".into()).unwrap();

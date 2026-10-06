@@ -306,7 +306,13 @@ fn decompile_spec(args: &Args, cfg: &Config, binary: &Binary, spec: Spec<'_>, al
   }
 
   let ret = spec.func.map(|f| f.return_type_defaulted());
-  let ast = ast::Function::from_ir(&cfg, &spec.name, ret, &ir, &ctrlflow);
+  let ast = match ast::Function::from_ir(&cfg, &spec.name, ret, &ir, &ctrlflow) {
+    Ok(ast) => ast,
+    Err(err) => {
+      eprintln!("Error while building annotated accesses for {}: {}", spec.name, err);
+      return 1;
+    }
+  };
   if let Some(path) = args.emit_ast.as_ref() {
     let text = format!("{:#?}", ast);
     write_to_path(path, &text);

@@ -208,7 +208,9 @@ struct Builder<'a> {
   assigns: Vec<(String, Type)>,
   assigned: HashSet<String>,
   mappings: HashMap<String, (Type, Expr)>,
+  layout_error: Option<String>,
 }
+
 
 fn unary_expr(op: UnaryOperator, rhs: Expr) -> Expr {
   Expr::Unary(Box::new(UnaryExpr { op, rhs }))
@@ -240,6 +242,7 @@ impl<'a> Builder<'a> {
       assigns: vec![],
       assigned: HashSet::new(),
       mappings: HashMap::new(),
+      layout_error: None,
     }
   }
 
@@ -559,12 +562,12 @@ impl<'a> Builder<'a> {
     let expr = Expr::Name(sym.name.clone());
     let typ = symref.get_type(&self.ir.symbols);
     //println!("enter symbol_to_expr_recurse");
-    let r = self.symbol_to_expr_recurse(expr, typ, symref.region);
+    let r = self.symbol_to_expr_recurse(expr, typ, symref.region, &sym.name);
     //println!("leave symbol_to_expr_recurse");
     r
   }
 
-  fn symbol_to_expr_recurse(&self, mut expr: Expr, typ: &Type, mut access: sym::Region) -> Expr {
+  fn symbol_to_expr_recurse(&mut self, mut expr: Expr, typ: &Type, mut access: sym::Region, symbol: &str) -> Expr {
     // FIXME: Unify this and the "access" code
 
     // println!("symbol_to_expr_recurse");
@@ -574,28 +577,49 @@ impl<'a> Builder<'a> {
     if !typ.is_primitive() {
       match typ {
         Type::Array(basetype, len) => {
-          let ArraySize::Known(len) = len else { panic!("Expected datatype to have known array length") };
-          let basetype_sz = basetype.size_in_bytes().unwrap();
+          let ArraySize::Known(len) = len else {
+            self.layout_error.get_or_insert_with(|| format!("Annotated access to {} uses an array with unknown bound ({})", symbol, typ));
+            return expr;
+          };
+          let Some(basetype_sz) = basetype.size_in_bytes() else {
+            self.layout_error.get_or_insert_with(|| format!("Cannot determine element size for annotated access to {} ({})", symbol, typ));
+            return expr;
+          };
+          if basetype_sz == 0 || access.off < 0 {
+            self.layout_error.get_or_insert_with(|| format!("Invalid byte offset {} for annotated access to {} ({})", access.off, symbol, typ));
+            return expr;
+          }
           let idx = access.off as usize / basetype_sz;
-          if idx > *len { panic!("Access out of range"); }
-          if access.sz as usize > basetype_sz { panic!("Access exceeds basetype size"); }
+          let element_off = access.off as usize % basetype_sz;
+          if idx >= *len || element_off + access.sz as usize > basetype_sz || access.off as usize + access.sz as usize > typ.size_in_bytes().unwrap_or(0) {
+            self.layout_error.get_or_insert_with(|| format!("Access byte range {}..{} is outside annotated {} layout {}", access.off, access.off + access.sz as i32, symbol, typ));
+            return expr;
+          }
 
+          let idx_expr = if idx <= i16::MAX as usize { Expr::DecimalConst(idx as i16) } else { Expr::HexConst(idx as u16) };
           let expr = Expr::ArrayAccess(
             Box::new(expr),
-            Box::new(Expr::DecimalConst(idx as i16)));
+            Box::new(idx_expr));
 
           access.off -= (idx * basetype_sz) as i32;
 
           // recurse
-          return self.symbol_to_expr_recurse(expr, basetype, access);
+          return self.symbol_to_expr_recurse(expr, basetype, access, symbol);
         }
         Type::Struct(struct_ref) => {
           let access_start = access.off as usize;
           let access_end = access_start + access.sz as usize;
-          let s = self.cfg.types.lookup_struct(*struct_ref).unwrap();
+          let Some(s) = self.cfg.types.lookup_struct(*struct_ref) else {
+            self.layout_error.get_or_insert_with(|| format!("Missing struct layout for annotated access to {} ({})", symbol, typ));
+            return expr;
+          };
           for mbr in &s.members {
             let mbr_start = mbr.off as usize;
-            let mbr_end = mbr_start + mbr.typ.size_in_bytes().unwrap();
+            let Some(mbr_size) = mbr.typ.size_in_bytes() else {
+              self.layout_error.get_or_insert_with(|| format!("Unknown member size for annotated access to {}.{}", symbol, mbr.name));
+              return expr;
+            };
+            let mbr_end = mbr_start + mbr_size;
             if !(mbr_start <= access_start && access_end <= mbr_end) { continue; }
 
             // Found!!
@@ -606,18 +630,31 @@ impl<'a> Builder<'a> {
             access.off -= mbr.off as i32;
 
             // recurse
-            return self.symbol_to_expr_recurse(expr, &mbr.typ, access);
+            return self.symbol_to_expr_recurse(expr, &mbr.typ, access, symbol);
           }
-          panic!("Failed to find member");
+          self.layout_error.get_or_insert_with(|| format!("Access byte range {}..{} does not fit any member of annotated {} ({})", access.off, access.off + access.sz as i32, symbol, typ));
+          return expr;
+        }
+        Type::GuestPtr(_, _) => {
+          // A pointer value itself is represented by its guest-width integer storage.
+          if access.off != 0 || access.sz as usize != typ.size_in_bytes().unwrap_or(0) {
+            self.layout_error.get_or_insert_with(|| format!("Partial access to annotated pointer {} is unsupported", symbol));
+          }
+          return expr;
         }
         _ => {
-          panic!("Unknown ... {:?}", typ);
+          self.layout_error.get_or_insert_with(|| format!("Unsupported annotated layout type for {} ({})", symbol, typ));
+          return expr;
         }
       }
     }
 
     // Base-case of a primitive
-    if access.off != 0 ||  access.sz as usize != typ.size_in_bytes().unwrap() {
+    let Some(typ_size) = typ.size_in_bytes() else {
+      self.layout_error.get_or_insert_with(|| format!("Unknown annotated access size for {} ({})", symbol, typ));
+      return expr;
+    };
+    if access.off != 0 || access.sz as usize != typ_size {
       expr = Expr::Unary(Box::new(UnaryExpr {
         op: UnaryOperator::Addr,
         rhs: expr,
@@ -633,7 +670,10 @@ impl<'a> Builder<'a> {
         1 => Type::U8,
         2 => Type::U16,
         4 => Type::U32,
-        _ => panic!("Unknown access size: {}", access.sz),
+        _ => {
+          self.layout_error.get_or_insert_with(|| format!("Unsupported access width {} for annotated {} ({})", access.sz, symbol, typ));
+          return expr;
+        },
       };
       expr = Expr::Cast(Type::ptr(t), Box::new(expr));
       expr = Expr::Deref(Box::new(expr));
@@ -975,10 +1015,11 @@ impl<'a> Builder<'a> {
     blk
   }
 
-  fn build(&mut self, name: &str, ret: Option<Type>) -> Function {
+  fn build(&mut self, name: &str, ret: Option<Type>) -> Result<Function, String> {
     let mut iter = self.cf.iter().peekable();
     let body = self.convert_body(&mut iter, 0);
     assert!(iter.next().is_none());
+    if let Some(err) = self.layout_error.take() { return Err(err); }
 
     // Group all decls by type to save codegen space
     // let mut type_map: HashMap<Type, usize> = HashMap::new();
@@ -1047,19 +1088,19 @@ impl<'a> Builder<'a> {
       frame_size = (self.frame_off_high.abs() - 2) as u16;
     }
 
-    Function {
+    Ok(Function {
       name: name.to_string(),
       ret,
       vardecls,
       varmaps,
       frame_size,
       body,
-    }
+    })
   }
 }
 
 impl Function {
-  pub fn from_ir(cfg: &Config, name: &str, ret: Option<Type>, ir: &ir::IR, ctrlflow: &ControlFlow) -> Self {
+  pub fn from_ir(cfg: &Config, name: &str, ret: Option<Type>, ir: &ir::IR, ctrlflow: &ControlFlow) -> Result<Self, String> {
     Builder::new(cfg, ir, ctrlflow).build(name, ret)
   }
 }

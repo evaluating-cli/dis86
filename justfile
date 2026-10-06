@@ -24,6 +24,7 @@ check:
   set -euo pipefail
   cd {{justfile_directory()}}
   PYTHONPATH=confgen python3 confgen/test_overlay_metadata.py
+  PYTHONPATH=confgen python3 confgen/test_annotation_types.py
   cargo test --manifest-path dis86/Cargo.toml --locked --all-targets
   cc -std=c11 -D_GNU_SOURCE -Dtypeof=__typeof__ \
     -Ihydra/src -Ihydra/include -fsyntax-only hydra/src/*.c

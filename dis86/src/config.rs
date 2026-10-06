@@ -352,6 +352,7 @@ impl Config {
         .ok_or_else(|| format!("No function 'size' property for '{}'", name))?;
       let size: u16 = size_str.parse()
         .map_err(|_| format!("Expected u16 for '{}.start', got '{}'", name, size_str))?;
+      if size == 0 { return Err(format!("Structure {} must have a non-zero guest layout size", name)); }
 
       let mbrs = s.get_node("members")
         .ok_or_else(|| format!("Expected {}.members node", name))?;
@@ -368,7 +369,8 @@ impl Config {
 
         let off = parse_u16(off_str)
           .map_err(|_| format!("Expected u16 hex for '{}.members.{}.off', got '{}'", name, key, off_str))?;
-        let typ = types.parse_type(type_str)?;
+        let typ = types.parse_type(type_str)
+          .map_err(|err| format!("Invalid annotated type for {}.{}: '{}' ({})", name, key, type_str, err))?;
         // let typ: Type = match type_str.parse() {
         //   Ok(typ) => typ,
         //   Err(err) => {
@@ -383,6 +385,18 @@ impl Config {
           typ,
           off,
         });
+      }
+
+      let mut cursor = 0usize;
+      for member in &members {
+        if member.off as usize != cursor {
+          return Err(format!("Invalid layout for {}.{}: member starts at 0x{:x}, expected 0x{:x}; add explicit padding members", name, member.name, member.off, cursor));
+        }
+        let size = member.typ.size_in_bytes().ok_or_else(|| format!("Unknown size for annotated member {}.{} ({})", name, member.name, member.typ))?;
+        cursor = cursor.checked_add(size).ok_or_else(|| format!("Layout overflow in {}.{}", name, member.name))?;
+      }
+      if cursor != size as usize {
+        return Err(format!("Invalid layout for {}: members occupy {} bytes, declared size is {}", name, cursor, size));
       }
 
 
@@ -417,11 +431,28 @@ impl Config {
       let typ = match types.parse_type(type_str) {
         Ok(typ) => typ,
         Err(err) => {
+          if type_str.chars().any(|ch| matches!(ch, '[' | ']' | '<' | '>')) {
+            return Err(format!("Invalid annotated type for global {}: '{}' ({})", key, type_str, err));
+          }
           // FIXME: Make this a hard error.. currently the configs have undefined struct names.. need to support that first :-(
           eprintln!("WRN: Expected type for '{}.type', got '{}' | {}", key, type_str, err);
           Type::Unknown
         }
       };
+
+      if typ.has_unknown_array_bound() {
+        return Err(format!("Global {} uses an array without all fixed bounds: {}", key, typ));
+      }
+
+      if matches!(typ, Type::Array(_, _)) && typ.size_in_bytes().is_none() {
+        return Err(format!("Global {} array layout size overflows for {}", key, typ));
+      }
+
+      if let Some(size) = typ.size_in_bytes() {
+        if (off as usize).checked_add(size).filter(|end| *end <= 0x10000).is_none() {
+          return Err(format!("Invalid layout for global {}: {} at 0x{:04x} extends beyond the 64 KiB data segment", key, typ, off));
+        }
+      }
 
       self.globals.push(Global {
         name: key.to_string(),

@@ -63,6 +63,18 @@ def gen_hdr(data, out=None):
     emit('/**************************************************************************************************************/')
     emit('')
 
+    pointer_typedefs = {}
+    for struct in structures:
+        for mbr in struct.members:
+            typedef = mbr.typ.guest_pointer_typedef()
+            if typedef is not None:
+                storage, name = typedef
+                pointer_typedefs[name] = storage
+    for name, storage in sorted(pointer_typedefs.items()):
+        emit(f'typedef {storage} {name}; /* guest pointer annotation; guest-width storage */')
+    if pointer_typedefs:
+        emit('')
+
     for struct in structures:
         emit(f'typedef struct {struct.struct_name()} {struct.name};')
         emit(f'struct __attribute__((packed)) {struct.struct_name()}')
@@ -80,7 +92,7 @@ def gen_hdr(data, out=None):
     emit('')
 
     for var in datasection:
-        cast = f'({var.typ.basetype}*)'
+        cast = f'({var.typ.storage_type()}*)'
         start = cast if var.typ.is_array else '*'+cast
         end = ''
         if var.typ.is_array:

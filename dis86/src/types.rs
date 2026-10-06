@@ -13,9 +13,13 @@ pub enum Type {
   Void, U8, U16, U32, I8, I16, I32,
   Array(Box<Type>, ArraySize),
   Ptr(Box<Type>),
+  GuestPtr(Box<Type>, GuestPtrKind),
   Struct(StructRef),
   Unknown,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GuestPtrKind { Near, NearSs, NearEs, Far }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ArraySize {
@@ -54,14 +58,24 @@ impl Type {
       Type::Array(typ, sz) => {
         let elt_sz = typ.size_in_bytes()?;
         let count = match sz {
-          ArraySize::Known(n) => Some(n),
+          ArraySize::Known(n) => Some(*n),
           ArraySize::Unknown => None,
         }?;
-        Some(elt_sz * count)
+        elt_sz.checked_mul(count)
       }
-      Type::Ptr(_) => None, // Not sure what to do here.. on 8086 this a (seg:off) pair, but on a modern machine (like in hydra) it'll be 8 bytes... Hmmm
+      Type::Ptr(_) => None,
+      Type::GuestPtr(_, GuestPtrKind::Far) => Some(4),
+      Type::GuestPtr(_, _) => Some(2),
       Type::Struct(r) => Some(r.size as usize),
       Type::Unknown => None,
+    }
+  }
+
+  pub fn has_unknown_array_bound(&self) -> bool {
+    match self {
+      Type::Array(base, size) => matches!(size, ArraySize::Unknown) || base.has_unknown_array_bound(),
+      Type::GuestPtr(base, _) | Type::Ptr(base) => base.has_unknown_array_bound(),
+      _ => false,
     }
   }
 
@@ -84,13 +98,27 @@ impl fmt::Display for Type {
       Type::I16  => write!(f, "i16"),
       Type::I32  => write!(f, "i32"),
       Type::Array(typ, sz)  => {
-        write!(f, "{}[", typ)?;
-        if let ArraySize::Known(n) = sz {
-          write!(f, "{}", n)?;
+        let mut dims = vec![sz];
+        let mut base = typ.as_ref();
+        while let Type::Array(inner, next) = base {
+          dims.push(next);
+          base = inner;
         }
-        write!(f, "]")
+        write!(f, "{}", base)?;
+        for dim in dims {
+          write!(f, "[")?;
+          if let ArraySize::Known(n) = dim { write!(f, "{}", n)?; }
+          write!(f, "]")?;
+        }
+        Ok(())
       }
       Type::Ptr(base)  => write!(f, "{}*", base),
+      Type::GuestPtr(base, kind) => match kind {
+        GuestPtrKind::Near => write!(f, "near<{}>", base),
+        GuestPtrKind::NearSs => write!(f, "near_ss<{}>", base),
+        GuestPtrKind::NearEs => write!(f, "near_es<{}>", base),
+        GuestPtrKind::Far => write!(f, "far<{}>", base),
+      },
       Type::Struct(r)  => write!(f, "struct_id_{}", r.idx),
       Type::Unknown => write!(f, "?unknown_type?"),
     }
@@ -128,35 +156,66 @@ impl TypeDatabase {
     self.structs.get(r.idx)
   }
 
-  fn parse_array_type(&self, s: &str) -> Result<Type, String> {
-    let array_start = s.find('[')
-      .ok_or_else(|| format!("No opening an array bracket"))?;
-    let array_end = s.find(']')
-      .ok_or_else(|| format!("No closing an array bracket"))?;
-    if array_end != s.len() - 1 {
-      return Err(format!("Array closing bracket isn't at the end of the type"));
+  pub fn parse_type(&self, s: &str) -> Result<Type, String> {
+    let s = s.trim();
+    if let Some(typ) = self.basetypes.get(s) { return Ok(typ.clone()); }
+
+    for (prefix, kind) in [("near_ss<", GuestPtrKind::NearSs), ("near_es<", GuestPtrKind::NearEs),
+                           ("near<", GuestPtrKind::Near), ("far<", GuestPtrKind::Far)] {
+      if s.starts_with(prefix) && s.ends_with('>') {
+        let inner = &s[prefix.len()..s.len()-1];
+        if inner.is_empty() { break; }
+        return Ok(Type::GuestPtr(Box::new(self.parse_type(inner)?), kind));
+      }
     }
 
-    let base_str = &s[..array_start];
-    let size_str = &s[array_start+1..array_end];
+    if let Some(open) = s.find('[') {
+      if !s.ends_with(']') { return Err(format!("Failed to parse type: '{}'", s)); }
+      let base = self.parse_type(&s[..open])?;
+      let mut dims = vec![];
+      let mut rest = &s[open..];
+      while !rest.is_empty() {
+        if !rest.starts_with('[') { return Err(format!("Failed to parse type: '{}'", s)); }
+        let end = rest.find(']').ok_or_else(|| format!("Failed to parse type: '{}'", s))?;
+        let dim = &rest[1..end];
+        let size = if dim.is_empty() { ArraySize::Unknown } else {
+          let n: usize = dim.parse().map_err(|_| format!("Invalid array bound '{}' in type '{}'", dim, s))?;
+          if n == 0 { return Err(format!("Array bound must be positive in type '{}'", s)); }
+          ArraySize::Known(n)
+        };
+        dims.push(size);
+        rest = &rest[end+1..];
+      }
+      let mut typ = base;
+      for size in dims.into_iter().rev() { typ = Type::Array(Box::new(typ), size); }
+      return Ok(typ);
+    }
+    Err(format!("Failed to parse type: '{}'", s))
+  }
+}
 
-    let base = self.parse_type(base_str)?;
-    let size = if size_str.len() > 0 {
-      let n: usize = size_str.parse()
-        .map_err(|_| format!("Cannot parse array size: {}", size_str))?;
-      ArraySize::Known(n)
-    } else {
-      ArraySize::Unknown
-    };
+#[cfg(test)]
+mod tests {
+  use super::*;
 
-    Ok(Type::Array(Box::new(base), size))
+  #[test]
+  fn recursive_arrays_preserve_c_dimension_order_and_size() {
+    let db = TypeDatabase::new();
+    let typ = db.parse_type("u16[3][5]").unwrap();
+    assert_eq!(typ, Type::Array(Box::new(Type::Array(Box::new(Type::U16), ArraySize::Known(5))), ArraySize::Known(3)));
+    assert_eq!(typ.size_in_bytes(), Some(30));
+    assert_eq!(typ.to_string(), "u16[3][5]");
   }
 
-  pub fn parse_type(&self, s: &str) -> Result<Type, String> {
-    if let Some(typ) = self.basetypes.get(s) {
-      return Ok(typ.clone())
+  #[test]
+  fn guest_pointer_annotations_have_guest_widths() {
+    let db = TypeDatabase::new();
+    for annotation in ["near<u16>", "near_ss<u16>", "near_es<u16>"] {
+      let typ = db.parse_type(annotation).unwrap();
+      assert_eq!(typ.size_in_bytes(), Some(2));
     }
-    self.parse_array_type(s)
-      .map_err(|_| format!("Failed to parse type: '{}'", s))
+    assert_eq!(db.parse_type("far<u16>").unwrap().size_in_bytes(), Some(4));
+    assert!(db.parse_type("near<>" ).is_err());
+    assert!(db.parse_type("u16[2][x]").is_err());
   }
 }

@@ -7,67 +7,101 @@ _TypeSizes = {
     'i32': 4,
 }
 
+def _pointer_width(typename):
+    spec = _pointer_spec(typename)
+    if spec is None:
+        return None
+    return 4 if spec[0] == 'far' else 2
+
+def _pointer_spec(typename):
+    import re
+    match = re.fullmatch(r'(near|near_ss|near_es|far)<([A-Za-z_]\w*)>', typename)
+    if match:
+        return match.groups()
+    return None
+
 def basetype_size_in_bytes(typename):
     return _TypeSizes.get(typename, None)
 
 class Type:
-    def __init__(self, basetype, is_array, array_len):
+    def __init__(self, basetype, dimensions=()):
         self.basetype = basetype
-        self.is_array = is_array
-        self.array_len = array_len
+        self.dimensions = list(dimensions)
+
+    @property
+    def is_array(self):
+        return bool(self.dimensions)
+
+    @property
+    def array_len(self):
+        return self.dimensions[0] if self.dimensions else None
+
+    @array_len.setter
+    def array_len(self, value):
+        if not self.dimensions:
+            raise Exception('Cannot set an array bound on a scalar type')
+        self.dimensions[0] = value
 
     @staticmethod
     def from_str(s):
-        parts = s.split('[')
-        if len(parts) > 2:
+        import re
+        m = re.fullmatch(r'([^\[\]]+)((?:\[[0-9]*\])*)', s)
+        if not m:
             raise Exception(f'Invalid type: "{s}"')
-
-        typ = Type(parts[0], False, None)
-        if len(parts) > 1:
-            typ.is_array = True
-            left = parts[1]
-            if len(left) == 0 or left[-1] != ']':
-                raise Exception('Expected closing brace in array type')
-            size_str = left[:-1]
-            if len(size_str) > 0:
-                typ.array_len = int(size_str)
-            else:
-                typ.array_len = None
-        return typ
+        base, suffix = m.groups()
+        if base.startswith(('near<', 'near_ss<', 'near_es<', 'far<')) and not _pointer_width(base):
+            raise Exception(f'Invalid guest pointer annotation: "{s}"')
+        dims = [int(n) if n else None for n in re.findall(r'\[([0-9]*)\]', suffix)]
+        if any(n == 0 for n in dims):
+            raise Exception(f'Array bounds must be positive: "{s}"')
+        return Type(base, dims)
 
     def as_basetype(self):
-        return Type(self.basetype, False, None)
+        return Type(self.basetype)
 
     def get_ctype_str_parts(self):
         assert isinstance(self.basetype, str)
+        basetype = self.guest_pointer_ctype() or self.basetype
 
         if not self.is_array:
-            return (self.basetype, '')
+            return (basetype, '')
         else:
-            if self.array_len is None:
+            if any(n is None for n in self.dimensions):
                 raise Exception(f'No array length provided for: {self} ... required by get_ctype_str_parts()')
+            return (basetype, ''.join(f'[{n}]' for n in self.dimensions))
 
-            return (self.basetype, f'[{self.array_len}]')
+    def storage_type(self):
+        return {2: 'u16', 4: 'u32'}.get(_pointer_width(self.basetype), self.basetype)
+
+    def guest_pointer_ctype(self):
+        spec = _pointer_spec(self.basetype)
+        if spec is None:
+            return None
+        kind, pointee = spec
+        return f'dis86_{kind}_ptr_{pointee}'
+
+    def guest_pointer_typedef(self):
+        ctype = self.guest_pointer_ctype()
+        return None if ctype is None else (self.storage_type(), ctype)
 
     def fmt_ctype_str(self, name):
         start, end = self.get_ctype_str_parts()
         return f'{start:<15} {name}{end}'
 
     def size_in_bytes(self):
-        basesz = basetype_size_in_bytes(self.basetype)
-        if not self.is_array: return basesz
-
-
+        basesz = _pointer_width(self.basetype) or basetype_size_in_bytes(self.basetype)
         if basesz is None: return None
-        if self.array_len is None: return None
-
-        return basesz * self.array_len
+        if any(n is None for n in self.dimensions): return None
+        for n in self.dimensions:
+            basesz *= n
+            if basesz > 0xffff:
+                raise Exception(f'Type size exceeds 16-bit guest layout: {self}')
+        return basesz
 
     def __str__(self):
         s = self.basetype
-        if self.is_array:
-            sz = '' if self.array_len is None else str(self.array_len)
-            s += f'[{sz}]'
+        for n in self.dimensions:
+            s += f'[{"" if n is None else n}]'
         return s
 
 class Off:
@@ -141,8 +175,12 @@ def validate_data_section(ds):
         off = g.off
         sz = g.typ.size_in_bytes()
         if sz is None:
+            if g.typ.is_array and any(n is None for n in g.typ.dimensions):
+                raise Exception('Global %s uses an array without all fixed bounds: %s' % (g.name, g.typ))
             print('WARN: Cannot determine size for %s' % g.name)
             continue
+        if off < 0 or off + sz > (1 << 16):
+            raise Exception('Global %s layout [%#x, %#x) exceeds the 64 KiB data section' % (g.name, off, off + sz))
         for i in range(off, off+sz):
             if mem[i] != 0:
                 raise Exception('Overlap detect in %s: [0x%04x, 0x%04x]' % (g.name, off, off+sz))
@@ -161,6 +199,14 @@ class TextData:
         if nbytes < 0: raise Exception(f"Negatively sized text-section region: {name}")
         if not self.typ.is_array: raise Exception(f"Expected array for text-section region: {name}")
         eltsz = self.typ.as_basetype().size_in_bytes()
+        if eltsz is None:
+            raise Exception(f"Cannot determine element size for text-section region: {name}")
+        for dim in self.typ.dimensions[1:]:
+            if dim is None:
+                raise Exception(f"Unknown inner array bound in text-section region: {name}")
+            eltsz *= dim
+        if eltsz is None or eltsz == 0:
+            raise Exception(f"Cannot determine element size for text-section region: {name}")
         if nbytes % eltsz != 0: raise Exception(f"Expected text-section region to be a multiple of {eltsz}: {name}")
         array_len = nbytes // eltsz
 
@@ -179,6 +225,8 @@ class Struct:
 
         if not self.name.endswith('_t'):
             raise Exception(f'Struct names should end with _t: {name}')
+        if not isinstance(size, int) or size <= 0 or size > 0xffff:
+            raise Exception(f'Struct size must fit a non-empty 16-bit guest layout: {name} ({size})')
 
         if name in _TypeSizes:
             raise Exception(f'Type name has already been defined: {name}')
