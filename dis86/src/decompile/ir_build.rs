@@ -643,6 +643,17 @@ impl IRBuilder<'_> {
     }
   }
 
+  fn process_calln_indirect(&mut self, ins: &instr::Instr) {
+    let nargs = self.heuristic_infer_call_arguments_by_context(ins, &format!(
+      "Unknown near ptr call from '{}' as binary loc {}", instr_str(ins), ins.addr));
+
+    let addr = self.append_asm_src_operand(&ins.operands[0]);
+    let mut operands = vec![addr];
+    operands.append(&mut self.load_args_from_stack(nargs));
+    let ret_ref = self.append_instr(Type::Unknown, Opcode::CallPtr, operands);
+    self.save_return_value(&Type::Unknown, ret_ref);
+  }
+
   fn process_callf(&mut self, ins: &instr::Instr) {
     let instr::Operand::Far(far) = &ins.operands[0] else {
       return self.process_callf_indirect(ins);
@@ -660,8 +671,11 @@ impl IRBuilder<'_> {
   }
 
   fn process_calln(&mut self, ins: &instr::Instr, cs_pushed: bool) {
+    // Register- or memory-indirect near calls (`call ax`, `call [0x49a]`)
+    // have no static target; model them like far-indirect calls (CallPtr
+    // with heuristically inferred stack args) instead of aborting.
     let instr::Operand::Rel(rel) = &ins.operands[0] else {
-      panic!("Expected near call to have relative operand");
+      return self.process_calln_indirect(ins);
     };
     let addr = ins.rel_addr(rel);
     if cs_pushed {
@@ -721,7 +735,17 @@ impl IRBuilder<'_> {
 
   fn append_asm_instr(&mut self, ins: &instr::Instr) {
     //println!("## {}", intel_syntax::format(ins, &[], false).unwrap());
-    assert!(ins.rep.is_none());
+
+    // REP-prefixed string instructions execute a counted loop with memory
+    // effects we don't model yet. Lower to Unimpl (like RCL/SBB above) so
+    // real binaries using `rep movs/stos/...` decompile with an explicit
+    // imprecision marker instead of aborting. Flags are conservatively
+    // clobbered because e.g. `repe scasb` defines the flags its caller tests.
+    if ins.rep.is_some() {
+      let vref = self.append_instr(Type::U16, Opcode::Unimpl, vec![]);
+      self.append_update_flags(vref);
+      return;
+    }
 
     let special = self.special.take();
 
@@ -762,9 +786,9 @@ impl IRBuilder<'_> {
         self.append_asm_dst_operand(&ins.operands[0], vref);
         self.append_update_flags(vref);
       }
-      instr::Opcode::OP_RCL => {
-        // FIXME: SIMILAR FOR RCL ... WE SIMPLY DON'T HAVE A GREAT WAY TO CAPTURE THE SEMANTICS OF ROTATION
-        // INCLUDING THE CARRY FLAG!!!
+      instr::Opcode::OP_RCL | instr::Opcode::OP_RCR | instr::Opcode::OP_ROL | instr::Opcode::OP_ROR => {
+        // FIXME: SIMILAR FOR RCL/RCR/ROL/ROR ... WE SIMPLY DON'T HAVE A GREAT WAY TO CAPTURE THE SEMANTICS
+        // OF ROTATION INCLUDING THE CARRY FLAG!!!
         let a = self.append_asm_src_operand(&ins.operands[0]);
         let b = self.append_asm_src_operand(&ins.operands[1]);
         let typ = self.deduce_type_binary(a, b);
@@ -1086,6 +1110,39 @@ impl IRBuilder<'_> {
       instr::Opcode::OP_STOS => {
         let src = self.append_asm_src_operand(&ins.operands[1]);
         self.append_asm_dst_operand(&ins.operands[0], src);
+      }
+      instr::Opcode::OP_MOVS => {
+        // Single-step move string (REP form is handled above). Like STOS/LODS,
+        // the SI/DI auto-update is not modeled.
+        let src = self.append_asm_src_operand(&ins.operands[1]);
+        self.append_asm_dst_operand(&ins.operands[0], src);
+      }
+      instr::Opcode::OP_CMPS => {
+        // Compare DS:SI against ES:DI (i.e. operands[1] minus operands[0]).
+        let dst = self.append_asm_src_operand(&ins.operands[0]);
+        let src = self.append_asm_src_operand(&ins.operands[1]);
+        let typ = self.deduce_type_binary(src, dst);
+        let vref = self.append_instr(typ, Opcode::Sub, vec![src, dst]);
+        self.append_update_flags(vref);
+      }
+      instr::Opcode::OP_SCAS => {
+        // Compare AL/AX against ES:DI (i.e. operands[0] minus operands[1]).
+        let a = self.append_asm_src_operand(&ins.operands[0]);
+        let b = self.append_asm_src_operand(&ins.operands[1]);
+        let typ = self.deduce_type_binary(a, b);
+        let vref = self.append_instr(typ, Opcode::Sub, vec![a, b]);
+        self.append_update_flags(vref);
+      }
+      instr::Opcode::OP_INS => {
+        let vref = self.append_instr(Type::U8, Opcode::Unimpl, vec![]);
+        self.append_update_flags(vref);
+      }
+      instr::Opcode::OP_OUTS => {
+        let vref = self.append_instr(Type::Void, Opcode::Unimpl, vec![]);
+        self.append_update_flags(vref);
+      }
+      instr::Opcode::OP_STD | instr::Opcode::OP_STC | instr::Opcode::OP_CMC | instr::Opcode::OP_CLC => {
+        self.append_instr(Type::Void, Opcode::Unimpl, vec![]);
       }
       instr::Opcode::OP_LODS => {
         let src = self.append_asm_src_operand(&ins.operands[1]);

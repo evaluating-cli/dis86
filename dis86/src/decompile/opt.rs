@@ -5,9 +5,15 @@ use std::collections::{hash_map, HashMap, HashSet, VecDeque};
 
 // Propagate operand through any ref opcodes
 fn operand_propagate(ir: &IR, mut r: Ref) -> Ref {
+  // Ref cycles arise from loop-carried locals: mem_symbol_to_ref turns a
+  // read-modify-write local in a loop into read -> phi -> ... -> read.
+  // Stop at the cycle instead of spinning; the remaining alias is resolved
+  // (or named) by later passes.
+  let mut seen = HashSet::new();
   loop {
     let Some(instr) = ir.instr(r) else { return r };
     if instr.opcode != Opcode::Ref { return r; }
+    if !seen.insert(r) { return r; }
     r = instr.operands[0];
   }
 }
@@ -344,8 +350,11 @@ fn stack_ptr_const_oper(ir: &IR, vref: Ref) -> Option<(Ref, i16)> {
   let Ref::Const(_) = cref else { return None };
 
   match instr.opcode {
+    // NOTE: Stack-pointer arithmetic wraps at 16 bits (e.g. `sub sp, 0x8000`
+    // materializes as const -32768, whose negation overflows i16), so fold
+    // with wrapping ops: bit-identical to the guest computation.
     Opcode::Add => Some((nref, ir.const_lookup(cref).unwrap())),
-    Opcode::Sub => Some((nref, -ir.const_lookup(cref).unwrap())),
+    Opcode::Sub => Some((nref, ir.const_lookup(cref).unwrap().wrapping_neg())),
     _ => None,
   }
 }
@@ -358,14 +367,14 @@ pub fn stack_ptr_accumulation(ir: &mut IR) {
       let instr = ir.instr(vref).unwrap();
       let Some((nref, b)) = stack_ptr_const_oper(ir, instr.operands[0]) else { continue };
 
-      let k = a+b;
+      let k = a.wrapping_add(b);
       if k > 0 {
         let cref = ir.const_new(k);
         let instr = ir.instr_mut(vref).unwrap();
         instr.opcode = Opcode::Add;
         instr.operands = vec![nref, cref];
       } else if k < 0 {
-        let cref = ir.const_new(-k);
+        let cref = ir.const_new(k.wrapping_neg());
         let instr = ir.instr_mut(vref).unwrap();
         instr.opcode = Opcode::Sub;
         instr.operands = vec![nref, cref];
@@ -679,13 +688,51 @@ pub fn simplify_branch_conds(ir: &mut IR) {
       let opcode_ge = opcode_new == Opcode::Geq;
 
       let upd_ref = instr.operands[0];
-      let upd_instr = ir.instr(upd_ref).unwrap();
+      let Some(upd_instr) = ir.instr(upd_ref) else { continue };
       if upd_instr.opcode != Opcode::UpdateFlags { continue; }
 
       let pred_ref = upd_instr.operands[1];
-      let pred_instr = ir.instr(pred_ref).unwrap();
+      let Some(pred_instr) = ir.instr(pred_ref) else { continue };
 
-      if pred_instr.opcode == Opcode::Sub {
+      // ZF is set from the result being zero by every ALU op below, so
+      // je/jne after any of them is exactly a comparison against zero.
+      // (Excluded: Mul/Div leave ZF undefined; Unimpl producers are unknown.
+      // Sub/And/Or keep their established arms below.)
+      let zf_exact_producer = matches!(pred_instr.opcode,
+        Opcode::Add | Opcode::Xor | Opcode::Shl | Opcode::Shr | Opcode::UShr | Opcode::Neg);
+
+      // Logical ops (test/and/xor) additionally clear OF and CF, so signed
+      // *and* unsigned relational tests are exactly comparisons vs zero
+      // (with ja/jbe degenerating to jne/je since CF == 0).
+      // (Or keeps its established arms below, including the Sign forms.)
+      let logical_producer = matches!(pred_instr.opcode,
+        Opcode::And | Opcode::Xor);
+
+      if opcode_eq && zf_exact_producer {
+        // add/xor/shl/... <v>; je/jne <tgt> is exactly <v> ==/!= 0.
+        let z = ir.const_new(0);
+        let instr = ir.instr_mut(r).unwrap();
+        instr.opcode = opcode_new;
+        instr.operands = vec![pred_ref, z];
+      }
+
+      else if logical_producer && !opcode_eq {
+        // and/or/xor <v>; jcc <tgt> for any relational cc: exactly vs zero.
+        let z = ir.const_new(0);
+        let rel_opcode = match opcode_new {
+          Opcode::UGt => Opcode::Neq,  // ja  <=> jne (CF == 0)
+          Opcode::ULeq => Opcode::Eq,  // jbe <=> je  (CF == 0)
+          // UGeq (jae) is always taken and ULt (jb) never taken here;
+          // leave those for the explicit UNIMPL_FLAGS marker in astgen.
+          Opcode::UGeq | Opcode::ULt => continue,
+          _ => opcode_new,
+        };
+        let instr = ir.instr_mut(r).unwrap();
+        instr.opcode = rel_opcode;
+        instr.operands = vec![pred_ref, z];
+      }
+
+      else if pred_instr.opcode == Opcode::Sub {
         // cmp <a>, <b>
         // jg <tgt>
         let lhs = pred_instr.operands[0];

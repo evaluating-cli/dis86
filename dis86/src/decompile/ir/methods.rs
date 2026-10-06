@@ -93,11 +93,21 @@ impl IR {
   }
 
   pub fn block_last_instr(&self, blkref: BlockRef) -> Option<&Instr> {
-    self.instr(self.block_last(blkref))
+    // NOTE: A block can legitimately be empty at build time: basic blocks
+    // containing only pure moves (e.g. `mov bx, 0xfffe`) lower to zero IR
+    // instructions because constants/registers need no computation. Callers
+    // must handle None (start_next_blk seals such blocks with a fallthrough
+    // jump; see ir_build.rs).
+    let last = self.block(blkref).data.last()?;
+    self.instr(last)
   }
 
   pub fn block_exits(&self, blkref: BlockRef) -> Vec<BlockRef> {
-    let instr = self.block_last_instr(blkref).unwrap();
+    // NOTE: An empty block is a (tail-)jump whose target lies outside the
+    // decompiled range, so no instructions were decoded into it. It has no
+    // exits: control flow leaves the function here. (Such blocks arise when
+    // an annotated function end cuts mid-flow; see start_next_blk.)
+    let Some(instr) = self.block_last_instr(blkref) else { return vec![];};
 
     match instr.opcode {
       Opcode::RetFar | Opcode::RetNear => vec![],
@@ -115,7 +125,7 @@ impl IR {
     }
   }
 
-  pub fn block_instr_count(&mut self, blkref: BlockRef) -> usize {
+  pub fn block_instr_count(&self, blkref: BlockRef) -> usize {
     self.block(blkref).data.count()
   }
 

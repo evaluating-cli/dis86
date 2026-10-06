@@ -403,6 +403,10 @@ impl<'a> Builder<'a> {
       ir::Opcode::Ref => {
         self.ref_to_expr(instr.operands[0], depth+1)
       }
+      ir::Opcode::Pin => {
+        // Pin marks a value for register allocation; transparent in C.
+        self.ref_to_expr(instr.operands[0], depth+1)
+      }
       ir::Opcode::Load8 => {
         if let Some(origin) = self.guest_pointer_origin(instr.operands[1], 0)
           .filter(|origin| self.guest_pointer_pair_matches(*origin, instr.operands[0])) {
@@ -511,6 +515,23 @@ impl<'a> Builder<'a> {
       ir::Opcode::Unimpl => {
         let exprs: Vec<_> = instr.operands.iter().map(|r| self.ref_to_expr(*r, depth+1)).collect();
         Expr::Abstract("UNIMPL", exprs)
+      }
+      ir::Opcode::UpdateFlags => {
+        // The flags value is consumed as data (e.g. `pushf`, or a flags
+        // definition surviving optimization into a value position). There is
+        // no C-level flags value, so mark the imprecision explicitly rather
+        // than aborting the whole function.
+        let exprs: Vec<_> = instr.operands.iter().map(|r| self.ref_to_expr(*r, depth+1)).collect();
+        Expr::Abstract("UNIMPL_FLAGS", exprs)
+      }
+      ir::Opcode::EqFlags | ir::Opcode::NeqFlags | ir::Opcode::GtFlags | ir::Opcode::GeqFlags |
+      ir::Opcode::LtFlags | ir::Opcode::LeqFlags | ir::Opcode::UGtFlags | ir::Opcode::UGeqFlags |
+      ir::Opcode::ULtFlags | ir::Opcode::ULeqFlags | ir::Opcode::SignFlags => {
+        // A flag test that survived `simplify_branch_conds` (e.g. its flag
+        // producer is unknown or relational-over-non-logical). Conditions
+        // built from these stay explicit in the C output via UNIMPL_FLAGS.
+        let exprs: Vec<_> = instr.operands.iter().map(|r| self.ref_to_expr(*r, depth+1)).collect();
+        Expr::Abstract("UNIMPL_FLAGS", exprs)
       }
       opcode @ _ => {
         panic!("Unimplemented {:?} in ast converter", opcode);
@@ -810,8 +831,25 @@ impl<'a> Builder<'a> {
   }
 
   fn make_label(&self, id: ElemId) -> Label {
-    let elem = self.cf.elem(id);
-    let Detail::BasicBlock(bb) = &elem.detail else { panic!("Expected basic block") };
+    // The target may have been folded into a structured elem; descend to its
+    // entry basic block, mirroring label_blocks_by_demand. (Goto chains are
+    // cut by the visited set; such IR is already degenerate.)
+    let mut id = id;
+    let mut seen = HashSet::new();
+    let bb = loop {
+      if !seen.insert(id) {
+        panic!("Cyclic goto chain while resolving label for {:?}", id);
+      }
+      let elem = self.cf.elem(id);
+      match &elem.detail {
+        Detail::BasicBlock(bb) => break bb,
+        Detail::Goto(g) => { id = g.target; }
+        Detail::ElemBlock(e) => { id = e.entry; }
+        Detail::Loop(l) => { id = l.entry; }
+        Detail::If(i) => { id = i.entry; }
+        Detail::Switch(s) => { id = s.entry; }
+      }
+    };
     Label(format!("{}", self.ir.block(bb.blkref).name))
   }
 
@@ -858,6 +896,12 @@ impl<'a> Builder<'a> {
   // Returns a jump condition expr if the block ends in a conditional branch
   #[must_use]
   fn emit_blk(&mut self, blk: &mut Block, bref: ir::BlockRef, inverted_cond: bool) -> Option<Expr> {
+    // An empty block is a (tail-)jump whose target lies outside the
+    // decompiled range: control flow leaves the function here. It carries no
+    // statements; any edge is supplied by the caller's control-flow Jump.
+    if self.ir.block_instr_count(bref) == 0 {
+      return None;
+    }
     for r in self.ir.iter_instrs(bref) {
       let instr = self.ir.instr(r).unwrap();
       match instr.opcode {
@@ -985,14 +1029,16 @@ impl<'a> Builder<'a> {
         blk.push_stmt(Stmt::Goto(Goto { label }));
       }
       control_flow::Jump::CondTargetTrue(tgt) => {
-        let cond = cond.unwrap();
+        // An empty range-exit block can stand where the conditional jump was
+        // expected; keep the edge with an explicit marker, as for ifstmt.
+        let cond = cond.unwrap_or_else(|| Expr::Abstract("UNIMPL", vec![]));
         let label = self.make_label(tgt);
         let goto = Stmt::Goto(Goto{label});
         let then_body = Block(vec![goto]);
         blk.push_stmt(Stmt::If(If {cond, then_body, else_body: None }));
       }
       control_flow::Jump::CondTargetFalse(tgt) => {
-        let cond = cond.unwrap();
+        let cond = cond.unwrap_or_else(|| Expr::Abstract("UNIMPL", vec![]));
         let label = self.make_label(tgt);
         let goto = Stmt::Goto(Goto{label});
         let then_body = Block(vec![goto]);
@@ -1000,7 +1046,7 @@ impl<'a> Builder<'a> {
         blk.push_stmt(Stmt::If(If {cond: cond, then_body, else_body: None }));
       }
       control_flow::Jump::CondTargetBoth(tgt_true, tgt_false) => {
-        let cond = cond.unwrap();
+        let cond = cond.unwrap_or_else(|| Expr::Abstract("UNIMPL", vec![]));
         let label_true = self.make_label(tgt_true);
         let label_false = self.make_label(tgt_false);
         blk.push_stmt(Stmt::CondGoto(CondGoto { cond, label_true, label_false }));
@@ -1044,8 +1090,12 @@ impl<'a> Builder<'a> {
       let label = self.make_label(ifstmt.entry);
       blk.push_stmt(Stmt::Label(label));
     }
-    let Some(cond) = self.emit_blk(blk, bb.blkref, ifstmt.inverted) else {
-      panic!("expected ifstmt entry to end in a conditional jump");
+    let cond = match self.emit_blk(blk, bb.blkref, ifstmt.inverted) {
+      Some(cond) => cond,
+      // The entry block carries no condition (e.g. an empty range-exit block
+      // was wired as the entry). The branch structure is kept with an
+      // explicit marker; guessing a condition would be worse.
+      None => Expr::Abstract("UNIMPL", vec![]),
     };
 
     let has_else = ifstmt.else_body.is_some();
@@ -1217,6 +1267,22 @@ impl<'a> Builder<'a> {
     }
 
     //println!("low_off: {}, high_off: {}", self.frame_off_low, self.frame_off_high);
+
+    // Ground the frame in every stack slot seen during symbolization, not
+    // just slots surviving into expressions: optimizer passes routinely
+    // eliminate push-save stores/loads, which would otherwise leave a ragged
+    // frame whose shallowest surviving local ends below the return-address
+    // slot. Table types come from infer_type_from_size, so only 1/2/4.
+    for (start_off, sz) in self.ir.symbols.local_extents() {
+      let start_off = start_off as i16;
+      if start_off.abs() > self.frame_off_high.abs() {
+        self.frame_off_high = start_off;
+      }
+      let end_off = start_off + sz as i16;
+      if end_off.abs() < self.frame_off_low.abs() {
+        self.frame_off_low = end_off;
+      }
+    }
 
     // Determine frame size (HACKY)
     let mut frame_size = 0;
