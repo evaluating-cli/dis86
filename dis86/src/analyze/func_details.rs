@@ -61,7 +61,7 @@ impl fmt::Display for Block {
 }
 
 impl FuncDetails {
-  pub fn build(func_start: SegOff, code_seg: &CodeSegment, binary: &Binary) -> Result<FuncDetails, String> {
+  pub fn build(func_start: SegOff, end: Option<SegOff>, code_seg: &CodeSegment, binary: &Binary) -> Result<FuncDetails, String> {
     assert!(func_start >= code_seg.start());
     let code_seg_end = code_seg.end();
 
@@ -115,8 +115,17 @@ impl FuncDetails {
         // Figure out what to do next
         match details.next {
           Next::Fallthrough(target) => {
-            addr = target;
-            continue;
+            // Respect the annotated (exclusive) end bound: a fallthrough
+            // that reaches or passes it is the function exit (e.g. a stub
+            // ending in a call followed by data). Without this, discovery
+            // walks off into bytes that are not code.
+            if end.is_some_and(|end| target >= end) {
+              block.exits = vec![];
+              block_complete = true;
+            } else {
+              addr = target;
+              continue;
+            }
           }
           Next::Return(ret) => {
             if return_kind.is_none() {
@@ -150,6 +159,41 @@ impl FuncDetails {
       // contains an observable RETF. (TODO: track an explicit noreturn kind.)
       return_kind: return_kind.unwrap_or(ReturnKind::Near),
     })
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use super::super::code_segment::{CodeSegment, Region};
+  use crate::segoff::{Seg, Off};
+
+  fn test_seg(size: u32) -> CodeSegment {
+    CodeSegment {
+      primary: Region { seg: Seg::Normal(0), skip_off: 0, size },
+      stub: None,
+    }
+  }
+
+  fn segoff(off: u16) -> SegOff {
+    SegOff { seg: Seg::Normal(0), off: Off(off) }
+  }
+
+  #[test]
+  fn analysis_respects_annotated_end_bound() {
+    // `call +1; arpl ...`: a stub ending in a call followed by data bytes.
+    // The 0x63
+    // byte is not decodable here, so unbounded analysis must fail while
+    // analysis bounded at the call's end must stop cleanly.
+    let binary = Binary::from_raw(&[0xE8, 0x01, 0x00, 0x63], None);
+    let seg = test_seg(4);
+
+    assert!(FuncDetails::build(segoff(0), None, &seg, &binary).is_err());
+
+    let bounded = FuncDetails::build(segoff(0), Some(segoff(3)), &seg, &binary).unwrap();
+    assert_eq!(bounded.end_addr_inferred, segoff(3));
+    assert_eq!(bounded.indirect_calls, 0);
+    assert_eq!(bounded.direct_calls.len(), 1);
   }
 }
 

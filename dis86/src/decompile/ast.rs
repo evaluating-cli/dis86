@@ -541,12 +541,24 @@ impl<'a> Builder<'a> {
 
   fn guest_pointer_origin(&self, r: ir::Ref, depth: usize) -> Option<GuestPointerOrigin> {
     let mut found = HashSet::new();
-    self.collect_guest_pointer_origins(r, depth, &mut found);
+    let mut visited = HashMap::new();
+    self.collect_guest_pointer_origins(r, depth, &mut found, &mut visited);
     if found.len() == 1 { found.into_iter().next() } else { None }
   }
 
-  fn collect_guest_pointer_origins(&self, r: ir::Ref, depth: usize, found: &mut HashSet<GuestPointerOrigin>) {
+  fn collect_guest_pointer_origins(&self, r: ir::Ref, depth: usize, found: &mut HashSet<GuestPointerOrigin>, visited: &mut HashMap<ir::Ref, usize>) {
     if depth > 24 { return; }
+    // Depth-aware memo: the reachable-origin set is monotonic in `found`,
+    // and exploration at depth d covers everything within 24-d steps, so a
+    // ref previously explored at a shallower-or-equal depth is a superset
+    // and never needs re-exploration. Without this, deep shared expression
+    // DAGs (stack-pointer arithmetic chains) re-explore shared
+    // subexpressions exponentially (branching up to depth 24). Stored depth
+    // keeps this sound across the depth cutoff and cyclic use-chains.
+    match visited.get(&r) {
+      Some(prior) if *prior <= depth => return,
+      _ => { visited.insert(r, depth); }
+    }
     match r {
       ir::Ref::Symbol(symref) => if let Type::GuestPtr(_, kind) = symref.get_type(&self.ir.symbols) {
         found.insert(GuestPointerOrigin { symbol: symref, kind: *kind, pointer_value: None });
@@ -568,11 +580,11 @@ impl<'a> Builder<'a> {
           return;
         }
         if matches!(i.opcode, ir::Opcode::Ref | ir::Opcode::Lower16 | ir::Opcode::Upper16) {
-          if let Some(operand) = i.operands.first() { self.collect_guest_pointer_origins(*operand, depth+1, found); }
+          if let Some(operand) = i.operands.first() { self.collect_guest_pointer_origins(*operand, depth+1, found, visited); }
           return;
         }
         for operand in &i.operands {
-          self.collect_guest_pointer_origins(*operand, depth+1, found);
+          self.collect_guest_pointer_origins(*operand, depth+1, found, visited);
         }
       }
       _ => (),
@@ -1017,7 +1029,11 @@ impl<'a> Builder<'a> {
         }
       }
     }
-    unreachable!("IR Block Should End With A Branching Instr");
+    // No terminator found (e.g. a stub ending in a call whose fallthrough
+    // jump was eliminated as dead): control leaves the function here, so
+    // there is no branch condition to return. Consistent with
+    // block_exits() returning no exits for such blocks.
+    None
   }
 
   fn emit_jump(&mut self, blk: &mut Block, jump: control_flow::Jump, cond: Option<Expr>) {
