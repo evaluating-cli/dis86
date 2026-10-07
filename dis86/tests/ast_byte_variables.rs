@@ -37,7 +37,7 @@ fn guest_pointer_expressions_emit_segmented_loads_and_stores() {
       Stmt::Expr(Expr::GuestMem(Box::new(Expr::Name("SS".into())), Box::new(Expr::Name("off".into())), 2)),
     ]),
   };
-  let source = gen::generate(&func, Flavor::Hydra).unwrap();
+  let source = gen::generate(&func, Flavor::Hydra { dgroup_seg: None }).unwrap();
   assert!(source.contains("STORE_16(ES, off, 0x1234);"), "missing segmented pointer store:\n{source}");
   assert!(source.contains("LOAD_16(SS, off)"), "missing segmented pointer read:\n{source}");
 }
@@ -65,7 +65,7 @@ fn annotated_near_es_pointer_reads_and_writes_use_segmented_memory() {
   sym::symbolize_globals(&mut ir, &cfg);
   let cf = ControlFlow::from_ir(&ir);
   let func = Function::from_ir(&cfg, "near_es_access", None, &ir, &cf).unwrap();
-  let source = gen::generate(&func, Flavor::Hydra).unwrap();
+  let source = gen::generate(&func, Flavor::Hydra { dgroup_seg: None }).unwrap();
   assert!(source.contains("tmp_0 = g_pointer;"), "pointer field should be read as its guest-width value:\n{source}");
   assert!(source.contains("STORE_16(ES, tmp_0, 0x1234);"), "missing ES pointer store:\n{source}");
   assert!(source.contains("LOAD_16(ES, tmp_0)"), "missing ES pointer read:\n{source}");
@@ -103,7 +103,7 @@ fn pointer_annotation_on_struct_member_reaches_indirect_accesses() {
   sym::symbolize_globals(&mut ir, &cfg);
   let cf = ControlFlow::from_ir(&ir);
   let func = Function::from_ir(&cfg, "struct_pointer_access", None, &ir, &cf).unwrap();
-  let source = gen::generate(&func, Flavor::Hydra).unwrap();
+  let source = gen::generate(&func, Flavor::Hydra { dgroup_seg: None }).unwrap();
   assert!(source.contains("g_holder.ptr"), "expected annotated struct pointer field read:\n{source}");
   assert!(source.contains("LOAD_16(ES,"), "struct pointer annotation must select ES for dereference:\n{source}");
 }
@@ -131,7 +131,7 @@ fn annotated_far_pointer_splits_segment_and_offset_for_memory_access() {
   sym::symbolize_globals(&mut ir, &cfg);
   let cf = ControlFlow::from_ir(&ir);
   let func = Function::from_ir(&cfg, "far_access", None, &ir, &cf).unwrap();
-  let source = gen::generate(&func, Flavor::Hydra).unwrap();
+  let source = gen::generate(&func, Flavor::Hydra { dgroup_seg: None }).unwrap();
   assert!(source.contains("LOAD_16("), "missing segmented far-pointer load:\n{source}");
   assert!(source.contains("g_far_pointer"), "far pointer must remain a guest-width field:\n{source}");
   assert!(!source.contains("g_far_pointer->"), "far pointer must not become a host pointer:\n{source}");
@@ -159,7 +159,7 @@ fn far_pointer_offset_with_unrelated_segment_keeps_raw_memory_path() {
   sym::symbolize_globals(&mut ir, &cfg);
   let cf = ControlFlow::from_ir(&ir);
   let func = Function::from_ir(&cfg, "far_segment_mismatch", None, &ir, &cf).unwrap();
-  let source = gen::generate(&func, Flavor::Hydra).unwrap();
+  let source = gen::generate(&func, Flavor::Hydra { dgroup_seg: None }).unwrap();
   assert!(source.contains("PTR_16(DS,"), "unpaired far-pointer segment must keep the original address path:\n{source}");
   assert!(!source.contains("LOAD_16("), "mismatched far pointer must not substitute its segment:\n{source}");
 }
@@ -185,7 +185,7 @@ fn near_es_pointer_with_unrelated_segment_keeps_raw_memory_path() {
   sym::symbolize_globals(&mut ir, &cfg);
   let cf = ControlFlow::from_ir(&ir);
   let func = Function::from_ir(&cfg, "near_es_segment_mismatch", None, &ir, &cf).unwrap();
-  let source = gen::generate(&func, Flavor::Hydra).unwrap();
+  let source = gen::generate(&func, Flavor::Hydra { dgroup_seg: None }).unwrap();
   assert!(source.contains("PTR_16(DS,"), "unpaired near-pointer segment must keep the original address path:\n{source}");
   assert!(!source.contains("LOAD_16("), "mismatched near pointer must not substitute its segment:\n{source}");
 }
@@ -208,7 +208,7 @@ fn nested_array_annotation_generates_c_dimension_order() {
   sym::symbolize_globals(&mut ir, &cfg);
   let cf = ControlFlow::from_ir(&ir);
   let func = Function::from_ir(&cfg, "grid_access", None, &ir, &cf).unwrap();
-  let source = gen::generate(&func, Flavor::Hydra).unwrap();
+  let source = gen::generate(&func, Flavor::Hydra { dgroup_seg: None }).unwrap();
   assert!(source.contains("g_grid[1][2]"), "expected row/column C indexing:\n{source}");
 }
 

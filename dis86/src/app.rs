@@ -56,6 +56,9 @@ fn print_help() {
   println!("");
   println!("CODEGEN FLAGS:");
   println!("  --codegen-hydra   emit code that integrates well with the hydra runtime (optional)");
+  println!("  --dgroup-seg HEX  link-time DGROUP segment (e.g. 0x607); with --codegen-hydra,");
+  println!("                    segment constants equal to it emit as (CODE_START_SEG + seg),");
+  println!("                    relocated per run instead of baked link-time (optional)");
 }
 
 fn write_to_path(path: &str, data: &str) {
@@ -93,6 +96,7 @@ struct Args {
 
   build_pin_all: bool,
   codegen_hydra: bool,
+  dgroup_seg: Option<String>,
 }
 
 fn match_flag(args: &mut Vec<std::ffi::OsString>, flag: &str) -> bool {
@@ -151,6 +155,7 @@ fn parse_args() -> Result<Args, pico_args::Error> {
     emit_code:       pargs.opt_value_from_str("--emit-code")?,
     build_pin_all:   false,
     codegen_hydra:   false,
+    dgroup_seg:      pargs.opt_value_from_str("--dgroup-seg")?,
   };
 
   let mut remaining = pargs.finish();
@@ -320,7 +325,11 @@ fn decompile_spec(args: &Args, cfg: &Config, binary: &Binary, spec: Spec<'_>, al
   }
 
   if args.emit_code.is_some() {
-    let flavor = if args.codegen_hydra { gen::Flavor::Hydra } else { gen::Flavor::Standard };
+    let dgroup = args.dgroup_seg.as_deref().map(|s| {
+      u16::from_str_radix(s.strip_prefix("0x").unwrap_or(s), 16)
+        .unwrap_or_else(|_| panic!("Expected hex u16 for --dgroup-seg, got '{}'", s))
+    });
+    let flavor = if args.codegen_hydra { gen::Flavor::Hydra { dgroup_seg: dgroup } } else { gen::Flavor::Standard };
     let code = gen::generate(&ast, flavor).unwrap();
     all_code.push_str(&code);
     all_code.push('\n');

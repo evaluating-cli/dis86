@@ -3,14 +3,14 @@ use std::fmt;
 
 pub enum Flavor {
   Standard,
-  Hydra,
+  Hydra { dgroup_seg: Option<u16> },
 }
 
 impl Flavor {
   fn instantiate(&self) -> Box<dyn FlavorImpl> {
     match self {
       Flavor::Standard => Box::new(Standard{}),
-      Flavor::Hydra => Box::new(Hydra{}),
+      Flavor::Hydra { dgroup_seg } => Box::new(Hydra{ dgroup_seg: *dgroup_seg }),
     }
   }
 }
@@ -21,6 +21,8 @@ trait FlavorImpl {
   fn frame_leave(&self, g: &mut Gen<'_>) -> fmt::Result;
   fn ret(&self, g: &mut Gen<'_>, ret: &Return) -> fmt::Result;
   fn call(&self, g: &mut Gen<'_>, name: &Expr, args: &[Expr], level: usize) -> fmt::Result;
+  /// Link-time DGROUP segment whose constants relocate per run, if any.
+  fn dgroup_seg(&self) -> Option<u16> { None }
 }
 
 struct Standard {}
@@ -79,8 +81,9 @@ impl FlavorImpl for Standard {
   }
 }
 
-struct Hydra {}
+struct Hydra { dgroup_seg: Option<u16> }
 impl FlavorImpl for Hydra {
+  fn dgroup_seg(&self) -> Option<u16> { self.dgroup_seg }
   fn func_sig(&self, g: &mut Gen<'_>, func: &Function) -> fmt::Result {
     let name = &func.name;
     let name = if name.starts_with("F_") { &name[2..] } else { name };
@@ -212,10 +215,24 @@ impl<'a> Gen<'a> {
         }
       }
       Expr::HexConst(k) => {
-        self.text(&format!("0x{:x}", k))?
+        // A link-time DGROUP segment constant relocates per run under
+        // Hydra (CODE_START_SEG is the discovered load segment); emit it
+        // relocated instead of baked. Applies to segment positions and
+        // segment-valued immediates alike (audited: every 0x607 in the
+        // FCD corpus is a segment). Standard flavor keeps raw values
+        // (identity-load assumption stays with the harness).
+        if imp.dgroup_seg().is_some_and(|g| *k == g) {
+          self.text(&format!("(CODE_START_SEG + 0x{:x})", k))?;
+        } else {
+          self.text(&format!("0x{:x}", k))?;
+        }
       }
       Expr::DecimalConst(k) => {
-        self.text(&format!("{}", k))?
+        if imp.dgroup_seg().is_some_and(|g| *k as u16 == g) {
+          self.text(&format!("(CODE_START_SEG + 0x{:x})", *k as u16))?;
+        } else {
+          self.text(&format!("{}", k))?;
+        }
       }
       Expr::Name(n) => {
         self.text(n)?;

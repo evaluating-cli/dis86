@@ -292,6 +292,39 @@ impl IRBuilder<'_> {
       vref = self.append_instr_with_attrs(Type::U16, Attribute::PIN, Opcode::Ref, vec![vref]);
     }
     self.ir.set_var(reg.0, self.cur, vref);
+    // Keep overlapping registers coherent: partial writes recompose the
+    // full register and full writes split into the fragments. Without
+    // this, a fragment read after an overlapping write sees a stale
+    // version (e.g. `mov al,[bx]` ... `call toupper` ... `mov [bx],al`
+    // must store the call result, FCD 0000:5b4f). BX/SI/DI/BP have no
+    // fragments: nothing more to do.
+    let (full, lo, hi) = match reg.0 {
+      instr::Reg::AL | instr::Reg::AH => (instr::Reg::AX, instr::Reg::AL, instr::Reg::AH),
+      instr::Reg::BL | instr::Reg::BH => (instr::Reg::BX, instr::Reg::BL, instr::Reg::BH),
+      instr::Reg::CL | instr::Reg::CH => (instr::Reg::CX, instr::Reg::CL, instr::Reg::CH),
+      instr::Reg::DL | instr::Reg::DH => (instr::Reg::DX, instr::Reg::DL, instr::Reg::DH),
+      instr::Reg::AX | instr::Reg::BX | instr::Reg::CX | instr::Reg::DX => {
+        let cur = self.ir.get_var(reg.0, self.cur);
+        let (upper, lower) = self.append_upper_lower_split(cur);
+        let (f_lo, f_hi) = match reg.0 {
+          instr::Reg::AX => (instr::Reg::AL, instr::Reg::AH),
+          instr::Reg::BX => (instr::Reg::BL, instr::Reg::BH),
+          instr::Reg::CX => (instr::Reg::CL, instr::Reg::CH),
+          _ => (instr::Reg::DL, instr::Reg::DH),
+        };
+        self.ir.set_var(f_lo, self.cur, lower);
+        self.ir.set_var(f_hi, self.cur, upper);
+        return;
+      }
+      _ => return,
+    };
+    let lo_v = self.ir.get_var(lo, self.cur);
+    let hi_v = self.ir.get_var(hi, self.cur);
+    let (use_lo, use_hi) = if reg.0 == lo { (vref, hi_v) } else { (lo_v, vref) };
+    let eight = self.ir.const_new(8);
+    let shifted = self.append_instr(Type::U16, Opcode::Shl, vec![use_hi, eight]);
+    let composed = self.append_instr(Type::U16, Opcode::Or, vec![shifted, use_lo]);
+    self.ir.set_var(full, self.cur, composed);
   }
 
   fn compute_mem_address(&mut self, mem: &instr::OperandMem) -> Ref {
@@ -558,6 +591,23 @@ impl IRBuilder<'_> {
         self.ir.set_var(instr::Reg::AX, self.cur, lower);
       }
       _ => panic!("Unsupported function return type: {}", ret_type),
+    }
+    // Calls clobber AX/CX/DX (Watcom caller-saved); refresh the
+    // partial-register views so later fragment uses see post-call values
+    // instead of stale pre-call versions (e.g. `call toupper` followed by
+    // `mov [bx],al` must store the call result, FCD 0000:5b4f).
+    // BX/SI/DI/BP are callee-saved: untouched.
+    for reg in [instr::Reg::AX, instr::Reg::CX, instr::Reg::DX] {
+      let cur = self.ir.get_var(reg, self.cur);
+      let (upper, lower) = self.append_upper_lower_split(cur);
+      let (lo, hi) = match reg {
+        instr::Reg::AX => (instr::Reg::AL, instr::Reg::AH),
+        instr::Reg::CX => (instr::Reg::CL, instr::Reg::CH),
+        instr::Reg::DX => (instr::Reg::DL, instr::Reg::DH),
+        _ => unreachable!(),
+      };
+      self.ir.set_var(lo, self.cur, lower);
+      self.ir.set_var(hi, self.cur, upper);
     }
   }
 
