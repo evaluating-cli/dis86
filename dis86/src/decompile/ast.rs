@@ -233,6 +233,92 @@ impl Block {
   }
 }
 
+/// Collect every variable name referenced anywhere in a body: pre-named
+/// IR refs surface as Expr::Name without passing through ref_name(), so
+/// temp/assigned sets alone miss them.
+fn collect_body_names(body: &Block, out: &mut Vec<String>) {
+  for stmt in &body.0 {
+    collect_stmt_names(stmt, out);
+  }
+}
+
+fn collect_stmt_names(stmt: &Stmt, out: &mut Vec<String>) {
+  match stmt {
+    Stmt::Label(_) | Stmt::Instr(_) | Stmt::Goto(_) | Stmt::Unreachable => (),
+    Stmt::Expr(e) => collect_expr_names(e, out),
+    Stmt::Assign(a) => { collect_expr_names(&a.lhs, out); collect_expr_names(&a.rhs, out); }
+    Stmt::CondGoto(c) => collect_expr_names(&c.cond, out),
+    Stmt::Return(r) => { for v in &r.vals { collect_expr_names(v, out); } }
+    Stmt::Loop(l) => collect_body_names(&l.body, out),
+    Stmt::If(i) => {
+      collect_expr_names(&i.cond, out);
+      collect_body_names(&i.then_body, out);
+      if let Some(else_body) = &i.else_body { collect_body_names(else_body, out); }
+    }
+    Stmt::Switch(s) => {
+      collect_expr_names(&s.switch_val, out);
+      for case in &s.cases {
+        for v in &case.cases { collect_expr_names(v, out); }
+        collect_body_names(&case.body, out);
+      }
+      if let Some(default) = &s.default { collect_body_names(default, out); }
+    }
+  }
+}
+
+fn collect_expr_names(expr: &Expr, out: &mut Vec<String>) {
+  match expr {
+    Expr::Name(n) => out.push(n.clone()),
+    Expr::Unary(u) => collect_expr_names(&u.rhs, out),
+    Expr::Binary(b) => { collect_expr_names(&b.lhs, out); collect_expr_names(&b.rhs, out); }
+    Expr::Call(f, args) => {
+      collect_expr_names(f, out);
+      for a in args { collect_expr_names(a, out); }
+    }
+    Expr::Abstract(_, args) => { for a in args { collect_expr_names(a, out); } }
+    Expr::ArrayAccess(l, i) | Expr::StructAccess(l, i) => {
+      collect_expr_names(l, out);
+      collect_expr_names(i, out);
+    }
+    Expr::Deref(e) => collect_expr_names(e, out),
+    Expr::GuestMem(s, o, _) => { collect_expr_names(s, out); collect_expr_names(o, out); }
+    Expr::Cast(_, e) => collect_expr_names(e, out),
+    Expr::HexConst(_) | Expr::DecimalConst(_) | Expr::UnimplPhi | Expr::UnimplPin => (),
+  }
+}
+
+/// Parent register, high-byte flag, and type for a versioned register
+/// fragment name (`ax_5`, `ah_3`, `ds_4`). Returns None for non-fragments.
+/// SP/BP are included as documented approximations (initialized from the
+/// post-FRAME_ENTER SP/BP the body observes); differential execution, not
+/// inspection, adjudicates them.
+fn entry_fragment_parent(name: &str) -> Option<(&'static str, bool, Type)> {
+  let (frag, _) = name.split_once('_')?;
+  match frag {
+    "ax" => Some(("AX", false, Type::U16)),
+    "bx" => Some(("BX", false, Type::U16)),
+    "cx" => Some(("CX", false, Type::U16)),
+    "dx" => Some(("DX", false, Type::U16)),
+    "si" => Some(("SI", false, Type::U16)),
+    "di" => Some(("DI", false, Type::U16)),
+    "cs" => Some(("CS", false, Type::U16)),
+    "ds" => Some(("DS", false, Type::U16)),
+    "es" => Some(("ES", false, Type::U16)),
+    "ss" => Some(("SS", false, Type::U16)),
+    "sp" => Some(("SP", false, Type::U16)),
+    "bp" => Some(("BP", false, Type::U16)),
+    "al" => Some(("AX", false, Type::U8)),
+    "bl" => Some(("BX", false, Type::U8)),
+    "cl" => Some(("CX", false, Type::U8)),
+    "dl" => Some(("DX", false, Type::U8)),
+    "ah" => Some(("AX", true, Type::U8)),
+    "bh" => Some(("BX", true, Type::U8)),
+    "ch" => Some(("CX", true, Type::U8)),
+    "dh" => Some(("DX", true, Type::U8)),
+    _ => None,
+  }
+}
+
 impl<'a> Builder<'a> {
   fn new(cfg: &'a Config, ir: &'a ir::IR, cf: &'a ControlFlow) -> Self {
     let n_uses = ir.compute_uses();
@@ -485,7 +571,18 @@ impl<'a> Builder<'a> {
         Expr::Name(self.ref_name(r))
       }
       ir::Opcode::Make32 => {
-        let exprs: Vec<_> = instr.operands.iter().map(|r| self.ref_to_expr(*r, depth+1)).collect();
+        // Both halves are 16-bit values, but C promotes arithmetic (and
+        // bare constants are `int`): cast halves that aren't already u16 so
+        // u16-checked consumers (hydra's MAKE_32 static asserts) accept the
+        // expression. Semantically identity: halves are 16-bit by IR
+        // construction (upper16/lower16 splits).
+        let exprs: Vec<_> = instr.operands.iter().map(|r| {
+          let e = self.ref_to_expr(*r, depth+1);
+          match e {
+            Expr::Cast(Type::U16, _) => e,
+            _ => Expr::Cast(Type::U16, Box::new(e)),
+          }
+        }).collect();
         Expr::Abstract("MAKE_32", exprs)
       }
       ir::Opcode::SignExtTo16 => {
@@ -1222,10 +1319,52 @@ impl<'a> Builder<'a> {
   }
 
   fn build(&mut self, name: &str, ret: Option<Type>) -> Result<Function, String> {
-    let mut iter = self.cf.iter().peekable();
-    let body = self.convert_body(&mut iter, 0);
+    let mut iter = self.cf.iter().peekable();    let mut body = self.convert_body(&mut iter, 0);
     assert!(iter.next().is_none());
     if let Some(err) = self.layout_error.take() { return Err(err); }
+
+    // Declare + initialize entry-register fragments: a versioned register
+    // use with no assignment in the function reads guest state at entry
+    // (hydra register macros / ambient inputs). Without decls the output
+    // does not compile. SP/BP inits read the post-FRAME_ENTER values the
+    // body observes (approximations; differential execution adjudicates).
+    // Keep deterministic: sorted order.
+    let mut used = vec![];
+    collect_body_names(&body, &mut used);
+    used.sort();
+    used.dedup();
+    let mut inits = vec![];
+    for n in &used {
+      if self.assigned.contains(n) { continue; }
+      if let Some((parent, high, typ)) = entry_fragment_parent(n) {
+        let rhs = if high {
+          Expr::Binary(Box::new(BinaryExpr {
+            op: BinaryOperator::Shr,
+            lhs: Expr::Name(parent.to_string()),
+            rhs: Expr::DecimalConst(8),
+          }))
+        } else {
+          Expr::Name(parent.to_string())
+        };
+        self.assigns.push((n.clone(), typ));
+        self.assigned.insert(n.clone());
+        inits.push(Stmt::Assign(Assign { decltype: None, lhs: Expr::Name(n.clone()), rhs }));
+      } else if n.strip_prefix("tmp_").is_some_and(|s| s.bytes().all(|b| b.is_ascii_digit())) {
+        // Orphan temp: used but never assigned (e.g. a use surviving in
+        // dead code whose definition was eliminated). Declare u32 and
+        // zero-init so output compiles; differential execution adjudicates
+        // any live occurrence (a use without definition is an IR-level
+        // undefined value either way).
+        self.assigns.push((n.clone(), Type::U32));
+        self.assigned.insert(n.clone());
+        inits.push(Stmt::Assign(Assign {
+          decltype: None,
+          lhs: Expr::Name(n.clone()),
+          rhs: Expr::DecimalConst(0),
+        }));
+      }
+    }
+    body.0.splice(0..0, inits);
 
     // Group all decls by type to save codegen space
     // let mut type_map: HashMap<Type, usize> = HashMap::new();
@@ -1339,6 +1478,8 @@ fn checked_byte_range(off: i32, sz: u16) -> Option<(usize, usize)> {
 #[cfg(test)]
 mod tests {
   use super::checked_byte_range;
+  use super::{entry_fragment_parent, collect_body_names, Block, Stmt, Expr, Assign, If, BinaryExpr, BinaryOperator};
+  use crate::types::Type;
 
   #[test]
   fn negative_offsets_are_rejected() {
@@ -1353,8 +1494,7 @@ mod tests {
   }
 
   #[test]
-  fn overflowing_ranges_are_rejected() {
-    // i32::MAX + u16::MAX only overflows usize on 32-bit targets; elsewhere it
+  fn overflowing_ranges_are_rejected() {    // i32::MAX + u16::MAX only overflows usize on 32-bit targets; elsewhere it
     // must pass through with the exact sum.
     #[cfg(target_pointer_width = "32")]
     assert_eq!(checked_byte_range(i32::MAX, u16::MAX), None);
@@ -1363,5 +1503,47 @@ mod tests {
       checked_byte_range(i32::MAX, u16::MAX),
       Some((i32::MAX as usize, i32::MAX as usize + u16::MAX as usize))
     );
+  }
+
+  #[test]
+  fn fragment_parents_map_correctly() {
+    assert_eq!(entry_fragment_parent("ax_5"), Some(("AX", false, Type::U16)));
+    assert_eq!(entry_fragment_parent("bl_1"), Some(("BX", false, Type::U8)));
+    assert_eq!(entry_fragment_parent("ah_3"), Some(("AX", true, Type::U8)));
+    assert_eq!(entry_fragment_parent("ds_4"), Some(("DS", false, Type::U16)));
+    // SP/BP included as documented approximations.
+    assert_eq!(entry_fragment_parent("sp_1"), Some(("SP", false, Type::U16)));
+    assert_eq!(entry_fragment_parent("bp_2"), Some(("BP", false, Type::U16)));
+    // Others aren't fragments.
+    assert_eq!(entry_fragment_parent("tmp_0"), None);
+    assert_eq!(entry_fragment_parent("AX"), None);
+  }
+
+  #[test]
+  fn body_name_walk_finds_nested_uses() {
+    // if (al_7 & 1) { bl_2 = F_x(ax_5); }
+    let cond = Expr::Binary(Box::new(BinaryExpr {
+      op: BinaryOperator::And,
+      lhs: Expr::Name("al_7".to_string()),
+      rhs: Expr::DecimalConst(1),
+    }));
+    let call = Expr::Call(
+      Box::new(Expr::Name("F_x".to_string())),
+      vec![Expr::Name("ax_5".to_string())],
+    );
+    let assign = Stmt::Assign(Assign {
+      decltype: None,
+      lhs: Expr::Name("bl_2".to_string()),
+      rhs: call,
+    });
+    let body = Block(vec![Stmt::If(If {
+      cond,
+      then_body: Block(vec![assign]),
+      else_body: None,
+    })]);
+    let mut names = vec![];
+    collect_body_names(&body, &mut names);
+    names.sort();
+    assert_eq!(names, vec!["F_x".to_string(), "al_7".to_string(), "ax_5".to_string(), "bl_2".to_string()]);
   }
 }

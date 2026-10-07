@@ -11,7 +11,17 @@
 #include "typedefs.h"
 
 #define FAIL(...) do { fprintf(stderr, "FAIL: "); fprintf(stderr, __VA_ARGS__); fprintf(stderr, "\n"); abort(); } while(0)
-#define UNIMPL() FAIL("UNIMPLEMENTED at %s:%d", __FILE__, __LINE__)
+/* Decompiler-output markers: UNIMPL/UNIMPL_FLAGS take the unmodeled inputs
+ * (evaluated then discarded) and trap loudly at runtime. Any executed path
+ * reaching one aborts the run, so differential testing pinpoints exactly
+ * which unmodeled operation needs implementing. (The no-arg UNIMPL() form
+ * used by handwritten runtime code keeps working via variadic matching.) */
+__attribute__((noreturn)) static inline u32 hydra_unimpl_trap(const char *file, int line) {
+  fprintf(stderr, "UNIMPL executed at %s:%d\n", file, line);
+  abort();
+}
+#define UNIMPL(...) (hydra_unimpl_trap(__FILE__, __LINE__))
+#define UNIMPL_FLAGS(...) (hydra_unimpl_trap(__FILE__, __LINE__))
 #define ASSUME(cond) do { if (!(cond)) FAIL("ASSUMPTION FAILED: (" #cond ") at %s:%d", __FILE__, __LINE__); } while(0)
 #define BARRIER() __atomic_thread_fence(__ATOMIC_SEQ_CST)
 
