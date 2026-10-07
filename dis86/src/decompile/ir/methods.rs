@@ -107,7 +107,20 @@ impl IR {
     // decompiled range, so no instructions were decoded into it. It has no
     // exits: control flow leaves the function here. (Such blocks arise when
     // an annotated function end cuts mid-flow; see start_next_blk.)
-    let Some(instr) = self.block_last_instr(blkref) else { return vec![];};
+    let Some(last_ref) = self.block(blkref).data.last() else { return vec![]; };
+
+    // Skip trailing Nops left by dead-code elimination: the last effective
+    // instruction determines control flow. A block whose last effective
+    // instruction is not a branch (e.g. a stub ending in a call whose
+    // fallthrough jump was eliminated as dead) likewise has no exits:
+    // control flow leaves the function here.
+    let eff = if self.instr(last_ref).unwrap().opcode == Opcode::Nop {
+      self.instr_prev(last_ref)
+    } else {
+      Some(last_ref)
+    };
+    let Some(eff) = eff else { return vec![]; };
+    let instr = self.instr(eff).unwrap();
 
     match instr.opcode {
       Opcode::RetFar | Opcode::RetNear => vec![],
@@ -120,8 +133,8 @@ impl IR {
       ],
       Opcode::JmpTbl => {
         instr.operands[1..].iter().map(|oper| oper.unwrap_block()).collect()
-      },
-      _ => panic!("Expected last instruction to be a branching instruction: {:?}", instr),
+      }
+      _ => vec![],
     }
   }
 
@@ -483,5 +496,41 @@ mod tests {
     let instr = ir.instr(phi).unwrap();
     assert_eq!(instr.opcode, Opcode::Phi);
     assert_eq!(instr.operands, vec![phi]);
+  }
+
+  fn append_op(ir: &mut IR, blk: BlockRef, opcode: Opcode) {
+    ir.block_instr_append(blk, Instr {
+      typ: Type::Void,
+      compare_width: None,
+      attrs: 0,
+      opcode,
+      operands: vec![],
+    });
+  }
+
+  #[test]
+  fn block_exits_tolerates_dce_erased_tail() {
+    // A stub ending in a call whose fallthrough jump was eliminated as dead
+    // (FCD 0000:4f3b) has no exits: control flow leaves the function here.
+    let mut ir = test_ir();
+    let b = ir.add_block("stub");
+    append_op(&mut ir, b, Opcode::CallArgs);
+    append_op(&mut ir, b, Opcode::Nop);
+    assert_eq!(ir.block_exits(b), vec![]);
+  }
+
+  #[test]
+  fn block_exits_empty_block_has_no_exits() {
+    let mut ir = test_ir();
+    let b = ir.add_block("empty");
+    assert_eq!(ir.block_exits(b), vec![]);
+  }
+
+  #[test]
+  fn block_exits_return_has_no_exits() {
+    let mut ir = test_ir();
+    let b = ir.add_block("ret");
+    append_op(&mut ir, b, Opcode::RetNear);
+    assert_eq!(ir.block_exits(b), vec![]);
   }
 }
