@@ -1029,8 +1029,10 @@ impl<'a> Builder<'a> {
         blk.push_stmt(Stmt::Goto(Goto { label }));
       }
       control_flow::Jump::CondTargetTrue(tgt) => {
-        // An empty range-exit block can stand where the conditional jump was
-        // expected; keep the edge with an explicit marker, as for ifstmt.
+        // Unreachable by construction: only basic blocks carry conditional
+        // jumps, and a block with a conditional jump has two exits, so it is
+        // non-empty and ends in the conditional branch emitted above. Kept as
+        // belt-and-braces; guessing a condition would be worse.
         let cond = cond.unwrap_or_else(|| Expr::Abstract("UNIMPL", vec![]));
         let label = self.make_label(tgt);
         let goto = Stmt::Goto(Goto{label});
@@ -1038,6 +1040,7 @@ impl<'a> Builder<'a> {
         blk.push_stmt(Stmt::If(If {cond, then_body, else_body: None }));
       }
       control_flow::Jump::CondTargetFalse(tgt) => {
+        // Unreachable by construction: see CondTargetTrue above.
         let cond = cond.unwrap_or_else(|| Expr::Abstract("UNIMPL", vec![]));
         let label = self.make_label(tgt);
         let goto = Stmt::Goto(Goto{label});
@@ -1046,6 +1049,7 @@ impl<'a> Builder<'a> {
         blk.push_stmt(Stmt::If(If {cond: cond, then_body, else_body: None }));
       }
       control_flow::Jump::CondTargetBoth(tgt_true, tgt_false) => {
+        // Unreachable by construction: see CondTargetTrue above.
         let cond = cond.unwrap_or_else(|| Expr::Abstract("UNIMPL", vec![]));
         let label_true = self.make_label(tgt_true);
         let label_false = self.make_label(tgt_false);
@@ -1092,9 +1096,9 @@ impl<'a> Builder<'a> {
     }
     let cond = match self.emit_blk(blk, bb.blkref, ifstmt.inverted) {
       Some(cond) => cond,
-      // The entry block carries no condition (e.g. an empty range-exit block
-      // was wired as the entry). The branch structure is kept with an
-      // explicit marker; guessing a condition would be worse.
+      // Unreachable by construction: infer_if requires exactly two exits, so
+      // the entry block is non-empty and ends in the conditional branch
+      // emitted above. Kept as belt-and-braces.
       None => Expr::Abstract("UNIMPL", vec![]),
     };
 
@@ -1273,26 +1277,10 @@ impl<'a> Builder<'a> {
     // eliminate push-save stores/loads, which would otherwise leave a ragged
     // frame whose shallowest surviving local ends below the return-address
     // slot. Table types come from infer_type_from_size, so only 1/2/4.
-    for (start_off, sz) in self.ir.symbols.local_extents() {
-      let start_off = start_off as i16;
-      if start_off.abs() > self.frame_off_high.abs() {
-        self.frame_off_high = start_off;
-      }
-      let end_off = start_off + sz as i16;
-      if end_off.abs() < self.frame_off_low.abs() {
-        self.frame_off_low = end_off;
-      }
-    }
-
-    // Determine frame size (HACKY)
-    let mut frame_size = 0;
-    if self.frame_off_high != 0 { // frame is non-zero
-      if self.frame_off_low < -2 {
-        panic!("Frame offsets are below the return address location (-2)");
-      }
-      assert!(self.frame_off_low >= self.frame_off_high);
-      frame_size = (self.frame_off_high.abs() - 2) as u16;
-    }
+    let (frame_off_low, frame_off_high, frame_size) =
+      ground_frame(self.frame_off_low, self.frame_off_high, self.ir.symbols.local_extents().into_iter())?;
+    self.frame_off_low = frame_off_low;
+    self.frame_off_high = frame_off_high;
 
     Ok(Function {
       name: name.to_string(),
@@ -1320,9 +1308,53 @@ fn checked_byte_range(off: i32, sz: u16) -> Option<(usize, usize)> {
   Some((start, start.checked_add(sz as usize)?))
 }
 
+/// Grounds a stack frame in the extents of the function's locals.
+///
+/// `low`/`high` are seeded with the offsets accumulated while symbolizing
+/// expressions; grounding over every local extent (including locals the
+/// optimizer stripped from expressions) can only widen them, so the seeded
+/// values are a lower bound on the frame. On return `low` is the least-negative
+/// (shallowest) local end offset and `high` the most-negative (deepest) local
+/// start offset; the returned size is the frame depth minus the 2-byte
+/// return-address slot at [-2, 0).
+///
+/// Errors instead of panicking when the extents cannot form a valid frame, so
+/// one malformed function degrades to a skipped function rather than aborting
+/// a batch decompile.
+fn ground_frame(
+  mut low: i16,
+  mut high: i16,
+  extents: impl Iterator<Item = (i32, u16)>,
+) -> Result<(i16, i16, u16), String> {
+  for (start, sz) in extents {
+    let start = i16::try_from(start)
+      .map_err(|_| format!("frame local start offset out of i16 range: {}", start))?;
+    let sz = i16::try_from(sz)
+      .map_err(|_| format!("frame local size out of i16 range: {}", sz))?;
+    let end = start.checked_add(sz)
+      .ok_or_else(|| format!("frame local extent overflows i16: start {} size {}", start, sz))?;
+    if (start as i32).abs() > (high as i32).abs() { high = start; }
+    if (end as i32).abs() < (low as i32).abs() { low = end; }
+  }
+
+  if high == 0 { return Ok((low, high, 0)); } // no frame
+  if low < -2 {
+    // A local extends below the 2-byte return-address slot at [-2, 0).
+    return Err(format!("frame offsets are below the return address location (-2): shallowest local ends at {}", low));
+  }
+  if low < high {
+    return Err(format!("inconsistent frame extents: shallowest local end {} is below deepest local start {}", low, high));
+  }
+  let depth = (high as i32).abs();
+  if depth < 2 {
+    return Err(format!("frame too shallow for a return address slot: depth {}", depth));
+  }
+  Ok((low, high, (depth - 2) as u16))
+}
+
 #[cfg(test)]
 mod tests {
-  use super::checked_byte_range;
+  use super::{checked_byte_range, ground_frame};
 
   #[test]
   fn negative_offsets_are_rejected() {
@@ -1347,5 +1379,58 @@ mod tests {
       checked_byte_range(i32::MAX, u16::MAX),
       Some((i32::MAX as usize, i32::MAX as usize + u16::MAX as usize))
     );
+  }
+
+  const NO_LOCALS: [(i32, u16); 0] = [];
+
+  #[test]
+  fn ground_frame_widens_to_eliminated_push_save_locals() {
+    // Regression: a push-save frame where the optimizer eliminated the
+    // si/di save stores leaves only the word locals [-6,-4) and [-8,-6) in
+    // expressions, seeding low at -4 (which alone would trip the "below the
+    // return address location" error). Grounding over every local extent --
+    // including the surviving-in-symbols push saves at [-2,0) and [-4,-2) --
+    // restores low = 0 and a well-formed frame.
+    let extents = [(-2i32, 2u16), (-4, 2), (-6, 2), (-8, 2)];
+    let (low, high, frame_size) =
+      ground_frame(-4, -6, extents.into_iter()).expect("push-save-only frame");
+    assert_eq!((low, high, frame_size), (0, -8, 6));
+  }
+
+  #[test]
+  fn ground_frame_accepts_single_local() {
+    // A word at [-2,0) is exactly the return-address slot: no room for locals
+    // beyond it, so the frame is zero-sized but well-formed.
+    let (low, high, frame_size) = ground_frame(i16::MIN + 1, 0, [(-2i32, 2u16)].into_iter()).unwrap();
+    assert_eq!((low, high, frame_size), (0, -2, 0));
+  }
+
+  #[test]
+  fn ground_frame_no_locals_means_no_frame() {
+    assert_eq!(ground_frame(i16::MIN + 1, 0, NO_LOCALS.into_iter()).unwrap(), (i16::MIN + 1, 0, 0));
+  }
+
+  #[test]
+  fn ground_frame_rejects_local_below_return_address_slot() {
+    // A word at [-5,-3) ends below the 2-byte return-address slot at [-2,0).
+    let err = ground_frame(i16::MIN + 1, 0, [(-5i32, 2u16)].into_iter()).unwrap_err();
+    assert!(err.contains("below the return address location"), "unexpected error: {err}");
+  }
+
+  #[test]
+  fn ground_frame_rejects_shallow_frame() {
+    // A lone byte local at [-1,0) leaves no room for the return-address slot;
+    // the pre-extraction code produced a garbage (wrapped) frame size here.
+    let err = ground_frame(i16::MIN + 1, 0, [(-1i32, 1u16)].into_iter()).unwrap_err();
+    assert!(err.contains("too shallow for a return address slot"), "unexpected error: {err}");
+  }
+
+  #[test]
+  fn ground_frame_rejects_unrepresentable_extents() {
+    // Out-of-i16-range extents must error, not wrap like the old `as i16` cast.
+    let err = ground_frame(i16::MIN + 1, 0, [(-40000i32, 2u16)].into_iter()).unwrap_err();
+    assert!(err.contains("start offset out of i16 range"), "unexpected error: {err}");
+    let err = ground_frame(i16::MIN + 1, 0, [(-4i32, 40000u16)].into_iter()).unwrap_err();
+    assert!(err.contains("size out of i16 range"), "unexpected error: {err}");
   }
 }

@@ -1110,7 +1110,11 @@ fn label_blocks_by_demand(cf: &mut ControlFlow) {
     let mut id = tgt;
     let mut seen = HashSet::new();
     loop {
-      if !seen.insert(id) { break; }
+      if !seen.insert(id) {
+        // Same enforcement point (and message) as ast::Builder::make_label,
+        // which runs on the same ids during emission.
+        panic!("Cyclic goto chain while resolving label for {:?}", id);
+      }
       let elem = cf.data.get_mut(id);
       match &mut elem.detail {
         Detail::BasicBlock(bb) => { bb.labeled = true; break; }
