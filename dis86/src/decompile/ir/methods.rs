@@ -484,4 +484,22 @@ mod tests {
     assert_eq!(instr.opcode, Opcode::Phi);
     assert_eq!(instr.operands, vec![phi]);
   }
+
+  #[test]
+  fn block_last_instr_empty_block_yields_none() {
+    // Blocks containing only pure moves lower to zero IR instructions, so an
+    // empty block is legitimate and must not panic (see start_next_blk).
+    let mut ir = test_ir();
+    let blk = ir.add_block("empty");
+    assert!(ir.block_last_instr(blk).is_none());
+  }
+
+  #[test]
+  fn block_exits_empty_block_has_no_exits() {
+    // An empty block is a jump whose target lies outside the decompiled
+    // range: control flow leaves the function here, so there are no exits.
+    let mut ir = test_ir();
+    let blk = ir.add_block("empty");
+    assert!(ir.block_exits(blk).is_empty());
+  }
 }

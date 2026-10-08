@@ -44,7 +44,8 @@ impl CodeSegments {
     }
   }
 
-  fn from_overlay_info(seginfo: &[mz::SegInfo], ovr: &mz::OverlayInfo) -> CodeSegments {    // Collect ordinary code segments and stub segments
+  // Collect ordinary code segments and stub segments
+  fn from_overlay_info(seginfo: &[mz::SegInfo], ovr: &mz::OverlayInfo) -> CodeSegments {
     let mut code_segments = vec![];
     let mut stub_segments = vec![];
     for s in seginfo {
