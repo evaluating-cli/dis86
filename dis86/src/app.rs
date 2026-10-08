@@ -201,12 +201,22 @@ pub fn run() -> i32 {
     };
 
   let mut all_code = String::new();
+  let mut failures = 0;
   for spec in specs {
+    let name = spec.name.clone();
     let ret = decompile_spec(&args, &cfg, &binary, spec, &mut all_code);
     if ret != 0 {
-      eprintln!("Error: Failed to decompile.");
-      return ret;
+      // Best-effort batch decompile: one malformed function must not abort
+      // the rest of the codeseg (the specific error was already reported by
+      // decompile_spec above). Count it, continue, and exit nonzero at the
+      // end if anything failed.
+      eprintln!("Error: Failed to decompile {}; continuing with the rest.", name);
+      failures += 1;
     }
+  }
+  if failures != 0 {
+    eprintln!("Error: Failed to decompile {} function(s).", failures);
+    return 1;
   }
 
   if let Some(path) = args.emit_code.as_ref() {
