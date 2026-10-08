@@ -1241,4 +1241,21 @@ mod tests {
     assert_eq!(instr.opcode, Opcode::Eq);
     assert_eq!(instr.operands, vec![inner, zero]);
   }
+
+  #[test]
+  fn unimpl_marker_survives_dead_code_elimination() {
+    // A standalone UNIMPL marker (e.g. from `stc`, which touches CF) has no
+    // consumers by construction. It must survive DCE so the imprecision
+    // reaches the generated C; otherwise the gap is silently erased.
+    let (mut ir, blk) = test_ir();
+    let marker = append_typed(&mut ir, blk, Type::Void, Opcode::Unimpl, vec![]);
+    let one = ir.const_new(1);
+    let two = ir.const_new(2);
+    let dead = append(&mut ir, blk, Opcode::Add, vec![one, two]);
+
+    deadcode_elimination(&mut ir);
+
+    assert_eq!(ir.instr(marker).unwrap().opcode, Opcode::Unimpl);
+    assert_eq!(ir.instr(dead).unwrap().opcode, Opcode::Nop);
+  }
 }

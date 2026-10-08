@@ -293,6 +293,10 @@ impl Opcode {
       Opcode::JmpTbl => true,
       Opcode::AssertEven => true,
       Opcode::AssertPos => true,
+      // An Unimpl marker is an explicit statement that precision was dropped
+      // here. Without this it is dead code (no consumers by construction) and
+      // DCE would erase the marker before codegen, silently hiding the gap.
+      Opcode::Unimpl => true,
       _ => false,
     }
   }
