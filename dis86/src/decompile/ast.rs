@@ -650,22 +650,23 @@ impl<'a> Builder<'a> {
     if symref.table() == sym::Table::Local {
 
       let start_off = sym.off;
-      if start_off.abs() > self.frame_off_high.abs() {
-        self.frame_off_high = start_off;
-      }
 
       let typ = symref.get_type(&self.ir.symbols);
-      let sz = match typ {
+      let sz: i16 = match typ {
         Type::U8 => 1,
         Type::U16 => 2,
         Type::U32 => 4,
         _ => panic!("Unsupported type: {:?}", typ),
       };
 
-      let end_off = start_off + sz;
-      if end_off.abs() < self.frame_off_low.abs() {
-        self.frame_off_low = end_off;
-      }
+      // Overflow here would need a local within 4 bytes of i16::MAX, which no
+      // bp-relative frame can produce; widen_frame (i32 comparisons) is what
+      // guards the realistic hazard, a local at i16::MIN from `sub sp,0x8000`.
+      let end_off = start_off.checked_add(sz)
+        .unwrap_or_else(|| panic!("local extent overflows i16: start {} size {}", start_off, sz));
+      let (low, high) = widen_frame(self.frame_off_low, self.frame_off_high, start_off, end_off);
+      self.frame_off_low = low;
+      self.frame_off_high = high;
 
       //println!("{} | start_off: {}, end_off: {}", sym.name, start_off, end_off);
     }
@@ -1308,6 +1309,18 @@ fn checked_byte_range(off: i32, sz: u16) -> Option<(usize, usize)> {
   Some((start, start.checked_add(sz as usize)?))
 }
 
+/// Widens a frame's (low, high) offsets to cover one local extent.
+///
+/// `low` is the least-negative (shallowest) local end offset seen so far and
+/// `high` the most-negative (deepest) local start offset. Comparisons run in
+/// i32 so an extent at i16::MIN (e.g. a `sub sp,0x8000` frame) cannot panic
+/// on `abs()` the way a direct i16 `abs()` would in debug builds.
+fn widen_frame(low: i16, high: i16, start: i16, end: i16) -> (i16, i16) {
+  let high = if (start as i32).abs() > (high as i32).abs() { start } else { high };
+  let low = if (end as i32).abs() < (low as i32).abs() { end } else { low };
+  (low, high)
+}
+
 /// Grounds a stack frame in the extents of the function's locals.
 ///
 /// `low`/`high` are seeded with the offsets accumulated while symbolizing
@@ -1333,8 +1346,7 @@ fn ground_frame(
       .map_err(|_| format!("frame local size out of i16 range: {}", sz))?;
     let end = start.checked_add(sz)
       .ok_or_else(|| format!("frame local extent overflows i16: start {} size {}", start, sz))?;
-    if (start as i32).abs() > (high as i32).abs() { high = start; }
-    if (end as i32).abs() < (low as i32).abs() { low = end; }
+    (low, high) = widen_frame(low, high, start, end);
   }
 
   if high == 0 { return Ok((low, high, 0)); } // no frame
@@ -1354,7 +1366,7 @@ fn ground_frame(
 
 #[cfg(test)]
 mod tests {
-  use super::{checked_byte_range, ground_frame};
+  use super::{checked_byte_range, ground_frame, widen_frame};
 
   #[test]
   fn negative_offsets_are_rejected() {
@@ -1432,5 +1444,22 @@ mod tests {
     assert!(err.contains("start offset out of i16 range"), "unexpected error: {err}");
     let err = ground_frame(i16::MIN + 1, 0, [(-4i32, 40000u16)].into_iter()).unwrap_err();
     assert!(err.contains("size out of i16 range"), "unexpected error: {err}");
+  }
+
+  #[test]
+  fn widen_frame_survives_i16_min_extent() {
+    // Regression: a `sub sp,0x8000` frame puts a local at i16::MIN, whose
+    // direct i16 abs() panics in debug builds. i32 comparisons must not.
+    assert_eq!(widen_frame(i16::MIN + 1, 0, i16::MIN, i16::MIN + 2), (i16::MIN + 2, i16::MIN));
+  }
+
+  #[test]
+  fn widen_frame_leaves_superset_unchanged() {
+    assert_eq!(widen_frame(-2, -8, -6, -4), (-2, -8));
+  }
+
+  #[test]
+  fn widen_frame_widens_both_directions() {
+    assert_eq!(widen_frame(-4, -6, -10, -1), (-1, -10));
   }
 }

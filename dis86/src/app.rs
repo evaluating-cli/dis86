@@ -204,14 +204,29 @@ pub fn run() -> i32 {
   let mut failures = 0;
   for spec in specs {
     let name = spec.name.clone();
-    let ret = decompile_spec(&args, &cfg, &binary, spec, &mut all_code);
-    if ret != 0 {
-      // Best-effort batch decompile: one malformed function must not abort
-      // the rest of the codeseg (the specific error was already reported by
-      // decompile_spec above). Count it, continue, and exit nonzero at the
-      // end if anything failed.
-      eprintln!("Error: Failed to decompile {}; continuing with the rest.", name);
-      failures += 1;
+    // Contain panics per function: ControlFlow inference and AST building
+    // still panic on degenerate input (goto cycles, unimplemented opcodes,
+    // unsupported types). Without this, one such function unwinds past the
+    // loop and aborts the whole batch. Truncate any partial output the
+    // panicking spec appended before counting it as failed.
+    let code_len = all_code.len();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+      decompile_spec(&args, &cfg, &binary, spec, &mut all_code)
+    }));
+    match outcome {
+      Ok(0) => {}
+      Ok(_) => {
+        // Best-effort batch decompile: one malformed function must not abort
+        // the rest of the codeseg (the specific error was already reported by
+        // decompile_spec above). Count it and continue.
+        eprintln!("Error: Failed to decompile {}; continuing with the rest.", name);
+        failures += 1;
+      }
+      Err(_) => {
+        all_code.truncate(code_len);
+        eprintln!("Error: Panicked while decompiling {}; continuing with the rest.", name);
+        failures += 1;
+      }
     }
   }
   if failures != 0 {
