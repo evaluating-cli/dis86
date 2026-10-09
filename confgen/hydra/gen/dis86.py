@@ -25,6 +25,14 @@ def gen_functions(functions):
         mode = 'far'
         if func.flags == 'NEAR':
             mode = 'near'
+        if func.flags == 'RET_UNKNOWN':
+            # Interim default: small-model near, matching the pre-flagging
+            # behavior. Explicitly mapped (NOT the fall-through default) so a
+            # future default change cannot silently flip noreturn functions.
+            # The marker is inert to the Rust parser (key lookups) but keeps
+            # the unresolved state visible and greppable in the generated BSL.
+            mode = 'near'
+            extra += 'ret_kind_unknown 1 '
         start = '""' if not func.start_addr else func.start_addr
         end = '""' if not func.end_addr else func.end_addr
         emit(f'    {func.name:30} {{ start {start} end {end} mode {mode} ret {func.ret} args {func.args} {extra}}} ')

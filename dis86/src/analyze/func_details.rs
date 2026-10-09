@@ -19,7 +19,11 @@ pub struct FuncDetails {
   pub end_addr_inferred: SegOff,
   pub direct_calls:      BTreeSet<SegOff>,
   pub indirect_calls:    usize,
-  pub return_kind:       ReturnKind,
+  // None when no return instruction was observed (noreturn helper, tail-jump
+  // exit, or IRET handler): the call mode is not inferable from analysis and
+  // must not be guessed here. analyze.rs surfaces it as an explicit
+  // RET_UNKNOWN suggestion flag for the operator to resolve.
+  pub return_kind:       Option<ReturnKind>,
 }
 
 impl fmt::Display for FuncDetails {
@@ -33,7 +37,10 @@ impl fmt::Display for FuncDetails {
     }
     writeln!(f, "]")?;
     writeln!(f, "indirect_calls:    {}", self.indirect_calls)?;
-    writeln!(f, "return_kind:       {}", self.return_kind)?;
+    match self.return_kind {
+      Some(kind) => writeln!(f, "return_kind:       {}", kind)?,
+      None       => writeln!(f, "return_kind:       unknown")?,
+    }
     Ok(())
   }
 }
@@ -144,11 +151,11 @@ impl FuncDetails {
       end_addr_inferred: largest_addr,
       direct_calls,
       indirect_calls,
-      // A function with no observed return either never returns (fatal-error
-      // helpers, exit paths) or ends in a tail jump. Default to Near: real-mode
-      // small-model code is near by construction, and any genuine far function
-      // contains an observable RETF. (TODO: track an explicit noreturn kind.)
-      return_kind: return_kind.unwrap_or(ReturnKind::Near),
+      // No defaulting: a function with no observed return leaves return_kind
+      // as None (see the field doc). Guessing Near here would silently
+      // mislabel genuine far-noreturn functions as near in the generated
+      // configs; analyze.rs reports the unknown kind explicitly instead.
+      return_kind,
     })
   }
 }
@@ -158,4 +165,43 @@ fn decode_one_instr(binary: &Binary, loc: SegOff, end: SegOff) -> Result<Instr, 
   let mut decoder = Decoder::new(binary.region_iter(loc, end));
   let (instr, _raw) = decoder.try_next()?.unwrap();
   Ok(instr)
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::analyze::code_segment::{CodeSegment, Region};
+  use crate::segoff::{Off, Seg};
+
+  fn segoff(off: u16) -> SegOff {
+    SegOff { seg: Seg::Normal(0), off: Off(off) }
+  }
+
+  fn test_seg(size: u32) -> CodeSegment {
+    CodeSegment { primary: Region { seg: Seg::Normal(0), skip_off: 0, size }, stub: None }
+  }
+
+  #[test]
+  fn ret_yields_near_return_kind() {
+    let binary = Binary::from_raw(&[0xC3], None);
+    let details = FuncDetails::build(segoff(0), &test_seg(1), &binary).unwrap();
+    assert_eq!(details.return_kind, Some(ReturnKind::Near));
+  }
+
+  #[test]
+  fn retf_yields_far_return_kind() {
+    let binary = Binary::from_raw(&[0xCB], None);
+    let details = FuncDetails::build(segoff(0), &test_seg(1), &binary).unwrap();
+    assert_eq!(details.return_kind, Some(ReturnKind::Far));
+  }
+
+  #[test]
+  fn noreturn_function_reports_unknown_return_kind() {
+    // A `jmp` to self never reaches a return instruction. The analyzer must
+    // report the kind as unknown rather than guessing Near (which mislabeled
+    // genuine far-noreturn functions as near in the generated configs).
+    let binary = Binary::from_raw(&[0xEB, 0xFE], None);
+    let details = FuncDetails::build(segoff(0), &test_seg(2), &binary).unwrap();
+    assert_eq!(details.return_kind, None);
+  }
 }

@@ -8,7 +8,11 @@ class FuncData:
         self.overlay = str(int(entry.overlay))
         self.seg = f'0x{entry.seg:04x}'
         self.off = f'0x{entry.off:04x}'
-        self.flags = str(func.flags)
+        # RET_UNKNOWN must never reach the C HYDRA_DEFINE_CALLSTUB bitmask
+        # (it has no C macro meaning). Interim: the same near default the BSL
+        # gets, with the unresolved state recorded for the header comment.
+        self.ret_unknown = func.flags == 'RET_UNKNOWN'
+        self.flags = 'NEAR' if self.ret_unknown else str(func.flags)
 
 def build_func_data(functions):
     dat = []
@@ -48,7 +52,8 @@ def gen_hdr(data, out=None):
     emit('/**************************************************************************************************************/')
     for func in func_data:
         addr = f'ADDR_MAKE_EXT({func.overlay}, {func.seg}, {func.off})'
-        emit(f'HYDRA_DEFINE_CALLSTUB( {func.name+",":30} {func.ret+",":8} {func.args+",":10} {addr}, {func.flags:15} )')
+        todo = ' /* TODO: return kind unknown; interim NEAR, resolve the call mode from the call sites */' if func.ret_unknown else ''
+        emit(f'HYDRA_DEFINE_CALLSTUB( {func.name+",":30} {func.ret+",":8} {func.args+",":10} {addr}, {func.flags:15} ){todo}')
     emit('')
 
     emit('/**************************************************************************************************************/')

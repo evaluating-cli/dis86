@@ -4,8 +4,9 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from hydra.annotations import Global, Member, Struct, Type, validate_data_section
-from hydra.gen.appdata import gen_hdr
+from hydra.annotations import Function, Global, Member, Struct, Type, validate_data_section
+from hydra.gen import dis86 as dis86_gen
+from hydra.gen.appdata import build_func_data, gen_hdr
 
 
 class AnnotationTypeTests(unittest.TestCase):
@@ -81,6 +82,58 @@ class AnnotationTypeTests(unittest.TestCase):
             subprocess.run(['cc', '-std=c11', '-Wall', '-Werror', str(source), '-o', str(exe)], check=True)
             result = subprocess.run([str(exe)], check=True, capture_output=True, text=True)
             self.assertIn('guest memory fixture passed', result.stdout)
+
+
+class RetUnknownFlagTests(unittest.TestCase):
+    def _func(self, name, flags):
+        return Function(False, name, None, None, '0000:1234', '0000:1300', flags=flags)
+
+    def _gen_functions_text(self, funcs):
+        buf = io.StringIO()
+        prev, dis86_gen.out = dis86_gen.out, buf
+        try:
+            dis86_gen.gen_functions(funcs)
+        finally:
+            dis86_gen.out = prev
+        return buf.getvalue()
+
+    def test_ret_unknown_emits_interim_near_with_marker(self):
+        # Interim default: small-model near (status quo), with an inert but
+        # greppable marker. Must NOT fall through to the far default, which
+        # would silently flip noreturn functions from near to far.
+        text = self._gen_functions_text([self._func('ret_unknown_a', 'RET_UNKNOWN')])
+        self.assertIn('mode near', text)
+        self.assertIn('ret_kind_unknown 1', text)
+
+    def test_near_and_default_modes_unchanged(self):
+        text = self._gen_functions_text([
+            self._func('ret_unknown_near_b', 'NEAR'),
+            self._func('ret_unknown_far_b', 0),
+        ])
+        near_line = next(l for l in text.splitlines() if 'ret_unknown_near_b' in l)
+        far_line = next(l for l in text.splitlines() if 'ret_unknown_far_b' in l)
+        self.assertIn('mode near', near_line)
+        self.assertNotIn('ret_kind_unknown', near_line)
+        self.assertIn('mode far', far_line)
+        self.assertNotIn('ret_kind_unknown', far_line)
+
+    def test_ret_unknown_callstub_maps_to_near_with_todo(self):
+        # The raw flag string must never reach the C HYDRA_DEFINE_CALLSTUB
+        # bitmask (it has no C macro meaning); the interim NEAR matches the
+        # BSL, and the TODO marks it unresolved.
+        dat = build_func_data([self._func('ret_unknown_c', 'RET_UNKNOWN')])
+        self.assertEqual(dat[0].flags, 'NEAR')
+        self.assertTrue(dat[0].ret_unknown)
+        output = io.StringIO()
+        gen_hdr({
+            'functions': [self._func('ret_unknown_d', 'RET_UNKNOWN')],
+            'structures': [], 'data_section': [], 'callstack': [],
+        }, out=output)
+        text = output.getvalue()
+        stub_line = next(l for l in text.splitlines() if 'ret_unknown_d' in l and 'CALLSTUB' in l)
+        self.assertIn(', NEAR', stub_line)
+        self.assertNotIn('RET_UNKNOWN', stub_line)
+        self.assertIn('TODO: return kind unknown', stub_line)
 
 
 if __name__ == '__main__':

@@ -247,10 +247,17 @@ fn generate_annotations(functions: &BTreeMap<SegOff, Result<FuncDetails, String>
           let name     = format!("\"{}\",", name);
           let start    = format!("\"{}\",", details.start_addr);
           let end      = format!("\"{}\"", details.end_addr_inferred);
-          let flags    = if details.return_kind == ReturnKind::Near {
-            ", flags = \"NEAR\""
-          } else {
-            ""
+          let flags    = match details.return_kind {
+            Some(ReturnKind::Near) => ", flags = \"NEAR\"",
+            Some(ReturnKind::Far) => "",
+            // Unknown — and likewise Interrupt, whose call mode is equally
+            // uninferable — is never silently mapped to a mode: RET_UNKNOWN
+            // marks the suggestion for the operator to resolve (confgen
+            // treats it as an interim near with a visible marker until then).
+            Some(ReturnKind::Interrupt) | None => {
+              println!("    # RET KIND UNKNOWN | {} | {} | no return instruction observed (noreturn, tail-jump exit, or IRET handler); resolve the call mode from the call sites: near calls need flags = \"NEAR\", far calls need no flag", name, addr);
+              ", flags = \"RET_UNKNOWN\""
+            }
           };
 
           let ret_str  = match ret {
