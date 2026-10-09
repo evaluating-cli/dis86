@@ -16,6 +16,9 @@ impl Finalizer {
   // one or more target block contain phis
   fn insert_intermediate_phi_blocks(&mut self, ir: &mut IR) {
     for blkref in ir.iter_blocks() {
+      // Dead blocks (declared as jump targets but containing no instructions,
+      // e.g. a branch into the middle of another instruction) have no exits.
+      if ir.block_instr_count(blkref) == 0 { continue; }
       let r = ir.block_last(blkref);
       let exits = ir.block_exits(blkref);
       if exits.len() <= 1 { continue; }

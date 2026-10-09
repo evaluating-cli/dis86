@@ -377,7 +377,7 @@ impl ControlFlow {
       let exits = ir.block_exits(b).into_iter().map(|x| ElemId(x.0)).collect();
       let preds = ir.block(b).preds.iter().map(|x| ElemId(x.0)).collect();
 
-      let jump_table = ir.block_last_instr(b).unwrap().opcode == ir::Opcode::JmpTbl;
+      let jump_table = ir.block_last_instr(b).is_some_and(|i| i.opcode == ir::Opcode::JmpTbl);
 
       cf.data.append_with_id(ElemId(b.0), Elem {
         entry: ElemId(b.0),
@@ -1104,9 +1104,27 @@ fn label_blocks_by_demand(cf: &mut ControlFlow) {
 
   // Phase 2: Label all targetted blocks
   for tgt in targets {
-    let elem = cf.data.get_mut(tgt);
-    let Detail::BasicBlock(bb) = &mut elem.detail else { panic!("Expected basic block for labeling") };
-    bb.labeled = true;
+    // The target may have been folded into a structured elem (if/loop/etc.)
+    // by inference; descend to its entry basic block so an emitted goto has
+    // a labeled destination. (Mirrors ast::Builder::make_label descent.)
+    let mut id = tgt;
+    let mut seen = HashSet::new();
+    loop {
+      if !seen.insert(id) {
+        // Same enforcement point (and message) as ast::Builder::make_label,
+        // which runs on the same ids during emission.
+        panic!("Cyclic goto chain while resolving label for {:?}", id);
+      }
+      let elem = cf.data.get_mut(id);
+      match &mut elem.detail {
+        Detail::BasicBlock(bb) => { bb.labeled = true; break; }
+        Detail::Goto(g) => { id = g.target; }
+        Detail::ElemBlock(e) => { id = e.entry; }
+        Detail::Loop(l) => { id = l.entry; }
+        Detail::If(i) => { id = i.entry; }
+        Detail::Switch(s) => { id = s.entry; }
+      }
+    }
   }
 }
 

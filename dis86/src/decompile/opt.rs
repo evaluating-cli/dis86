@@ -5,9 +5,15 @@ use std::collections::{hash_map, HashMap, HashSet, VecDeque};
 
 // Propagate operand through any ref opcodes
 fn operand_propagate(ir: &IR, mut r: Ref) -> Ref {
+  // Ref cycles arise from loop-carried locals: mem_symbol_to_ref turns a
+  // read-modify-write local in a loop into read -> phi -> ... -> read.
+  // Stop at the cycle instead of spinning; the remaining alias is resolved
+  // (or named) by later passes.
+  let mut seen = HashSet::new();
   loop {
     let Some(instr) = ir.instr(r) else { return r };
     if instr.opcode != Opcode::Ref { return r; }
+    if !seen.insert(r) { return r; }
     r = instr.operands[0];
   }
 }
@@ -344,8 +350,11 @@ fn stack_ptr_const_oper(ir: &IR, vref: Ref) -> Option<(Ref, i16)> {
   let Ref::Const(_) = cref else { return None };
 
   match instr.opcode {
+    // NOTE: Stack-pointer arithmetic wraps at 16 bits (e.g. `sub sp, 0x8000`
+    // materializes as const -32768, whose negation overflows i16), so fold
+    // with wrapping ops: bit-identical to the guest computation.
     Opcode::Add => Some((nref, ir.const_lookup(cref).unwrap())),
-    Opcode::Sub => Some((nref, -ir.const_lookup(cref).unwrap())),
+    Opcode::Sub => Some((nref, ir.const_lookup(cref).unwrap().wrapping_neg())),
     _ => None,
   }
 }
@@ -358,14 +367,14 @@ pub fn stack_ptr_accumulation(ir: &mut IR) {
       let instr = ir.instr(vref).unwrap();
       let Some((nref, b)) = stack_ptr_const_oper(ir, instr.operands[0]) else { continue };
 
-      let k = a+b;
+      let k = a.wrapping_add(b);
       if k > 0 {
         let cref = ir.const_new(k);
         let instr = ir.instr_mut(vref).unwrap();
         instr.opcode = Opcode::Add;
         instr.operands = vec![nref, cref];
       } else if k < 0 {
-        let cref = ir.const_new(-k);
+        let cref = ir.const_new(k.wrapping_neg());
         let instr = ir.instr_mut(vref).unwrap();
         instr.opcode = Opcode::Sub;
         instr.operands = vec![nref, cref];
@@ -679,13 +688,61 @@ pub fn simplify_branch_conds(ir: &mut IR) {
       let opcode_ge = opcode_new == Opcode::Geq;
 
       let upd_ref = instr.operands[0];
-      let upd_instr = ir.instr(upd_ref).unwrap();
+      let Some(upd_instr) = ir.instr(upd_ref) else { continue };
       if upd_instr.opcode != Opcode::UpdateFlags { continue; }
 
       let pred_ref = upd_instr.operands[1];
-      let pred_instr = ir.instr(pred_ref).unwrap();
+      let Some(pred_instr) = ir.instr(pred_ref) else { continue };
 
-      if pred_instr.opcode == Opcode::Sub {
+      // ZF is set from the result being zero by the ALU ops below, so
+      // je/jne after any of them is exactly a comparison against zero.
+      // (Excluded: Mul/Div leave ZF undefined; Unimpl producers are unknown;
+      // shifts leave flags unchanged when the count is zero, and the count
+      // is usually not a nonzero constant here. Sub/And/Or keep their
+      // established arms below.)
+      let zf_exact_producer = matches!(pred_instr.opcode,
+        Opcode::Add | Opcode::Xor | Opcode::Neg);
+
+      // Logical ops (and/xor) additionally clear OF and CF, so signed
+      // *and* unsigned relational tests are exactly comparisons vs zero
+      // (with ja/jbe degenerating to jne/je since CF == 0).
+      // (Or keeps its established arms below, including the Sign forms.)
+      let logical_producer = matches!(pred_instr.opcode,
+        Opcode::And | Opcode::Xor);
+
+      if opcode_eq && zf_exact_producer {
+        // add/xor/shl/... <v>; je/jne <tgt> is exactly <v> ==/!= 0.
+        let z = ir.const_new(0);
+        let instr = ir.instr_mut(r).unwrap();
+        instr.opcode = opcode_new;
+        instr.operands = vec![pred_ref, z];
+      }
+
+      else if logical_producer && !opcode_eq {
+        // and/xor <v>; jcc <tgt> for any relational cc: exactly vs zero.
+        // Like the Sub arm below: a byte-typed producer needs the Byte width
+        // so codegen sign/zero-extends correctly (a U8 0xFF is -1 as i8).
+        let compare_width = match pred_instr.typ {
+          Type::U8 | Type::I8 => Some(CompareWidth::Byte),
+          Type::U16 | Type::I16 => Some(CompareWidth::Word),
+          _ => None,
+        };
+        let z = ir.const_new(0);
+        let rel_opcode = match opcode_new {
+          Opcode::UGt => Opcode::Neq,  // ja  <=> jne (CF == 0)
+          Opcode::ULeq => Opcode::Eq,  // jbe <=> je  (CF == 0)
+          // UGeq (jae) is always taken and ULt (jb) never taken here;
+          // leave those for the explicit UNIMPL_FLAGS marker in astgen.
+          Opcode::UGeq | Opcode::ULt => continue,
+          _ => opcode_new,
+        };
+        let instr = ir.instr_mut(r).unwrap();
+        instr.opcode = rel_opcode;
+        instr.operands = vec![pred_ref, z];
+        instr.compare_width = compare_width;
+      }
+
+      else if pred_instr.opcode == Opcode::Sub {
         // cmp <a>, <b>
         // jg <tgt>
         let lhs = pred_instr.operands[0];
@@ -1193,5 +1250,152 @@ mod tests {
     let instr = ir.instr(outer).unwrap();
     assert_eq!(instr.opcode, Opcode::Eq);
     assert_eq!(instr.operands, vec![inner, zero]);
+  }
+
+  #[test]
+  fn unimpl_marker_survives_dead_code_elimination() {
+    // A standalone UNIMPL marker (e.g. from `stc`, which touches CF) has no
+    // consumers by construction. It must survive DCE so the imprecision
+    // reaches the generated C; otherwise the gap is silently erased.
+    let (mut ir, blk) = test_ir();
+    let marker = append_typed(&mut ir, blk, Type::Void, Opcode::Unimpl, vec![]);
+    let one = ir.const_new(1);
+    let two = ir.const_new(2);
+    let dead = append(&mut ir, blk, Opcode::Add, vec![one, two]);
+
+    deadcode_elimination(&mut ir);
+
+    assert_eq!(ir.instr(marker).unwrap().opcode, Opcode::Unimpl);
+    assert_eq!(ir.instr(dead).unwrap().opcode, Opcode::Nop);
+  }
+
+  // Builds `producer -> UpdateFlags -> cond` and returns (producer, cond).
+  fn flags_over(
+    ir: &mut IR,
+    blk: BlockRef,
+    producer: Opcode,
+    cond: Opcode,
+  ) -> (Ref, Ref) {
+    let lhs = ir.const_new(0x00ff);
+    let rhs = ir.const_new(0x0f0f);
+    let operands = match producer {
+      Opcode::Neg => vec![lhs],
+      _ => vec![lhs, rhs],
+    };
+    let prod = append_typed(ir, blk, Type::U16, producer, operands);
+    let flags = Ref::Init(crate::asm::instr::Reg::FLAGS);
+    let update = append_typed(ir, blk, Type::U16, Opcode::UpdateFlags, vec![flags, prod]);
+    let condition = append_typed(ir, blk, Type::U16, cond, vec![update]);
+    (prod, condition)
+  }
+
+  #[test]
+  fn zf_exact_producers_simplify_equality_tests_against_zero() {
+    // add/xor/neg set ZF from the result being zero, so a following je/jne
+    // is exactly a comparison of the result against zero.
+    for producer in [Opcode::Add, Opcode::Xor, Opcode::Neg] {
+      for (cond, expected) in [(Opcode::EqFlags, Opcode::Eq), (Opcode::NeqFlags, Opcode::Neq)] {
+        let (mut ir, blk) = test_ir();
+        let (prod, condition) = flags_over(&mut ir, blk, producer, cond);
+
+        simplify_branch_conds(&mut ir);
+
+        let instr = ir.instr(condition).unwrap();
+        assert_eq!(instr.opcode, expected, "{producer:?} producer with {cond:?}");
+        assert_eq!(ir.const_lookup(instr.operands[1]), Some(0), "rhs must be the zero constant");
+        assert_eq!(instr.operands[0], prod, "lhs must be the producer value");
+      }
+    }
+  }
+
+  #[test]
+  fn shifts_are_not_zf_exact_producers() {
+    // A shift with a zero count leaves flags unchanged (Intel), so je/jne
+    // after a variable-count shift is not provably a test against zero and
+    // must stay a UNIMPL_FLAGS marker instead of being rewritten.
+    for producer in [Opcode::Shl, Opcode::Shr, Opcode::UShr] {
+      let (mut ir, blk) = test_ir();
+      let (_prod, condition) = flags_over(&mut ir, blk, producer, Opcode::EqFlags);
+
+      simplify_branch_conds(&mut ir);
+
+      assert_eq!(ir.instr(condition).unwrap().opcode, Opcode::EqFlags, "{producer:?} producer");
+    }
+  }
+
+  #[test]
+  fn logical_relational_keeps_byte_producer_width() {
+    // A byte-typed `and` (e.g. `and byte ptr [si], 0xF`) followed by a signed
+    // relational jump must carry the Byte width, or codegen zero-extends a
+    // U8 0xFF to 255 instead of sign-extending to -1.
+    let (mut ir, blk) = test_ir();
+    let lhs = ir.const_new(0x00ff);
+    let rhs = ir.const_new(0x0f0f);
+    let prod = append_typed(&mut ir, blk, Type::U8, Opcode::And, vec![lhs, rhs]);
+    let flags = Ref::Init(crate::asm::instr::Reg::FLAGS);
+    let update = append_typed(&mut ir, blk, Type::U16, Opcode::UpdateFlags, vec![flags, prod]);
+    let condition = append_typed(&mut ir, blk, Type::U16, Opcode::LtFlags, vec![update]);
+
+    simplify_branch_conds(&mut ir);
+
+    let instr = ir.instr(condition).unwrap();
+    assert_eq!(instr.opcode, Opcode::Lt);
+    assert_eq!(instr.compare_width, Some(CompareWidth::Byte));
+    assert_eq!(instr.operands[0], prod);
+    assert_eq!(ir.const_lookup(instr.operands[1]), Some(0));
+  }
+
+  #[test]
+  fn logical_producers_simplify_relational_tests_against_zero() {
+    // and/xor clear OF and CF in addition to setting ZF, so relational tests
+    // become comparisons against zero, with ja/jbe degenerating to jne/je.
+    for producer in [Opcode::And, Opcode::Xor] {
+      for (cond, expected) in [
+        (Opcode::UGtFlags, Opcode::Neq),  // ja  <=> jne (CF == 0)
+        (Opcode::ULeqFlags, Opcode::Eq),  // jbe <=> je  (CF == 0)
+        (Opcode::LtFlags, Opcode::Lt),    // signed forms pass through
+        (Opcode::GeqFlags, Opcode::Geq),
+      ] {
+        let (mut ir, blk) = test_ir();
+        let (prod, condition) = flags_over(&mut ir, blk, producer, cond);
+
+        simplify_branch_conds(&mut ir);
+
+        let instr = ir.instr(condition).unwrap();
+        assert_eq!(instr.opcode, expected, "{producer:?} producer with {cond:?}");
+        assert_eq!(instr.operands[0], prod, "lhs must be the producer value");
+        assert_eq!(ir.const_lookup(instr.operands[1]), Some(0), "rhs must be the zero constant");
+      }
+    }
+  }
+
+  #[test]
+  fn logical_producers_leave_always_or_never_taken_tests_marked() {
+    // jae is always taken and jb never taken after a logical op (CF == 0).
+    // These stay as UNIMPL_FLAGS markers rather than being mis-simplified.
+    for cond in [Opcode::UGeqFlags, Opcode::ULtFlags] {
+      for producer in [Opcode::And, Opcode::Xor] {
+        let (mut ir, blk) = test_ir();
+        let (_prod, condition) = flags_over(&mut ir, blk, producer, cond);
+
+        simplify_branch_conds(&mut ir);
+
+        assert_eq!(ir.instr(condition).unwrap().opcode, cond, "{producer:?} producer with {cond:?}");
+      }
+    }
+  }
+
+  #[test]
+  fn mul_and_div_are_not_zf_exact_producers() {
+    // Mul/Div leave ZF undefined, so equality tests after them must stay as
+    // UNIMPL_FLAGS markers instead of being rewritten against zero.
+    for producer in [Opcode::IMul, Opcode::UMul, Opcode::IDiv, Opcode::UDiv] {
+      let (mut ir, blk) = test_ir();
+      let (_prod, condition) = flags_over(&mut ir, blk, producer, Opcode::EqFlags);
+
+      simplify_branch_conds(&mut ir);
+
+      assert_eq!(ir.instr(condition).unwrap().opcode, Opcode::EqFlags, "{producer:?} producer");
+    }
   }
 }

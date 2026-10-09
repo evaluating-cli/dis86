@@ -74,6 +74,11 @@ pub enum Opcode {
 
   CallFar,
   CallNear,
+  // Indirect call with no statically known target: covers both near-indirect
+  // (`call ax`, `call [mem]`) and far-indirect (`callf [mem]`) sites as one
+  // explicit-imprecision marker. Always renders as CALL_FAR_INDIRECT in the
+  // C output regardless of which form produced it; a refined near/far split
+  // would need the target's segment to be resolvable at the call site.
   CallPtr,
   CallArgs,
   Int,
@@ -293,6 +298,10 @@ impl Opcode {
       Opcode::JmpTbl => true,
       Opcode::AssertEven => true,
       Opcode::AssertPos => true,
+      // An Unimpl marker is an explicit statement that precision was dropped
+      // here. Without this it is dead code (no consumers by construction) and
+      // DCE would erase the marker before codegen, silently hiding the gap.
+      Opcode::Unimpl => true,
       _ => false,
     }
   }

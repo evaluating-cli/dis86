@@ -93,11 +93,24 @@ impl IR {
   }
 
   pub fn block_last_instr(&self, blkref: BlockRef) -> Option<&Instr> {
-    self.instr(self.block_last(blkref))
+    // NOTE: A block can legitimately be empty at build time: basic blocks
+    // containing only pure moves (e.g. `mov bx, 0xfffe`) lower to zero IR
+    // instructions because constants/registers need no computation. Callers
+    // must handle None (start_next_blk seals such blocks with a fallthrough
+    // jump; see ir_build.rs).
+    let last = self.block(blkref).data.last()?;
+    self.instr(last)
   }
 
   pub fn block_exits(&self, blkref: BlockRef) -> Vec<BlockRef> {
-    let instr = self.block_last_instr(blkref).unwrap();
+    // NOTE: An empty block is a (tail-)jump whose target lies outside the
+    // decompiled range, so no instructions were decoded into it. It has no
+    // exits: control flow leaves the function here. (Such blocks arise when
+    // an annotated function end cuts mid-flow; see start_next_blk.)
+    // This is a deliberate robustness-over-precision tradeoff: the truncated
+    // tail jump is dropped from the C output rather than aborting. Treat the
+    // end of such a function as UNIMPL: the guest may continue elsewhere.
+    let Some(instr) = self.block_last_instr(blkref) else { return vec![];};
 
     match instr.opcode {
       Opcode::RetFar | Opcode::RetNear => vec![],
@@ -115,7 +128,7 @@ impl IR {
     }
   }
 
-  pub fn block_instr_count(&mut self, blkref: BlockRef) -> usize {
+  pub fn block_instr_count(&self, blkref: BlockRef) -> usize {
     self.block(blkref).data.count()
   }
 
@@ -473,5 +486,23 @@ mod tests {
     let instr = ir.instr(phi).unwrap();
     assert_eq!(instr.opcode, Opcode::Phi);
     assert_eq!(instr.operands, vec![phi]);
+  }
+
+  #[test]
+  fn block_last_instr_empty_block_yields_none() {
+    // Blocks containing only pure moves lower to zero IR instructions, so an
+    // empty block is legitimate and must not panic (see start_next_blk).
+    let mut ir = test_ir();
+    let blk = ir.add_block("empty");
+    assert!(ir.block_last_instr(blk).is_none());
+  }
+
+  #[test]
+  fn block_exits_empty_block_has_no_exits() {
+    // An empty block is a jump whose target lies outside the decompiled
+    // range: control flow leaves the function here, so there are no exits.
+    let mut ir = test_ir();
+    let blk = ir.add_block("empty");
+    assert!(ir.block_exits(blk).is_empty());
   }
 }

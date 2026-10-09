@@ -127,6 +127,14 @@ pub struct SymbolMap {
 }
 
 impl SymbolMap {
+  /// (offset, size) of every stack slot below/around SP0 seen during
+  /// symbolization, including push-saves the optimizer may later remove.
+  /// Used to ground frame-size computation when surviving expression
+  /// mappings alone would describe a ragged frame. See ast::Builder.
+  pub fn local_extents(&self) -> Vec<(i32, u16)> {
+    self.locals.symbols.iter().map(|s| (s.off.into(), s.size)).collect()
+  }
+
   pub fn new() -> Self {
     let mut this = Self {
       params: SymbolTable::new(),

@@ -144,7 +144,11 @@ impl FuncDetails {
       end_addr_inferred: largest_addr,
       direct_calls,
       indirect_calls,
-      return_kind: return_kind.unwrap(),
+      // A function with no observed return either never returns (fatal-error
+      // helpers, exit paths) or ends in a tail jump. Default to Near: real-mode
+      // small-model code is near by construction, and any genuine far function
+      // contains an observable RETF. (TODO: track an explicit noreturn kind.)
+      return_kind: return_kind.unwrap_or(ReturnKind::Near),
     })
   }
 }
