@@ -107,6 +107,9 @@ impl IR {
     // decompiled range, so no instructions were decoded into it. It has no
     // exits: control flow leaves the function here. (Such blocks arise when
     // an annotated function end cuts mid-flow; see start_next_blk.)
+    // This is a deliberate robustness-over-precision tradeoff: the truncated
+    // tail jump is dropped from the C output rather than aborting. Treat the
+    // end of such a function as UNIMPL: the guest may continue elsewhere.
     let Some(last_ref) = self.block(blkref).data.last() else { return vec![]; };
 
     // Skip trailing Nops left by dead-code elimination: the last effective

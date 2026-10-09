@@ -736,6 +736,12 @@ impl IRBuilder<'_> {
   fn append_asm_instr(&mut self, ins: &instr::Instr) {
     //println!("## {}", intel_syntax::format(ins, &[], false).unwrap());
 
+    // Consume the push-cs marker first: it only describes the *immediately*
+    // following instruction (the `push cs; call near` far-call idiom). Taking
+    // it before the REP early-return below keeps e.g.
+    // `push cs; rep movs; call near` from misclassifying the later call.
+    let special = self.special.take();
+
     // REP-prefixed string instructions execute a counted loop with memory
     // effects we don't model yet. Lower to Unimpl (like RCL/SBB above) so
     // real binaries using `rep movs/stos/...` decompile with an explicit
@@ -746,8 +752,6 @@ impl IRBuilder<'_> {
       self.append_update_flags(vref);
       return;
     }
-
-    let special = self.special.take();
 
     // process simple unary operations
     if let Some(opcode) = simple_unary_operation(ins.opcode) {
@@ -1134,15 +1138,23 @@ impl IRBuilder<'_> {
         self.append_update_flags(vref);
       }
       instr::Opcode::OP_INS => {
-        let vref = self.append_instr(Type::U8, Opcode::Unimpl, vec![]);
-        self.append_update_flags(vref);
+        // Neither the value nor the SI/DI update is modeled; INS does not
+        // affect flags, so the flags value must be left intact.
+        self.append_instr(Type::Void, Opcode::Unimpl, vec![]);
       }
       instr::Opcode::OP_OUTS => {
-        let vref = self.append_instr(Type::Void, Opcode::Unimpl, vec![]);
-        self.append_update_flags(vref);
-      }
-      instr::Opcode::OP_STD | instr::Opcode::OP_STC | instr::Opcode::OP_CMC | instr::Opcode::OP_CLC => {
         self.append_instr(Type::Void, Opcode::Unimpl, vec![]);
+      }
+      instr::Opcode::OP_STD => {
+        // Direction flag is not modeled at all; no modeled value is affected.
+        self.append_instr(Type::Void, Opcode::Unimpl, vec![]);
+      }
+      instr::Opcode::OP_STC | instr::Opcode::OP_CLC | instr::Opcode::OP_CMC => {
+        // These set/clear/complement CF. The IR carries one opaque flags
+        // value, so redefining it here makes a subsequent jb/jae degrade to
+        // UNIMPL_FLAGS rather than silently reading a stale carry.
+        let marker = self.append_instr(Type::Void, Opcode::Unimpl, vec![]);
+        self.append_update_flags(marker);
       }
       instr::Opcode::OP_LODS => {
         let src = self.append_asm_src_operand(&ins.operands[1]);
