@@ -21,11 +21,10 @@ pub struct FuncDetails {
   pub indirect_calls:    usize,
   // None when no return instruction was observed (noreturn helper or
   // tail-jump exit): the call mode is not inferable from analysis and
-  // must not be guessed here. (An IRET-ending function is usually
-  // classified instead, by whatever RET/RETF decoding reaches past the
-  // IRET — see the Interrupt-arm comment in analyze.rs.) analyze.rs
-  // surfaces None as an explicit RET_UNKNOWN suggestion flag for the
-  // operator to resolve.
+  // must not be guessed here. (An IRET-ending function instead reports
+  // Some(ReturnKind::Interrupt); see Next::Return handling below.)
+  // analyze.rs surfaces None as an explicit RET_UNKNOWN suggestion flag
+  // for the operator to resolve.
   pub return_kind:       Option<ReturnKind>,
 }
 
@@ -228,6 +227,17 @@ mod tests {
     let binary = Binary::from_raw(&[0xEB, 0xFE], None);
     let details = FuncDetails::build(segoff(0), None, &test_seg(2), &binary).unwrap();
     assert_eq!(details.return_kind, None);
+  }
+
+  #[test]
+  fn iret_terminates_function_as_interrupt() {
+    // An interrupt handler ends at the IRET: discovery must stop there
+    // (end == 1) instead of decoding the trailing undecodable bytes, and
+    // the kind must be Interrupt rather than unknown.
+    let binary = Binary::from_raw(&[0xCF, 0xFF, 0xFF], None);
+    let details = FuncDetails::build(segoff(0), None, &test_seg(3), &binary).unwrap();
+    assert_eq!(details.return_kind, Some(ReturnKind::Interrupt));
+    assert_eq!(details.end_addr_inferred, segoff(1));
   }
 }
 

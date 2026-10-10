@@ -228,8 +228,7 @@ fn ret_kind_flags(kind: Option<ReturnKind>, configured: Option<CallMode>) -> &'s
     Some(ReturnKind::Far) => "",
     // An interrupt handler returns via IRET, not RET/RETF, so it has no
     // near/far call mode by construction: never inherit a configured mode.
-    // (Production reachability waits on #50: nothing constructs Interrupt
-    // yet, since OP_IRET falls through in instr_details.)
+    // (Produced by OP_IRET since #50; previously unreachable dead code.)
     Some(ReturnKind::Interrupt) => ", flags = \"RET_UNKNOWN\"",
     None => match configured {
       Some(CallMode::Near) => ", flags = \"RET_UNKNOWN_CONFIG_NEAR\"",
@@ -273,7 +272,15 @@ fn render_suggestion(
       (None, Some(CallMode::Far)) => " (keeping configured far)",
       _ => "",
     };
-    lines.push(format!("    # RET KIND UNKNOWN | {} | {} | {}{}; resolve the call mode from the call sites: near calls need flags = \"NEAR\", far calls need no flag", bare_name, addr, reason, kept));
+    // Interrupt handlers are CPU-dispatched via the IVT, never called, so
+    // "resolve from the call sites" would be wrong advice for them: the
+    // operator must pick a mode manually if the handler also needs to be
+    // analyzed as a called function.
+    let guidance = match kind {
+      Some(ReturnKind::Interrupt) => "CPU-dispatched via the IVT (not called); to analyze it as a called function, set the call mode manually: near calls need flags = \"NEAR\", far calls need no flag",
+      _ => "resolve the call mode from the call sites: near calls need flags = \"NEAR\", far calls need no flag",
+    };
+    lines.push(format!("    # RET KIND UNKNOWN | {} | {} | {}{}; {}", bare_name, addr, reason, kept, guidance));
   }
   lines.push(format!("    F( {:<30} {:<7} {:<12} {} {}{} ),", quoted_name, ret_str, args_str, start, end, flags));
   lines
@@ -423,6 +430,23 @@ mod tests {
     );
     assert_eq!(lines.len(), 1);
     assert!(lines[0].contains("NEAR"), "unexpected entry: {}", lines[0]);
+  }
+
+  #[test]
+  fn suggestion_gives_interrupt_specific_guidance() {
+    // Interrupt handlers are CPU-dispatched via the IVT, never called, so
+    // the diagnostic must not advise resolving from call sites — and must
+    // not inherit a configured mode, even when one is present.
+    let lines = render_suggestion(
+      "F_irq", segoff(0x400),
+      "\"F_irq\",", "None,", "None,", "\"0000:0400\",", "\"0000:0401\"",
+      Some(ReturnKind::Interrupt), ", flags = \"RET_UNKNOWN\"", Some(CallMode::Far),
+    );
+    assert_eq!(lines.len(), 2);
+    assert!(lines[0].contains("interrupt-return terminator"), "unexpected diagnostic: {}", lines[0]);
+    assert!(lines[0].contains("CPU-dispatched via the IVT"), "unexpected diagnostic: {}", lines[0]);
+    assert!(!lines[0].contains("keeping configured"), "interrupt must not inherit: {}", lines[0]);
+    assert!(lines[1].contains("RET_UNKNOWN"), "unexpected entry: {}", lines[1]);
   }
 
   #[test]
