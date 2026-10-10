@@ -37,17 +37,19 @@ impl CodeSegments {
       (Some(seginfo), Some(ovr)) => Self::from_overlay_info(seginfo, ovr),
       // Plain MZ image without FBOV metadata: a single segment covering the
       // whole load image, addressed relative to the load base (seg 0).
-      // Segment offsets are u16, so an image larger than 64K has no
-      // single-segment representation: reject upfront rather than panicking
-      // later in CodeSegment::end().
+      // Segment offsets are u16, so an image that needs offsets past 0xFFFF
+      // has no single-segment representation: reject upfront rather than
+      // panicking later in CodeSegment::end().
       _ => {
-        let size: u32 = exe.exe_data().len().try_into().unwrap();
-        if size > u16::MAX as u32 {
+        // usize comparison first: the narrowing below is then provably safe,
+        // with no panic-shaped try_into on the oversized path.
+        let size = exe.exe_data().len();
+        if size > u16::MAX as usize {
           return Err(format!(
-            "plain-MZ load image is {} bytes, larger than one 64K segment: analysis needs FBOV seginfo metadata (or a smaller image)",
+            "plain-MZ load image is {} bytes: no single 64K segment can cover it (segment offsets are u16); analysis needs FBOV seginfo metadata (or a smaller image)",
             size));
         }
-        let primary = Region { seg: Seg::Normal(0), skip_off: 0, size };
+        let primary = Region { seg: Seg::Normal(0), skip_off: 0, size: size as u32 };
         Ok(CodeSegments(vec![CodeSegment { primary, stub: None }]))
       }
     }
@@ -67,7 +69,7 @@ impl CodeSegments {
       // entry (maxoff < minoff) would panic in CodeSegment::end().
       if skip_off + size > u16::MAX as u32 {
         return Err(format!(
-          "seginfo segment {} spans {:#06x}..{:#06x}, larger than one 64K segment: corrupt FBOV metadata?",
+          "seginfo segment {} spans {:#06x}..{:#06x}: no single 64K segment can cover it (segment offsets are u16); corrupt FBOV metadata?",
           seg, skip_off, skip_off + size));
       }
       let region = Region {
@@ -188,7 +190,7 @@ mod tests {
   }
 
   #[test]
-  fn wrapped_seginfosegment_is_rejected_upfront() {
+  fn wrapped_seginfo_segment_is_rejected_upfront() {
     // Corrupt seginfo (maxoff < minoff) would wrap end() to a bogus offset;
     // reject with the segment named instead of panicking later.
     let mut exe = mz::Exe::decode(&synthetic_plain_mz_with_image(32)).expect("valid synthetic plain MZ");
