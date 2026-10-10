@@ -19,10 +19,13 @@ pub struct FuncDetails {
   pub end_addr_inferred: SegOff,
   pub direct_calls:      BTreeSet<SegOff>,
   pub indirect_calls:    usize,
-  // None when no return instruction was observed (noreturn helper, tail-jump
-  // exit, or IRET handler): the call mode is not inferable from analysis and
-  // must not be guessed here. analyze.rs surfaces it as an explicit
-  // RET_UNKNOWN suggestion flag for the operator to resolve.
+  // None when no return instruction was observed (noreturn helper or
+  // tail-jump exit): the call mode is not inferable from analysis and
+  // must not be guessed here. (An IRET-ending function is usually
+  // classified instead, by whatever RET/RETF decoding reaches past the
+  // IRET — see the Interrupt-arm comment in analyze.rs.) analyze.rs
+  // surfaces None as an explicit RET_UNKNOWN suggestion flag for the
+  // operator to resolve.
   pub return_kind:       Option<ReturnKind>,
 }
 

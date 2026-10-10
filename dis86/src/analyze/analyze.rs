@@ -247,7 +247,7 @@ fn generate_annotations(functions: &BTreeMap<SegOff, Result<FuncDetails, String>
           // Capture the bare name before the rebind below: the guidance
           // line follows the sibling `# IGNORED ...` comment styles, which
           // print the bare name, not the quoted padded form.
-          let bare_name = name.clone();
+          let bare_name = name.as_str();
           let name     = format!("\"{}\",", name);
           let start    = format!("\"{}\",", details.start_addr);
           let end      = format!("\"{}\"", details.end_addr_inferred);

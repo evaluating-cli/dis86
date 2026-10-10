@@ -526,12 +526,28 @@ fn parse_u16(s: &str) -> Result<u16, String> {
 mod tests {
   use super::*;
 
-  fn write_temp_config(name: &str, text: &str) -> std::path::PathBuf {
-    // Include the pid so concurrent `cargo test` invocations sharing TMPDIR
-    // (e.g. worktrees on one machine) cannot race on the same file.
-    let path = std::env::temp_dir().join(format!("{}_{}", name, std::process::id()));
-    std::fs::write(&path, text).unwrap();
-    path
+  // Removes the temp config on drop, so a failing assertion cannot leak
+  // the file into TMPDIR (house pattern, cf. DosemuProcess's Drop).
+  struct TempConfig(std::path::PathBuf);
+
+  impl TempConfig {
+    fn write(name: &str, text: &str) -> Self {
+      // Include the pid so concurrent `cargo test` invocations sharing TMPDIR
+      // (e.g. worktrees on one machine) cannot race on the same file.
+      let path = std::env::temp_dir().join(format!("{}_{}", name, std::process::id()));
+      std::fs::write(&path, text).unwrap();
+      TempConfig(path)
+    }
+
+    fn path(&self) -> &std::path::Path {
+      &self.0
+    }
+  }
+
+  impl Drop for TempConfig {
+    fn drop(&mut self) {
+      let _ = std::fs::remove_file(&self.0);
+    }
   }
 
   #[test]
@@ -540,7 +556,7 @@ mod tests {
     // analyzer could not infer. The BSL lexer has no comments, so the marker
     // is an inert extra property: the parser must ignore it and keep the
     // explicitly emitted interim mode.
-    let path = write_temp_config("dis86_ret_unknown_test.bsl", r#"
+    let tmp = TempConfig::write("dis86_ret_unknown_test.bsl", r#"
 dis86 {
   code_segments {
   }
@@ -556,8 +572,7 @@ dis86 {
   }
 }
 "#);
-    let cfg = Config::from_path(path.to_str().unwrap()).unwrap();
-    std::fs::remove_file(&path).unwrap();
+    let cfg = Config::from_path(tmp.path().to_str().unwrap()).unwrap();
     assert_eq!(cfg.funcs.len(), 2);
     assert_eq!(cfg.funcs[0].mode, CallMode::Near);
     assert_eq!(cfg.funcs[1].mode, CallMode::Far);
