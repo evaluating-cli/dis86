@@ -158,7 +158,7 @@ pub fn instr_details(ins: &Instr, binary: &Binary) -> Result<InstrDetails, Strin
     Opcode::OP_INT        => (),
     // Opcode::OP_INTO    => (),
     // Opcode::OP_INVAL   => (),
-    Opcode::OP_IRET       => (),
+    Opcode::OP_IRET       => ret = Some(ReturnKind::Interrupt),
     // Opcode::OP_JA      => (),
     // Opcode::OP_JAE     => (),
     // Opcode::OP_JB      => (),
@@ -285,5 +285,13 @@ mod tests {
     // `call +1` (E8 01 00) targets the `ret` at offset 3.
     let d = details_for(&[0xE8, 0x01, 0x00, 0xC3]);
     assert!(matches!(d.call, Some(Call::Direct(_))));
+  }
+
+  #[test]
+  fn iret_yields_interrupt_return() {
+    // `iret` (CF) terminates the block as an interrupt return, not a
+    // fallthrough: decoding must not continue past it.
+    let d = details_for(&[0xCF]);
+    assert!(matches!(d.next, Next::Return(ReturnKind::Interrupt)));
   }
 }

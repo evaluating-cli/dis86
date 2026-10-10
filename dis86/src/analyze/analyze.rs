@@ -226,11 +226,16 @@ fn ret_kind_flags(kind: Option<ReturnKind>, configured: Option<CallMode>) -> &'s
   match kind {
     Some(ReturnKind::Near) => ", flags = \"NEAR\"",
     Some(ReturnKind::Far) => "",
-    // An interrupt handler returns via IRET, not RET/RETF, so it has no
-    // near/far call mode by construction: never inherit a configured mode.
-    // (Production reachability waits on #50: nothing constructs Interrupt
-    // yet, since OP_IRET falls through in instr_details.)
-    Some(ReturnKind::Interrupt) => ", flags = \"RET_UNKNOWN\"",
+    // An interrupt handler returns via IRET, not RET/RETF, so the IRET
+    // itself implies no near/far call mode: never *guess* from the kind.
+    // An operator-configured mode is still inherited (with the unresolved
+    // marker), so resolving a handler's mode survives regeneration exactly
+    // like a plain unknown (see the None arm below).
+    Some(ReturnKind::Interrupt) => match configured {
+      Some(CallMode::Near) => ", flags = \"RET_UNKNOWN_CONFIG_NEAR\"",
+      Some(CallMode::Far) => ", flags = \"RET_UNKNOWN_CONFIG_FAR\"",
+      None => ", flags = \"RET_UNKNOWN\"",
+    },
     None => match configured {
       Some(CallMode::Near) => ", flags = \"RET_UNKNOWN_CONFIG_NEAR\"",
       Some(CallMode::Far) => ", flags = \"RET_UNKNOWN_CONFIG_FAR\"",
@@ -266,14 +271,23 @@ fn render_suggestion(
       Some(ReturnKind::Interrupt) => "interrupt-return terminator; no near/far call mode applies",
       _ => "no return instruction observed (noreturn helper or tail-jump exit)",
     };
-    // The "keeping configured" note only applies to plain unknown:
-    // interrupt handlers never inherit a configured mode (see above).
+    // The "keeping configured" note applies to plain unknown and to
+    // interrupt handlers alike: both preserve the operator's mode while
+    // carrying the unresolved marker.
     let kept = match (kind, configured) {
-      (None, Some(CallMode::Near)) => " (keeping configured near)",
-      (None, Some(CallMode::Far)) => " (keeping configured far)",
+      (None | Some(ReturnKind::Interrupt), Some(CallMode::Near)) => " (keeping configured near)",
+      (None | Some(ReturnKind::Interrupt), Some(CallMode::Far)) => " (keeping configured far)",
       _ => "",
     };
-    lines.push(format!("    # RET KIND UNKNOWN | {} | {} | {}{}; resolve the call mode from the call sites: near calls need flags = \"NEAR\", far calls need no flag", bare_name, addr, reason, kept));
+    // Interrupt handlers are CPU-dispatched via the IVT, never called, so
+    // "resolve from the call sites" would be wrong advice for them: the
+    // operator must pick a mode manually if the handler also needs to be
+    // analyzed as a called function.
+    let guidance = match kind {
+      Some(ReturnKind::Interrupt) => "CPU-dispatched via the IVT (not called); to analyze it as a called function, set the call mode manually: near calls need flags = \"NEAR\", far calls need no flag",
+      _ => "resolve the call mode from the call sites: near calls need flags = \"NEAR\", far calls need no flag",
+    };
+    lines.push(format!("    # RET KIND UNKNOWN | {} | {} | {}{}; {}", bare_name, addr, reason, kept, guidance));
   }
   lines.push(format!("    F( {:<30} {:<7} {:<12} {} {}{} ),", quoted_name, ret_str, args_str, start, end, flags));
   lines
@@ -376,11 +390,12 @@ mod tests {
     // regeneration never downgrades the decision back to unresolved.
     assert_eq!(ret_kind_flags(None, Some(CallMode::Near)), ", flags = \"RET_UNKNOWN_CONFIG_NEAR\"");
     assert_eq!(ret_kind_flags(None, Some(CallMode::Far)), ", flags = \"RET_UNKNOWN_CONFIG_FAR\"");
-    // Interrupt handlers have no call mode by construction: never inherit,
-    // even when a mode happens to be configured.
+    // Interrupt handlers: the IRET itself implies no mode (never guess),
+    // but an operator-configured mode is inherited with the marker, so a
+    // manual resolution survives regeneration like a plain unknown.
     assert_eq!(ret_kind_flags(Some(ReturnKind::Interrupt), None), ", flags = \"RET_UNKNOWN\"");
-    assert_eq!(ret_kind_flags(Some(ReturnKind::Interrupt), Some(CallMode::Near)), ", flags = \"RET_UNKNOWN\"");
-    assert_eq!(ret_kind_flags(Some(ReturnKind::Interrupt), Some(CallMode::Far)), ", flags = \"RET_UNKNOWN\"");
+    assert_eq!(ret_kind_flags(Some(ReturnKind::Interrupt), Some(CallMode::Near)), ", flags = \"RET_UNKNOWN_CONFIG_NEAR\"");
+    assert_eq!(ret_kind_flags(Some(ReturnKind::Interrupt), Some(CallMode::Far)), ", flags = \"RET_UNKNOWN_CONFIG_FAR\"");
   }
 
   fn segoff(off: u16) -> SegOff {
@@ -423,6 +438,33 @@ mod tests {
     );
     assert_eq!(lines.len(), 1);
     assert!(lines[0].contains("NEAR"), "unexpected entry: {}", lines[0]);
+  }
+
+  #[test]
+  fn suggestion_gives_interrupt_specific_guidance() {
+    // Interrupt handlers are CPU-dispatched via the IVT, never called, so
+    // the diagnostic must not advise resolving from call sites. A
+    // configured mode is still inherited (with the marker) so a manual
+    // resolution survives regeneration; unconfigured stays plain unknown.
+    let lines = render_suggestion(
+      "F_irq", segoff(0x400),
+      "\"F_irq\",", "None,", "None,", "\"0000:0400\",", "\"0000:0401\"",
+      Some(ReturnKind::Interrupt), ", flags = \"RET_UNKNOWN_CONFIG_FAR\"", Some(CallMode::Far),
+    );
+    assert_eq!(lines.len(), 2);
+    assert!(lines[0].contains("interrupt-return terminator"), "unexpected diagnostic: {}", lines[0]);
+    assert!(lines[0].contains("CPU-dispatched via the IVT"), "unexpected diagnostic: {}", lines[0]);
+    assert!(lines[0].contains("(keeping configured far)"), "unexpected diagnostic: {}", lines[0]);
+    assert!(lines[1].contains("RET_UNKNOWN_CONFIG_FAR"), "unexpected entry: {}", lines[1]);
+
+    let unconfigured = render_suggestion(
+      "F_irq2", segoff(0x500),
+      "\"F_irq2\",", "None,", "None,", "\"0000:0500\",", "\"0000:0501\"",
+      Some(ReturnKind::Interrupt), ", flags = \"RET_UNKNOWN\"", None,
+    );
+    assert_eq!(unconfigured.len(), 2);
+    assert!(!unconfigured[0].contains("keeping configured"), "unexpected diagnostic: {}", unconfigured[0]);
+    assert!(unconfigured[1].contains("\"RET_UNKNOWN\""), "unexpected entry: {}", unconfigured[1]);
   }
 
   #[test]
