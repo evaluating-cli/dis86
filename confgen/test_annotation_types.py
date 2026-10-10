@@ -122,7 +122,8 @@ class RetUnknownFlagTests(unittest.TestCase):
     def test_ret_unknown_table_stays_consistent_across_consumers(self):
         # The shared RET_UNKNOWN_MODES contract: every flag the analyzer can
         # emit must map to an interim mode in the BSL and to matching C
-        # callstub flags, both marked unresolved.
+        # callstub flags, both marked unresolved — and the C TODO must name
+        # the same interim mode (never a hard-coded NEAR on a far interim).
         from hydra.annotations import RET_UNKNOWN_MODES
         for i, (flag, (mode, cflags)) in enumerate(RET_UNKNOWN_MODES.items()):
             name = f'ret_unknown_tbl_{i}'
@@ -133,6 +134,14 @@ class RetUnknownFlagTests(unittest.TestCase):
             dat = build_func_data([self._func(f'{name}_cs', flag)])
             self.assertEqual(dat[0].flags, cflags)
             self.assertTrue(dat[0].ret_unknown)
+            self.assertEqual(dat[0].interim, mode.upper())
+            output = io.StringIO()
+            gen_hdr({
+                'functions': [self._func(f'{name}_hdr', flag)],
+                'structures': [], 'data_section': [], 'callstack': [],
+            }, out=output)
+            stub_line = next(l for l in output.getvalue().splitlines() if f'{name}_hdr' in l and 'CALLSTUB' in l)
+            self.assertIn(f'interim {mode.upper()}', stub_line)
 
     def test_near_and_default_modes_unchanged(self):
         text = self._gen_functions_text([
