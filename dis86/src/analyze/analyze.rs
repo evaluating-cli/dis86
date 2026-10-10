@@ -244,18 +244,26 @@ fn generate_annotations(functions: &BTreeMap<SegOff, Result<FuncDetails, String>
           println!("start: {}  end: {}  indirect_calls: {}",
                    details.start_addr, details.end_addr_inferred, details.indirect_calls);
         } else {
+          // Capture the bare name before the rebind below: the guidance
+          // line follows the sibling `# IGNORED ...` comment styles, which
+          // print the bare name, not the quoted padded form.
+          let bare_name = name.clone();
           let name     = format!("\"{}\",", name);
           let start    = format!("\"{}\",", details.start_addr);
           let end      = format!("\"{}\"", details.end_addr_inferred);
           let flags    = match details.return_kind {
             Some(ReturnKind::Near) => ", flags = \"NEAR\"",
             Some(ReturnKind::Far) => "",
-            // Unknown — and likewise Interrupt, whose call mode is equally
-            // uninferable — is never silently mapped to a mode: RET_UNKNOWN
-            // marks the suggestion for the operator to resolve (confgen
-            // treats it as an interim near with a visible marker until then).
+            // Unknown is never silently mapped to a mode: RET_UNKNOWN marks
+            // the suggestion for the operator to resolve (confgen treats it
+            // as an interim near with a visible marker until then).
+            // Interrupt rides along: any such function would face the same
+            // uninferable call mode — but note this arm is currently
+            // unconstructed (instr_details only emits Near/Far; OP_IRET is a
+            // fallthrough, so an iret-ending function is usually classified
+            // by whatever RET/RETF decoding reaches past the IRET).
             Some(ReturnKind::Interrupt) | None => {
-              println!("    # RET KIND UNKNOWN | {} | {} | no return instruction observed (noreturn, tail-jump exit, or IRET handler); resolve the call mode from the call sites: near calls need flags = \"NEAR\", far calls need no flag", name, addr);
+              println!("    # RET KIND UNKNOWN | {} | {} | no return instruction observed (noreturn helper or tail-jump exit); resolve the call mode from the call sites: near calls need flags = \"NEAR\", far calls need no flag", bare_name, addr);
               ", flags = \"RET_UNKNOWN\""
             }
           };

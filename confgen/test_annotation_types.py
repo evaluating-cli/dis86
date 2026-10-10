@@ -86,7 +86,8 @@ class AnnotationTypeTests(unittest.TestCase):
 
 class RetUnknownFlagTests(unittest.TestCase):
     def _func(self, name, flags):
-        return Function(False, name, None, None, '0000:1234', '0000:1300', flags=flags)
+        return Function(reimpl=False, name=name, ret=None, args=None,
+                        start_addr='0000:1234', end_addr='0000:1300', flags=flags)
 
     def _gen_functions_text(self, funcs):
         buf = io.StringIO()

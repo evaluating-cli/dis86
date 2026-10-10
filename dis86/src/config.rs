@@ -527,7 +527,9 @@ mod tests {
   use super::*;
 
   fn write_temp_config(name: &str, text: &str) -> std::path::PathBuf {
-    let path = std::env::temp_dir().join(name);
+    // Include the pid so concurrent `cargo test` invocations sharing TMPDIR
+    // (e.g. worktrees on one machine) cannot race on the same file.
+    let path = std::env::temp_dir().join(format!("{}_{}", name, std::process::id()));
     std::fs::write(&path, text).unwrap();
     path
   }
