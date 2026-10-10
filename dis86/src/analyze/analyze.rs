@@ -213,27 +213,78 @@ impl FunctionNames {
 }
 
 /// Suggestion flags for the annotations format, from the analysis' return
-/// kind and any already-configured mode. Observed kinds are authoritative;
-/// an unknown kind defers to the operator's resolved mode so regeneration
-/// never downgrades a decision back to unresolved. Far is confgen's no-flag
-/// default; the RET_UNKNOWN marker is the cross-language contract confgen
-/// branches on (interim near + visible marker until resolved).
+/// kind and any already-configured mode. Observed kinds are authoritative.
+/// An unknown kind never downgrades an operator-resolved mode, but the
+/// unresolved state must still persist: plain RET_UNKNOWN reaches only
+/// newly-discovered functions, while RET_UNKNOWN_CONFIG_* preserve the
+/// configured mode *and* carry the unresolved state, so confgen keeps
+/// emitting the marker until the operator resolves the flag itself.
+/// (See RET_UNKNOWN_MODES in confgen/hydra/annotations.py for the
+/// cross-language contract: BSL mode + greppable marker + C TODO comment.)
 fn ret_kind_flags(kind: Option<ReturnKind>, configured: Option<CallMode>) -> &'static str {
   match kind {
     Some(ReturnKind::Near) => ", flags = \"NEAR\"",
     Some(ReturnKind::Far) => "",
     // An interrupt handler returns via IRET, not RET/RETF, so it has no
     // near/far call mode by construction: never inherit a configured mode.
+    // (Production reachability waits on #50: nothing constructs Interrupt
+    // yet, since OP_IRET falls through in instr_details.)
     Some(ReturnKind::Interrupt) => ", flags = \"RET_UNKNOWN\"",
-    // Unknown defers to an operator-resolved mode so regeneration never
-    // downgrades a decision; only unresolved-and-unknown emits the marker
-    // that confgen branches on.
     None => match configured {
-      Some(CallMode::Near) => ", flags = \"NEAR\"",
-      Some(CallMode::Far) => "",
+      Some(CallMode::Near) => ", flags = \"RET_UNKNOWN_CONFIG_NEAR\"",
+      Some(CallMode::Far) => ", flags = \"RET_UNKNOWN_CONFIG_FAR\"",
       None => ", flags = \"RET_UNKNOWN\"",
     },
   }
+}
+
+/// Renders one analyzed function's suggestion output as ordered lines: the
+/// unknown-kind diagnostic first (when applicable), then the F(...) entry.
+/// Pure for testability — the caller only prints. Documents the
+/// incomplete-inventory caveat: indirect-call and error branches (rendered
+/// by render_ignored_indirect/render_ignored_error below) emit no F(...)
+/// line at all, so grepping the output is not a complete inventory of
+/// unresolved call modes.
+fn render_suggestion(
+  bare_name: &str,
+  addr: SegOff,
+  quoted_name: &str,
+  ret_str: &str,
+  args_str: &str,
+  start: &str,
+  end: &str,
+  kind: Option<ReturnKind>,
+  flags: &str,
+  configured: Option<CallMode>,
+) -> Vec<String> {
+  let mut lines = vec![];
+  if matches!(kind, None | Some(ReturnKind::Interrupt)) {
+    // The diagnostic always prints: it is the operator signal, even when a
+    // configured mode is preserved below.
+    let reason = match kind {
+      Some(ReturnKind::Interrupt) => "interrupt-return terminator; no near/far call mode applies",
+      _ => "no return instruction observed (noreturn helper or tail-jump exit)",
+    };
+    // The "keeping configured" note only applies to plain unknown:
+    // interrupt handlers never inherit a configured mode (see above).
+    let kept = match (kind, configured) {
+      (None, Some(CallMode::Near)) => " (keeping configured near)",
+      (None, Some(CallMode::Far)) => " (keeping configured far)",
+      _ => "",
+    };
+    lines.push(format!("    # RET KIND UNKNOWN | {} | {} | {}{}; resolve the call mode from the call sites: near calls need flags = \"NEAR\", far calls need no flag", bare_name, addr, reason, kept));
+  }
+  lines.push(format!("    F( {:<30} {:<7} {:<12} {} {}{} ),", quoted_name, ret_str, args_str, start, end, flags));
+  lines
+}
+
+fn render_ignored_indirect(name: &str, addr: SegOff, start: SegOff, end: SegOff, indirect_calls: usize) -> String {
+  format!("    # IGNORED INDIRECT CALLS | {} | {} | start: {}  end: {}  indirect_calls: {}",
+    name, addr, start, end, indirect_calls)
+}
+
+fn render_ignored_error(name: &str, addr: SegOff, err: &str) -> String {
+  format!("    # IGNORED ERROR | {} | {} | error: '{}'", name, addr, err)
 }
 
 fn generate_annotations(functions: &BTreeMap<SegOff, Result<FuncDetails, String>>, cfg: &Config) {
@@ -264,9 +315,7 @@ fn generate_annotations(functions: &BTreeMap<SegOff, Result<FuncDetails, String>
     match result {
       Ok(details) => {
         if details.indirect_calls > 0 {
-          print!("    # IGNORED INDIRECT CALLS | {} | {} | ", name, addr);
-          println!("start: {}  end: {}  indirect_calls: {}",
-                   details.start_addr, details.end_addr_inferred, details.indirect_calls);
+          println!("{}", render_ignored_indirect(&name, *addr, details.start_addr, details.end_addr_inferred, details.indirect_calls));
         } else {
           // Capture the bare name before the rebind below: the guidance
           // line follows the sibling `# IGNORED ...` comment styles, which
@@ -275,23 +324,7 @@ fn generate_annotations(functions: &BTreeMap<SegOff, Result<FuncDetails, String>
           let name     = format!("\"{}\",", name);
           let start    = format!("\"{}\",", details.start_addr);
           let end      = format!("\"{}\"", details.end_addr_inferred);
-          let flags = ret_kind_flags(details.return_kind, configured_mode);
-          if matches!(details.return_kind, None | Some(ReturnKind::Interrupt)) {
-            // The diagnostic always prints: it is the operator signal, even
-            // when a configured mode is preserved below.
-            let reason = match details.return_kind {
-              Some(ReturnKind::Interrupt) => "interrupt-return terminator; no near/far call mode applies",
-              _ => "no return instruction observed (noreturn helper or tail-jump exit)",
-            };
-            // The "keeping configured" note only applies to plain unknown:
-            // interrupt handlers never inherit a configured mode (see above).
-            let kept = match (details.return_kind, configured_mode) {
-              (None, Some(CallMode::Near)) => " (keeping configured near)",
-              (None, Some(CallMode::Far)) => " (keeping configured far)",
-              _ => "",
-            };
-            println!("    # RET KIND UNKNOWN | {} | {} | {}{}; resolve the call mode from the call sites: near calls need flags = \"NEAR\", far calls need no flag", bare_name, addr, reason, kept);
-          }
+          let flags    = ret_kind_flags(details.return_kind, configured_mode);
 
           let ret_str  = match ret {
             Some(ret) => format!("\"{}\",", ret),
@@ -303,11 +336,16 @@ fn generate_annotations(functions: &BTreeMap<SegOff, Result<FuncDetails, String>
             None       => "None,".to_string(),
           };
 
-          println!("    F( {:<30} {:<7} {:<12} {} {}{} ),", name, ret_str, args_str, start, end, flags);
+          for line in render_suggestion(
+            bare_name, *addr, &name, &ret_str, &args_str, &start, &end,
+            details.return_kind, flags, configured_mode,
+          ) {
+            println!("{}", line);
+          }
         }
       }
       Err(err) => {
-        println!("    # IGNORED ERROR | {} | {} | error: '{}'", name, addr, err);
+        println!("{}", render_ignored_error(&name, *addr, err));
       }
     }
   }
@@ -328,17 +366,74 @@ mod tests {
 
   #[test]
   fn ret_kind_flags_unknown_defers_to_configured_mode() {
-    // Unresolved and unconfigured: the RET_UNKNOWN marker confgen branches
-    // on (interim near + visible marker until the operator resolves it).
+    // Unresolved and unconfigured: the plain RET_UNKNOWN marker confgen
+    // branches on (interim near + visible marker until the operator
+    // resolves it).
     assert_eq!(ret_kind_flags(None, None), ", flags = \"RET_UNKNOWN\"");
-    // Unresolved but already configured: preserve the operator's decision
-    // so regeneration never downgrades it back to unresolved.
-    assert_eq!(ret_kind_flags(None, Some(CallMode::Near)), ", flags = \"NEAR\"");
-    assert_eq!(ret_kind_flags(None, Some(CallMode::Far)), "");
+    // Unresolved but already configured: preserve the configured mode *and*
+    // carry the unresolved state, so confgen keeps emitting the marker and
+    // regeneration never downgrades the decision back to unresolved.
+    assert_eq!(ret_kind_flags(None, Some(CallMode::Near)), ", flags = \"RET_UNKNOWN_CONFIG_NEAR\"");
+    assert_eq!(ret_kind_flags(None, Some(CallMode::Far)), ", flags = \"RET_UNKNOWN_CONFIG_FAR\"");
     // Interrupt handlers have no call mode by construction: never inherit,
     // even when a mode happens to be configured.
     assert_eq!(ret_kind_flags(Some(ReturnKind::Interrupt), None), ", flags = \"RET_UNKNOWN\"");
     assert_eq!(ret_kind_flags(Some(ReturnKind::Interrupt), Some(CallMode::Near)), ", flags = \"RET_UNKNOWN\"");
     assert_eq!(ret_kind_flags(Some(ReturnKind::Interrupt), Some(CallMode::Far)), ", flags = \"RET_UNKNOWN\"");
+  }
+
+  fn segoff(off: u16) -> SegOff {
+    use crate::segoff::Off;
+    SegOff { seg: Seg::Normal(0), off: Off(off) }
+  }
+
+  #[test]
+  fn suggestion_renders_diagnostic_before_entry_with_bare_name() {
+    let lines = render_suggestion(
+      "F_new", segoff(0x100),
+      "\"F_new\",", "None,", "None,", "\"0000:0100\",", "\"0000:0110\"",
+      None, ", flags = \"RET_UNKNOWN\"", None,
+    );
+    assert_eq!(lines.len(), 2);
+    assert!(lines[0].starts_with("    # RET KIND UNKNOWN | F_new | 0000:0100 | no return instruction observed"),
+      "unexpected diagnostic: {}", lines[0]);
+    assert!(lines[1].starts_with("    F( "), "unexpected entry: {}", lines[1]);
+    assert!(lines[1].contains("RET_UNKNOWN"), "unexpected entry: {}", lines[1]);
+  }
+
+  #[test]
+  fn suggestion_preserves_configured_mode_with_kept_note() {
+    let lines = render_suggestion(
+      "F_cfg", segoff(0x200),
+      "\"F_cfg\",", "None,", "None,", "\"0000:0200\",", "\"0000:0210\"",
+      None, ", flags = \"RET_UNKNOWN_CONFIG_FAR\"", Some(CallMode::Far),
+    );
+    assert_eq!(lines.len(), 2);
+    assert!(lines[0].contains("(keeping configured far)"), "unexpected diagnostic: {}", lines[0]);
+    assert!(lines[1].contains("RET_UNKNOWN_CONFIG_FAR"), "unexpected entry: {}", lines[1]);
+  }
+
+  #[test]
+  fn suggestion_omits_diagnostic_for_known_kinds() {
+    let lines = render_suggestion(
+      "F_known", segoff(0x300),
+      "\"F_known\",", "None,", "None,", "\"0000:0300\",", "\"0000:0310\"",
+      Some(ReturnKind::Near), ", flags = \"NEAR\"", Some(CallMode::Near),
+    );
+    assert_eq!(lines.len(), 1);
+    assert!(lines[0].contains("NEAR"), "unexpected entry: {}", lines[0]);
+  }
+
+  #[test]
+  fn ignored_branches_emit_no_suggestion_line() {
+    // Documents the incomplete-inventory caveat: these branches emit only
+    // their comment line, so grepping suggestion output for unresolved
+    // modes misses them by construction.
+    let indirect = render_ignored_indirect("F_ind", segoff(0), segoff(0), segoff(0x10), 2);
+    assert!(indirect.contains("IGNORED INDIRECT CALLS"), "unexpected line: {}", indirect);
+    assert!(!indirect.contains("F("), "unexpected suggestion line: {}", indirect);
+    let err = render_ignored_error("F_err", segoff(0), "boom");
+    assert!(err.contains("IGNORED ERROR"), "unexpected line: {}", err);
+    assert!(!err.contains("F("), "unexpected suggestion line: {}", err);
   }
 }

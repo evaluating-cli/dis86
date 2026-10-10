@@ -106,6 +106,34 @@ class RetUnknownFlagTests(unittest.TestCase):
         self.assertIn('mode near', text)
         self.assertIn('ret_kind_unknown 1', text)
 
+    def test_ret_unknown_config_flags_preserve_mode_with_marker(self):
+        # Configured-but-unconfirmed modes keep their interim mode *and*
+        # carry the marker, so regeneration neither downgrades the operator
+        # decision nor loses the unresolved state.
+        near_text = self._gen_functions_text([self._func('ret_unknown_cn', 'RET_UNKNOWN_CONFIG_NEAR')])
+        near_line = next(l for l in near_text.splitlines() if 'ret_unknown_cn' in l)
+        self.assertIn('mode near', near_line)
+        self.assertIn('ret_kind_unknown 1', near_line)
+        far_text = self._gen_functions_text([self._func('ret_unknown_cf', 'RET_UNKNOWN_CONFIG_FAR')])
+        far_line = next(l for l in far_text.splitlines() if 'ret_unknown_cf' in l)
+        self.assertIn('mode far', far_line)
+        self.assertIn('ret_kind_unknown 1', far_line)
+
+    def test_ret_unknown_table_stays_consistent_across_consumers(self):
+        # The shared RET_UNKNOWN_MODES contract: every flag the analyzer can
+        # emit must map to an interim mode in the BSL and to matching C
+        # callstub flags, both marked unresolved.
+        from hydra.annotations import RET_UNKNOWN_MODES
+        for i, (flag, (mode, cflags)) in enumerate(RET_UNKNOWN_MODES.items()):
+            name = f'ret_unknown_tbl_{i}'
+            text = self._gen_functions_text([self._func(name, flag)])
+            line = next(l for l in text.splitlines() if name in l)
+            self.assertIn(f'mode {mode}', line)
+            self.assertIn('ret_kind_unknown 1', line)
+            dat = build_func_data([self._func(f'{name}_cs', flag)])
+            self.assertEqual(dat[0].flags, cflags)
+            self.assertTrue(dat[0].ret_unknown)
+
     def test_near_and_default_modes_unchanged(self):
         text = self._gen_functions_text([
             self._func('ret_unknown_near_b', 'NEAR'),

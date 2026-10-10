@@ -1,5 +1,7 @@
 import sys
 
+from hydra.annotations import RET_UNKNOWN_MODES
+
 ## MUST BE SET BY SETUP!
 out = None
 def emit(s): print(s, file=out)
@@ -25,13 +27,13 @@ def gen_functions(functions):
         mode = 'far'
         if func.flags == 'NEAR':
             mode = 'near'
-        if func.flags == 'RET_UNKNOWN':
-            # Interim default: small-model near, matching the pre-flagging
-            # behavior. Explicitly mapped (NOT the fall-through default) so a
-            # future default change cannot silently flip noreturn functions.
-            # The marker is inert to the Rust parser (key lookups) but keeps
-            # the unresolved state visible and greppable in the generated BSL.
-            mode = 'near'
+        if func.flags in RET_UNKNOWN_MODES:
+            # Unresolved return kind: interim mode (never the fall-through
+            # default, which would silently flip these functions) plus an
+            # inert greppable marker. Operator decisions are preserved by
+            # the flag itself (see RET_UNKNOWN_MODES); the marker only
+            # records that the mode is interim.
+            mode, _cflags = RET_UNKNOWN_MODES[func.flags]
             extra += 'ret_kind_unknown 1 '
         start = '""' if not func.start_addr else func.start_addr
         end = '""' if not func.end_addr else func.end_addr
