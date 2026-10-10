@@ -530,11 +530,17 @@ mod tests {
   // the file into TMPDIR (house pattern, cf. DosemuProcess's Drop).
   struct TempConfig(std::path::PathBuf);
 
+  // Disambiguates temp files beyond the pid: unit tests in one binary share
+  // a pid across threads, so a second test reusing the same name would race
+  // without this.
+  static TEMP_CONFIG_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
   impl TempConfig {
     fn write(name: &str, text: &str) -> Self {
       // Include the pid so concurrent `cargo test` invocations sharing TMPDIR
       // (e.g. worktrees on one machine) cannot race on the same file.
-      let path = std::env::temp_dir().join(format!("{}_{}", name, std::process::id()));
+      let n = TEMP_CONFIG_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+      let path = std::env::temp_dir().join(format!("{}_{}_{}", name, std::process::id(), n));
       std::fs::write(&path, text).unwrap();
       TempConfig(path)
     }

@@ -222,7 +222,13 @@ fn ret_kind_flags(kind: Option<ReturnKind>, configured: Option<CallMode>) -> &'s
   match kind {
     Some(ReturnKind::Near) => ", flags = \"NEAR\"",
     Some(ReturnKind::Far) => "",
-    _ => match configured {
+    // An interrupt handler returns via IRET, not RET/RETF, so it has no
+    // near/far call mode by construction: never inherit a configured mode.
+    Some(ReturnKind::Interrupt) => ", flags = \"RET_UNKNOWN\"",
+    // Unknown defers to an operator-resolved mode so regeneration never
+    // downgrades a decision; only unresolved-and-unknown emits the marker
+    // that confgen branches on.
+    None => match configured {
       Some(CallMode::Near) => ", flags = \"NEAR\"",
       Some(CallMode::Far) => "",
       None => ", flags = \"RET_UNKNOWN\"",
@@ -277,10 +283,12 @@ fn generate_annotations(functions: &BTreeMap<SegOff, Result<FuncDetails, String>
               Some(ReturnKind::Interrupt) => "interrupt-return terminator; no near/far call mode applies",
               _ => "no return instruction observed (noreturn helper or tail-jump exit)",
             };
-            let kept = match configured_mode {
-              Some(CallMode::Near) => " (keeping configured near)",
-              Some(CallMode::Far) => " (keeping configured far)",
-              None => "",
+            // The "keeping configured" note only applies to plain unknown:
+            // interrupt handlers never inherit a configured mode (see above).
+            let kept = match (details.return_kind, configured_mode) {
+              (None, Some(CallMode::Near)) => " (keeping configured near)",
+              (None, Some(CallMode::Far)) => " (keeping configured far)",
+              _ => "",
             };
             println!("    # RET KIND UNKNOWN | {} | {} | {}{}; resolve the call mode from the call sites: near calls need flags = \"NEAR\", far calls need no flag", bare_name, addr, reason, kept);
           }
@@ -323,10 +331,14 @@ mod tests {
     // Unresolved and unconfigured: the RET_UNKNOWN marker confgen branches
     // on (interim near + visible marker until the operator resolves it).
     assert_eq!(ret_kind_flags(None, None), ", flags = \"RET_UNKNOWN\"");
-    assert_eq!(ret_kind_flags(Some(ReturnKind::Interrupt), None), ", flags = \"RET_UNKNOWN\"");
     // Unresolved but already configured: preserve the operator's decision
     // so regeneration never downgrades it back to unresolved.
     assert_eq!(ret_kind_flags(None, Some(CallMode::Near)), ", flags = \"NEAR\"");
     assert_eq!(ret_kind_flags(None, Some(CallMode::Far)), "");
+    // Interrupt handlers have no call mode by construction: never inherit,
+    // even when a mode happens to be configured.
+    assert_eq!(ret_kind_flags(Some(ReturnKind::Interrupt), None), ", flags = \"RET_UNKNOWN\"");
+    assert_eq!(ret_kind_flags(Some(ReturnKind::Interrupt), Some(CallMode::Near)), ", flags = \"RET_UNKNOWN\"");
+    assert_eq!(ret_kind_flags(Some(ReturnKind::Interrupt), Some(CallMode::Far)), ", flags = \"RET_UNKNOWN\"");
   }
 }
