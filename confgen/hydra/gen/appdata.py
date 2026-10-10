@@ -1,5 +1,7 @@
 import sys
 
+from hydra.annotations import RET_UNKNOWN_MODES
+
 class FuncData:
     def __init__(self, func, name, entry):
         self.name = name
@@ -8,7 +10,16 @@ class FuncData:
         self.overlay = str(int(entry.overlay))
         self.seg = f'0x{entry.seg:04x}'
         self.off = f'0x{entry.off:04x}'
-        self.flags = str(func.flags)
+        # RET_UNKNOWN* must never reach the C HYDRA_DEFINE_CALLSTUB bitmask
+        # (it has no C macro meaning). Interim bitmask matches the BSL
+        # interim mode in RET_UNKNOWN_MODES; the unresolved state is
+        # recorded for the header TODO comment instead.
+        if func.flags in RET_UNKNOWN_MODES:
+            _mode, self.flags = RET_UNKNOWN_MODES[func.flags]
+            self.ret_unknown = True
+        else:
+            self.flags = str(func.flags)
+            self.ret_unknown = False
 
 def build_func_data(functions):
     dat = []
@@ -48,7 +59,8 @@ def gen_hdr(data, out=None):
     emit('/**************************************************************************************************************/')
     for func in func_data:
         addr = f'ADDR_MAKE_EXT({func.overlay}, {func.seg}, {func.off})'
-        emit(f'HYDRA_DEFINE_CALLSTUB( {func.name+",":30} {func.ret+",":8} {func.args+",":10} {addr}, {func.flags:15} )')
+        todo = ' /* TODO: return kind unknown; interim NEAR, resolve the call mode from the call sites */' if func.ret_unknown else ''
+        emit(f'HYDRA_DEFINE_CALLSTUB( {func.name+",":30} {func.ret+",":8} {func.args+",":10} {addr}, {func.flags:15} ){todo}')
     emit('')
 
     emit('/**************************************************************************************************************/')

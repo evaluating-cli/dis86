@@ -4,3 +4,6 @@
 .DS_Store
 build/
 /dosemu2/
+# Local benchmark/session artifacts: never committed, never added.
+/FCD.EXE
+/codex-session-*.md

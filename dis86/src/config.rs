@@ -521,3 +521,66 @@ fn parse_u16(s: &str) -> Result<u16, String> {
     s.parse().map_err(|err: std::num::ParseIntError| err.to_string())
   }
 }
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  // Removes the temp config on drop, so a failing assertion cannot leak
+  // the file into TMPDIR (house pattern, cf. DosemuProcess's Drop).
+  struct TempConfig(std::path::PathBuf);
+
+  // Disambiguates temp files beyond the pid: unit tests in one binary share
+  // a pid across threads, so a second test reusing the same name would race
+  // without this.
+  static TEMP_CONFIG_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+  impl TempConfig {
+    fn write(name: &str, text: &str) -> Self {
+      // Include the pid so concurrent `cargo test` invocations sharing TMPDIR
+      // (e.g. worktrees on one machine) cannot race on the same file.
+      let n = TEMP_CONFIG_SEQ.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+      let path = std::env::temp_dir().join(format!("{}_{}_{}", name, std::process::id(), n));
+      std::fs::write(&path, text).unwrap();
+      TempConfig(path)
+    }
+
+    fn path(&self) -> &std::path::Path {
+      &self.0
+    }
+  }
+
+  impl Drop for TempConfig {
+    fn drop(&mut self) {
+      let _ = std::fs::remove_file(&self.0);
+    }
+  }
+
+  #[test]
+  fn ret_kind_unknown_marker_is_ignored_by_config_parsing() {
+    // confgen emits `ret_kind_unknown 1` for functions whose return kind the
+    // analyzer could not infer. The BSL lexer has no comments, so the marker
+    // is an inert extra property: the parser must ignore it and keep the
+    // explicitly emitted interim mode.
+    let tmp = TempConfig::write("dis86_ret_unknown_test.bsl", r#"
+dis86 {
+  code_segments {
+  }
+  functions {
+    F1 { start 0000:0100 end "" mode near ret None args None ret_kind_unknown 1 }
+    F2 { start 0000:0200 end "" mode far ret None args None }
+  }
+  structures {
+  }
+  globals {
+  }
+  text_section {
+  }
+}
+"#);
+    let cfg = Config::from_path(tmp.path().to_str().unwrap()).unwrap();
+    assert_eq!(cfg.funcs.len(), 2);
+    assert_eq!(cfg.funcs[0].mode, CallMode::Near);
+    assert_eq!(cfg.funcs[1].mode, CallMode::Far);
+  }
+}

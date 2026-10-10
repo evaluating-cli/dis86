@@ -141,6 +141,20 @@ class Addr:
 ### FIXME RENAME
 UNKNOWN=-1
 
+## Return-kind flags the analyzer emits when it cannot infer a call mode
+## (see dis86 ret_kind_flags). Each maps to the interim call mode confgen
+## assumes until the operator resolves the flag itself. gen/dis86.py (BSL
+## mode + greppable marker) and gen/appdata.py (C callstub bitmask + TODO
+## comment) must stay consistent with this table: the BSL mode and the C
+## flags must agree, and the raw flag string must never reach C (it has no
+## macro meaning there).
+RET_UNKNOWN_MODES = {
+    # flag: (bsl_mode, c_flags)
+    'RET_UNKNOWN': ('near', 'NEAR'),
+    'RET_UNKNOWN_CONFIG_NEAR': ('near', 'NEAR'),
+    'RET_UNKNOWN_CONFIG_FAR': ('far', '0'),
+}
+
 FUNCTION_ALL_NAMES = set()
 def _verify_unique(name):
     if name in FUNCTION_ALL_NAMES:
