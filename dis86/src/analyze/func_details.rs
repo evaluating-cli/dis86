@@ -173,7 +173,7 @@ fn decode_one_instr(binary: &Binary, loc: SegOff, end: SegOff) -> Result<Instr, 
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::analyze::code_segment::{CodeSegment, Region};
+  use crate::analyze::code_segment::Region;
   use crate::segoff::{Off, Seg};
 
   fn segoff(off: u16) -> SegOff {

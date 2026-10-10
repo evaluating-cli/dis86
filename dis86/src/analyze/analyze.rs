@@ -1,5 +1,5 @@
 use crate::binary::{Binary, Fmt};
-use crate::config::Config;
+use crate::config::{CallMode, Config};
 use crate::segoff::{Seg, SegOff};
 use crate::util::range_set::RangeSet;
 
@@ -212,6 +212,24 @@ impl FunctionNames {
   }
 }
 
+/// Suggestion flags for the annotations format, from the analysis' return
+/// kind and any already-configured mode. Observed kinds are authoritative;
+/// an unknown kind defers to the operator's resolved mode so regeneration
+/// never downgrades a decision back to unresolved. Far is confgen's no-flag
+/// default; the RET_UNKNOWN marker is the cross-language contract confgen
+/// branches on (interim near + visible marker until resolved).
+fn ret_kind_flags(kind: Option<ReturnKind>, configured: Option<CallMode>) -> &'static str {
+  match kind {
+    Some(ReturnKind::Near) => ", flags = \"NEAR\"",
+    Some(ReturnKind::Far) => "",
+    _ => match configured {
+      Some(CallMode::Near) => ", flags = \"NEAR\"",
+      Some(CallMode::Far) => "",
+      None => ", flags = \"RET_UNKNOWN\"",
+    },
+  }
+}
+
 fn generate_annotations(functions: &BTreeMap<SegOff, Result<FuncDetails, String>>, cfg: &Config) {
   let mut function_names = FunctionNames::from_cfg(cfg);
 
@@ -232,9 +250,9 @@ fn generate_annotations(functions: &BTreeMap<SegOff, Result<FuncDetails, String>
     }
 
 
-    let (name, ret, args) = match cfg.func_lookup(*addr) {
-      Some(func) => (func.name.clone(), func.ret.clone(), func.args),
-      None       => (function_names.compute_unique(&seg_name), None, None),
+    let (name, ret, args, configured_mode) = match cfg.func_lookup(*addr) {
+      Some(func) => (func.name.clone(), func.ret.clone(), func.args, Some(func.mode)),
+      None       => (function_names.compute_unique(&seg_name), None, None, None),
     };
 
     match result {
@@ -251,22 +269,21 @@ fn generate_annotations(functions: &BTreeMap<SegOff, Result<FuncDetails, String>
           let name     = format!("\"{}\",", name);
           let start    = format!("\"{}\",", details.start_addr);
           let end      = format!("\"{}\"", details.end_addr_inferred);
-          let flags    = match details.return_kind {
-            Some(ReturnKind::Near) => ", flags = \"NEAR\"",
-            Some(ReturnKind::Far) => "",
-            // Unknown is never silently mapped to a mode: RET_UNKNOWN marks
-            // the suggestion for the operator to resolve (confgen treats it
-            // as an interim near with a visible marker until then).
-            // Interrupt rides along: any such function would face the same
-            // uninferable call mode — but note this arm is currently
-            // unconstructed (instr_details only emits Near/Far; OP_IRET is a
-            // fallthrough, so an iret-ending function is usually classified
-            // by whatever RET/RETF decoding reaches past the IRET).
-            Some(ReturnKind::Interrupt) | None => {
-              println!("    # RET KIND UNKNOWN | {} | {} | no return instruction observed (noreturn helper or tail-jump exit); resolve the call mode from the call sites: near calls need flags = \"NEAR\", far calls need no flag", bare_name, addr);
-              ", flags = \"RET_UNKNOWN\""
-            }
-          };
+          let flags = ret_kind_flags(details.return_kind, configured_mode);
+          if matches!(details.return_kind, None | Some(ReturnKind::Interrupt)) {
+            // The diagnostic always prints: it is the operator signal, even
+            // when a configured mode is preserved below.
+            let reason = match details.return_kind {
+              Some(ReturnKind::Interrupt) => "interrupt-return terminator; no near/far call mode applies",
+              _ => "no return instruction observed (noreturn helper or tail-jump exit)",
+            };
+            let kept = match configured_mode {
+              Some(CallMode::Near) => " (keeping configured near)",
+              Some(CallMode::Far) => " (keeping configured far)",
+              None => "",
+            };
+            println!("    # RET KIND UNKNOWN | {} | {} | {}{}; resolve the call mode from the call sites: near calls need flags = \"NEAR\", far calls need no flag", bare_name, addr, reason, kept);
+          }
 
           let ret_str  = match ret {
             Some(ret) => format!("\"{}\",", ret),
@@ -285,5 +302,31 @@ fn generate_annotations(functions: &BTreeMap<SegOff, Result<FuncDetails, String>
         println!("    # IGNORED ERROR | {} | {} | error: '{}'", name, addr, err);
       }
     }
+  }
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+
+  #[test]
+  fn ret_kind_flags_observed_kinds_are_authoritative() {
+    assert_eq!(ret_kind_flags(Some(ReturnKind::Near), None), ", flags = \"NEAR\"");
+    assert_eq!(ret_kind_flags(Some(ReturnKind::Far), None), "");
+    // Even against a conflicting configured mode: analysis evidence wins.
+    assert_eq!(ret_kind_flags(Some(ReturnKind::Near), Some(CallMode::Far)), ", flags = \"NEAR\"");
+    assert_eq!(ret_kind_flags(Some(ReturnKind::Far), Some(CallMode::Near)), "");
+  }
+
+  #[test]
+  fn ret_kind_flags_unknown_defers_to_configured_mode() {
+    // Unresolved and unconfigured: the RET_UNKNOWN marker confgen branches
+    // on (interim near + visible marker until the operator resolves it).
+    assert_eq!(ret_kind_flags(None, None), ", flags = \"RET_UNKNOWN\"");
+    assert_eq!(ret_kind_flags(Some(ReturnKind::Interrupt), None), ", flags = \"RET_UNKNOWN\"");
+    // Unresolved but already configured: preserve the operator's decision
+    // so regeneration never downgrades it back to unresolved.
+    assert_eq!(ret_kind_flags(None, Some(CallMode::Near)), ", flags = \"NEAR\"");
+    assert_eq!(ret_kind_flags(None, Some(CallMode::Far)), "");
   }
 }
