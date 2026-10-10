@@ -110,7 +110,20 @@ impl IR {
     // This is a deliberate robustness-over-precision tradeoff: the truncated
     // tail jump is dropped from the C output rather than aborting. Treat the
     // end of such a function as UNIMPL: the guest may continue elsewhere.
-    let Some(instr) = self.block_last_instr(blkref) else { return vec![];};
+    let Some(last_ref) = self.block(blkref).data.last() else { return vec![]; };
+
+    // Skip trailing Nops left by dead-code elimination: the last effective
+    // instruction determines control flow. A block whose last effective
+    // instruction is not a branch (e.g. a stub ending in a call whose
+    // fallthrough jump was eliminated as dead) likewise has no exits:
+    // control flow leaves the function here.
+    let eff = if self.instr(last_ref).unwrap().opcode == Opcode::Nop {
+      self.instr_prev(last_ref)
+    } else {
+      Some(last_ref)
+    };
+    let Some(eff) = eff else { return vec![]; };
+    let instr = self.instr(eff).unwrap();
 
     match instr.opcode {
       Opcode::RetFar | Opcode::RetNear => vec![],
@@ -123,8 +136,8 @@ impl IR {
       ],
       Opcode::JmpTbl => {
         instr.operands[1..].iter().map(|oper| oper.unwrap_block()).collect()
-      },
-      _ => panic!("Expected last instruction to be a branching instruction: {:?}", instr),
+      }
+      _ => vec![],
     }
   }
 
@@ -497,6 +510,27 @@ mod tests {
     assert!(ir.block_last_instr(blk).is_none());
   }
 
+  fn append_op(ir: &mut IR, blk: BlockRef, opcode: Opcode) {
+    ir.block_instr_append(blk, Instr {
+      typ: Type::Void,
+      compare_width: None,
+      attrs: 0,
+      opcode,
+      operands: vec![],
+    });
+  }
+
+  #[test]
+  fn block_exits_tolerates_dce_erased_tail() {
+    // A stub ending in a call whose fallthrough jump was eliminated as dead
+    // has no exits: control flow leaves the function here.
+    let mut ir = test_ir();
+    let b = ir.add_block("stub");
+    append_op(&mut ir, b, Opcode::CallArgs);
+    append_op(&mut ir, b, Opcode::Nop);
+    assert_eq!(ir.block_exits(b), vec![]);
+  }
+
   #[test]
   fn block_exits_empty_block_has_no_exits() {
     // An empty block is a jump whose target lies outside the decompiled
@@ -504,5 +538,13 @@ mod tests {
     let mut ir = test_ir();
     let blk = ir.add_block("empty");
     assert!(ir.block_exits(blk).is_empty());
+  }
+
+  #[test]
+  fn block_exits_return_has_no_exits() {
+    let mut ir = test_ir();
+    let b = ir.add_block("ret");
+    append_op(&mut ir, b, Opcode::RetNear);
+    assert_eq!(ir.block_exits(b), vec![]);
   }
 }

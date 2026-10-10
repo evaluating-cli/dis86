@@ -108,7 +108,7 @@ impl Analyze {
     let func = self.cfg.func_lookup_by_name(name).unwrap(); // FIXME
     let code_seg = self.code_segments.find_for_function(func).unwrap(); // FIXME
     assert!(func.start >= code_seg.start());
-    FuncDetails::build(func.start, code_seg, &self.binary).unwrap() // HAX FIXME
+    FuncDetails::build(func.start, func.end, code_seg, &self.binary).unwrap() // HAX FIXME
   }
 
   pub fn analyze_function_by_start(&self, start: SegOff) -> Result<FuncDetails, String> {
@@ -116,7 +116,8 @@ impl Analyze {
       return Err(format!("Failed to find code segement"));
     };
     assert!(start >= code_seg.start());
-    FuncDetails::build(start, code_seg, &self.binary)
+    let end = self.cfg.func_lookup(start).and_then(|f| f.end);
+    FuncDetails::build(start, end, code_seg, &self.binary)
   }
 
   // Scan known functions to find new functions, then scan those, return a big list of all found functions

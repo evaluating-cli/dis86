@@ -57,6 +57,11 @@ fn determine_calln(ins: &Instr, _binary: &Binary) -> Result<Call, String> {
     Ok(Call::Direct(addr))
   } else if let Operand::Mem(_) = &ins.operands[0] {
     Ok(Call::Indirect)
+  } else if let Operand::Reg(_) = &ins.operands[0] {
+    // Register-indirect near calls (`call cx`) have no static target;
+    // counted as indirect like memory-indirect calls. Matches the
+    // decompiler, which models them via CallPtr (ir_build.rs).
+    Ok(Call::Indirect)
   } else {
     Err(format!("Unsupported operand to CALL for '{}'", instr_str(ins)))
   }
@@ -243,4 +248,42 @@ pub fn instr_details(ins: &Instr, binary: &Binary) -> Result<InstrDetails, Strin
   }
 
   Ok(InstrDetails { next: Next::Fallthrough(ins.end_addr()), call })
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::asm::decode::Decoder;
+  use crate::segoff::{Seg, Off};
+
+  fn details_for(bytes: &[u8]) -> InstrDetails {
+    let binary = Binary::from_raw(bytes, None);
+    let start = SegOff { seg: Seg::Normal(0), off: Off(0) };
+    let end = SegOff { seg: Seg::Normal(0), off: Off(bytes.len() as u16) };
+    let mut decoder = Decoder::new(binary.region_iter(start, end));
+    let (instr, _raw) = decoder.try_next().unwrap().unwrap();
+    instr_details(&instr, &binary).unwrap()
+  }
+
+  #[test]
+  fn register_indirect_call_counts_as_indirect() {
+    // `call cx` (FF D1) has no static target; it must not error, matching
+    // the decompiler which models it via CallPtr.
+    let d = details_for(&[0xFF, 0xD1, 0xC3]);
+    assert!(matches!(d.call, Some(Call::Indirect)));
+  }
+
+  #[test]
+  fn memory_indirect_call_counts_as_indirect() {
+    // `call far [0x0000]` (FF 1E 0000).
+    let d = details_for(&[0xFF, 0x1E, 0x00, 0x00, 0xC3]);
+    assert!(matches!(d.call, Some(Call::Indirect)));
+  }
+
+  #[test]
+  fn relative_call_is_direct() {
+    // `call +1` (E8 01 00) targets the `ret` at offset 3.
+    let d = details_for(&[0xE8, 0x01, 0x00, 0xC3]);
+    assert!(matches!(d.call, Some(Call::Direct(_))));
+  }
 }
