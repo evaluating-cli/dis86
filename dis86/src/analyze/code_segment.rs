@@ -26,33 +26,54 @@ impl CodeSegment {
   }
 }
 
+#[derive(Debug)]
 pub struct CodeSegments(pub Vec<CodeSegment>);
 
 impl CodeSegments {
   // Should basically match those that were manually found in annotations.py
-  pub fn from_binary(binary: &Binary) -> CodeSegments {
-    let exe = binary.exe().unwrap(); // FIXME
+  pub fn from_binary(binary: &Binary) -> Result<CodeSegments, String> {
+    let exe = binary.exe().ok_or_else(|| "analyze mode requires an MZ executable binary".to_string())?;
     match (exe.seginfo.as_ref(), exe.ovr.as_ref()) {
       (Some(seginfo), Some(ovr)) => Self::from_overlay_info(seginfo, ovr),
       // Plain MZ image without FBOV metadata: a single segment covering the
       // whole load image, addressed relative to the load base (seg 0).
+      // Segment offsets are u16, so an image larger than 64K has no
+      // single-segment representation: reject upfront rather than panicking
+      // later in CodeSegment::end().
       _ => {
         let size: u32 = exe.exe_data().len().try_into().unwrap();
+        if size > u16::MAX as u32 {
+          return Err(format!(
+            "plain-MZ load image is {} bytes, larger than one 64K segment: analysis needs FBOV seginfo metadata (or a smaller image)",
+            size));
+        }
         let primary = Region { seg: Seg::Normal(0), skip_off: 0, size };
-        CodeSegments(vec![CodeSegment { primary, stub: None }])
+        Ok(CodeSegments(vec![CodeSegment { primary, stub: None }]))
       }
     }
   }
 
   // Collect ordinary code segments and stub segments
-  fn from_overlay_info(seginfo: &[mz::SegInfo], ovr: &mz::OverlayInfo) -> CodeSegments {
+  fn from_overlay_info(seginfo: &[mz::SegInfo], ovr: &mz::OverlayInfo) -> Result<CodeSegments, String> {
     let mut code_segments = vec![];
     let mut stub_segments = vec![];
     for s in seginfo {
+      // Copy packed-struct fields out before use: taking references to them
+      // is unaligned UB, even inside format!.
+      let seg = s.seg;
+      let skip_off = s.minoff as u32;
+      let size = s.size() as u32;
+      // Same u16-offset bound as the plain-MZ fallback: a wrapped seginfo
+      // entry (maxoff < minoff) would panic in CodeSegment::end().
+      if skip_off + size > u16::MAX as u32 {
+        return Err(format!(
+          "seginfo segment {} spans {:#06x}..{:#06x}, larger than one 64K segment: corrupt FBOV metadata?",
+          seg, skip_off, skip_off + size));
+      }
       let region = Region {
-        seg: Seg::Normal(s.seg),
-        skip_off: s.minoff as u32,
-        size: s.size() as u32,
+        seg: Seg::Normal(seg),
+        skip_off,
+        size,
       };
       if s.typ == mz::SegInfoType::CODE && s.size() != 0 {
         code_segments.push(CodeSegment { primary: region, stub: None, });
@@ -74,7 +95,7 @@ impl CodeSegments {
       code_segments.push(CodeSegment { primary: region, stub: Some(stub) });
     }
 
-    CodeSegments(code_segments)
+    Ok(CodeSegments(code_segments))
   }
 
   pub fn find_by_segment(&self, seg: Seg) -> Option<&CodeSegment> {
@@ -109,12 +130,20 @@ mod tests {
   use super::*;
   use crate::binary::Binary;
 
-  fn synthetic_plain_mz() -> Vec<u8> {
-    // MZ header: 32-byte header followed by a 32-byte load image, no FBOV.
-    let mut data = vec![0u8; 96];
+  fn synthetic_plain_mz_with_image(image_len: usize) -> Vec<u8> {
+    // MZ header (cparhdr=2 paragraphs => 32-byte header/load-base gap) plus
+    // a load image of image_len bytes, no FBOV. exe_end - exe_start must
+    // equal image_len, with exe_end = cp*512 - (512-cblp when cblp != 0).
+    let exe_end = 32 + image_len as u32;
+    let (cp, cblp) = if exe_end % 512 == 0 {
+      (exe_end / 512, 0)
+    } else {
+      (exe_end / 512 + 1, exe_end % 512)
+    };
+    let mut data = vec![0u8; exe_end as usize];
     data[0..2].copy_from_slice(b"MZ");
-    data[2..4].copy_from_slice(&64u16.to_le_bytes()); // cblp
-    data[4..6].copy_from_slice(&1u16.to_le_bytes());  // cp
+    data[2..4].copy_from_slice(&(cblp as u16).to_le_bytes()); // cblp
+    data[4..6].copy_from_slice(&(cp as u16).to_le_bytes());  // cp
     data[8..10].copy_from_slice(&2u16.to_le_bytes()); // cparhdr
     data[24..26].copy_from_slice(&28u16.to_le_bytes()); // lfarlc
     data
@@ -122,17 +151,52 @@ mod tests {
 
   #[test]
   fn plain_mz_yields_single_load_base_segment() {
-    let exe = mz::Exe::decode(&synthetic_plain_mz()).expect("valid synthetic plain MZ");
+    let exe = mz::Exe::decode(&synthetic_plain_mz_with_image(32)).expect("valid synthetic plain MZ");
     assert!(exe.seginfo.is_none());
     assert!(exe.ovr.is_none());
     let binary = Binary::from_exe(&exe, None);
-    let segs = CodeSegments::from_binary(&binary);
+    let segs = CodeSegments::from_binary(&binary).expect("small image fits one segment");
     assert_eq!(segs.0.len(), 1);
     let primary = &segs.0[0].primary;
     assert_eq!(primary.seg, Seg::Normal(0));
     assert_eq!(primary.skip_off, 0);
     assert_eq!(primary.size, 32);
     assert!(segs.0[0].stub.is_none());
+  }
+
+  #[test]
+  fn plain_mz_at_64k_boundary_is_accepted() {
+    // Largest representable image: end() lands exactly on 0xFFFF.
+    let exe = mz::Exe::decode(&synthetic_plain_mz_with_image(u16::MAX as usize))
+      .expect("valid synthetic plain MZ");
+    let binary = Binary::from_exe(&exe, None);
+    let segs = CodeSegments::from_binary(&binary).expect("64K image fits one segment");
+    assert_eq!(segs.0.len(), 1);
+    assert_eq!(segs.0[0].primary.size, u16::MAX as u32);
+    assert_eq!(segs.0[0].end(), SegOff { seg: Seg::Normal(0), off: Off(u16::MAX) });
+  }
+
+  #[test]
+  fn plain_mz_above_64k_is_rejected_upfront() {
+    // One byte over: no single-segment representation exists, so from_binary
+    // errs instead of deferring a panic to CodeSegment::end().
+    let exe = mz::Exe::decode(&synthetic_plain_mz_with_image(u16::MAX as usize + 1))
+      .expect("valid synthetic plain MZ");
+    let binary = Binary::from_exe(&exe, None);
+    let err = CodeSegments::from_binary(&binary).expect_err(">64K image must be rejected");
+    assert!(err.contains("64K"), "unexpected error: {}", err);
+  }
+
+  #[test]
+  fn wrapped_seginfosegment_is_rejected_upfront() {
+    // Corrupt seginfo (maxoff < minoff) would wrap end() to a bogus offset;
+    // reject with the segment named instead of panicking later.
+    let mut exe = mz::Exe::decode(&synthetic_plain_mz_with_image(32)).expect("valid synthetic plain MZ");
+    exe.seginfo = Some(vec![mz::SegInfo { seg: 1, minoff: 0x100, maxoff: 0x0000, typ: mz::SegInfoType::CODE }]);
+    exe.ovr = Some(mz::OverlayInfo { file_offset: 0, segs: vec![], stubs: vec![] });
+    let binary = Binary::from_exe(&exe, None);
+    let err = CodeSegments::from_binary(&binary).expect_err("wrapped seginfo must be rejected");
+    assert!(err.contains("segment 1"), "unexpected error: {}", err);
   }
 }
 

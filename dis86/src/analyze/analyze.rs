@@ -16,16 +16,16 @@ pub struct Analyze {
 }
 
 impl Analyze {
-  pub fn new(cfg: &Config, exe_path: &str) -> Self {
+  pub fn new(cfg: &Config, exe_path: &str) -> Result<Self, String> {
     let fmt = Fmt::Exe(exe_path.to_string());
-    let binary = Binary::from_fmt(&fmt, Some(cfg)).unwrap();
-    let code_segments = CodeSegments::from_binary(&binary);
+    let binary = Binary::from_fmt(&fmt, Some(cfg))?;
+    let code_segments = CodeSegments::from_binary(&binary)?;
 
-    Self {
+    Ok(Self {
       cfg: cfg.clone(),
       binary,
       code_segments,
-    }
+    })
   }
 
   pub fn dump_info(&self) {
