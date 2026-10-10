@@ -205,40 +205,18 @@ mod tests {
     assert_eq!(bounded.indirect_calls, 0);
     assert_eq!(bounded.direct_calls.len(), 1);
   }
-}
-
-// FIXME: THIS FUNCTION IS WAY TOO COMPLICATED FOR ITS SIMPLE TASK: APIs NEED IMPROVEMENT
-fn decode_one_instr(binary: &Binary, loc: SegOff, end: SegOff) -> Result<Instr, String> {
-  let mut decoder = Decoder::new(binary.region_iter(loc, end));
-  let (instr, _raw) = decoder.try_next()?.unwrap();
-  Ok(instr)
-}
-
-#[cfg(test)]
-mod tests {
-  use super::*;
-  use crate::analyze::code_segment::Region;
-  use crate::segoff::{Off, Seg};
-
-  fn segoff(off: u16) -> SegOff {
-    SegOff { seg: Seg::Normal(0), off: Off(off) }
-  }
-
-  fn test_seg(size: u32) -> CodeSegment {
-    CodeSegment { primary: Region { seg: Seg::Normal(0), skip_off: 0, size }, stub: None }
-  }
 
   #[test]
   fn ret_yields_near_return_kind() {
     let binary = Binary::from_raw(&[0xC3], None);
-    let details = FuncDetails::build(segoff(0), &test_seg(1), &binary).unwrap();
+    let details = FuncDetails::build(segoff(0), None, &test_seg(1), &binary).unwrap();
     assert_eq!(details.return_kind, Some(ReturnKind::Near));
   }
 
   #[test]
   fn retf_yields_far_return_kind() {
     let binary = Binary::from_raw(&[0xCB], None);
-    let details = FuncDetails::build(segoff(0), &test_seg(1), &binary).unwrap();
+    let details = FuncDetails::build(segoff(0), None, &test_seg(1), &binary).unwrap();
     assert_eq!(details.return_kind, Some(ReturnKind::Far));
   }
 
@@ -248,7 +226,14 @@ mod tests {
     // report the kind as unknown rather than guessing Near (which mislabeled
     // genuine far-noreturn functions as near in the generated configs).
     let binary = Binary::from_raw(&[0xEB, 0xFE], None);
-    let details = FuncDetails::build(segoff(0), &test_seg(2), &binary).unwrap();
+    let details = FuncDetails::build(segoff(0), None, &test_seg(2), &binary).unwrap();
     assert_eq!(details.return_kind, None);
   }
+}
+
+// FIXME: THIS FUNCTION IS WAY TOO COMPLICATED FOR ITS SIMPLE TASK: APIs NEED IMPROVEMENT
+fn decode_one_instr(binary: &Binary, loc: SegOff, end: SegOff) -> Result<Instr, String> {
+  let mut decoder = Decoder::new(binary.region_iter(loc, end));
+  let (instr, _raw) = decoder.try_next()?.unwrap();
+  Ok(instr)
 }
