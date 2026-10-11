@@ -244,13 +244,16 @@ fn ret_kind_flags(kind: Option<ReturnKind>, configured: Option<CallMode>) -> &'s
   }
 }
 
-/// Renders one analyzed function's suggestion output as ordered lines: the
-/// unknown-kind diagnostic first (when applicable), then the F(...) entry.
-/// Pure for testability — the caller only prints. Documents the
-/// incomplete-inventory caveat: indirect-call and error branches (rendered
-/// by render_ignored_indirect/render_ignored_error below) emit no F(...)
-/// line at all, so grepping the output is not a complete inventory of
-/// unresolved call modes.
+/// Renders one analyzed function's suggestion output as up to three
+/// ordered lines: the `# RET KIND UNKNOWN` diagnostic (for unanalyzable
+/// or interrupt kinds), the `# MIXED RETURN KINDS` diagnostic (when the
+/// function has exits of differing kinds and the classification came
+/// from the first exit in ascending block order only), then the F(...)
+/// entry. Pure for testability — the caller only prints.
+/// Incomplete-inventory caveat: indirect-call and error branches
+/// (rendered by render_ignored_indirect/render_ignored_error below) emit
+/// no F(...) line at all, so grepping the output is not a complete
+/// inventory of unresolved call modes.
 fn render_suggestion(
   bare_name: &str,
   addr: SegOff,
@@ -262,6 +265,7 @@ fn render_suggestion(
   kind: Option<ReturnKind>,
   flags: &str,
   configured: Option<CallMode>,
+  ignored: &[ReturnKind],
 ) -> Vec<String> {
   let mut lines = vec![];
   if matches!(kind, None | Some(ReturnKind::Interrupt)) {
@@ -288,6 +292,20 @@ fn render_suggestion(
       _ => "resolve the call mode from the call sites: near calls need flags = \"NEAR\", far calls need no flag",
     };
     lines.push(format!("    # RET KIND UNKNOWN | {} | {} | {}{}; {}", bare_name, addr, reason, kept, guidance));
+  }
+  if !ignored.is_empty() {
+    // A mixed-kind function: the classification `kind` came from the
+    // first exit in ascending block order only (block-pop order, not
+    // necessarily the lowest-address instruction: overlapping blocks
+    // from mid-instruction jump targets are possible), so the annotated
+    // call mode may not fit every exit path. `kind` is always Some here
+    // (an ignored kind is only recorded after a first kind was observed);
+    // the `if let` keeps that invariant structural for future callers.
+    if let Some(kind) = kind {
+      let others: Vec<String> = ignored.iter().map(|k| k.to_string()).collect();
+      lines.push(format!("    # MIXED RETURN KINDS | {} | {} | classified {} by the first exit in ascending block order; other exits: {}; the annotated call mode may not fit every exit path",
+        bare_name, addr, kind, others.join(", ")));
+    }
   }
   lines.push(format!("    F( {:<30} {:<7} {:<12} {} {}{} ),", quoted_name, ret_str, args_str, start, end, flags));
   lines
@@ -354,6 +372,7 @@ fn generate_annotations(functions: &BTreeMap<SegOff, Result<FuncDetails, String>
           for line in render_suggestion(
             bare_name, *addr, &name, &ret_str, &args_str, &start, &end,
             details.return_kind, flags, configured_mode,
+            &details.ignored_return_kinds,
           ) {
             println!("{}", line);
           }
@@ -408,7 +427,7 @@ mod tests {
     let lines = render_suggestion(
       "F_new", segoff(0x100),
       "\"F_new\",", "None,", "None,", "\"0000:0100\",", "\"0000:0110\"",
-      None, ", flags = \"RET_UNKNOWN\"", None,
+      None, ", flags = \"RET_UNKNOWN\"", None, &[],
     );
     assert_eq!(lines.len(), 2);
     assert!(lines[0].starts_with("    # RET KIND UNKNOWN | F_new | 0000:0100 | no return instruction observed"),
@@ -422,7 +441,7 @@ mod tests {
     let lines = render_suggestion(
       "F_cfg", segoff(0x200),
       "\"F_cfg\",", "None,", "None,", "\"0000:0200\",", "\"0000:0210\"",
-      None, ", flags = \"RET_UNKNOWN_CONFIG_FAR\"", Some(CallMode::Far),
+      None, ", flags = \"RET_UNKNOWN_CONFIG_FAR\"", Some(CallMode::Far), &[],
     );
     assert_eq!(lines.len(), 2);
     assert!(lines[0].contains("(keeping configured far)"), "unexpected diagnostic: {}", lines[0]);
@@ -434,7 +453,7 @@ mod tests {
     let lines = render_suggestion(
       "F_known", segoff(0x300),
       "\"F_known\",", "None,", "None,", "\"0000:0300\",", "\"0000:0310\"",
-      Some(ReturnKind::Near), ", flags = \"NEAR\"", Some(CallMode::Near),
+      Some(ReturnKind::Near), ", flags = \"NEAR\"", Some(CallMode::Near), &[],
     );
     assert_eq!(lines.len(), 1);
     assert!(lines[0].contains("NEAR"), "unexpected entry: {}", lines[0]);
@@ -449,7 +468,7 @@ mod tests {
     let lines = render_suggestion(
       "F_irq", segoff(0x400),
       "\"F_irq\",", "None,", "None,", "\"0000:0400\",", "\"0000:0401\"",
-      Some(ReturnKind::Interrupt), ", flags = \"RET_UNKNOWN_CONFIG_FAR\"", Some(CallMode::Far),
+      Some(ReturnKind::Interrupt), ", flags = \"RET_UNKNOWN_CONFIG_FAR\"", Some(CallMode::Far), &[],
     );
     assert_eq!(lines.len(), 2);
     assert!(lines[0].contains("interrupt-return terminator"), "unexpected diagnostic: {}", lines[0]);
@@ -460,13 +479,46 @@ mod tests {
     let unconfigured = render_suggestion(
       "F_irq2", segoff(0x500),
       "\"F_irq2\",", "None,", "None,", "\"0000:0500\",", "\"0000:0501\"",
-      Some(ReturnKind::Interrupt), ", flags = \"RET_UNKNOWN\"", None,
+      Some(ReturnKind::Interrupt), ", flags = \"RET_UNKNOWN\"", None, &[],
     );
     assert_eq!(unconfigured.len(), 2);
     assert!(!unconfigured[0].contains("keeping configured"), "unexpected diagnostic: {}", unconfigured[0]);
     assert!(unconfigured[1].contains("\"RET_UNKNOWN\""), "unexpected entry: {}", unconfigured[1]);
   }
 
+  #[test]
+  fn suggestion_flags_mixed_return_kinds() {
+    // A function whose exits differ in kind keeps the first-in-block-order
+    // classification but gains a `# MIXED RETURN KINDS` line naming the
+    // dropped exits, so the operator can verify the annotated call
+    // mode fits every exit path. Homogeneous functions emit no such line.
+    let ignored = [ReturnKind::Interrupt, ReturnKind::Far];
+    let lines = render_suggestion(
+      "F_mix", segoff(0x600),
+      "\"F_mix\",", "None,", "None,", "\"0000:0600\",", "\"0000:0610\"",
+      Some(ReturnKind::Near), ", flags = \"NEAR\"", None, &ignored,
+    );
+    assert_eq!(lines.len(), 2);
+    assert!(lines[0].starts_with("    # MIXED RETURN KINDS | F_mix | 0000:0600 | classified near by the first exit in ascending block order; other exits: interrupt, far"),
+      "unexpected diagnostic: {}", lines[0]);
+    assert!(lines[1].contains("NEAR"), "unexpected entry: {}", lines[1]);
+  }
+
+  #[test]
+  fn suggestion_mixed_needs_a_classified_kind() {
+    // Structural pin for the mixed diagnostic: with no classified kind
+    // (None) there is nothing to attribute the dropped exits to, so no
+    // MIXED line is emitted — and, critically, no panic. Only reachable
+    // by future callers; FuncDetails never produces this combination.
+    let lines = render_suggestion(
+      "F_none", segoff(0x700),
+      "\"F_none\",", "None,", "None,", "\"0000:0700\",", "\"0000:0710\"",
+      None, ", flags = \"RET_UNKNOWN\"", None, &[ReturnKind::Interrupt],
+    );
+    assert!(lines.iter().all(|l| !l.contains("MIXED RETURN KINDS")),
+      "unexpected mixed diagnostic: {:?}", lines);
+    assert_eq!(lines.len(), 2);
+  }
   #[test]
   fn ignored_branches_emit_no_suggestion_line() {
     // Documents the incomplete-inventory caveat: these branches emit only

@@ -26,6 +26,16 @@ pub struct FuncDetails {
   // analyze.rs surfaces None as an explicit RET_UNKNOWN suggestion flag
   // for the operator to resolve.
   pub return_kind:       Option<ReturnKind>,
+  // Return kinds observed on exits other than the one `return_kind`
+  // reports (first-wins on ascending block order). Non-empty means the
+  // function has exits of differing kinds: the classified kind came
+  // from the first exit in ascending block order — not necessarily the
+  // lowest-address instruction, since overlapping blocks from
+  // mid-instruction jump targets are possible — and these others were
+  // dropped, so the annotated call mode may not fit every exit path.
+  // Repeats of the winning kind are normal (any multi-`ret` function)
+  // and stay unrecorded; see the Next::Return handling below.
+  pub ignored_return_kinds: Vec<ReturnKind>,
 }
 
 impl fmt::Display for FuncDetails {
@@ -42,6 +52,10 @@ impl fmt::Display for FuncDetails {
     match self.return_kind {
       Some(kind) => writeln!(f, "return_kind:       {}", kind)?,
       None       => writeln!(f, "return_kind:       unknown")?,
+    }
+    if !self.ignored_return_kinds.is_empty() {
+      let others: Vec<String> = self.ignored_return_kinds.iter().map(|k| k.to_string()).collect();
+      writeln!(f, "ignored_return_kinds: [{}]", others.join(", "))?;
     }
     Ok(())
   }
@@ -81,6 +95,7 @@ impl FuncDetails {
     let mut direct_calls = BTreeSet::new();
     let mut indirect_calls = 0;
     let mut return_kind = None;
+    let mut ignored_return_kinds: Vec<ReturnKind> = vec![];
 
     // Iterate over blocks
     while let Some(loc) = workqueue.pop() {
@@ -137,8 +152,18 @@ impl FuncDetails {
             }
           }
           Next::Return(ret) => {
-            if return_kind.is_none() {
-              return_kind = Some(ret);
+            // First-wins on ascending block order (see WorkQueue::pop):
+            // the first exit in block-pop order classifies the function.
+            // Later exits of a *differing* kind are recorded instead of
+            // silently dropped, so the diagnostic can flag a function
+            // whose annotated call mode may not fit every exit path.
+            // Repeats of the winning kind are normal and unrecorded.
+            match return_kind {
+              None => return_kind = Some(ret),
+              Some(winning) if winning != ret && !ignored_return_kinds.contains(&ret) => {
+                ignored_return_kinds.push(ret);
+              }
+              _ => (),
             }
             block.exits = vec![];
             block_complete = true;
@@ -167,6 +192,7 @@ impl FuncDetails {
       // mislabel genuine far-noreturn functions as near in the generated
       // configs; analyze.rs reports the unknown kind explicitly instead.
       return_kind,
+      ignored_return_kinds,
     })
   }
 }
@@ -238,6 +264,38 @@ mod tests {
     let details = FuncDetails::build(segoff(0), None, &test_seg(3), &binary).unwrap();
     assert_eq!(details.return_kind, Some(ReturnKind::Interrupt));
     assert_eq!(details.end_addr_inferred, segoff(1));
+  }
+
+  #[test]
+  fn mixed_return_kinds_record_ignored_not_winning() {
+    // `jz +1; ret; iret`: the first exit in ascending block order (the
+    // `ret` at 0x02) wins the classification, but the differing `iret`
+    // exit must be recorded, not silently dropped, so the diagnostic
+    // can flag it.
+    let binary = Binary::from_raw(&[0x74, 0x01, 0xC3, 0xCF], None);
+    let details = FuncDetails::build(segoff(0), None, &test_seg(4), &binary).unwrap();
+    assert_eq!(details.return_kind, Some(ReturnKind::Near));
+    assert_eq!(details.ignored_return_kinds, vec![ReturnKind::Interrupt]);
+  }
+
+  #[test]
+  fn ret_retf_mix_records_ignored_far() {
+    // The pre-existing RET/RETF variant of the same rule: `jz +1; ret;
+    // retf` classifies Near and records the dropped Far exit.
+    let binary = Binary::from_raw(&[0x74, 0x01, 0xC3, 0xCB], None);
+    let details = FuncDetails::build(segoff(0), None, &test_seg(4), &binary).unwrap();
+    assert_eq!(details.return_kind, Some(ReturnKind::Near));
+    assert_eq!(details.ignored_return_kinds, vec![ReturnKind::Far]);
+  }
+
+  #[test]
+  fn repeated_winning_kind_records_nothing() {
+    // Repeats of the winning kind are normal (any multi-`ret`
+    // function): `jz +1; ret; ret` must record no ignored kinds.
+    let binary = Binary::from_raw(&[0x74, 0x01, 0xC3, 0xC3], None);
+    let details = FuncDetails::build(segoff(0), None, &test_seg(4), &binary).unwrap();
+    assert_eq!(details.return_kind, Some(ReturnKind::Near));
+    assert!(details.ignored_return_kinds.is_empty());
   }
 }
 
