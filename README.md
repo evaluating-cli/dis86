@@ -111,7 +111,7 @@ Emit C code:
 ./target/debug/dis86 --config <your_config.bsl> --binary-exe <program.exe> --name <function_name> --emit-code <output-file>
 ```
 
-Other modes: `--analyze` (config-driven analysis), `--start-addr`/`--end-addr` (address-range slices), `--codeseg-name` (decompile a whole configured code segment), and `--codegen-hydra` (Hydra-flavored codegen). Run `dis86 --help` for the full list. The `mzfile` companion binary inspects and extracts MZ executables.
+Other modes: `--analyze` (config-driven analysis), `--start-addr`/`--end-addr` (address-range slices), `--codeseg-name` (decompile a whole configured code segment), `--codegen-hydra` (Hydra-flavored codegen), and `--codegen-hydra --relocatable-seg HEX[,HEX...]` (emit listed absolute link-time segment values as `(CODE_START_SEG + seg)` for relocated Hydra execution). Run `dis86 --help` for the full list. The `mzfile` companion binary inspects and extracts MZ executables.
 
 ## Caveats & Limitations
 

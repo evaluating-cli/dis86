@@ -37,7 +37,7 @@ fn guest_pointer_expressions_emit_segmented_loads_and_stores() {
       Stmt::Expr(Expr::GuestMem(Box::new(Expr::Name("SS".into())), Box::new(Expr::Name("off".into())), 2)),
     ]),
   };
-  let source = gen::generate(&func, Flavor::Hydra).unwrap();
+  let source = gen::generate(&func, Flavor::Hydra { relocatable_segs: vec![] }).unwrap();
   assert!(source.contains("STORE_16(ES, off, 0x1234);"), "missing segmented pointer store:\n{source}");
   assert!(source.contains("LOAD_16(SS, off)"), "missing segmented pointer read:\n{source}");
 }
@@ -65,7 +65,7 @@ fn annotated_near_es_pointer_reads_and_writes_use_segmented_memory() {
   sym::symbolize_globals(&mut ir, &cfg);
   let cf = ControlFlow::from_ir(&ir);
   let func = Function::from_ir(&cfg, "near_es_access", None, &ir, &cf).unwrap();
-  let source = gen::generate(&func, Flavor::Hydra).unwrap();
+  let source = gen::generate(&func, Flavor::Hydra { relocatable_segs: vec![] }).unwrap();
   assert!(source.contains("tmp_0 = g_pointer;"), "pointer field should be read as its guest-width value:\n{source}");
   assert!(source.contains("STORE_16(ES, tmp_0, 0x1234);"), "missing ES pointer store:\n{source}");
   assert!(source.contains("LOAD_16(ES, tmp_0)"), "missing ES pointer read:\n{source}");
@@ -103,7 +103,7 @@ fn pointer_annotation_on_struct_member_reaches_indirect_accesses() {
   sym::symbolize_globals(&mut ir, &cfg);
   let cf = ControlFlow::from_ir(&ir);
   let func = Function::from_ir(&cfg, "struct_pointer_access", None, &ir, &cf).unwrap();
-  let source = gen::generate(&func, Flavor::Hydra).unwrap();
+  let source = gen::generate(&func, Flavor::Hydra { relocatable_segs: vec![] }).unwrap();
   assert!(source.contains("g_holder.ptr"), "expected annotated struct pointer field read:\n{source}");
   assert!(source.contains("LOAD_16(ES,"), "struct pointer annotation must select ES for dereference:\n{source}");
 }
@@ -131,7 +131,7 @@ fn annotated_far_pointer_splits_segment_and_offset_for_memory_access() {
   sym::symbolize_globals(&mut ir, &cfg);
   let cf = ControlFlow::from_ir(&ir);
   let func = Function::from_ir(&cfg, "far_access", None, &ir, &cf).unwrap();
-  let source = gen::generate(&func, Flavor::Hydra).unwrap();
+  let source = gen::generate(&func, Flavor::Hydra { relocatable_segs: vec![] }).unwrap();
   assert!(source.contains("LOAD_16("), "missing segmented far-pointer load:\n{source}");
   assert!(source.contains("g_far_pointer"), "far pointer must remain a guest-width field:\n{source}");
   assert!(!source.contains("g_far_pointer->"), "far pointer must not become a host pointer:\n{source}");
@@ -159,7 +159,7 @@ fn far_pointer_offset_with_unrelated_segment_keeps_raw_memory_path() {
   sym::symbolize_globals(&mut ir, &cfg);
   let cf = ControlFlow::from_ir(&ir);
   let func = Function::from_ir(&cfg, "far_segment_mismatch", None, &ir, &cf).unwrap();
-  let source = gen::generate(&func, Flavor::Hydra).unwrap();
+  let source = gen::generate(&func, Flavor::Hydra { relocatable_segs: vec![] }).unwrap();
   assert!(source.contains("PTR_16(DS,"), "unpaired far-pointer segment must keep the original address path:\n{source}");
   assert!(!source.contains("LOAD_16("), "mismatched far pointer must not substitute its segment:\n{source}");
 }
@@ -185,7 +185,7 @@ fn near_es_pointer_with_unrelated_segment_keeps_raw_memory_path() {
   sym::symbolize_globals(&mut ir, &cfg);
   let cf = ControlFlow::from_ir(&ir);
   let func = Function::from_ir(&cfg, "near_es_segment_mismatch", None, &ir, &cf).unwrap();
-  let source = gen::generate(&func, Flavor::Hydra).unwrap();
+  let source = gen::generate(&func, Flavor::Hydra { relocatable_segs: vec![] }).unwrap();
   assert!(source.contains("PTR_16(DS,"), "unpaired near-pointer segment must keep the original address path:\n{source}");
   assert!(!source.contains("LOAD_16("), "mismatched near pointer must not substitute its segment:\n{source}");
 }
@@ -208,7 +208,7 @@ fn nested_array_annotation_generates_c_dimension_order() {
   sym::symbolize_globals(&mut ir, &cfg);
   let cf = ControlFlow::from_ir(&ir);
   let func = Function::from_ir(&cfg, "grid_access", None, &ir, &cf).unwrap();
-  let source = gen::generate(&func, Flavor::Hydra).unwrap();
+  let source = gen::generate(&func, Flavor::Hydra { relocatable_segs: vec![] }).unwrap();
   assert!(source.contains("g_grid[1][2]"), "expected row/column C indexing:\n{source}");
 }
 
@@ -449,4 +449,144 @@ fn reducible_if_with_empty_then_arm_generates_one_arm_if() {
 
   let source = gen::generate(&func, Flavor::Standard).unwrap();
   assert!(source.contains("if ("), "missing if in generated source:\n{source}");
+}
+
+fn reloc_func(consts: Vec<Expr>) -> Function {
+  Function {
+    name: "reloc".into(),
+    ret: None,
+    vardecls: vec![],
+    varmaps: vec![],
+    frame_size: 0,
+    body: Block(consts.into_iter().map(|rhs| Stmt::Assign(Assign {
+      decltype: None,
+      lhs: Expr::Name("AX".into()),
+      rhs,
+    })).collect()),
+  }
+}
+
+#[test]
+fn hydra_relocatable_hex_consts_emit_code_start_seg_offset() {
+  // A hex constant in the explicit table relocates; one outside it stays baked.
+  // High values relocate too: they always reach the AST through HexConst.
+  let func = reloc_func(vec![Expr::HexConst(0x456), Expr::HexConst(0x1234), Expr::HexConst(0xf000)]);
+  let source = gen::generate(&func, Flavor::Hydra { relocatable_segs: vec![0x456, 0xf000] }).unwrap();
+  assert!(source.contains("AX = (CODE_START_SEG + 0x456);"), "listed segment must relocate:\n{source}");
+  assert!(source.contains("AX = (CODE_START_SEG + 0xf000);"), "high segment must relocate:\n{source}");
+  assert!(source.contains("AX = 0x1234;"), "unlisted constant must stay baked:\n{source}");
+}
+
+#[test]
+fn hydra_decimal_consts_relocate_only_when_nonnegative() {
+  // The AST builder only produces -255..=255 as DecimalConst; a negative
+  // immediate is never a segment value, so even a matching table entry
+  // (here the -16 bit pattern 0xfff0) must not relocate it.
+  let func = reloc_func(vec![Expr::DecimalConst(16), Expr::DecimalConst(-16)]);
+  let source = gen::generate(&func, Flavor::Hydra { relocatable_segs: vec![0x10, 0xfff0] }).unwrap();
+  assert!(source.contains("AX = (CODE_START_SEG + 0x10);"), "listed small segment must relocate:\n{source}");
+  assert!(source.contains("AX = -16;"), "negative immediate must stay plain:\n{source}");
+}
+
+#[test]
+fn hydra_case_labels_and_array_indices_never_relocate() {
+  // Case labels must be integer constant expressions (CODE_START_SEG is
+  // a runtime value) and an index computes an element position, never a
+  // segment value: both render plain (deeply) even when listed.
+  let func = Function {
+    name: "reloc_pos".into(),
+    ret: None,
+    vardecls: vec![],
+    varmaps: vec![],
+    frame_size: 0,
+    body: Block(vec![
+      Stmt::Switch(dis86::decompile::ast::Switch {
+        switch_val: Expr::Name("AX".into()),
+        cases: vec![dis86::decompile::ast::SwitchCase {
+          cases: vec![Expr::DecimalConst(0x10), Expr::HexConst(0x10)],
+          body: Block(vec![]),
+        }],
+        default: None,
+      }),
+      Stmt::Assign(Assign {
+        decltype: None,
+        lhs: Expr::Name("AX".into()),
+        rhs: Expr::ArrayAccess(Box::new(Expr::Name("g_grid".into())), Box::new(Expr::DecimalConst(0x10))),
+      }),
+      Stmt::Assign(Assign {
+        decltype: None,
+        lhs: Expr::Name("AX".into()),
+        rhs: Expr::ArrayAccess(
+          Box::new(Expr::Name("g_grid".into())),
+          Box::new(Expr::Binary(Box::new(dis86::decompile::ast::BinaryExpr {
+            op: dis86::decompile::ast::BinaryOperator::Add,
+            lhs: Expr::Name("BX".into()),
+            rhs: Expr::HexConst(0x10),
+          })))),
+      }),
+    ]),
+  };
+  let source = gen::generate(&func, Flavor::Hydra { relocatable_segs: vec![0x10] }).unwrap();
+  assert!(source.contains("case 16:"), "decimal case label must stay a constant expression:\n{source}");
+  assert!(source.contains("case 0x10:"), "hex case label must stay a constant expression:\n{source}");
+  assert!(source.contains("g_grid[16]"), "const array index must stay a plain value:\n{source}");
+  assert!(source.contains("g_grid[(BX + 0x10)]"), "computed index must stay a plain value:\n{source}");
+}
+
+#[test]
+fn hydra_memory_offsets_and_frame_mappings_never_relocate() {
+  // The segment operand of a guest access relocates when listed, but the
+  // offset operand is an address, never a segment value — as are PTR_*
+  // offsets and frame mappings (SP0 + off), even nested inside arithmetic.
+  use dis86::decompile::ast::{BinaryExpr, BinaryOperator, VarMap};
+  let func = Function {
+    name: "reloc_off".into(),
+    ret: None,
+    vardecls: vec![],
+    varmaps: vec![VarMap {
+      typ: Type::U16,
+      name: "V".into(),
+      mapping_expr: Expr::Binary(Box::new(BinaryExpr {
+        op: BinaryOperator::Add,
+        lhs: Expr::Name("SP0".into()),
+        rhs: Expr::HexConst(0x456),
+      })),
+    }],
+    frame_size: 0,
+    body: Block(vec![
+      Stmt::Expr(Expr::GuestMem(
+        Box::new(Expr::HexConst(0x456)),
+        Box::new(Expr::HexConst(0x456)),
+        2,
+      )),
+      Stmt::Assign(Assign {
+        decltype: None,
+        lhs: Expr::Abstract("PTR_16".into(), vec![Expr::Name("SS".into()), Expr::HexConst(0x456)]),
+        rhs: Expr::HexConst(0x1234),
+      }),
+    ]),
+  };
+  let source = gen::generate(&func, Flavor::Hydra { relocatable_segs: vec![0x456] }).unwrap();
+  assert!(
+    source.contains("LOAD_16((CODE_START_SEG + 0x456), 0x456);"),
+    "segment operand relocates, offset stays plain:\n{source}"
+  );
+  assert!(
+    source.contains("PTR_16(SS, 0x456) = 0x1234;"),
+    "PTR offset stays plain:\n{source}"
+  );
+  assert!(
+    source.contains("#define V SP0 + 0x456"),
+    "frame mapping offset stays plain:\n{source}"
+  );
+}
+
+#[test]
+fn standard_flavor_ignores_relocation_table_entirely() {
+  // Standard codegen has no relocation concept: everything stays baked.
+  let func = reloc_func(vec![Expr::HexConst(0x456), Expr::DecimalConst(0x456)]);
+  let source = gen::generate(&func, Flavor::Standard).unwrap();
+  assert!(!source.contains("CODE_START_SEG"), "standard must never relocate:\n{source}");
+  assert!(source.contains("AX = 0x456;"), "standard must keep the baked hex value:\n{source}");
+  assert!(source.contains("AX = 1110;"), "standard must keep the baked decimal value:\n{source}");
 }

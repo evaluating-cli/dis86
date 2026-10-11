@@ -3,14 +3,21 @@ use std::fmt;
 
 pub enum Flavor {
   Standard,
-  Hydra,
+  // relocatable_segs: absolute link-time segment values that must emit
+  // relocated under Hydra (CODE_START_SEG + seg) instead of baked. The
+  // list is operator-audited: it comes only from an explicit
+  // --relocatable-seg flag. There is no derived default, because no
+  // value-derived table can be safe by default (small segment bases
+  // like 0x0 collide with ordinary integer constants). Sorted,
+  // deduped. Standard ignores it.
+  Hydra { relocatable_segs: Vec<u16> },
 }
 
 impl Flavor {
   fn instantiate(&self) -> Box<dyn FlavorImpl> {
     match self {
       Flavor::Standard => Box::new(Standard{}),
-      Flavor::Hydra => Box::new(Hydra{}),
+      Flavor::Hydra { relocatable_segs } => Box::new(Hydra{ relocatable_segs: relocatable_segs.clone() }),
     }
   }
 }
@@ -21,6 +28,7 @@ trait FlavorImpl {
   fn frame_leave(&self, g: &mut Gen<'_>) -> fmt::Result;
   fn ret(&self, g: &mut Gen<'_>, ret: &Return) -> fmt::Result;
   fn call(&self, g: &mut Gen<'_>, name: &Expr, args: &[Expr], level: usize) -> fmt::Result;
+  fn relocatable_segs(&self) -> &[u16] { &[] }
 }
 
 struct Standard {}
@@ -79,8 +87,9 @@ impl FlavorImpl for Standard {
   }
 }
 
-struct Hydra {}
+struct Hydra { relocatable_segs: Vec<u16> }
 impl FlavorImpl for Hydra {
+  fn relocatable_segs(&self) -> &[u16] { &self.relocatable_segs }
   fn func_sig(&self, g: &mut Gen<'_>, func: &Function) -> fmt::Result {
     let name = &func.name;
     let name = if name.starts_with("F_") { &name[2..] } else { name };
@@ -142,11 +151,16 @@ struct Gen<'a> {
   f: &'a mut dyn fmt::Write,
   indent_level: usize,
   newline: bool,
+  // When set, HexConst/DecimalConst render raw even on table membership.
+  // Positions that are provably addresses, never segment values (memory
+  // offsets, frame mappings, array indices, case labels), render through
+  // expr_plain so a listed value used there still addresses correctly.
+  plain_consts: bool,
 }
 
 impl<'a> Gen<'a> {
   fn new(f: &'a mut dyn fmt::Write) -> Self {
-    Self { f, indent_level: 0, newline: true }
+    Self { f, indent_level: 0, newline: true, plain_consts: false }
   }
 
   fn endline(&mut self) -> fmt::Result {
@@ -192,6 +206,16 @@ impl<'a> Gen<'a> {
     self.text(oper.as_operator_str())
   }
 
+  fn expr_plain(&mut self, expr: &Expr, level: usize, imp: &dyn FlavorImpl) -> fmt::Result {
+    // Render with relocation suppressed, deeply: a nested const inside an
+    // offset expression (e.g. SP0 + off) is an offset too. Save/restore so
+    // nesting a plain region inside a relocating one is safe.
+    let saved = std::mem::replace(&mut self.plain_consts, true);
+    let r = self.expr(expr, level, imp);
+    self.plain_consts = saved;
+    r
+  }
+
   fn expr(&mut self, expr: &Expr, level: usize, imp: &dyn FlavorImpl) -> fmt::Result {
     match expr {
       Expr::Unary(u) => {
@@ -212,10 +236,29 @@ impl<'a> Gen<'a> {
         }
       }
       Expr::HexConst(k) => {
-        self.text(&format!("0x{:x}", k))?
+        // Under Hydra the recompiled code runs relocated (CODE_START_SEG
+        // is the runtime load delta): a baked absolute link-time segment
+        // constant must emit relocated, not baked. The match is against
+        // the explicit operator-audited table only. Positions that are
+        // provably addresses render raw via expr_plain; every other const
+        // equal to a listed value relocates, so a listed value must not
+        // double as a data or offset immediate in the emitted functions.
+        if !self.plain_consts && imp.relocatable_segs().contains(k) {
+          self.text(&format!("(CODE_START_SEG + 0x{:x})", k))?
+        } else {
+          self.text(&format!("0x{:x}", k))?
+        }
       }
       Expr::DecimalConst(k) => {
-        self.text(&format!("{}", k))?
+        // Same relocation rule as HexConst: segment-valued immediates
+        // reach the AST through both const forms. Negatives never
+        // relocate: a negative immediate cannot be a segment value, and
+        // the i16->u16 cast would otherwise wrap e.g. -16 into 0xfff0.
+        if *k >= 0 && !self.plain_consts && imp.relocatable_segs().contains(&(*k as u16)) {
+          self.text(&format!("(CODE_START_SEG + 0x{:x})", *k as u16))?
+        } else {
+          self.text(&format!("{}", k))?
+        }
       }
       Expr::Name(n) => {
         self.text(n)?;
@@ -232,7 +275,8 @@ impl<'a> Gen<'a> {
         self.text(&format!("LOAD_{}(", width * 8))?;
         self.expr(seg, 0, imp)?;
         self.text(", ")?;
-        self.expr(off, 0, imp)?;
+        // The offset is an address, never a segment value.
+        self.expr_plain(off, 0, imp)?;
         self.text(")")?;
       }
       Expr::Call(name, args) => {
@@ -240,16 +284,29 @@ impl<'a> Gen<'a> {
       }
       Expr::Abstract(name, args) => {
         self.text(&format!("{}(", name))?;
+        // PTR_8/16/32 always carry (seg, off): the segment operand
+        // relocates normally, the offset operands render plain. Other
+        // abstract calls carry opaque value lists and relocate normally.
+        let plain_from = match *name {
+          "PTR_8" | "PTR_16" | "PTR_32" => 1,
+          _ => usize::MAX,
+        };
         for (i, arg) in args.iter().enumerate() {
           if i != 0 { self.text(", ")?; }
-          self.expr(arg, 0, imp)?;
+          if i >= plain_from {
+            self.expr_plain(arg, 0, imp)?;
+          } else {
+            self.expr(arg, 0, imp)?;
+          }
         }
         self.text(")")?;
       }
       Expr::ArrayAccess(lhs, idx) => {
         self.expr(lhs, level+1, imp)?;
         self.text("[")?;
-        self.expr(idx, level+1, imp)?;
+        // An index computes an element position, never a segment value:
+        // render plain (deeply, so computed indices are covered too).
+        self.expr_plain(idx, level+1, imp)?;
         self.text("]")?;
       }
       Expr::StructAccess(lhs, mbr) => {
@@ -292,7 +349,7 @@ impl<'a> Gen<'a> {
           self.text(&format!("STORE_{}(", width * 8))?;
           self.expr(seg, 0, imp)?;
           self.text(", ")?;
-          self.expr(off, 0, imp)?;
+          self.expr_plain(off, 0, imp)?;
           self.text(", ")?;
           self.expr(&s.rhs, 0, imp)?;
           self.text(");")?;
@@ -360,7 +417,10 @@ impl<'a> Gen<'a> {
         for case in &sw.cases {
           for (i, case_expr) in case.cases.iter().enumerate() {
             self.text("case ")?;
-            self.expr(case_expr, 0, imp)?;
+            // Case labels must be integer constant expressions: render
+            // plain. A relocated label (CODE_START_SEG + seg) is a
+            // runtime value and would not compile.
+            self.expr_plain(case_expr, 0, imp)?;
             self.text(":")?;
             if i+1 != case.cases.len() {
               self.endline()?;
@@ -410,7 +470,9 @@ impl<'a> Gen<'a> {
     self.endline()?;
     for d in maps {
       self.text(&format!("#define {} ", d.name))?;
-      self.expr(&d.mapping_expr, 0, imp)?;
+      // A frame mapping is a stack address computation (SP0 + off),
+      // never a segment value.
+      self.expr_plain(&d.mapping_expr, 0, imp)?;
       self.endline()?;
     }
     Ok(())

@@ -671,7 +671,7 @@ impl IRBuilder<'_> {
   }
 
   fn process_calln(&mut self, ins: &instr::Instr, cs_pushed: bool) {
-    // Register- or memory-indirect near calls (`call ax`, `call [0x49a]`)
+    // Register- or memory-indirect near calls (`call ax`, `call [bx]`)
     // have no static target; model them like far-indirect calls (CallPtr
     // with heuristically inferred stack args) instead of aborting.
     let instr::Operand::Rel(rel) = &ins.operands[0] else {
