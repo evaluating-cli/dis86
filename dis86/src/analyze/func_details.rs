@@ -29,10 +29,12 @@ pub struct FuncDetails {
   // Return kinds observed on exits other than the one `return_kind`
   // reports (first-wins on ascending block order). Non-empty means the
   // function has exits of differing kinds: the classified kind came
-  // from the lowest-address exit and these others were dropped, so the
-  // annotated call mode may not fit every exit path. Repeats of the
-  // winning kind are normal (any multi-`ret` function) and stay
-  // unrecorded; see the Next::Return handling below.
+  // from the first exit in ascending block order — not necessarily the
+  // lowest-address instruction, since overlapping blocks from
+  // mid-instruction jump targets are possible — and these others were
+  // dropped, so the annotated call mode may not fit every exit path.
+  // Repeats of the winning kind are normal (any multi-`ret` function)
+  // and stay unrecorded; see the Next::Return handling below.
   pub ignored_return_kinds: Vec<ReturnKind>,
 }
 
@@ -151,8 +153,8 @@ impl FuncDetails {
           }
           Next::Return(ret) => {
             // First-wins on ascending block order (see WorkQueue::pop):
-            // the lowest-address exit classifies the function. Later
-            // exits of a *differing* kind are recorded instead of
+            // the first exit in block-pop order classifies the function.
+            // Later exits of a *differing* kind are recorded instead of
             // silently dropped, so the diagnostic can flag a function
             // whose annotated call mode may not fit every exit path.
             // Repeats of the winning kind are normal and unrecorded.
@@ -266,9 +268,10 @@ mod tests {
 
   #[test]
   fn mixed_return_kinds_record_ignored_not_winning() {
-    // `jz +1; ret; iret`: the lowest-address exit (the `ret` at 0x02)
-    // wins the classification, but the differing `iret` exit must be
-    // recorded, not silently dropped, so the diagnostic can flag it.
+    // `jz +1; ret; iret`: the first exit in ascending block order (the
+    // `ret` at 0x02) wins the classification, but the differing `iret`
+    // exit must be recorded, not silently dropped, so the diagnostic
+    // can flag it.
     let binary = Binary::from_raw(&[0x74, 0x01, 0xC3, 0xCF], None);
     let details = FuncDetails::build(segoff(0), None, &test_seg(4), &binary).unwrap();
     assert_eq!(details.return_kind, Some(ReturnKind::Near));
