@@ -56,6 +56,10 @@ fn print_help() {
   println!("");
   println!("CODEGEN FLAGS:");
   println!("  --codegen-hydra   emit code that integrates well with the hydra runtime (optional)");
+  println!("  --relocatable-seg HEX[,HEX...]");
+  println!("                    absolute link-time segment values to emit relocated as");
+  println!("                    (CODE_START_SEG + seg) instead of baked (optional, only");
+  println!("                    with --codegen-hydra; comma- or whitespace-separated)");
 }
 
 fn write_to_path(path: &str, data: &str) {
@@ -93,6 +97,10 @@ struct Args {
 
   build_pin_all: bool,
   codegen_hydra: bool,
+  // Explicit relocation table: comma-separated absolute link-time
+  // segment values, hex with optional 0x prefix. Only meaningful with
+  // --codegen-hydra.
+  relocatable_seg: Option<String>,
 }
 
 fn match_flag(args: &mut Vec<std::ffi::OsString>, flag: &str) -> bool {
@@ -103,6 +111,26 @@ fn match_flag(args: &mut Vec<std::ffi::OsString>, flag: &str) -> bool {
     }
   }
   false
+}
+
+// Parse an explicit relocation table: comma- or whitespace-separated
+// absolute link-time segment values, hex with an optional 0x prefix.
+// Sorted, deduped; error text (not panic) on bad input, matching the
+// --analyze error convention.
+fn parse_relocatable_segs(list: &str) -> Result<Vec<u16>, String> {
+  use std::collections::BTreeSet;
+  let mut set = BTreeSet::new();
+  for tok in list.split(|c: char| c == ',' || c.is_whitespace()).filter(|t| !t.is_empty()) {
+    let hex = tok.strip_prefix("0x").or_else(|| tok.strip_prefix("0X")).unwrap_or(tok);
+    match u16::from_str_radix(hex, 16) {
+      Ok(v) => { set.insert(v); }
+      Err(_) => return Err(format!("Expected hex u16 list for --relocatable-seg, got '{}'", tok)),
+    }
+  }
+  if set.is_empty() {
+    return Err("Expected at least one segment value for --relocatable-seg".to_string());
+  }
+  Ok(set.into_iter().collect())
 }
 
 fn parse_binary_fmt(pargs: &mut pico_args::Arguments) -> Result<binary::Fmt, pico_args::Error> {
@@ -151,6 +179,7 @@ fn parse_args() -> Result<Args, pico_args::Error> {
     emit_code:       pargs.opt_value_from_str("--emit-code")?,
     build_pin_all:   false,
     codegen_hydra:   false,
+    relocatable_seg: pargs.opt_value_from_str("--relocatable-seg")?,
   };
 
   let mut remaining = pargs.finish();
@@ -177,6 +206,32 @@ pub fn run() -> i32 {
   };
 
   let cfg = Config::from_path(&args.config).unwrap();
+
+  // Parse the relocation table once per run (not per function): a bad
+  // value is a single upfront error, even without --codegen-hydra, and
+  // the audit line below prints once.
+  let relocatable_segs: Vec<u16> = match args.relocatable_seg.as_deref() {
+    Some(list) => {
+      let segs = match parse_relocatable_segs(list) {
+        Ok(segs) => segs,
+        Err(err) => {
+          eprintln!("Error: {}", err);
+          return 1;
+        }
+      };
+      if args.codegen_hydra {
+        segs
+      } else {
+        eprintln!("Warning: --relocatable-seg has no effect without --codegen-hydra; ignoring.");
+        vec![]
+      }
+    }
+    None => vec![],
+  };
+  if args.emit_code.is_some() && args.codegen_hydra {
+    let table: Vec<String> = relocatable_segs.iter().map(|s| format!("0x{:x}", s)).collect();
+    eprintln!("relocatable segments: [{}]", table.join(", "));
+  }
 
   if args.analyze {
     let binary::Fmt::Exe(path) = &args.binary else { panic!("expected --binary-exe in --analyze mode") };
@@ -211,7 +266,7 @@ pub fn run() -> i32 {
     // panicking spec appended before counting it as failed.
     let code_len = all_code.len();
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-      decompile_spec(&args, &cfg, &binary, spec, &mut all_code)
+      decompile_spec(&args, &cfg, &binary, spec, &mut all_code, &relocatable_segs)
     }));
     match outcome {
       Ok(0) => {}
@@ -241,7 +296,7 @@ pub fn run() -> i32 {
   0
 }
 
-fn decompile_spec(args: &Args, cfg: &Config, binary: &Binary, spec: Spec<'_>, all_code: &mut String) -> i32 {
+fn decompile_spec(args: &Args, cfg: &Config, binary: &Binary, spec: Spec<'_>, all_code: &mut String, relocatable_segs: &[u16]) -> i32 {
   let region = binary.region_iter(spec.start, spec.end);
   let mut decoder = Decoder::new(region);
   let mut instr_list = vec![];
@@ -345,7 +400,17 @@ fn decompile_spec(args: &Args, cfg: &Config, binary: &Binary, spec: Spec<'_>, al
   }
 
   if args.emit_code.is_some() {
-    let flavor = if args.codegen_hydra { gen::Flavor::Hydra } else { gen::Flavor::Standard };
+    // Segment relocation: Hydra runs the recompiled code relocated, so
+    // baked absolute link-time segment constants listed in the explicit
+    // --relocatable-seg table (parsed once in run()) emit as
+    // (CODE_START_SEG + seg) instead of baked. The table is
+    // operator-audited by construction (the operator typed it); there
+    // is no derived default. Standard keeps raw values.
+    let flavor = if args.codegen_hydra {
+      gen::Flavor::Hydra { relocatable_segs: relocatable_segs.to_vec() }
+    } else {
+      gen::Flavor::Standard
+    };
     let code = gen::generate(&ast, flavor).unwrap();
     all_code.push_str(&code);
     all_code.push('\n');
@@ -353,4 +418,26 @@ fn decompile_spec(args: &Args, cfg: &Config, binary: &Binary, spec: Spec<'_>, al
   }
 
   return 0;
+}
+
+#[cfg(test)]
+mod tests {
+  use super::parse_relocatable_segs;
+
+  #[test]
+  fn relocatable_seg_list_parses_hex_with_optional_prefix() {
+    // Comma list, optional 0x/0X prefixes, sorted and deduped.
+    assert_eq!(parse_relocatable_segs("0x456,1789,0x456").unwrap(), vec![0x456, 0x1789]);
+    assert_eq!(parse_relocatable_segs("0X1 2").unwrap(), vec![0x1, 0x2]);
+    assert_eq!(parse_relocatable_segs("ffff").unwrap(), vec![0xffff]);
+  }
+
+  #[test]
+  fn relocatable_seg_list_rejects_empty_and_bad_tokens() {
+    // Error text (not panic): empty list, non-hex token, out-of-range.
+    assert!(parse_relocatable_segs("").is_err());
+    assert!(parse_relocatable_segs("  , ").is_err());
+    assert!(parse_relocatable_segs("0x456,banana").is_err());
+    assert!(parse_relocatable_segs("0x10000").is_err());
+  }
 }
