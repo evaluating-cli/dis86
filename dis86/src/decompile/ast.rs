@@ -485,7 +485,18 @@ impl<'a> Builder<'a> {
         Expr::Name(self.ref_name(r))
       }
       ir::Opcode::Make32 => {
-        let exprs: Vec<_> = instr.operands.iter().map(|r| self.ref_to_expr(*r, depth+1)).collect();
+        // Both halves are 16-bit values, but C promotes arithmetic (and
+        // bare constants are `int`): cast halves that aren't already u16 so
+        // u16-checked consumers (hydra's MAKE_32 static asserts) accept the
+        // expression. Semantically identity: halves are 16-bit by IR
+        // construction (upper16/lower16 splits).
+        let exprs: Vec<_> = instr.operands.iter().map(|r| {
+          let e = self.ref_to_expr(*r, depth+1);
+          match e {
+            Expr::Cast(Type::U16, _) => e,
+            _ => Expr::Cast(Type::U16, Box::new(e)),
+          }
+        }).collect();
         Expr::Abstract("MAKE_32", exprs)
       }
       ir::Opcode::SignExtTo16 => {

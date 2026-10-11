@@ -590,3 +590,27 @@ fn standard_flavor_ignores_relocation_table_entirely() {
   assert!(source.contains("AX = 0x456;"), "standard must keep the baked hex value:\n{source}");
   assert!(source.contains("AX = 1110;"), "standard must keep the baked decimal value:\n{source}");
 }
+
+#[test]
+fn hydra_make32_halves_cast_to_u16() {
+  // Both MAKE_32 halves must reach the C as u16: bare constants are C
+  // int and promoted arithmetic widens, tripping hydra's _Generic
+  // asserts on MAKE_32. The casts are semantically identity — halves
+  // are 16-bit by IR construction (upper16/lower16 splits) — and a
+  // half already carrying a u16 cast must not be double-cast.
+  let types = Rc::new(TypeDatabase::new());
+  let cfg = empty_config(types.clone());
+  let mut ir = ir::IR::new(types);
+  let blk = ir.add_block("entry");
+  let hi = ir.const_new(0x12);
+  let dividend = append(&mut ir, blk, Type::U32, Opcode::Make32, vec![hi, Ref::Init(Reg::AX)]);
+  append(&mut ir, blk, Type::Void, Opcode::RetNear, vec![dividend]);
+
+  let cf = ControlFlow::from_ir(&ir);
+  let func = Function::from_ir(&cfg, "make32_halves", None, &ir, &cf).unwrap();
+  let source = gen::generate(&func, Flavor::Hydra { relocatable_segs: vec![] }).unwrap();
+  assert!(
+    source.contains("MAKE_32((u16)18, (u16)AX)"),
+    "both halves must carry identity u16 casts:\n{source}"
+  );
+}
