@@ -308,6 +308,32 @@ fn byte_stack_symbol_reads_and_writes_emit_ptr8_mapping() {
 }
 
 #[test]
+fn hydra_entry_fragments_get_declared_and_initialized() {
+  // A versioned register read with no dominating definition (an
+  // unresolved entry phi) observes guest state at entry; without a
+  // decl + init the output does not compile. Phis never emit their
+  // own assignment, so the bare fragment name is used-never-assigned.
+  // Same for orphan temps (zero-init u32).
+  let types = Rc::new(TypeDatabase::new());
+  let cfg = empty_config(types.clone());
+  let mut ir = ir::IR::new(types);
+  let blk = ir.add_block("entry");
+  // Fresh blocks are unsealed: reading an undefined register mints an
+  // incomplete phi, the entry-read shape (phi_create names the version).
+  let cx = ir.get_var(ir::Name::Var("cx".to_string()), blk);
+  let orphan = ir.get_var(ir::Name::Var("tmp".to_string()), blk);
+  append(&mut ir, blk, Type::Void, Opcode::RetNear, vec![cx, orphan]);
+
+  let cf = ControlFlow::from_ir(&ir);
+  let func = Function::from_ir(&cfg, "entry_frag", None, &ir, &cf).unwrap();
+  let source = gen::generate(&func, Flavor::Hydra { relocatable_segs: vec![] }).unwrap();
+  assert!(source.contains("cx_1 = CX;"), "fragment must init from its parent register:\n{source}");
+  assert!(source.contains("u16 cx_1;"), "fragment must be declared:\n{source}");
+  assert!(source.contains("tmp_1 = 0;"), "orphan temp must zero-init:\n{source}");
+  assert!(source.contains("u32 tmp_1;"), "orphan temp must be declared:\n{source}");
+}
+
+#[test]
 fn byte_global_store_emits_symbol_assignment() {
   let types = Rc::new(TypeDatabase::new());
   let mut cfg = empty_config(types.clone());
