@@ -95,6 +95,16 @@ impl<'a> IRBuilder<'a> {
     this.ir.set_var(instr::Reg::SS, this.cur, Ref::Init(instr::Reg::SS));
     this.ir.set_var(instr::Reg::DS, this.cur, Ref::Init(instr::Reg::DS));
 
+    // Seed the byte fragments too: append_asm_dst_reg reads the sibling
+    // when recomposing, and an unseeded fragment would materialize as an
+    // operand-less Phi whose name is never declared in the output.
+    for reg in [instr::Reg::AL, instr::Reg::AH,
+                instr::Reg::BL, instr::Reg::BH,
+                instr::Reg::CL, instr::Reg::CH,
+                instr::Reg::DL, instr::Reg::DH] {
+      this.ir.set_var(reg, this.cur, Ref::Init(reg));
+    }
+
     this.ir.set_var(instr::Reg::IP, this.cur, Ref::Init(instr::Reg::IP));
     this.ir.set_var(instr::Reg::FLAGS, this.cur, Ref::Init(instr::Reg::FLAGS));
 
@@ -292,6 +302,46 @@ impl IRBuilder<'_> {
       vref = self.append_instr_with_attrs(Type::U16, Attribute::PIN, Opcode::Ref, vec![vref]);
     }
     self.ir.set_var(reg.0, self.cur, vref);
+    // Keep overlapping registers coherent: partial writes recompose the
+    // full register and full writes split into the fragments. Without
+    // this, a fragment read after an overlapping write sees a stale
+    // version (e.g. `mov al,[bx]` ... `call toupper` ... `mov [bx],al`
+    // must store the call result). BX/SI/DI/BP have no
+    // fragments: nothing more to do.
+    let (full, lo, hi) = match reg.0 {
+      instr::Reg::AL | instr::Reg::AH => (instr::Reg::AX, instr::Reg::AL, instr::Reg::AH),
+      instr::Reg::BL | instr::Reg::BH => (instr::Reg::BX, instr::Reg::BL, instr::Reg::BH),
+      instr::Reg::CL | instr::Reg::CH => (instr::Reg::CX, instr::Reg::CL, instr::Reg::CH),
+      instr::Reg::DL | instr::Reg::DH => (instr::Reg::DX, instr::Reg::DL, instr::Reg::DH),
+      instr::Reg::AX | instr::Reg::BX | instr::Reg::CX | instr::Reg::DX => {
+        let cur = self.ir.get_var(reg.0, self.cur);
+        let (upper, lower) = self.append_upper_lower_split(cur);
+        let (f_lo, f_hi) = match reg.0 {
+          instr::Reg::AX => (instr::Reg::AL, instr::Reg::AH),
+          instr::Reg::BX => (instr::Reg::BL, instr::Reg::BH),
+          instr::Reg::CX => (instr::Reg::CL, instr::Reg::CH),
+          _ => (instr::Reg::DL, instr::Reg::DH),
+        };
+        self.ir.set_var(f_lo, self.cur, lower);
+        self.ir.set_var(f_hi, self.cur, upper);
+        return;
+      }
+      _ => return,
+    };
+    // An 8-bit destination only keeps the low byte: a 16-bit source moved
+    // into a fragment would otherwise leak its high byte into the pair's
+    // high byte through the Or below. Mask at the write so every fragment
+    // value reaching the recompose is genuinely 8 bits wide.
+    let mask = self.ir.const_new(0xFF);
+    let masked = self.append_instr(Type::U16, Opcode::And, vec![vref, mask]);
+    self.ir.set_var(reg.0, self.cur, masked);
+    let lo_v = self.ir.get_var(lo, self.cur);
+    let hi_v = self.ir.get_var(hi, self.cur);
+    let (use_lo, use_hi) = if reg.0 == lo { (masked, hi_v) } else { (lo_v, masked) };
+    let eight = self.ir.const_new(8);
+    let shifted = self.append_instr(Type::U16, Opcode::Shl, vec![use_hi, eight]);
+    let composed = self.append_instr(Type::U16, Opcode::Or, vec![shifted, use_lo]);
+    self.ir.set_var(full, self.cur, composed);
   }
 
   fn compute_mem_address(&mut self, mem: &instr::OperandMem) -> Ref {
@@ -558,6 +608,23 @@ impl IRBuilder<'_> {
         self.ir.set_var(instr::Reg::AX, self.cur, lower);
       }
       _ => panic!("Unsupported function return type: {}", ret_type),
+    }
+    // Calls clobber AX/CX/DX (Watcom caller-saved); refresh the
+    // partial-register views so later fragment uses see post-call values
+    // instead of stale pre-call versions (e.g. `call toupper` followed by
+    // `mov [bx],al` must store the call result).
+    // BX/SI/DI/BP are callee-saved: untouched.
+    for reg in [instr::Reg::AX, instr::Reg::CX, instr::Reg::DX] {
+      let cur = self.ir.get_var(reg, self.cur);
+      let (upper, lower) = self.append_upper_lower_split(cur);
+      let (lo, hi) = match reg {
+        instr::Reg::AX => (instr::Reg::AL, instr::Reg::AH),
+        instr::Reg::CX => (instr::Reg::CL, instr::Reg::CH),
+        instr::Reg::DX => (instr::Reg::DL, instr::Reg::DH),
+        _ => unreachable!(),
+      };
+      self.ir.set_var(lo, self.cur, lower);
+      self.ir.set_var(hi, self.cur, upper);
     }
   }
 
@@ -881,9 +948,12 @@ impl IRBuilder<'_> {
           self.ir.set_var(reg, self.cur, vref);
         }
         let _saved_sp = self.append_pop();
+        // Route through append_asm_dst_reg so the byte fragments are
+        // re-split from the restored full values (a raw set_var would
+        // leave them holding pre-pusha versions).
         for reg in [instr::Reg::BX, instr::Reg::DX, instr::Reg::CX, instr::Reg::AX] {
           let vref = self.append_pop();
-          self.ir.set_var(reg, self.cur, vref);
+          self.append_asm_dst_reg(&instr::OperandReg(reg), vref);
         }
       }
       instr::Opcode::OP_LEAVE => {
@@ -1248,4 +1318,146 @@ pub fn build_from_instrs(instrs: &[instr::Instr], cfg: &Config, spec: &spec::Spe
   let mut bld = IRBuilder::new(cfg, instrs, spec, binary, overlay, pin_all);
   bld.build();
   bld.ir
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use crate::types::TypeDatabase;
+  use std::rc::Rc;
+
+  fn test_builder<'a>(cfg: &'a Config, instrs: &'a [instr::Instr], spec: &'a spec::Spec<'a>, binary: &'a binary::Binary) -> IRBuilder<'a> {
+    IRBuilder::new(cfg, instrs, spec, binary, false, false)
+  }
+
+  #[test]
+  fn partial_writes_recompose_full_register() {
+    // mov ax, K then mov al, M must leave AX as (HI<<8)|M, not a bare
+    // store of M: a later fragment read would otherwise see a stale
+    // version (e.g. setups elided across calls going stale).
+    let types = Rc::new(TypeDatabase::new());
+    let cfg = Config { types: types.clone(), structs: vec![], code_segs: vec![], funcs: vec![], indirects: vec![], globals: vec![], text_section: vec![] };
+    let binary = binary::Binary::from_raw(&[0xC3], None);
+    let spec = spec::Spec::from_start_and_end(Some(SegOff { seg: Seg::Normal(0), off: Off(0) }), Some(SegOff { seg: Seg::Normal(0), off: Off(1) }));
+    let instrs: &[instr::Instr] = &[];
+    let mut b = test_builder(&cfg, instrs, &spec, &binary);
+    let cur = b.cur;
+    // Full write splits into fragments.
+    let full = b.ir.const_new(0x1234);
+    b.append_asm_dst_reg(&instr::OperandReg(instr::Reg::AX), full);
+    let al = b.ir.get_var(instr::Reg::AL, cur);
+    let ah = b.ir.get_var(instr::Reg::AH, cur);
+    assert_eq!(b.ir.instr(al).unwrap().opcode, Opcode::Lower16);
+    assert_eq!(b.ir.instr(ah).unwrap().opcode, Opcode::Upper16);
+    // Partial write recomposes instead of bare-storing.
+    let lo_new = b.ir.const_new(0x56);
+    b.append_asm_dst_reg(&instr::OperandReg(instr::Reg::AL), lo_new);
+    let ax = b.ir.get_var(instr::Reg::AX, cur);
+    let ax_instr = b.ir.instr(ax).expect("AX must be recomposed, not a bare constant");
+    assert_eq!(ax_instr.opcode, Opcode::Or);
+    assert_eq!(ax_instr.operands.len(), 2);
+    // The incoming byte is masked to 8 bits at the write, so the Or
+    // carries And(lo_new, 0xFF) rather than lo_new itself.
+    let masked = ax_instr.operands.iter().find_map(|r| {
+      let i = b.ir.instr(*r)?;
+      (i.opcode == Opcode::And && i.operands.contains(&lo_new)).then_some(*r)
+    }).expect("recomposition must carry the masked new LO");
+    assert!(ax_instr.operands.contains(&masked));
+    assert!(
+      ax_instr.operands.iter().any(|r| b.ir.instr(*r).map(|i| i.opcode) == Some(Opcode::Shl)),
+      "recomposition must shift the preserved HI"
+    );
+  }
+
+  #[test]
+  fn undefined_sibling_register_seeds_initial_value() {
+    // A fragment read with no prior write must resolve to the initial
+    // register value (a machine.h byte alias), never to an
+    // operand-less Phi whose name is never declared in the output.
+    let types = Rc::new(TypeDatabase::new());
+    let cfg = Config { types: types.clone(), structs: vec![], code_segs: vec![], funcs: vec![], indirects: vec![], globals: vec![], text_section: vec![] };
+    let binary = binary::Binary::from_raw(&[0xC3], None);
+    let spec = spec::Spec::from_start_and_end(Some(SegOff { seg: Seg::Normal(0), off: Off(0) }), Some(SegOff { seg: Seg::Normal(0), off: Off(1) }));
+    let instrs: &[instr::Instr] = &[];
+    let mut b = test_builder(&cfg, instrs, &spec, &binary);
+    let cur = b.cur;
+    assert_eq!(b.ir.get_var(instr::Reg::AL, cur), Ref::Init(instr::Reg::AL));
+    assert_eq!(b.ir.get_var(instr::Reg::AH, cur), Ref::Init(instr::Reg::AH));
+    assert_eq!(b.ir.get_var(instr::Reg::CL, cur), Ref::Init(instr::Reg::CL));
+    assert_eq!(b.ir.get_var(instr::Reg::DH, cur), Ref::Init(instr::Reg::DH));
+  }
+
+  #[test]
+  fn first_fragment_write_has_no_undeclared_phi() {
+    // `mov ah, 9` as the first write to the pair: the recomposed AX
+    // must reference Init(AL), not a Phi over the never-written sibling.
+    let types = Rc::new(TypeDatabase::new());
+    let cfg = Config { types: types.clone(), structs: vec![], code_segs: vec![], funcs: vec![], indirects: vec![], globals: vec![], text_section: vec![] };
+    let binary = binary::Binary::from_raw(&[0xC3], None);
+    let spec = spec::Spec::from_start_and_end(Some(SegOff { seg: Seg::Normal(0), off: Off(0) }), Some(SegOff { seg: Seg::Normal(0), off: Off(1) }));
+    let instrs: &[instr::Instr] = &[];
+    let mut b = test_builder(&cfg, instrs, &spec, &binary);
+    let cur = b.cur;
+    let nine = b.ir.const_new(9);
+    b.append_asm_dst_reg(&instr::OperandReg(instr::Reg::AH), nine);
+    let ax = b.ir.get_var(instr::Reg::AX, cur);
+    let ax_instr = b.ir.instr(ax).expect("AX must be recomposed from the first fragment write");
+    assert_eq!(ax_instr.opcode, Opcode::Or);
+    assert!(
+      ax_instr.operands.contains(&Ref::Init(instr::Reg::AL)),
+      "untouched sibling must be the initial register value, not a Phi"
+    );
+  }
+
+  #[test]
+  fn partial_write_masks_wide_source() {
+    // `mov cl, dx` with DX holding 16 bits: the fragment keeps only the
+    // low byte, so the recomposed CX is (HI<<8)|(DX&0xFF), never leaking
+    // DX's high byte into the pair.
+    let types = Rc::new(TypeDatabase::new());
+    let cfg = Config { types: types.clone(), structs: vec![], code_segs: vec![], funcs: vec![], indirects: vec![], globals: vec![], text_section: vec![] };
+    let binary = binary::Binary::from_raw(&[0xC3], None);
+    let spec = spec::Spec::from_start_and_end(Some(SegOff { seg: Seg::Normal(0), off: Off(0) }), Some(SegOff { seg: Seg::Normal(0), off: Off(1) }));
+    let instrs: &[instr::Instr] = &[];
+    let mut b = test_builder(&cfg, instrs, &spec, &binary);
+    let cur = b.cur;
+    let wide = b.ir.const_new(0x12AB);
+    b.append_asm_dst_reg(&instr::OperandReg(instr::Reg::CL), wide);
+    let cl = b.ir.get_var(instr::Reg::CL, cur);
+    let cl_instr = b.ir.instr(cl).expect("fragment must hold the masked write");
+    assert_eq!(cl_instr.opcode, Opcode::And);
+    assert!(cl_instr.operands.contains(&wide), "mask must apply to the incoming value");
+    let cx = b.ir.get_var(instr::Reg::CX, cur);
+    let cx_instr = b.ir.instr(cx).expect("CX must be recomposed");
+    assert_eq!(cx_instr.opcode, Opcode::Or);
+    assert!(cx_instr.operands.contains(&cl), "recomposition must carry the masked LO");
+  }
+
+  #[test]
+  fn calls_refresh_partial_register_views() {
+    // Calls clobber AX/CX/DX: after save_return_value the fragment
+    // views must be splits of the post-call value, not stale
+    // pre-call versions (call f + mov [bx],al must store the result).
+    let types = Rc::new(TypeDatabase::new());
+    let cfg = Config { types: types.clone(), structs: vec![], code_segs: vec![], funcs: vec![], indirects: vec![], globals: vec![], text_section: vec![] };
+    let binary = binary::Binary::from_raw(&[0xC3], None);
+    let spec = spec::Spec::from_start_and_end(Some(SegOff { seg: Seg::Normal(0), off: Off(0) }), Some(SegOff { seg: Seg::Normal(0), off: Off(1) }));
+    let instrs: &[instr::Instr] = &[];
+    let mut b = test_builder(&cfg, instrs, &spec, &binary);
+    let cur = b.cur;
+    let stale_lo = b.ir.const_new(0x11);
+    b.ir.set_var(instr::Reg::AL, cur, stale_lo);
+    let ret = b.ir.const_new(0x3344);
+    b.save_return_value(&Type::U16, ret);
+    let ax = b.ir.get_var(instr::Reg::AX, cur);
+    assert_eq!(ax, ret);
+    let al = b.ir.get_var(instr::Reg::AL, cur);
+    let al_instr = b.ir.instr(al).expect("AL must be refreshed post-call, not stale");
+    assert_eq!(al_instr.opcode, Opcode::Lower16);
+    assert_eq!(al_instr.operands, vec![ret]);
+    let ah = b.ir.get_var(instr::Reg::AH, cur);
+    let ah_instr = b.ir.instr(ah).expect("AH must be refreshed post-call, not stale");
+    assert_eq!(ah_instr.opcode, Opcode::Upper16);
+    assert_eq!(ah_instr.operands, vec![ret]);
+  }
 }
