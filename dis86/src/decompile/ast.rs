@@ -233,9 +233,11 @@ impl Block {
   }
 }
 
-/// Collect every variable name referenced anywhere in a body: pre-named
+/// Collect every Expr::Name referenced anywhere in a body: pre-named
 /// IR refs surface as Expr::Name without passing through ref_name(), so
-/// temp/assigned sets alone miss them.
+/// temp/assigned sets alone miss them. This deliberately includes names
+/// in non-variable positions (call callees, struct members, array
+/// indices); downstream filters are narrow and ignore the rest.
 fn collect_body_names(body: &Block, out: &mut Vec<String>) {
   for stmt in &body.0 {
     collect_stmt_names(stmt, out);
@@ -293,7 +295,10 @@ fn collect_expr_names(expr: &Expr, out: &mut Vec<String>) {
 /// post-FRAME_ENTER SP/BP the body observes); differential execution, not
 /// inspection, adjudicates them.
 fn entry_fragment_parent(name: &str) -> Option<(&'static str, bool, Type)> {
-  let (frag, _) = name.split_once('_')?;
+  // Like the tmp_ branch below, only an all-digit suffix counts: a
+  // variable symbol such as ax_buf_1 must not be read as fragment ax.
+  let (frag, suffix) = name.split_once('_')?;
+  if suffix.is_empty() || !suffix.bytes().all(|b| b.is_ascii_digit()) { return None; }
   match frag {
     "ax" => Some(("AX", false, Type::U16)),
     "bx" => Some(("BX", false, Type::U16)),
@@ -341,6 +346,18 @@ impl<'a> Builder<'a> {
 
   fn lookup_uses(&self, r: ir::Ref) -> usize {
     *self.n_uses.get(&r).unwrap_or(&0)
+  }
+
+  /// Width for an orphan tmp_ name: the producing instruction's type
+  /// when the ref is recoverable from temp_names, u32 otherwise.
+  /// Exact-width consumers (MAKE_32, UPPER/LOWER) assert on the C type,
+  /// so a blind u32 guess can break either direction.
+  fn orphan_temp_type(&self, name: &str) -> Type {
+    self.temp_names.iter()
+      .find(|(_, n)| *n == name)
+      .and_then(|(r, _)| self.ir.instr(*r))
+      .map(|i| i.typ.clone())
+      .unwrap_or(Type::U32)
   }
 
   fn ref_name(&mut self, r: ir::Ref) -> String {
@@ -1313,7 +1330,8 @@ impl<'a> Builder<'a> {
   }
 
   fn build(&mut self, name: &str, ret: Option<Type>) -> Result<Function, String> {
-    let mut iter = self.cf.iter().peekable();    let mut body = self.convert_body(&mut iter, 0);
+    let mut iter = self.cf.iter().peekable();
+    let mut body = self.convert_body(&mut iter, 0);
     assert!(iter.next().is_none());
     if let Some(err) = self.layout_error.take() { return Err(err); }
 
@@ -1345,11 +1363,12 @@ impl<'a> Builder<'a> {
         inits.push(Stmt::Assign(Assign { decltype: None, lhs: Expr::Name(n.clone()), rhs }));
       } else if n.strip_prefix("tmp_").is_some_and(|s| s.bytes().all(|b| b.is_ascii_digit())) {
         // Orphan temp: used but never assigned (e.g. a use surviving in
-        // dead code whose definition was eliminated). Declare u32 and
-        // zero-init so output compiles; differential execution adjudicates
-        // any live occurrence (a use without definition is an IR-level
-        // undefined value either way).
-        self.assigns.push((n.clone(), Type::U32));
+        // dead code whose definition was eliminated). Declare at the
+        // producing instruction's width and zero-init so output compiles;
+        // differential execution adjudicates any live occurrence (a use
+        // without definition is an IR-level undefined value either way).
+        let typ = self.orphan_temp_type(n);
+        self.assigns.push((n.clone(), typ));
         self.assigned.insert(n.clone());
         inits.push(Stmt::Assign(Assign {
           decltype: None,
@@ -1510,8 +1529,7 @@ fn ground_frame(
 
 #[cfg(test)]
 mod tests {
-  use super::{checked_byte_range, ground_frame, widen_frame};
-  use super::{entry_fragment_parent, collect_body_names, Block, Stmt, Expr, Assign, If, BinaryExpr, BinaryOperator};
+  use super::{checked_byte_range, ground_frame, widen_frame, entry_fragment_parent, collect_body_names, Block, Stmt, Expr, Assign, If, BinaryExpr, BinaryOperator};
   use crate::types::Type;
 
   #[test]
@@ -1621,6 +1639,33 @@ mod tests {
     // Others aren't fragments.
     assert_eq!(entry_fragment_parent("tmp_0"), None);
     assert_eq!(entry_fragment_parent("AX"), None);
+    // A non-numeric suffix is a variable symbol, not a versioned name.
+    assert_eq!(entry_fragment_parent("ax_buf_1"), None);
+    assert_eq!(entry_fragment_parent("ax_"), None);
+  }
+
+  #[test]
+  fn orphan_temp_type_uses_producing_instruction_width() {
+    use std::rc::Rc;
+    use crate::types::TypeDatabase;
+    let types = Rc::new(TypeDatabase::new());
+    let cfg = super::Config { types: types.clone(), structs: vec![], code_segs: vec![], funcs: vec![], indirects: vec![], globals: vec![], text_section: vec![] };
+    let mut ir = super::ir::IR::new(types);
+    let blk = ir.add_block("entry");
+    let wide = ir.block_instr_append(blk, super::ir::Instr {
+      typ: Type::U16,
+      compare_width: None,
+      attrs: super::ir::Attribute::NONE,
+      opcode: super::ir::Opcode::Lower16,
+      operands: vec![],
+    });
+    let cf = super::ControlFlow::from_ir(&ir);
+    let mut b = super::Builder::new(&cfg, &ir, &cf);
+    b.temp_names.insert(wide, "tmp_7".to_string());
+    // A recoverable ref declares at its producing width, not u32.
+    assert_eq!(b.orphan_temp_type("tmp_7"), Type::U16);
+    // An unrecoverable name keeps the u32 fallback.
+    assert_eq!(b.orphan_temp_type("tmp_9"), Type::U32);
   }
 
   #[test]
