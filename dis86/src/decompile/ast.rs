@@ -233,6 +233,91 @@ impl Block {
   }
 }
 
+/// Collect every Expr::Name referenced anywhere in a body: pre-named
+/// IR refs surface as Expr::Name without passing through ref_name(), so
+/// temp/assigned sets alone miss them. This deliberately includes names
+/// in non-variable positions (call callees, struct members, array
+/// indices); downstream filters are narrow and ignore the rest.
+fn collect_body_names(body: &Block, out: &mut Vec<String>) {
+  for stmt in &body.0 {
+    collect_stmt_names(stmt, out);
+  }
+}
+
+fn collect_stmt_names(stmt: &Stmt, out: &mut Vec<String>) {
+  match stmt {
+    Stmt::Label(_) | Stmt::Instr(_) | Stmt::Goto(_) | Stmt::Unreachable => (),
+    Stmt::Expr(e) => collect_expr_names(e, out),
+    Stmt::Assign(a) => { collect_expr_names(&a.lhs, out); collect_expr_names(&a.rhs, out); }
+    Stmt::CondGoto(c) => collect_expr_names(&c.cond, out),
+    Stmt::Return(r) => { for v in &r.vals { collect_expr_names(v, out); } }
+    Stmt::Loop(l) => collect_body_names(&l.body, out),
+    Stmt::If(i) => {
+      collect_expr_names(&i.cond, out);
+      collect_body_names(&i.then_body, out);
+      if let Some(else_body) = &i.else_body { collect_body_names(else_body, out); }
+    }
+    Stmt::Switch(s) => {
+      collect_expr_names(&s.switch_val, out);
+      for case in &s.cases {
+        for v in &case.cases { collect_expr_names(v, out); }
+        collect_body_names(&case.body, out);
+      }
+      if let Some(default) = &s.default { collect_body_names(default, out); }
+    }
+  }
+}
+
+fn collect_expr_names(expr: &Expr, out: &mut Vec<String>) {
+  match expr {
+    Expr::Name(n) => out.push(n.clone()),
+    Expr::Unary(u) => collect_expr_names(&u.rhs, out),
+    Expr::Binary(b) => { collect_expr_names(&b.lhs, out); collect_expr_names(&b.rhs, out); }
+    Expr::Call(f, args) => {
+      collect_expr_names(f, out);
+      for a in args { collect_expr_names(a, out); }
+    }
+    Expr::Abstract(_, args) => { for a in args { collect_expr_names(a, out); } }
+    Expr::ArrayAccess(l, i) | Expr::StructAccess(l, i) => {
+      collect_expr_names(l, out);
+      collect_expr_names(i, out);
+    }
+    Expr::Deref(e) => collect_expr_names(e, out),
+    Expr::GuestMem(s, o, _) => { collect_expr_names(s, out); collect_expr_names(o, out); }
+    Expr::Cast(_, e) => collect_expr_names(e, out),
+    Expr::HexConst(_) | Expr::DecimalConst(_) | Expr::UnimplPhi | Expr::UnimplPin => (),
+  }
+}
+
+/// Parent register, high-byte flag, and type for a versioned byte-
+/// register name (`al_7`, `ah_3`). Returns None for anything else.
+///
+/// Only the 8 byte registers are here, and that is a deliberate,
+/// verified set rather than an enumeration of all fragments: the 14
+/// registers seeded in IRBuilder::new (ir_build.rs) resolve to
+/// Ref::Init, which renders inline as the register macro (SP as SP0),
+/// so they can never surface as a bare versioned name. get_var returns
+/// the seed before ever reaching the zero-operand-phi fall-through.
+/// The byte registers are not seeded, so a read with no dominating def
+/// mints a zero-operand entry phi that this table completes.
+fn entry_fragment_parent(name: &str) -> Option<(&'static str, bool, Type)> {
+  // Only an all-digit suffix counts: a variable symbol such as al_buf_1
+  // must not be read as fragment al.
+  let (frag, suffix) = name.split_once('_')?;
+  if suffix.is_empty() || !suffix.bytes().all(|b| b.is_ascii_digit()) { return None; }
+  match frag {
+    "al" => Some(("AX", false, Type::U8)),
+    "cl" => Some(("CX", false, Type::U8)),
+    "dl" => Some(("DX", false, Type::U8)),
+    "bl" => Some(("BX", false, Type::U8)),
+    "ah" => Some(("AX", true, Type::U8)),
+    "ch" => Some(("CX", true, Type::U8)),
+    "dh" => Some(("DX", true, Type::U8)),
+    "bh" => Some(("BX", true, Type::U8)),
+    _ => None,
+  }
+}
+
 impl<'a> Builder<'a> {
   fn new(cfg: &'a Config, ir: &'a ir::IR, cf: &'a ControlFlow) -> Self {
     let n_uses = ir.compute_uses();
@@ -1242,9 +1327,48 @@ impl<'a> Builder<'a> {
 
   fn build(&mut self, name: &str, ret: Option<Type>) -> Result<Function, String> {
     let mut iter = self.cf.iter().peekable();
-    let body = self.convert_body(&mut iter, 0);
+    let mut body = self.convert_body(&mut iter, 0);
     assert!(iter.next().is_none());
     if let Some(err) = self.layout_error.take() { return Err(err); }
+
+    // Declare + initialize entry byte-register fragments: a versioned
+    // byte-register use with no assignment in the function reads guest
+    // state at entry (the 8 byte registers are not seeded in IRBuilder).
+    // Without decls the output does not compile. A fragment additionally
+    // requires the name to resolve to Name::Reg in ir.names: a same-
+    // spelled symbol renders identically but must not inherit a register
+    // init. Seeded registers render inline upstream and never reach here.
+    // Keep deterministic: sorted order.
+    let mut used = vec![];
+    collect_body_names(&body, &mut used);
+    used.sort();
+    used.dedup();
+    let mut inits = vec![];
+    for n in &used {
+      if self.assigned.contains(n) { continue; }
+      // A fragment name must come from an actual register version: the
+      // rendered string alone cannot tell Name::Reg(AL) from Name::Var("al").
+      let is_reg = self.ir.names.values().any(|full| {
+        matches!(full.0, ir::Name::Reg(_)) && format!("{}_{}", full.0, full.1) == *n
+      });
+      if is_reg {
+        if let Some((parent, high, typ)) = entry_fragment_parent(n) {
+          let rhs = if high {
+            Expr::Binary(Box::new(BinaryExpr {
+              op: BinaryOperator::Shr,
+              lhs: Expr::Name(parent.to_string()),
+              rhs: Expr::DecimalConst(8),
+            }))
+          } else {
+            Expr::Name(parent.to_string())
+          };
+          self.assigns.push((n.clone(), typ));
+          self.assigned.insert(n.clone());
+          inits.push(Stmt::Assign(Assign { decltype: None, lhs: Expr::Name(n.clone()), rhs }));
+        }
+      }
+    }
+    body.0.splice(0..0, inits);
 
     // Group all decls by type to save codegen space
     // let mut type_map: HashMap<Type, usize> = HashMap::new();
@@ -1396,7 +1520,8 @@ fn ground_frame(
 
 #[cfg(test)]
 mod tests {
-  use super::{checked_byte_range, ground_frame, widen_frame};
+  use super::{checked_byte_range, ground_frame, widen_frame, entry_fragment_parent, collect_body_names, Block, Stmt, Expr, Assign, If, BinaryExpr, BinaryOperator};
+  use crate::types::Type;
 
   #[test]
   fn negative_offsets_are_rejected() {
@@ -1491,5 +1616,62 @@ mod tests {
   #[test]
   fn widen_frame_widens_both_directions() {
     assert_eq!(widen_frame(-4, -6, -10, -1), (-1, -10));
+  }
+
+  #[test]
+  fn fragment_parents_map_correctly() {
+    // Only the 8 byte registers are fragments; the 14 registers seeded
+    // in IRBuilder::new resolve to Ref::Init upstream and never orphan.
+    assert_eq!(entry_fragment_parent("al_1"), Some(("AX", false, Type::U8)));
+    assert_eq!(entry_fragment_parent("cl_1"), Some(("CX", false, Type::U8)));
+    assert_eq!(entry_fragment_parent("dl_1"), Some(("DX", false, Type::U8)));
+    assert_eq!(entry_fragment_parent("bl_1"), Some(("BX", false, Type::U8)));
+    assert_eq!(entry_fragment_parent("ah_3"), Some(("AX", true, Type::U8)));
+    assert_eq!(entry_fragment_parent("ch_3"), Some(("CX", true, Type::U8)));
+    assert_eq!(entry_fragment_parent("dh_3"), Some(("DX", true, Type::U8)));
+    assert_eq!(entry_fragment_parent("bh_3"), Some(("BX", true, Type::U8)));
+    // Seeded registers resolve upstream and never orphan; SP/BP/IP/FLAGS
+    // likewise never surface as bare versioned names.
+    assert_eq!(entry_fragment_parent("ax_5"), None);
+    assert_eq!(entry_fragment_parent("cx_1"), None);
+    assert_eq!(entry_fragment_parent("ds_4"), None);
+    assert_eq!(entry_fragment_parent("sp_1"), None);
+    assert_eq!(entry_fragment_parent("bp_2"), None);
+    assert_eq!(entry_fragment_parent("ip_1"), None);
+    assert_eq!(entry_fragment_parent("flags_1"), None);
+    // Others aren't fragments.
+    assert_eq!(entry_fragment_parent("tmp_0"), None);
+    assert_eq!(entry_fragment_parent("AX"), None);
+    // A non-numeric suffix is a variable symbol, not a versioned name.
+    assert_eq!(entry_fragment_parent("al_buf_1"), None);
+    assert_eq!(entry_fragment_parent("al_"), None);
+  }
+
+  #[test]
+  fn body_name_walk_finds_nested_uses() {
+    // if (al_7 & 1) { bl_2 = F_x(ax_5); }
+    let cond = Expr::Binary(Box::new(BinaryExpr {
+      op: BinaryOperator::And,
+      lhs: Expr::Name("al_7".to_string()),
+      rhs: Expr::DecimalConst(1),
+    }));
+    let call = Expr::Call(
+      Box::new(Expr::Name("F_x".to_string())),
+      vec![Expr::Name("ax_5".to_string())],
+    );
+    let assign = Stmt::Assign(Assign {
+      decltype: None,
+      lhs: Expr::Name("bl_2".to_string()),
+      rhs: call,
+    });
+    let body = Block(vec![Stmt::If(If {
+      cond,
+      then_body: Block(vec![assign]),
+      else_body: None,
+    })]);
+    let mut names = vec![];
+    collect_body_names(&body, &mut names);
+    names.sort();
+    assert_eq!(names, vec!["F_x".to_string(), "al_7".to_string(), "ax_5".to_string(), "bl_2".to_string()]);
   }
 }
