@@ -309,46 +309,46 @@ fn byte_stack_symbol_reads_and_writes_emit_ptr8_mapping() {
 
 #[test]
 fn hydra_entry_fragments_get_declared_and_initialized() {
-  // A versioned register read with no dominating definition (an
-  // unresolved entry phi) observes guest state at entry; without a
+  // Versioned byte-register reads with no dominating definition (the 8
+  // byte registers are not seeded in IRBuilder, so an entry read mints
+  // an unresolved entry phi) observe guest state at entry; without a
   // decl + init the output does not compile. Phis never emit their
-  // own assignment, so the bare fragment name is used-never-assigned.
-  // Same for orphan temps (zero-init at the IR's own width).
+  // own assignment, so the bare fragment names are used-never-assigned.
   let types = Rc::new(TypeDatabase::new());
   let cfg = empty_config(types.clone());
   let mut ir = ir::IR::new(types);
   let blk = ir.add_block("entry");
-  // Fresh blocks are unsealed: reading an undefined register mints an
-  // incomplete phi, the entry-read shape (phi_create names the version).
-  let cx = ir.get_var(ir::Name::Reg(Reg::CX), blk);
-  let orphan = ir.get_var(ir::Name::Var("tmp".to_string()), blk);
-  append(&mut ir, blk, Type::Void, Opcode::RetNear, vec![cx, orphan]);
+  // Fresh blocks are unsealed: reading an undefined byte register mints
+  // an incomplete phi, the entry-read shape (phi_create names the version).
+  let al = ir.get_var(ir::Name::Reg(Reg::AL), blk);
+  let ah = ir.get_var(ir::Name::Reg(Reg::AH), blk);
+  append(&mut ir, blk, Type::Void, Opcode::RetNear, vec![al, ah]);
 
   let cf = ControlFlow::from_ir(&ir);
   let func = Function::from_ir(&cfg, "entry_frag", None, &ir, &cf).unwrap();
   let source = gen::generate(&func, Flavor::Hydra { relocatable_segs: vec![] }).unwrap();
-  assert!(source.contains("cx_1 = CX;"), "fragment must init from its parent register:\n{source}");
-  assert!(source.contains("u16 cx_1, tmp_1;"), "fragment and orphan must share the u16 decl:\n{source}");
-  assert!(source.contains("tmp_1 = 0;"), "orphan temp must zero-init:\n{source}");
+  assert!(source.contains("al_1 = AX;"), "fragment must init from its parent register:\n{source}");
+  assert!(source.contains("ah_1 = AX >> 8;"), "high fragment must shift its parent register:\n{source}");
+  assert!(source.contains("u8 ah_1, al_1;"), "fragments must be declared:\n{source}");
 }
 
 #[test]
 fn symbol_named_like_register_is_not_a_fragment() {
-  // Name::Var("cx") renders identically to Name::Reg(CX) ("cx_1"), but it
+  // Name::Var("al") renders identically to Name::Reg(AL) ("al_1"), but it
   // is a symbol, not a register version: it must not inherit a register
   // init. It stays undeclared (loud) instead of silently wrong.
   let types = Rc::new(TypeDatabase::new());
   let cfg = empty_config(types.clone());
   let mut ir = ir::IR::new(types);
   let blk = ir.add_block("entry");
-  let cx = ir.get_var(ir::Name::Var("cx".to_string()), blk);
-  append(&mut ir, blk, Type::Void, Opcode::RetNear, vec![cx]);
+  let al = ir.get_var(ir::Name::Var("al".to_string()), blk);
+  append(&mut ir, blk, Type::Void, Opcode::RetNear, vec![al]);
 
   let cf = ControlFlow::from_ir(&ir);
-  let func = Function::from_ir(&cfg, "sym_cx", None, &ir, &cf).unwrap();
+  let func = Function::from_ir(&cfg, "sym_al", None, &ir, &cf).unwrap();
   let source = gen::generate(&func, Flavor::Hydra { relocatable_segs: vec![] }).unwrap();
-  assert!(!source.contains("cx_1 = CX;"), "a same-spelled symbol must not init from the register:\n{source}");
-  assert!(!source.contains("u16 cx_1;"), "a same-spelled symbol must not be declared a fragment:\n{source}");
+  assert!(!source.contains("al_1 = AX;"), "a same-spelled symbol must not init from the register:\n{source}");
+  assert!(!source.contains("u8 al_1;"), "a same-spelled symbol must not be declared a fragment:\n{source}");
 }
 
 #[test]
