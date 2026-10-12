@@ -596,8 +596,7 @@ fn hydra_make32_halves_cast_to_u16() {
   // Both MAKE_32 halves must reach the C as u16: bare constants are C
   // int and promoted arithmetic widens, tripping hydra's _Generic
   // asserts on MAKE_32. The casts are semantically identity — halves
-  // are 16-bit by IR construction (upper16/lower16 splits) — and a
-  // half already carrying a u16 cast must not be double-cast.
+  // are 16-bit by IR construction (upper16/lower16 splits).
   let types = Rc::new(TypeDatabase::new());
   let cfg = empty_config(types.clone());
   let mut ir = ir::IR::new(types);
@@ -612,5 +611,33 @@ fn hydra_make32_halves_cast_to_u16() {
   assert!(
     source.contains("MAKE_32((u16)18, (u16)AX)"),
     "both halves must carry identity u16 casts:\n{source}"
+  );
+}
+
+#[test]
+fn hydra_make32_half_with_u16_cast_is_not_double_cast() {
+  // Upper16/Lower16 halves already render as a u16 cast, so the Make32
+  // guard must pass them through untouched rather than emitting
+  // (u16)(u16)x. A lone Lower16 half survives optimization (the
+  // upper+lower fusion needs both halves of one source), and this path
+  // runs no opt passes, so the half reaches codegen as a cast.
+  let types = Rc::new(TypeDatabase::new());
+  let cfg = empty_config(types.clone());
+  let mut ir = ir::IR::new(types);
+  let blk = ir.add_block("entry");
+  let lo = append(&mut ir, blk, Type::U16, Opcode::Lower16, vec![Ref::Init(Reg::DX)]);
+  let v = append(&mut ir, blk, Type::U32, Opcode::Make32, vec![Ref::Init(Reg::AX), lo]);
+  append(&mut ir, blk, Type::Void, Opcode::RetNear, vec![v]);
+
+  let cf = ControlFlow::from_ir(&ir);
+  let func = Function::from_ir(&cfg, "make32_nodouble", None, &ir, &cf).unwrap();
+  let source = gen::generate(&func, Flavor::Hydra { relocatable_segs: vec![] }).unwrap();
+  assert!(
+    source.contains("MAKE_32((u16)AX, (u16)DX)"),
+    "u16 half must pass through untouched:\n{source}"
+  );
+  assert!(
+    !source.contains("(u16)(u16)"),
+    "double cast must not occur:\n{source}"
   );
 }
