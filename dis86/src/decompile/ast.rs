@@ -203,6 +203,12 @@ struct Builder<'a> {
   n_uses: HashMap<ir::Ref, usize>,
   temp_names: HashMap<ir::Ref, String>,
   temp_count: usize,
+  // Every name ref_name() hands out, keyed by rendered string: the ref
+  // it came from plus the IR Name behind it. The splice below inspects
+  // body names (not refs), so this is how an orphan recovers its
+  // producing ref and how a fragment proves it is Name::Reg, not a
+  // same-spelled symbol. Absent names are genuinely dead code.
+  name_refs: HashMap<String, (ir::Ref, ir::Name)>,
   frame_off_low: i16,  // less negative
   frame_off_high: i16, // more negative
 
@@ -291,37 +297,39 @@ fn collect_expr_names(expr: &Expr, out: &mut Vec<String>) {
 
 /// Parent register, high-byte flag, and type for a versioned register
 /// fragment name (`ax_5`, `ah_3`, `ds_4`). Returns None for non-fragments.
-/// SP/BP are included as documented approximations (initialized from the
-/// post-FRAME_ENTER SP/BP the body observes); differential execution, not
-/// inspection, adjudicates them.
+/// The register table lives in asm::instr (from_str_upper + info); this
+/// only adds the version-suffix check and the byte-register parent/high
+/// mapping. SP/BP are deliberately excluded (see issue #61): FRAME_ENTER
+/// runs before these inits, so neither reads the entry value. IP/FLAGS
+/// are never fragments.
 fn entry_fragment_parent(name: &str) -> Option<(&'static str, bool, Type)> {
   // Like the tmp_ branch below, only an all-digit suffix counts: a
   // variable symbol such as ax_buf_1 must not be read as fragment ax.
   let (frag, suffix) = name.split_once('_')?;
   if suffix.is_empty() || !suffix.bytes().all(|b| b.is_ascii_digit()) { return None; }
-  match frag {
-    "ax" => Some(("AX", false, Type::U16)),
-    "bx" => Some(("BX", false, Type::U16)),
-    "cx" => Some(("CX", false, Type::U16)),
-    "dx" => Some(("DX", false, Type::U16)),
-    "si" => Some(("SI", false, Type::U16)),
-    "di" => Some(("DI", false, Type::U16)),
-    "cs" => Some(("CS", false, Type::U16)),
-    "ds" => Some(("DS", false, Type::U16)),
-    "es" => Some(("ES", false, Type::U16)),
-    "ss" => Some(("SS", false, Type::U16)),
-    "sp" => Some(("SP", false, Type::U16)),
-    "bp" => Some(("BP", false, Type::U16)),
-    "al" => Some(("AX", false, Type::U8)),
-    "bl" => Some(("BX", false, Type::U8)),
-    "cl" => Some(("CX", false, Type::U8)),
-    "dl" => Some(("DX", false, Type::U8)),
-    "ah" => Some(("AX", true, Type::U8)),
-    "bh" => Some(("BX", true, Type::U8)),
-    "ch" => Some(("CX", true, Type::U8)),
-    "dh" => Some(("DX", true, Type::U8)),
-    _ => None,
-  }
+  // Fragment locals render lowercase (ir::display::reg_name); the tables
+  // themselves are uppercase.
+  let reg = crate::asm::instr::Reg::from_str_upper(&frag.to_ascii_uppercase())?;
+  if matches!(reg,
+    crate::asm::instr::Reg::SP | crate::asm::instr::Reg::BP |
+    crate::asm::instr::Reg::IP | crate::asm::instr::Reg::FLAGS) { return None; }
+  let (parent, high) = match reg {
+    crate::asm::instr::Reg::AL => (crate::asm::instr::Reg::AX, false),
+    crate::asm::instr::Reg::CL => (crate::asm::instr::Reg::CX, false),
+    crate::asm::instr::Reg::DL => (crate::asm::instr::Reg::DX, false),
+    crate::asm::instr::Reg::BL => (crate::asm::instr::Reg::BX, false),
+    crate::asm::instr::Reg::AH => (crate::asm::instr::Reg::AX, true),
+    crate::asm::instr::Reg::CH => (crate::asm::instr::Reg::CX, true),
+    crate::asm::instr::Reg::DH => (crate::asm::instr::Reg::DX, true),
+    crate::asm::instr::Reg::BH => (crate::asm::instr::Reg::BX, true),
+    r => (r, false),
+  };
+  let typ = match reg.info().sz {
+    crate::asm::instr::Size::Size8 => Type::U8,
+    crate::asm::instr::Size::Size16 => Type::U16,
+    _ => return None,
+  };
+  Some((parent.info().name, high, typ))
 }
 
 impl<'a> Builder<'a> {
@@ -334,6 +342,7 @@ impl<'a> Builder<'a> {
       n_uses,
       temp_names: HashMap::new(),
       temp_count: 0,
+      name_refs: HashMap::new(),
       frame_off_low: i16::MIN+1,
       frame_off_high: 0,
 
@@ -349,12 +358,13 @@ impl<'a> Builder<'a> {
   }
 
   /// Width for an orphan tmp_ name: the producing instruction's type
-  /// when the ref is recoverable from temp_names, u32 otherwise.
+  /// when the ref is recoverable through name_refs, u32 otherwise.
+  /// Phi orphans resolve here too (phi_create types them U16), which is
+  /// what the rest of codegen already assumes via instr.typ.
   /// Exact-width consumers (MAKE_32, UPPER/LOWER) assert on the C type,
   /// so a blind u32 guess can break either direction.
   fn orphan_temp_type(&self, name: &str) -> Type {
-    self.temp_names.iter()
-      .find(|(_, n)| *n == name)
+    self.name_refs.get(name)
       .and_then(|(r, _)| self.ir.instr(*r))
       .map(|i| i.typ.clone())
       .unwrap_or(Type::U32)
@@ -362,7 +372,9 @@ impl<'a> Builder<'a> {
 
   fn ref_name(&mut self, r: ir::Ref) -> String {
     if let Some(n) = self.ir.names.get(&r) {
-      return format!("{}_{}", n.0, n.1);
+      let s = format!("{}_{}", n.0, n.1);
+      self.name_refs.insert(s.clone(), (r, n.0.clone()));
+      return s;
     }
     if let Some(n) = self.temp_names.get(&r) {
       return n.clone();
@@ -370,6 +382,7 @@ impl<'a> Builder<'a> {
     let name = format!("tmp_{}", self.temp_count);
     self.temp_count += 1;
     self.temp_names.insert(r, name.clone());
+    self.name_refs.insert(name.clone(), (r, ir::Name::Var(name.clone())));
     name
   }
 
@@ -1338,8 +1351,10 @@ impl<'a> Builder<'a> {
     // Declare + initialize entry-register fragments: a versioned register
     // use with no assignment in the function reads guest state at entry
     // (hydra register macros / ambient inputs). Without decls the output
-    // does not compile. SP/BP inits read the post-FRAME_ENTER values the
-    // body observes (approximations; differential execution adjudicates).
+    // does not compile. SP/BP are excluded (issue #61) so those stay loud.
+    // A fragment arm also requires the name to resolve to Name::Reg: a
+    // same-spelled symbol (e.g. a local named "cx") renders identically
+    // but must not inherit a register init.
     // Keep deterministic: sorted order.
     let mut used = vec![];
     collect_body_names(&body, &mut used);
@@ -1348,20 +1363,25 @@ impl<'a> Builder<'a> {
     let mut inits = vec![];
     for n in &used {
       if self.assigned.contains(n) { continue; }
-      if let Some((parent, high, typ)) = entry_fragment_parent(n) {
-        let rhs = if high {
-          Expr::Binary(Box::new(BinaryExpr {
-            op: BinaryOperator::Shr,
-            lhs: Expr::Name(parent.to_string()),
-            rhs: Expr::DecimalConst(8),
-          }))
-        } else {
-          Expr::Name(parent.to_string())
-        };
-        self.assigns.push((n.clone(), typ));
-        self.assigned.insert(n.clone());
-        inits.push(Stmt::Assign(Assign { decltype: None, lhs: Expr::Name(n.clone()), rhs }));
-      } else if n.strip_prefix("tmp_").is_some_and(|s| s.bytes().all(|b| b.is_ascii_digit())) {
+      // A fragment name must come from an actual register version: the
+      // rendered string alone cannot tell Name::Reg(CX) from Name::Var("cx").
+      let is_reg_version = self.name_refs.get(n).is_some_and(|(_, nm)| matches!(nm, ir::Name::Reg(_)));
+      if is_reg_version {
+        if let Some((parent, high, typ)) = entry_fragment_parent(n) {
+          let rhs = if high {
+            Expr::Binary(Box::new(BinaryExpr {
+              op: BinaryOperator::Shr,
+              lhs: Expr::Name(parent.to_string()),
+              rhs: Expr::DecimalConst(8),
+            }))
+          } else {
+            Expr::Name(parent.to_string())
+          };
+          self.assigns.push((n.clone(), typ));
+          self.assigned.insert(n.clone());
+          inits.push(Stmt::Assign(Assign { decltype: None, lhs: Expr::Name(n.clone()), rhs }));
+        }
+      } else if n.strip_prefix("tmp_").is_some_and(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit())) {
         // Orphan temp: used but never assigned (e.g. a use surviving in
         // dead code whose definition was eliminated). Declare at the
         // producing instruction's width and zero-init so output compiles;
@@ -1633,9 +1653,12 @@ mod tests {
     assert_eq!(entry_fragment_parent("bl_1"), Some(("BX", false, Type::U8)));
     assert_eq!(entry_fragment_parent("ah_3"), Some(("AX", true, Type::U8)));
     assert_eq!(entry_fragment_parent("ds_4"), Some(("DS", false, Type::U16)));
-    // SP/BP included as documented approximations.
-    assert_eq!(entry_fragment_parent("sp_1"), Some(("SP", false, Type::U16)));
-    assert_eq!(entry_fragment_parent("bp_2"), Some(("BP", false, Type::U16)));
+    // SP/BP are excluded (issue #61): neither reads the entry value.
+    assert_eq!(entry_fragment_parent("sp_1"), None);
+    assert_eq!(entry_fragment_parent("bp_2"), None);
+    // IP/FLAGS are never fragments.
+    assert_eq!(entry_fragment_parent("ip_1"), None);
+    assert_eq!(entry_fragment_parent("flags_1"), None);
     // Others aren't fragments.
     assert_eq!(entry_fragment_parent("tmp_0"), None);
     assert_eq!(entry_fragment_parent("AX"), None);
@@ -1652,19 +1675,15 @@ mod tests {
     let cfg = super::Config { types: types.clone(), structs: vec![], code_segs: vec![], funcs: vec![], indirects: vec![], globals: vec![], text_section: vec![] };
     let mut ir = super::ir::IR::new(types);
     let blk = ir.add_block("entry");
-    let wide = ir.block_instr_append(blk, super::ir::Instr {
-      typ: Type::U16,
-      compare_width: None,
-      attrs: super::ir::Attribute::NONE,
-      opcode: super::ir::Opcode::Lower16,
-      operands: vec![],
-    });
+    // Fresh blocks are unsealed: reading an undefined name mints an
+    // incomplete phi, the dominant orphan shape. phi_create types it U16.
+    let phi = ir.get_var(super::ir::Name::Var("tmp".to_string()), blk);
     let cf = super::ControlFlow::from_ir(&ir);
     let mut b = super::Builder::new(&cfg, &ir, &cf);
-    b.temp_names.insert(wide, "tmp_7".to_string());
-    // A recoverable ref declares at its producing width, not u32.
-    assert_eq!(b.orphan_temp_type("tmp_7"), Type::U16);
-    // An unrecoverable name keeps the u32 fallback.
+    assert_eq!(b.ref_name(phi), "tmp_1");
+    // A phi orphan declares at the IR's own width, not the u32 fallback.
+    assert_eq!(b.orphan_temp_type("tmp_1"), Type::U16);
+    // A name no ref ever produced keeps the u32 fallback.
     assert_eq!(b.orphan_temp_type("tmp_9"), Type::U32);
   }
 
