@@ -476,10 +476,17 @@ impl<'a> Gen<'a> {
     Ok(())
   }
 
-  fn varmaps_def(&mut self, maps: &[VarMap], imp: &dyn FlavorImpl) -> fmt::Result {
+  fn varmaps_def(&mut self, func: &Function, imp: &dyn FlavorImpl) -> fmt::Result {
     self.text(&format!("u16 SP0 = SP;"))?;
     self.endline()?;
-    for d in maps {
+    if func.uses_entry_bp {
+      // The body reads the entry (caller's) BP, which FRAME_ENTER below
+      // overwrites, so snapshot it while it still holds the caller's
+      // value. Gated on actual use: an unused local would warn. Issue #62.
+      self.text("u16 BP0 = BP;")?;
+      self.endline()?;
+    }
+    for d in &func.varmaps {
       self.text(&format!("#define {} ", d.name))?;
       // A frame mapping is a stack address computation (SP0 + off),
       // never a segment value.
@@ -516,7 +523,7 @@ impl<'a> Gen<'a> {
     self.endline()?;
     self.enter_block()?;
     self.endline()?;
-    self.varmaps_def(&func.varmaps, imp)?;
+    self.varmaps_def(func, imp)?;
     self.endline()?;
     imp.frame_enter(self, func.frame_size)?;
     self.endline()?;
