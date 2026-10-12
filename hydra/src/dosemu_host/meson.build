@@ -54,6 +54,16 @@ test_overlay_budget = executable(
   link_with : [libhydra, libhydra_dosemu],
 )
 
+## Host-independent coverage for the UNIMPL/UNIMPL_FLAGS markers
+## (hydra/src/header.h): the decompiler emits these calls for unmodeled
+## operations (UNIMPL) and imprecise flags values (UNIMPL_FLAGS). Both must
+## accept operands in expression position; UNIMPL must also trap loudly in
+## statement position, and UNIMPL_FLAGS must warn and return 0 in condition
+## position. Header-inline only; no library needed.
+test_unimpl_trap = executable(
+  'test_unimpl_trap', 'test_unimpl_trap.c',
+)
+
 ## Phase 4/5: guest program (nasm -> .COM) + driver integration test.
 
 testprog_com = custom_target(

@@ -300,6 +300,17 @@ impl<'a> Gen<'a> {
           }
         }
         self.text(")")?;
+        // Static inventory for the markers: a commented marker travels with
+        // every unmodeled-operation call, so grep over emitted C counts
+        // them whether or not they execute. Kept distinct because the two
+        // gaps behave and cost differently: UNIMPL aborts when reached
+        // (unknown operation), UNIMPL_FLAGS warns and returns 0 (known-
+        // but-imprecise flags value).
+        match *name {
+          "UNIMPL" => { self.text(" /* UNIMPL op */")?; },
+          "UNIMPL_FLAGS" => { self.text(" /* UNIMPL flags */")?; },
+          _ => (),
+        }
       }
       Expr::ArrayAccess(lhs, idx) => {
         self.expr(lhs, level+1, imp)?;
