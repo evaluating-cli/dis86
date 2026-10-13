@@ -1,19 +1,44 @@
 
 ==================== A: caller sets AX, calls callee annotated 'regargs ax' (register writeback idiom) ====================
+WARN: Far call to callee with unknown args, inferred 0 arg(s)... possibly erroneously
+exit=0
+u32 caller(void)
+{
+  u16 SP0 = SP;
 
-thread 'main' (2805) panicked at src/app.rs:208:45:
-called `Result::unwrap()` on an `Err` value: "Failed to parse register name: ax"
-note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
-exit=101
-cat: /tmp/verify2/caller.c: No such file or directory
+
+  u32 tmp_0;
+
+  AX = 0x1234;
+  tmp_0 = callee();
+  return MAKE_32((u16)(tmp_0 >> 16), (u16)tmp_0); /* NEAR */
+
+}
+
+
 
 ==================== A2: same, but Hydra-flavored codegen ====================
+relocatable segments: []
+WARN: Far call to callee with unknown args, inferred 0 arg(s)... possibly erroneously
+exit=0
+HYDRA_FUNC(H_caller)
+{
+  u16 SP0 = SP;
 
-thread 'main' (2807) panicked at src/app.rs:208:45:
-called `Result::unwrap()` on an `Err` value: "Failed to parse register name: ax"
-note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
-exit=101
-cat: /tmp/verify2/caller_h.c: No such file or directory
+  FRAME_ENTER(0);
+
+  u32 tmp_0;
+
+  AX = 0x1234;
+  tmp_0 = callee(m);
+  DX = (u16)(tmp_0 >> 16);
+  AX = (u16)tmp_0;
+  FRAME_LEAVE();
+  RETURN_NEAR();
+
+}
+
+
 
 ==================== B: 'mov bx,5; ret' - does a callee-saved register write reach the guest? ====================
 exit=0

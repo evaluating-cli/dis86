@@ -6,7 +6,7 @@ REQUIRED OPTIONS:
   --config          path to binary configuration file (required)
   --binary-exe      path to MZ format exe on the filesystem (exactly 1 --binary-* flag required)
 
-thread 'main' (2797) panicked at src/bin/mzfile.rs:325:3:
+thread 'main' (2770) panicked at src/bin/mzfile.rs:325:3:
 Unknown command: /tmp/verify/synth_65.exe
 note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
 mzfile(path) exit=101
