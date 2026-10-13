@@ -34,7 +34,7 @@ cfg_a = """dis86 {
   code_segments { _0000 { seg 0 name CODE } }
   functions {
     caller { start 0000:0000 end 0000:0007 mode near ret None args None }
-    callee { start 0000:0007 end 0000:0008 mode near ret None args None regargs ax }
+    callee { start 0000:0007 end 0000:0008 mode near ret None args None regargs AX }
   }
   structures {}
   globals {}
