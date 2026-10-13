@@ -1,0 +1,62 @@
+
+==================== #68 mzfile invocation (path vs subcommand) ====================
+usage: ./dis86/target/debug/dis86 OPTIONS
+
+REQUIRED OPTIONS:
+  --config          path to binary configuration file (required)
+  --binary-exe      path to MZ format exe on the filesystem (exactly 1 --binary-* flag required)
+
+thread 'main' (2758) panicked at src/bin/mzfile.rs:325:3:
+Unknown command: /tmp/verify/synth_65.exe
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+mzfile(path) exit=101
+MZ Header:
+  magic:    0x4d5a ("MZ")
+  cblp      0x004b (75)
+  cp        0x0001 (1)
+  crlc      0x0000 (0)
+  cparhdr   0x0004 (4)
+  minalloc  0x0000 (0)
+  maxalloc  0xffff (65535)
+  ss        0x0000 (0)
+  sp        0xfffe (65534)
+  csum      0x0000 (0)
+  ip        0x0000 (0)
+  cs        0x0000 (0)
+  lfarlc    0x0040 (64)
+  ovno      0x0000 (0)
+
+Exe Region:
+  start     0x00000040
+  end       0x0000004b
+
+Relocations:
+
+mzfile(info) exit=0
+
+==================== #68 confgen loader with a .src extension ====================
+Traceback (most recent call last):
+  File "/home/runner/work/dis86/dis86/confgen/generate.py", line 34, in <module>
+    run()
+  File "/home/runner/work/dis86/dis86/confgen/generate.py", line 16, in run
+    data = load.annotations(args.source)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/runner/work/dis86/dis86/confgen/hydra/gen/load.py", line 5, in annotations
+    mod = importlib.util.module_from_spec(spec)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "<frozen importlib._bootstrap>", line 810, in module_from_spec
+AttributeError: 'NoneType' object has no attribute 'loader'
+src exit=1
+dis86 {
+  code_segments {
+  }
+  functions {
+  }
+  structures {
+  }
+  globals {
+  }
+  text_section {
+  }
+}
+py exit=0

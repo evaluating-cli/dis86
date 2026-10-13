@@ -1,0 +1,69 @@
+
+==================== #69 source under test: adc ax,bx; sbb ax,ax; rol al,1; rep movsb; stc; ret ====================
+exit=0
+u32 main(void)
+{
+  u16 SP0 = SP;
+
+
+  u16 bx_2, al_3, tmp_0;
+
+  bx_2 = UNIMPL(BX, AX) /* UNIMPL op */;
+  al_3 = UNIMPL((u16)UNIMPL(AX, AX) /* UNIMPL op */, 1) /* UNIMPL op */;
+  tmp_0 = UNIMPL() /* UNIMPL op */;
+  UNIMPL() /* UNIMPL op */;
+
+}
+
+
+
+==================== #69 UNIMPL/UNIMPL_FLAGS marker counts in the emitted C ====================
+4
+0
+
+==================== #69 lowering sites at this HEAD ====================
+817:    if ins.rep.is_some() {
+818:      let vref = self.append_instr(Type::U16, Opcode::Unimpl, vec![]);
+847:      instr::Opcode::OP_SBB => {
+856:        let vref = self.append_instr(typ, Opcode::Unimpl, vec![a, b]);
+860:      instr::Opcode::OP_RCL | instr::Opcode::OP_RCR | instr::Opcode::OP_ROL | instr::Opcode::OP_ROR => {
+866:        let vref = self.append_instr(typ, Opcode::Unimpl, vec![a, b]);
+870:      instr::Opcode::OP_ADC => {
+875:        let vref = self.append_instr(typ, Opcode::Unimpl, vec![a, b]);
+1210:      instr::Opcode::OP_INS => {
+1213:        self.append_instr(Type::Void, Opcode::Unimpl, vec![]);
+1215:      instr::Opcode::OP_OUTS => {
+1216:        self.append_instr(Type::Void, Opcode::Unimpl, vec![]);
+1218:      instr::Opcode::OP_STD => {
+1220:        self.append_instr(Type::Void, Opcode::Unimpl, vec![]);
+1222:      instr::Opcode::OP_STC | instr::Opcode::OP_CLC | instr::Opcode::OP_CMC => {
+1226:        let marker = self.append_instr(Type::Void, Opcode::Unimpl, vec![]);
+1234:        self.append_instr(Type::Void, Opcode::Unimpl, vec![]);
+1237:        self.append_instr(Type::Void, Opcode::Unimpl, vec![]);
+1239:      instr::Opcode::OP_IN => {
+1240:        self.append_instr(Type::U8, Opcode::Unimpl, vec![]);
+1242:      instr::Opcode::OP_OUT => {
+1243:        self.append_instr(Type::Void, Opcode::Unimpl, vec![]);
+1246:        self.append_instr(Type::Void, Opcode::Unimpl, vec![]);
+
+==================== #69 hydra runtime semantics of the markers ====================
+/* Decompiler-output markers: UNIMPL/UNIMPL_FLAGS take the unmodeled inputs
+ * (type-checked in an unevaluated sizeof, then discarded) and stay visible
+ * at runtime. UNIMPL is an unknown operation: any executed path reaching
+ * one aborts the run, so differential testing pinpoints exactly which
+ * operation needs implementing. UNIMPL_FLAGS is a known-but-imprecise flags
+ * value: reaching one warns on stderr and returns 0 rather than aborting
+ * the whole function (see dis86/src/decompile/ast.rs). (The no-arg UNIMPL()
+ * form used by handwritten runtime code keeps working via variadic
+ * matching.) */
+__attribute__((noreturn)) static inline u32 hydra_unimpl_trap(const char *file, int line) {
+  fprintf(stderr, "UNIMPL executed at %s:%d\n", file, line);
+  abort();
+}
+static inline u32 hydra_unimpl_flags_warn(const char *file, int line) {
+  fprintf(stderr, "UNIMPL_FLAGS executed at %s:%d\n", file, line);
+  return 0;
+}
+#define UNIMPL(...) ((void)sizeof((int[]){0, ##__VA_ARGS__}), hydra_unimpl_trap(__FILE__, __LINE__))
+#define UNIMPL_FLAGS(...) ((void)sizeof((int[]){0, ##__VA_ARGS__}), hydra_unimpl_flags_warn(__FILE__, __LINE__))
+#define ASSUME(cond) do { if (!(cond)) FAIL("ASSUMPTION FAILED: (" #cond ") at %s:%d", __FILE__, __LINE__); } while(0)
