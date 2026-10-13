@@ -1398,4 +1398,47 @@ mod tests {
       assert_eq!(ir.instr(condition).unwrap().opcode, Opcode::EqFlags, "{producer:?} producer");
     }
   }
+
+  // ---- TEMPORARY arena verification harness for issue #64 ----------------
+  // Constructs the invariant violation directly: a live instruction holds a
+  // Ref::Instr operand into a block that deadblock_elimination then removes.
+  // Remove this block after collecting the verification output.
+  fn issue64_fixture() -> (IR, BlockRef, BlockRef) {
+    let mut ir = IR::new(Rc::new(TypeDatabase::new()));
+    let entry = ir.add_block("entry");
+    let dead = ir.add_block("dead"); // never targeted: zero preds
+
+    // A value defined inside the dead block...
+    let seven = ir.const_new(7);
+    let dead_val = append_typed(&mut ir, dead, Type::U16, Opcode::Add, vec![seven, seven]);
+
+    // ...that a live stack-pointer instruction still references.
+    let k = ir.const_new(4);
+    ir.block_instr_append(entry, Instr {
+      typ: Type::U16,
+      compare_width: None,
+      attrs: Attribute::STACK_PTR,
+      opcode: Opcode::Add,
+      operands: vec![dead_val, k],
+    });
+
+    (ir, entry, dead)
+  }
+
+  #[test]
+  fn issue64_stack_ptr_accumulation_panics_on_dangling_ref() {
+    let (mut ir, _entry, dead) = issue64_fixture();
+    deadblock_elimination(&mut ir);
+    assert!(ir.blocks[dead.0].is_none(), "dead block must have been removed");
+    println!("ISSUE64: dead block removed; operand Ref::Instr({:?}, 0) is now dangling", dead);
+    // Expected (buggy) behavior: panics in IR::block via IR::instr.
+    stack_ptr_accumulation(&mut ir);
+  }
+
+  #[test]
+  fn issue64_full_optimize_panics_on_dangling_ref() {
+    let (mut ir, _entry, dead) = issue64_fixture();
+    println!("ISSUE64: running full optimize() with a dangling Ref::Instr({:?}, 0)", dead);
+    optimize(&mut ir);
+  }
 }
