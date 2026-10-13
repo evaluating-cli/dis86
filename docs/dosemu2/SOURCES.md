@@ -2,14 +2,11 @@
 
 > **Note (2026-08-17, updated 2026-10-05):** SST (SingleStepTests hardware captures) is the validation authority for emu86. The current Hydra host is the external dosdebug client in `hydra/src/dosemu_host/` (see `OPTION_D_DESIGN.md`). The coordinates below describe the frozen validator transport/patch carrier, kept as reference only.
 
-The implementation is pinned to dosemu2 commit `604ce0cdd1a71f657e2a2df623d216d5ab289313`. Line numbers in upstream sources may change; the carrier patches are the reviewable record of the exact changes.
+The implementation was pinned to dosemu2 commit `604ce0cdd1a71f657e2a2df623d216d5ab289313`. Line numbers in upstream sources may change; the carrier patches were the reviewable record of the exact changes and have since been removed with the retired transport.
 
 ## Authoritative repository paths
 
-- `patches/dosemu2/series` — two-patch squashed frozen carrier.
-- `docs/dosemu2/FREEZE_ABI_V1.md` — ABI-v1 freeze and dosemu2-side change gate.
-- `patches/dosemu2/*.patch` — exact dosemu2 changes and commit messages.
-- `.github/workflows/dosemu2-patches.yml` — pinned apply/build/link and runtime probes, including FDPP/comcom32 provenance.
+- `docs/dosemu2/FREEZE_ABI_V1.md` — ABI-v1 freeze and dosemu2-side change gate (reference-only).
 - `scripts/dosemu2-runtime-probe.rs` — shared-memory and runtime behavior probe.
 - `scripts/make-dosemu2-runtime-probe.py` — MZ fixtures used by the runtime job.
 - `dis86/src/emu86/validator/dosemu_process.rs` — dosemu2 launch, ownership, stepping, diagnostics, and shutdown.

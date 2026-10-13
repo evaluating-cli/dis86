@@ -83,4 +83,3 @@ On a separate axis, emu86's instruction behavior is *hardware*-anchored against 
 | [`TESTING.md`](TESTING.md) | Current hosting tests and exact-head evidence + reference-only frozen-transport evidence. |
 | [`REVIEW.md`](REVIEW.md) | Reference-only: design decisions and review cautions. |
 | [`SOURCES.md`](SOURCES.md) | Code and upstream source coordinates. |
-| [`patches/dosemu2/README.md`](../../patches/dosemu2/README.md) | Reference-only: patch provenance and carrier mechanics. |
