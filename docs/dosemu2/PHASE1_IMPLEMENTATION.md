@@ -5,7 +5,7 @@
 **Pinned dosemu2 base:** `604ce0cdd1a71f657e2a2df623d216d5ab289313`  
 **Scope:** 16-bit real-mode MZ executables; one concurrent validator instance  
 **ABI:** version 1, 88-byte structure preserving the legacy 64-byte Hydra prefix in page-sized `/hydra_remote` backing  
-**Status:** dosemu2 carrier and current Rust adapter path are implemented; expanded semantic runtime coverage remains incomplete.
+**Status:** the dosemu2 carrier (since removed) and current Rust adapter path were implemented; expanded semantic runtime coverage remains incomplete.
 
 ## 1. Landed implementation map
 
@@ -14,12 +14,12 @@
 - **#12 merged:** CMPS byte/word + REP termination, configurable PSP/MZ loading, and initial-state normalization.
 - **#14 merged:** SHL/SHR/SAR behavior aligned with the pinned simx86 interpreter.
 
-### dosemu2 carrier
+### dosemu2 carrier (retired)
 
-`patches/dosemu2/series` contains two squashed frozen feature patches. The former development patches 0001–0010 are closed historical development; see the authoritative [`FREEZE_ABI_V1.md`](FREEZE_ABI_V1.md).
+The carrier was two squashed frozen feature patches (since removed). The former development patches 0001–0010 are closed historical development; see the authoritative [`FREEZE_ABI_V1.md`](FREEZE_ABI_V1.md).
 
-1. `0001-simx86-add-executable-scoped-validator-control.patch` carries the simx86 ABI, activation, execution, lifecycle, atomic publication, protected-mode rejection, handler boundary, termination, fault, and interrupt-service behavior developed in historical patches 0001 and 0003–0010.
-2. `0002-mapping-expose-live-low-memory-backing.patch` carries the generic mapping-backing query and live `/dosemu_mem` alias work developed in historical patch 0002.
+1. The simx86 patch carried the simx86 ABI, activation, execution, lifecycle, atomic publication, protected-mode rejection, handler boundary, termination, fault, and interrupt-service behavior developed in historical patches 0001 and 0003–0010.
+2. The mapping patch carried the generic mapping-backing query and live `/dosemu_mem` alias work developed in historical patch 0002.
 
 ### Rust validator path
 

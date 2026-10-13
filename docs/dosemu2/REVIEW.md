@@ -18,7 +18,7 @@ Imported state is a 16-bit real-mode contract. General registers and FLAGS prese
 
 ## Node boundaries require metadata
 
-`TNode.seqlen` is byte length, not instruction count. The carrier publishes `TNode.seqnum` and raw flags so the Rust adapter does not infer consumption from opcode length. This plumbing is implemented, but REP, interrupt-shadow behavior, and their composition remain not integration-tested.
+`TNode.seqlen` is byte length, not instruction count. The carrier published `TNode.seqnum` and raw flags so the Rust adapter does not infer consumption from opcode length. This plumbing is implemented, but REP, interrupt-shadow behavior, and their composition remain not integration-tested.
 
 ## Host services and application handlers are different contracts
 
@@ -32,6 +32,6 @@ Activation combines executable path, MZ entry, PSP/MCB/environment identity, and
 
 ## Approval boundary
 
-The focused carrier build/runtime job supports the implemented claims listed in [`TESTING.md`](TESTING.md). It does not approve prefixed/application-handler cases, broader BIOS coverage, REP, interrupt shadow, helper exclusion, lifecycle transitions, broad mutation, or full differential state/memory comparison.
+The focused retired-carrier build/runtime job supported the implemented claims listed in [`TESTING.md`](TESTING.md). It does not approve prefixed/application-handler cases, broader BIOS coverage, REP, interrupt shadow, helper exclusion, lifecycle transitions, broad mutation, or full differential state/memory comparison.
 
 Strict lockstep correctness also makes no performance claim. Hydra native-function interception, overlays, and hybrid-performance benchmarking remain separate work.

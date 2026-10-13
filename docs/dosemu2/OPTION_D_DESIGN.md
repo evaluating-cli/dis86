@@ -335,6 +335,6 @@ The dosemu2 low-memory backing is `uint8_t *lowmem_base` (`mapping.c:83`, declar
 (`mapfile.c`) create the backing as a `memfd_create` or `shm_open`+`shm_unlink` —
 anonymous, but accessible via `/proc/<pid>/fd/`.
 
-The frozen patches (`patches/dosemu2/0001`, `0002`) are the reference implementation of
-the boundary hook and low-memory-backing query. They are not applied. The ABI-v1
-contract they implement is described in `FREEZE_ABI_V1.md` (reference-only).
+The retired two-patch carrier was the reference implementation of the boundary hook and
+low-memory-backing query; it has been removed and was never applied by the current host.
+The ABI-v1 contract it implemented is described in `FREEZE_ABI_V1.md` (reference-only).

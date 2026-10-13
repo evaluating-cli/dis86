@@ -8,7 +8,7 @@
 
 **Freeze authority:** [`FREEZE_ABI_V1.md`](FREEZE_ABI_V1.md). If this phase description and the versioned freeze differ, the freeze controls ABI-v1.
 
-**Implementation:** dosemu2 carrier in `patches/dosemu2/`, with prerequisites from PR #12, Rust integration from PRs #18–#23, and service-boundary patch 0010 from PR #25.
+**Implementation (retired):** a dosemu2 patch carrier (since removed), with prerequisites from PR #12, Rust integration from PRs #18–#23, and service-boundary patch 0010 from PR #25.
 
 ## 1. Status and interpretation
 
@@ -17,7 +17,7 @@ This is the normative behavior specification. The CPU hook, low-memory export, A
 | Evidence level | Current claim |
 | --- | --- |
 | Specified | All requirements below. |
-| Implemented | Two-patch frozen dosemu2 carrier plus current dis86 adapter/outcome/shutdown path. |
+| Implemented | Two-patch frozen dosemu2 carrier (since removed) plus current dis86 adapter/outcome/shutdown path. |
 | Unit tested | Host-independent ABI/state/comparison/reference-CPU paths. |
 | Pinned-runtime tested | Build/link, ABI init, basic step, live low-memory alias, end barrier/clean exit, nonterminating `INT 21h/AH=30h` post-service acknowledgement, target-exit/fault publication, terminating MZ smoke fixture. |
 | Remaining implementation | No known gap in the tested standalone `INT 21h` host-service acknowledgement path; expanded corpus may still expose REP/shadow/helper/lifecycle or interrupt-classification fixes. |
