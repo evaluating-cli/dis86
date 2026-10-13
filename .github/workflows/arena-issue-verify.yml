@@ -1,13 +1,17 @@
 name: arena-issue-verify
 
-# TEMPORARY: arena research harness to run the published repros for issues
-# #64/#65/#66/#67/#69 against this branch's HEAD. Delete after use.
+# TEMPORARY: arena research harness. Runs the published repros for issues
+# #64/#65/#66/#67/#68/#69 against this branch's HEAD and commits the captured
+# evidence back to the branch (CI logs are not reachable from the agent).
+# Delete this workflow, .arena-verify/, and the OPT test additions afterwards.
 on:
   push:
+    paths-ignore:
+      - '.arena-verify/out/**'
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   verify:
@@ -21,86 +25,19 @@ jobs:
         with:
           workspaces: dis86
       - name: Build dis86
-        run: |
-          git rev-parse HEAD
-          cargo build --manifest-path dis86/Cargo.toml --locked --bin dis86
+        run: cargo build --manifest-path dis86/Cargo.toml --locked
       - name: Generate repro binaries and configs
         env:
           OUT: /tmp/verify
         run: |
           mkdir -p /tmp/verify
           python3 .arena-verify/make_repros.py
-      - name: Issue 66 - INT register setup is dead-code-eliminated
-        continue-on-error: true
+      - name: Run repros (best effort, evidence captured)
+        run: bash .arena-verify/run.sh
+      - name: Commit evidence
         run: |
-          set +e
-          D=./dis86/target/debug/dis86
-          echo "=== #66: default emit-code ==="
-          $D --config /tmp/verify/repro66.bsl --binary-exe /tmp/verify/synth_66.exe --name main --emit-code /tmp/verify/66.c
-          echo "exit=$?"
-          cat /tmp/verify/66.c
-          echo "=== #66: --emit-ir-final (Nop'd setup) ==="
-          $D --config /tmp/verify/repro66.bsl --binary-exe /tmp/verify/synth_66.exe --name main --emit-ir-final /tmp/verify/66.ir
-          echo "exit=$?"
-          grep -n "nop\|int " /tmp/verify/66.ir | head -20
-          echo "=== #66: --build-pin-all emit-code ==="
-          $D --config /tmp/verify/repro66.bsl --binary-exe /tmp/verify/synth_66.exe --name main --emit-code /tmp/verify/66_pin.c --build-pin-all
-          echo "exit=$?"
-          cat /tmp/verify/66_pin.c
-      - name: Issue 67 - out-of-range branch silently dropped
-        continue-on-error: true
-        run: |
-          set +e
-          D=./dis86/target/debug/dis86
-          echo "=== #67: decompile A (range ends 0000:0009, jmp target 0000:000a) ==="
-          $D --config /tmp/verify/repro67.bsl --binary-exe /tmp/verify/synth_67.exe --name A --emit-code /tmp/verify/67a.c 2>/tmp/verify/67a.err
-          echo "exit=$?"
-          echo "--- stdout: emitted A ---"
-          cat /tmp/verify/67a.c
-          echo "--- stderr (looking for a diagnostic) ---"
-          cat /tmp/verify/67a.err
-          echo "--- word count of stderr ---"
-          wc -c /tmp/verify/67a.err
-          echo "=== #67: B decompiles normally ==="
-          $D --config /tmp/verify/repro67.bsl --binary-exe /tmp/verify/synth_67.exe --name B --emit-code /tmp/verify/67b.c
-          echo "exit=$?"
-          cat /tmp/verify/67b.c
-      - name: Issue 65 - analyze range spans embedded data
-        continue-on-error: true
-        run: |
-          set +e
-          D=./dis86/target/debug/dis86
-          echo "=== #65: --analyze suggestion ==="
-          $D --config /tmp/verify/repro65.bsl --binary-exe /tmp/verify/synth_65.exe --analyze 2>&1
-          echo "analyze exit=$?"
-          echo "=== #65: --codeseg-name with the suggested range verbatim ==="
-          $D --config /tmp/verify/repro65.bsl --binary-exe /tmp/verify/synth_65.exe --codeseg-name CODE --emit-code /tmp/verify/65.c 2>&1
-          echo "exit=$?"
-          echo "=== #65: --codeseg-name with the corrected start (0000:0006) ==="
-          $D --config /tmp/verify/repro65_fixed.bsl --binary-exe /tmp/verify/synth_65.exe --codeseg-name CODE --emit-code /tmp/verify/65f.c 2>&1
-          echo "exit=$?"
-          echo "--- emitted (corrected) ---"
-          cat /tmp/verify/65f.c
-      - name: Issue 69 - UNIMPL lowerings
-        continue-on-error: true
-        run: |
-          set +e
-          D=./dis86/target/debug/dis86
-          echo "=== #69: setup (adc ax,bx / sbb ax,ax / rol al,1 / rep movsb / stc / ret) ==="
-          $D --config /tmp/verify/repro69.bsl --binary-exe /tmp/verify/synth_69.exe --name main --emit-code /tmp/verify/69.c
-          echo "exit=$?"
-          cat /tmp/verify/69.c
-          echo "=== #69: lowering sites at this HEAD ==="
-          grep -n "OP_SBB\|OP_RCL\|OP_RCR\|OP_ROL\|OP_ROR\|OP_ADC\|OP_INS\|OP_OUTS\|OP_STD =>\|OP_STC\|OP_IN =>\|OP_OUT =>\|ins.rep.is_some()" dis86/src/decompile/ir_build.rs
-      - name: Issue 64 - dangling Ref::Instr after deadblock_elimination
-        continue-on-error: true
-        run: |
-          set +e
-          cargo test --manifest-path dis86/Cargo.toml --locked --lib issue64 -- --nocapture --test-threads=1 2>&1 | tail -60
-          echo "test exit=${PIPESTATUS[0]}"
-      - name: Issue 64 - full optimize() variant
-        continue-on-error: true
-        run: |
-          set +e
-          cargo test --manifest-path dis86/Cargo.toml --locked --lib issue64_full_optimize_panics_on_dangling_ref -- --nocapture 2>&1 | tail -40
-          echo "test exit=${PIPESTATUS[0]}"
+          git config user.name "arena-verify"
+          git config user.email "arena-verify@users.noreply.github.com"
+          git add -f .arena-verify/out
+          git commit -m "TEMP: captured issue-verification evidence [skip ci]" || echo "nothing to commit"
+          git push
