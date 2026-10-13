@@ -2,15 +2,14 @@
 
 > **Note (2026-08-17):** SST (SingleStepTests hardware captures) is the validation authority for emu86. This ABI-v1 freeze records the historical dosemu2 validator transport; it is not the current Hydra host interface or an emu86 validation authority.
 
-**Freeze version:** 1  
-**Status:** Frozen  
-**Pinned upstream:** `dosemu2/dosemu2` commit `604ce0cdd1a71f657e2a2df623d216d5ab289313`  
-**Active carrier:** the two patches listed by `patches/dosemu2/series`
-
-> The two frozen patches (`patches/dosemu2/0001`, `0002`) are the reference implementation of this contract; the boundary-hook and low-memory-backing semantics informed the current Hydra hosting approach (see [`OPTION_D_DESIGN.md`](OPTION_D_DESIGN.md)).
-
+**Freeze version:** 1
+**Status:** Frozen (retired)
 **Pinned upstream:** `dosemu2/dosemu2` commit `604ce0cdd1a71f657e2a2df623d216d5ab289313`
-**Carrier:** the two patches listed by `patches/dosemu2/series`
+
+> This ABI-v1 freeze records a **retired** contract. The two-patch carrier that
+> implemented it has been removed; the boundary-hook and low-memory-backing
+> semantics informed the current Hydra hosting approach (see
+> [`OPTION_D_DESIGN.md`](OPTION_D_DESIGN.md)).
 
 ## ABI layout
 
@@ -57,13 +56,15 @@ The ABI supported **only one validator instance controlling a 16-bit real-mode M
 application through simx86**. Protected-mode/DPMI, 32-bit applications, multiple
 controllers, and other CPU backends were outside scope and failed closed.
 
-## Carrier
+## Carrier (retired)
 
-1. `0001-simx86-add-executable-scoped-validator-control.patch` — simx86 boundary hook,
-   activation gate, state exchange, stepping, lifecycle, interrupt-service deferral.
-2. `0002-mapping-expose-live-low-memory-backing.patch` — generic mapping-backing query
-   exposing `lowmem_base` as the live POSIX-SHM backing at `/dosemu_mem`.
+The contract was implemented by a two-patch carrier, since removed:
 
-Both patches apply only against the pinned upstream commit. The former ten-patch
+1. simx86 boundary hook, activation gate, state exchange, stepping, lifecycle,
+   interrupt-service deferral.
+2. Generic mapping-backing query exposing `lowmem_base` as the live POSIX-SHM
+   backing at `/dosemu_mem`.
+
+The carrier applied only against the pinned upstream commit. The former ten-patch
 development series (0001--0010) is closed historical development, available only in Git
 history.

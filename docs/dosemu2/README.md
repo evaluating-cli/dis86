@@ -49,7 +49,7 @@ Instruction-level interception is used only for bounded raw-code/native→guest 
 
 ## Reference: retired validator transport
 
-Development patches 0001–0010 are closed historical development. The active carrier is the two-patch squashed frozen series, governed by [`FREEZE_ABI_V1.md`](FREEZE_ABI_V1.md).
+Development patches 0001–0010 are closed historical development. The carrier was the two-patch squashed frozen series (since removed), governed by [`FREEZE_ABI_V1.md`](FREEZE_ABI_V1.md).
 
 Historical patch 0010 implemented deferred acknowledgement for standalone nonterminating host services. Eligible unchanged DOS/BIOS vectors are normalized at the exact saved return `CS:IP`. Application-installed handlers are a different contract: they remain visible and controller-stepped in lockstep.
 
@@ -62,7 +62,7 @@ dispatches, 45 raw/native→guest runs, 45 returns, 66 redirects, CF preservatio
 preservation, byte-for-byte raw scratch restoration, and a live dosemu2 process at
 completion.
 
-**Pinned-runtime proven (historical validator):** the frozen carrier applies/builds/links; pinned FDPP and comcom32 provisioning; ABI initialization; basic request/step acknowledgement; live `/dosemu_mem` bidirectional aliasing; end barrier and clean shutdown; terminating MZ execution; target-exit and fault publication; an unprefixed `INT 21h/AH=30h` acknowledgement at the post-service target boundary with DOS-returned state; and (historically) the validator corpus mode (`emu86_validator --corpus`) running a small declarative fixture set with per-boundary register and memory-window comparison, proven before the validator binary and fixture corpus were archived.
+**Pinned-runtime proven (historical validator, retired):** the frozen carrier applied/built/linked; pinned FDPP and comcom32 provisioning; ABI initialization; basic request/step acknowledgement; live `/dosemu_mem` bidirectional aliasing; end barrier and clean shutdown; terminating MZ execution; target-exit and fault publication; an unprefixed `INT 21h/AH=30h` acknowledgement at the post-service target boundary with DOS-returned state; and (historically) the validator corpus mode (`emu86_validator --corpus`) running a small declarative fixture set with per-boundary register and memory-window comparison, proven before the validator binary and fixture corpus were archived.
 
 **Host-only proven (emu86, unit level):** the host-side fixture corpus (REP string-op matrix and seeded register/segment mutation) was deleted when the differential validator was archived. On a separate axis, emu86's instruction behavior is *hardware*-anchored against the SingleStepTests 80286 captures via the SST harness (`docs/emu86/sst.md`); that axis is unrelated to — and does not speak to — twin equivalence with dosemu2 simx86.
 
@@ -83,4 +83,3 @@ On a separate axis, emu86's instruction behavior is *hardware*-anchored against 
 | [`TESTING.md`](TESTING.md) | Current hosting tests and exact-head evidence + reference-only frozen-transport evidence. |
 | [`REVIEW.md`](REVIEW.md) | Reference-only: design decisions and review cautions. |
 | [`SOURCES.md`](SOURCES.md) | Code and upstream source coordinates. |
-| [`patches/dosemu2/README.md`](../../patches/dosemu2/README.md) | Reference-only: patch provenance and carrier mechanics. |

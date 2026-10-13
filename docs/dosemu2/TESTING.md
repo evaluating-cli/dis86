@@ -224,7 +224,7 @@ approach.
 Testing claims use these levels; passing a lower level must not be reported as passing a higher one.
 
 1. **Specified:** behavior is required by `PHASE1_SPEC.md`.
-2. **Implemented:** code exists in `patches/dosemu2/` and/or the dis86 adapter.
+2. **Implemented:** code existed in the dosemu2 carrier (since removed) and/or the dis86 adapter.
 3. **Unit tested:** host-independent tests exercise code without booting dosemu2.
 4. **Pinned-runtime tested:** the patches are applied to dosemu2 commit `604ce0cdd1a71f657e2a2df623d216d5ab289313` and exercised with the pinned runtime stack. The shared-memory contract is ABI version **1**.
 5. **Still-unverified E2E:** the expanded pinned-runtime differential corpus has not yet proved the behavior.
@@ -251,11 +251,11 @@ The optional SDL frontend remains separate:
 cargo build --manifest-path dis86/Cargo.toml --features sdl --bin emu86
 ```
 
-## Pinned-runtime coverage
+## Pinned-runtime coverage (retired)
 
-The `dosemu2 frozen feature patches` workflow uses `patches/dosemu2/` as the historical
-implementation carrier. It applied the frozen patch series to the pinned dosemu2
-commit and exercised the validator transport. Focused historical evidence included:
+The retired `dosemu2 frozen feature patches` workflow applied the frozen patch series to
+the pinned dosemu2 commit and exercised the validator transport; its carrier has since
+been removed. Focused historical evidence included:
 
 - patch-series apply/compile/link success;
 - ABI-v1 initialization;
