@@ -190,6 +190,10 @@ pub struct Function {
   pub vardecls: Vec<VarDecl>,
   pub varmaps: Vec<VarMap>,
   pub frame_size: u16,
+  /// True when the body reads the entry (caller's) BP seed: FRAME_ENTER
+  /// overwrites the live BP before the body runs, so codegen must snapshot
+  /// it (BP0) alongside SP0. Set in the Ref::Init render arm. Issue #62.
+  pub uses_entry_bp: bool,
   pub body: Block,
 }
 
@@ -205,6 +209,9 @@ struct Builder<'a> {
   temp_count: usize,
   frame_off_low: i16,  // less negative
   frame_off_high: i16, // more negative
+  // Set when an entry-BP seed renders into the AST (issue #62): the body
+  // then needs a BP0 snapshot beside SP0, since FRAME_ENTER clobbers BP.
+  uses_entry_bp: bool,
 
   assigns: Vec<(String, Type)>,
   assigned: HashSet<String>,
@@ -330,6 +337,7 @@ impl<'a> Builder<'a> {
       temp_count: 0,
       frame_off_low: i16::MIN+1,
       frame_off_high: 0,
+      uses_entry_bp: false,
 
       assigns: vec![],
       assigned: HashSet::new(),
@@ -464,6 +472,12 @@ impl<'a> Builder<'a> {
     if let ir::Ref::Init(reg) = r {
       let name = if reg == crate::asm::instr::Reg::SP {
         "SP0".to_string()
+      } else if reg == crate::asm::instr::Reg::BP {
+        // The entry (caller's) BP: FRAME_ENTER overwrites the live BP
+        // before the body runs, so render the BP0 snapshot beside SP0.
+        // Issue #62.
+        self.uses_entry_bp = true;
+        "BP0".to_string()
       } else {
         reg.info().name.to_string()
       };
@@ -1443,6 +1457,7 @@ impl<'a> Builder<'a> {
       vardecls,
       varmaps,
       frame_size,
+      uses_entry_bp: self.uses_entry_bp,
       body,
     })
   }

@@ -28,6 +28,7 @@ fn guest_pointer_expressions_emit_segmented_loads_and_stores() {
     vardecls: vec![],
     varmaps: vec![],
     frame_size: 0,
+    uses_entry_bp: false,
     body: Block(vec![
       Stmt::Assign(Assign {
         decltype: None,
@@ -502,6 +503,7 @@ fn reloc_func(consts: Vec<Expr>) -> Function {
     vardecls: vec![],
     varmaps: vec![],
     frame_size: 0,
+    uses_entry_bp: false,
     body: Block(consts.into_iter().map(|rhs| Stmt::Assign(Assign {
       decltype: None,
       lhs: Expr::Name("AX".into()),
@@ -543,6 +545,7 @@ fn hydra_case_labels_and_array_indices_never_relocate() {
     vardecls: vec![],
     varmaps: vec![],
     frame_size: 0,
+    uses_entry_bp: false,
     body: Block(vec![
       Stmt::Switch(dis86::decompile::ast::Switch {
         switch_val: Expr::Name("AX".into()),
@@ -597,6 +600,7 @@ fn hydra_memory_offsets_and_frame_mappings_never_relocate() {
       })),
     }],
     frame_size: 0,
+    uses_entry_bp: false,
     body: Block(vec![
       Stmt::Expr(Expr::GuestMem(
         Box::new(Expr::HexConst(0x456)),
@@ -684,4 +688,71 @@ fn hydra_make32_half_with_u16_cast_is_not_double_cast() {
     !source.contains("(u16)(u16)"),
     "double cast must not occur:\n{source}"
   );
+}
+
+#[test]
+fn entry_bp_read_snapshots_callers_bp_before_frame_enter() {
+  // An entry-BP read (seeded, no dominating BP definition, as in a
+  // function with no standard prologue) must not render the live BP:
+  // FRAME_ENTER overwrites BP before the body runs, so live BP is
+  // SP0-2, never the caller's BP. The AST renders the seed as BP0,
+  // snapshotted next to SP0 before the prologue. Issue #62.
+  let types = Rc::new(TypeDatabase::new());
+  let cfg = empty_config(types.clone());
+  let mut ir = ir::IR::new(types);
+  let blk = ir.add_block("entry");
+  let off = ir.const_new(4);
+  let addr = append(&mut ir, blk, Type::U16, Opcode::Add, vec![Ref::Init(Reg::BP), off]);
+  append(&mut ir, blk, Type::Void, Opcode::RetNear, vec![addr]);
+
+  sym::symbolize(&mut ir, &cfg);
+  let cf = ControlFlow::from_ir(&ir);
+  let func = Function::from_ir(&cfg, "entry_bp_read", None, &ir, &cf).unwrap();
+  assert!(func.uses_entry_bp, "seeded BP read must flag the BP0 snapshot");
+  let source = gen::generate(&func, Flavor::Hydra { relocatable_segs: vec![] }).unwrap();
+  assert!(source.contains("u16 BP0 = BP;"), "BP0 snapshot missing:\n{source}");
+  assert!(source.contains("BP0 + 4"), "entry-BP read must render the snapshot, not live BP:\n{source}");
+  // Token-level: the only permitted bare-BP occurrence is the BP0
+  // snapshot's own RHS. (`BP0` itself is a distinct token, so a line
+  // mixing live BP with the snapshot still fails.) Issue #62.
+  let bare_bp = source
+    .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+    .filter(|tok| *tok == "BP")
+    .count();
+  assert_eq!(bare_bp, 1, "live BP must never render outside the BP0 snapshot:\n{source}");
+  let decl = source.find("u16 BP0 = BP;").unwrap();
+  let frame = source.find("FRAME_ENTER(").unwrap();
+  assert!(decl < frame, "BP0 must snapshot before the prologue clobbers BP:\n{source}");
+}
+
+#[test]
+fn redefined_bp_read_needs_no_snapshot() {
+  // A BP read dominated by a redefinition (e.g. a `mov bp, sp`
+  // rewriting the var, as in a standard prologue) resolves through
+  // the register var to an expression, never touching the seed:
+  // no BP0 decl, so the common case emits no unused variable. The
+  // seed/redefine/read sequence mirrors the real pipeline: IRBuilder
+  // entry state (set_var BP = Init(BP)), append_asm_dst_reg (`mov bp,
+  // X` rewrites the var; BP has no fragments), and operand encoding
+  // via get_var(BP). Issue #62.
+  let types = Rc::new(TypeDatabase::new());
+  let cfg = empty_config(types.clone());
+  let mut ir = ir::IR::new(types);
+  let blk = ir.add_block("entry");
+  ir.set_var(Reg::BP, blk, Ref::Init(Reg::BP));
+  let two = ir.const_new(2);
+  let mov = append(&mut ir, blk, Type::U16, Opcode::Add, vec![Ref::Init(Reg::SP), two]);
+  ir.set_var(Reg::BP, blk, mov);
+  let bp = ir.get_var(Reg::BP, blk);
+  let four = ir.const_new(4);
+  let read = append(&mut ir, blk, Type::U16, Opcode::Add, vec![bp, four]);
+  append(&mut ir, blk, Type::Void, Opcode::RetNear, vec![read]);
+
+  sym::symbolize(&mut ir, &cfg);
+  let cf = ControlFlow::from_ir(&ir);
+  let func = Function::from_ir(&cfg, "redefined_bp_read", None, &ir, &cf).unwrap();
+  assert!(!func.uses_entry_bp, "a redefined-BP read never touches the seed");
+  let source = gen::generate(&func, Flavor::Hydra { relocatable_segs: vec![] }).unwrap();
+  assert!(!source.contains("BP0"), "no unused BP0 snapshot in the common case:\n{source}");
+  assert!(source.contains("u16 SP0 = SP;"), "the SP-based expression must still render:\n{source}");
 }
