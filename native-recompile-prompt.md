@@ -20,12 +20,12 @@ decompiler (`dis86`) and hybrid runtime (`hydra`) as your tools.
 the original `<TARGET.EXE>`, produces the same observable outputs
 (stdout/files/screen effects/exit behavior — whatever this program's
 observable surface turns out to be; see §6). Prove it with golden-vs-native
-logs + diffs and repro commands (§8).
+logs + diffs and repro commands.
 
 **If it cannot be done,** do not just stop: exhaust every reasonable
 workaround first, then deliver a best-effort report: what works, exact
 blocker(s), what was tried, partial artifacts, and why no workaround exists
-(§9). Partial progress with a precise blocker diagnosis counts as a result.
+(§8). Partial progress with a precise blocker diagnosis counts as a result.
 
 ## 2. Target handoff + discovery
 
@@ -37,11 +37,11 @@ blocker(s), what was tried, partial artifacts, and why no workaround exists
   start from zero with `--analyze` + `confgen` (Phase 1).
 - Repo `README.md` lists "re-compilable to equivalent binaries" as a
   non-goal. **This mission overrides that** for `<TARGET.EXE>`.
-- `<TARGET.EXE>`, `/dosemu2/`, and `build/` are gitignored (see
-  `.gitignore`). **All** of your work — scratch, docs, harness, logs —
-  lives under `build/recompile-<TARGET_NAME>/` (gitignored). Nothing you
-  produce for this task is committed; the final report is delivered as
-  session output plus files under `build/recompile-<TARGET_NAME>/docs/`.
+- `<TARGET.EXE>` and `build/` are gitignored (see `.gitignore`). **All** of
+  your work — scratch, docs, harness, logs — lives under
+  `build/recompile-<TARGET_NAME>/` (gitignored). Nothing you produce for this
+  task is committed; the final report is delivered as session output plus files
+  under `build/recompile-<TARGET_NAME>/docs/`.
 
 ## 3. Repository map (your tools)
 
@@ -52,8 +52,6 @@ blocker(s), what was tried, partial artifacts, and why no workaround exists
 | `confgen/generate.py` + `confgen/hydra/{annotations.py,gen/}` | Generate `.bsl` config / appdata headers from an annotation source: `PYTHONPATH=confgen python3 confgen/generate.py SRC --dis86-conf\|--appdata-hdr\|--appdata-src`. `SRC` must be an **importable Python source file** (give it a `.py` extension — `confgen/hydra/gen/load.py` loads it via `importlib` and will not accept an arbitrary extension such as `.src`). |
 | `hydra/` | Hybrid runtime (C, Meson). **You may use Hydra headers/macros as a runtime library** in the final native binary. Current host = external dosdebug client in `hydra/src/dosemu_host/` (see `docs/dosemu2/README.md`). Build: `just build-hydra`. |
 | `docs/` | 8086/DOS notes (`dos_int21h.txt`, `dos_interrupts.txt`, `dos_memory_map.txt`, `dos_psp.txt`, `mz_header.txt`), `docs/dosemu2/` (host design, `TESTING.md`, `SOURCES.md`), `docs/emu86/sst.md` (hardware-anchored validation ledger for emu86). |
-| `patches/dosemu2/` + `scripts/apply-dosemu2-patches.sh` | **Reference only** — retired validator transport, pinned to dosemu2 base `604ce0cd`. Do NOT apply; current hosting uses stock dosemu2. |
-| `dosemu2/` | **Reference source checkout** (gitignored, already downloaded): upstream dosemu2 at `d5e626d55` (2026-10-10), matching the installed `dosemu2-2.0pre9 rev 7076` binary. Use it read-only to understand DOS/BIOS behavior, `simx86` (`src/base/emu-i386/simx86/interp.c`), memory mapping (`src/base/lib/mapping/`), and the dosdebug protocol (`src/plugin/debugger/dosdebug.c`, `src/doc/README/dosdebug`). Do not build or modify it unless you have a concrete reason; record the reason. |
 | `just check` | Host-independent gate (confgen tests + `cargo test` + `cc -fsyntax-only` on hydra). **Keep it green throughout.** If `just` is not installed, run its underlying commands directly (`PYTHONPATH=confgen python3 confgen/test_*.py`, `cargo test --manifest-path dis86/Cargo.toml --locked --all-targets`, and the `cc -fsyntax-only` lines from the `justfile`). |
 
 Key `dis86` invocations (run `build/bin/dis86 --help` for the full list;
@@ -120,16 +118,13 @@ build/recompile-<TARGET_NAME>/
   docs/
     FORENSICS.md      # Phase 0 findings: what <TARGET.EXE> is and does
     STUBS.md          # Phase 3 shim/stub log with fidelity claims
-    RESULT.md         # final report (§8) or impossibility report (§9)
+    RESULT.md         # final report or impossibility report
   annotations.py      # your annotation source (confgen input; must be importable)
   <TARGET_NAME>.bsl   # generated dis86 config
   appdata.h / appdata.c (if used)
   emitted/            # raw dis86 --emit-code outputs per codeseg
   native/             # native shims + main + Makefile/CMake/Meson bits
   <TARGET_NAME>       # final native binary
-  golden/             # golden captures of the ORIGINAL under dosemu2/emu86
-  native-logs/        # same inputs run against your native binary
-  diffs/              # comparisons + verdict
 ```
 
 ## 6. Phase 0 — forensics first (MANDATORY, before any batch decompile)
@@ -141,8 +136,7 @@ build/recompile-<TARGET_NAME>/
    the entry (`--start-addr`/`--end-addr` slices) and a few relocation
    targets.
 3. Inventory the DOS/BIOS surface: `INT 10h/16h/21h`, file I/O, video mode,
-   keyboard, timers, mouse, sound. Consult `docs/dos_*.txt` and the
-   `dosemu2/` reference sources for semantics.
+   keyboard, timers, mouse, sound. Consult `docs/dos_*.txt` for semantics.
 4. Write `build/recompile-<TARGET_NAME>/docs/FORENSICS.md`: what the program
    is, its inputs/outputs, its observable surface, memory/segment layout,
    interrupt usage, and any packer/overlay/self-modifying-code signs. If you
@@ -179,36 +173,10 @@ embedded data and out-of-range branch targets; see §3) → write `annotations.p
   claim. **You choose the segment/relocation memory model** (e.g. linearized
   guest-memory array vs. preserved segment semantics) — document the choice
   and justify it. The final `build/recompile-<TARGET_NAME>/<TARGET_NAME>`
-  must **not require dosemu2 at runtime** (dosemu2/emu86 are oracle tools
-  only, §8).
+  must **not require dosemu2 at runtime** (dosemu2 and emu86 are oracle tools
+  only).
 
-## 8. Phase 4 — oracle and parity evidence (REQUIRED)
-
-You design the oracle: there is no pre-made test suite for this binary.
-
-For a non-interactive capture, launch stock dosemu2 with a host directory
-mounted and a DOS command, e.g. `dosemu -dumb -d <hostdir> -E "<command>"`, then
-read the produced files/output on the host (set `XDG_RUNTIME_DIR` to a real
-directory if you plan to drive dosdebug FIFOs, and use a terminal/`emulated` CPU
-config for headless runs). For interactive/full-screen (`INT 10h`) programs,
-drive the dosdebug FIFOs (`-H1`) as described in `docs/dosemu2/README.md`.
-
-1. Capture **golden behavior** by running the original `<TARGET.EXE>`
-   under stock dosemu2 (driven via its dosdebug FIFOs per
-   `docs/dosemu2/README.md`, or interactively) and/or under `emu86`.
-   Record exact launch commands, inputs (keystrokes/files/config), and
-   outputs in `build/recompile-<TARGET_NAME>/golden/`.
-2. Run your native binary on the **same inputs**; store transcripts in
-   `build/recompile-<TARGET_NAME>/native-logs/`.
-3. Diff golden vs. native in `build/recompile-<TARGET_NAME>/diffs/` with a
-   verdict per case.
-4. Final report (session output + `build/recompile-<TARGET_NAME>/docs/RESULT.md`):
-   artifact paths, build commands, the `--relocatable-seg` table, shim/stub
-   list with fidelity, memory-model justification, parity table (inputs →
-   golden → native → verdict), repro commands for every claim, and known
-   gaps.
-
-## 9. Impossibility bar
+## 8. Impossibility bar
 
 Declare impossible only after all reasonable workarounds are exhausted
 (extra annotations, opcode/IR/AST contributions to `dis86/`, CFG
@@ -219,7 +187,7 @@ that defeats static decompilation, DOS/hardware surface that cannot be
 shimmed natively. Report: what works, exact failing function(s)/address(es)
 with disassembly + IR dumps, everything tried, and why each failed.
 
-## 10. Hard constraints
+## 9. Hard constraints
 
 1. `<TARGET.EXE>` stays local and gitignored. Never `git add`/`commit` it.
 2. `just check` green at every stopping point.
@@ -227,10 +195,8 @@ with disassembly + IR dumps, everything tried, and why each failed.
    justified in `RESULT.md`.
 4. Evidence over assertion: every parity/fidelity claim needs a log + diff +
    repro command.
-5. `dosemu2/` is a read-only reference. If you modify or rebuild it, justify
-   why in the final report.
-6. Everything task-related lives under `build/recompile-<TARGET_NAME>/`. Do
+5. Everything task-related lives under `build/recompile-<TARGET_NAME>/`. Do
    not create new committed paths for the task.
 
-Begin with Phase 0. End with either a working native binary plus the §8
-evidence, or the §9 impossibility report. Good luck.
+Begin with Phase 0. End with either a working native binary, or the §8
+impossibility report. Good luck.
