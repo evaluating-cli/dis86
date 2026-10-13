@@ -27,13 +27,12 @@ jobs:
       - name: Build dis86
         run: cargo build --manifest-path dis86/Cargo.toml --locked
       - name: Generate repro binaries and configs
-        env:
-          OUT: /tmp/verify
         run: |
-          mkdir -p /tmp/verify
-          python3 .arena-verify/make_repros.py
+          mkdir -p /tmp/verify /tmp/verify2
+          OUT=/tmp/verify python3 .arena-verify/make_repros.py
+          OUT=/tmp/verify2 python3 .arena-verify/make_repros2.py
       - name: Run repros (best effort, evidence captured)
-        run: bash .arena-verify/run.sh
+        run: for s in .arena-verify/run*.sh; do bash "$s"; done
       - name: Commit evidence
         run: |
           git config user.name "arena-verify"
