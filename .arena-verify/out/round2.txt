@@ -1,0 +1,93 @@
+
+==================== A: caller sets AX, calls callee annotated 'regargs ax' (register writeback idiom) ====================
+
+thread 'main' (2805) panicked at src/app.rs:208:45:
+called `Result::unwrap()` on an `Err` value: "Failed to parse register name: ax"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+exit=101
+cat: /tmp/verify2/caller.c: No such file or directory
+
+==================== A2: same, but Hydra-flavored codegen ====================
+
+thread 'main' (2807) panicked at src/app.rs:208:45:
+called `Result::unwrap()` on an `Err` value: "Failed to parse register name: ax"
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+exit=101
+cat: /tmp/verify2/caller_h.c: No such file or directory
+
+==================== B: 'mov bx,5; ret' - does a callee-saved register write reach the guest? ====================
+exit=0
+u32 main(void)
+{
+  u16 SP0 = SP;
+
+
+
+  return MAKE_32(DX, AX); /* NEAR */
+
+}
+
+
+
+==================== B2: IR-final for the same function ====================
+exit=0
+
+b0: () entry
+0   |   sp.2     = void     pin        SP                  
+0   |   bp.2     = void     pin        BP                  
+0   |   si.2     = void     pin        SI                  
+0   |   di.2     = void     pin        DI                  
+0   |   ss.2     = void     pin        SS                  
+0   |   ds.2     = void     pin        DS                  
+0   |              void     retn       AX                   DX                  
+
+
+==================== C: 'sub ax,ax; int 21h; jz +1' - flags after INT ====================
+exit=0
+u32 main(void)
+{
+  u16 SP0 = SP;
+
+
+  u16 ax_2;
+
+  ax_2 = AX - AX;
+  INT(0x21);
+  if (AX == AX) {
+    goto addr_0007;
+  }
+  return MAKE_32(DX, ax_2); /* NEAR */
+addr_0007:;
+  return MAKE_32(DX, ax_2); /* NEAR */
+
+}
+
+
+
+==================== C2: IR-final for the same function ====================
+exit=0
+
+b0: () entry
+2   |   ax.2     = u16      sub        AX                   AX                  
+0   |   t0       = void     int        #0x21               
+1   |   t1       = u16      eq         AX                   AX                  
+0   |              void     jne        t1                   b2                   b1                  
+
+b1: (b0) addr_0006
+0   |   sp.3     = void     pin        SP                  
+0   |   bp.3     = void     pin        BP                  
+0   |   si.3     = void     pin        SI                  
+0   |   di.3     = void     pin        DI                  
+0   |   ss.3     = void     pin        SS                  
+0   |   ds.3     = void     pin        DS                  
+0   |              void     retn       ax.2                 DX                  
+
+b2: (b0) addr_0007
+0   |   sp.5     = void     pin        SP                  
+0   |   bp.5     = void     pin        BP                  
+0   |   si.5     = void     pin        SI                  
+0   |   di.5     = void     pin        DI                  
+0   |   ss.5     = void     pin        SS                  
+0   |   ds.5     = void     pin        DS                  
+0   |              void     retn       ax.2                 DX                  
+
