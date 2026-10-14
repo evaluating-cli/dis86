@@ -1310,14 +1310,20 @@ impl IRBuilder<'_> {
         last_was_jump = false;
       }
       let Some((targets, fallthrough)) = self.jump_targets(ins) else { continue };
+      // Every target — including an implicit fallthrough — needs a block:
+      // conditional lowerings resolve ins.end_addr() via get_block, which
+      // panics on a missing entry when the branch is the last decoded
+      // instruction. Only explicit targets are range-checked below.
+      for tgt in &targets {
+        block_start.insert(*tgt);
+      }
       // Explicit branch targets (everything but a trailing fallthrough)
       // must lie inside the function's [start, end): anything outside
       // decodes to zero instructions, becomes an empty block, and is
       // silently dropped from the output. Warn loudly instead of hiding
       // the lost edge; the drop semantics are unchanged.
-      let explicit = targets.len() - usize::from(fallthrough);
+      let explicit = targets.len().saturating_sub(usize::from(fallthrough));
       for tgt in &targets[..explicit] {
-        block_start.insert(*tgt);
         if !self.target_in_range(*tgt) {
           eprintln!("WARN: {}: branch at {} targets {} outside function range [{}, {}); the edge is dropped from the output",
             self.spec.name, ins.addr, tgt, self.spec.start, self.spec.end);
@@ -1588,12 +1594,12 @@ mod tests {
     }
   }
 
-  fn jmp_instr(addr_off: u16, n_bytes: u16, rel: u16) -> instr::Instr {
+  fn jmp_instr(opcode: instr::Opcode, addr_off: u16, n_bytes: u16, rel: u16) -> instr::Instr {
     let mut operands = ArrayVec::new();
     operands.push(instr::Operand::Rel(instr::OperandRel { val: rel }));
     instr::Instr {
       rep: None,
-      opcode: instr::Opcode::OP_JMP,
+      opcode,
       operands,
       addr: SegOff { seg: Seg::Normal(0), off: Off(addr_off) },
       n_bytes,
@@ -1635,7 +1641,7 @@ mod tests {
     // preserving the drop: no panic, empty target block, no exits.
     let (_types, cfg, binary, spec) = test_spec(0x0000, 0x0009, &[0xC3]);
     // JMP at 0x0006, 3 bytes: end 0x0009 + rel 1 -> target 0x000a.
-    let instrs = [jmp_instr(0x0006, 3, 1)];
+    let instrs = [jmp_instr(instr::Opcode::OP_JMP, 0x0006, 3, 1)];
     let mut b = test_builder(&cfg, &instrs, &spec, &binary);
     assert!(!b.target_in_range(SegOff { seg: Seg::Normal(0), off: Off(0x000a) }));
     b.build();
@@ -1651,7 +1657,7 @@ mod tests {
     // code path with target_in_range true and links the edge normally.
     let (_types, cfg, binary, spec) = test_spec(0x0000, 0x0008, &[0xC3]);
     // JMP at 0x0000, 2 bytes: rel 2 -> target 0x0004.
-    let instrs = [jmp_instr(0x0000, 2, 2)];
+    let instrs = [jmp_instr(instr::Opcode::OP_JMP, 0x0000, 2, 2)];
     let mut b = test_builder(&cfg, &instrs, &spec, &binary);
     assert!(b.target_in_range(SegOff { seg: Seg::Normal(0), off: Off(0x0004) }));
     b.build();
@@ -1685,5 +1691,28 @@ mod tests {
       SegOff { seg: Seg::Normal(0), off: Off(0x000a) }, "repro shape: jmp targets 0x000a");
     let mut ir = build_from_instrs(&instr_list, &cfg, &spec, &binary, false, false);
     crate::decompile::opt::optimize(&mut ir);
+    // The dropped edge still materializes as exactly one empty exit-less
+    // block (the 0x000a stub); the mov lowering keeps entry non-empty.
+    let empties: Vec<_> = ir.iter_blocks()
+      .filter(|b| ir.block_instr_count(*b) == 0 && ir.block_exits(*b).is_empty())
+      .collect();
+    assert_eq!(empties.len(), 1, "exactly one empty exit-less block (the dropped 0x000a edge)");
+  }
+
+  #[test]
+  fn trailing_conditional_branch_fallthrough_still_gets_a_block() {
+    // Regression: excluding the fallthrough from block_start made
+    // get_block(ins.end_addr()) panic when a conditional branch is the
+    // last decoded instruction. The fallthrough (here spec.end, a normal
+    // function exit) must still get a block, silently.
+    let (_types, cfg, binary, spec) = test_spec(0x0000, 0x0004, &[0xC3]);
+    // JNE at 0x0002, 2 bytes: end 0x0004 == spec.end; rel wraps to target 0x0000.
+    let instrs = [jmp_instr(instr::Opcode::OP_JNE, 0x0002, 2, 0xFFFC)];
+    let mut b = test_builder(&cfg, &instrs, &spec, &binary);
+    b.build();
+    let fall = SegOff { seg: Seg::Normal(0), off: Off(0x0004) };
+    let blk = *b.addrmap.get(&fall).expect("fallthrough at spec.end still gets a block");
+    assert_eq!(b.ir.block_instr_count(blk), 0, "fallthrough block is empty");
+    assert!(b.ir.block_exits(blk).is_empty());
   }
 }
