@@ -109,7 +109,7 @@ impl IR {
         blkref.0,
       );
       assert!(
-        !self.iter_blocks().any(|b| self.block(b).incomplete_phis.iter()
+        !self.iter_blocks().any(|b| b != blkref && self.block(b).incomplete_phis.iter()
           .any(|(_, r)| matches!(r, Ref::Instr(t, _) if *t == blkref))),
         "IR::block_remove: BlockRef({}) is still referenced by incomplete phis",
         blkref.0,
@@ -192,12 +192,16 @@ impl IR {
       || matches!(o, Ref::Block(t) if *t == target)
   }
 
-  /// Refs of live instructions whose operands mention `target`, either as a
-  /// value (`Ref::Instr`) or a branch target (`Ref::Block`). Nop instructions
-  /// carry no operands and are skipped.
+  /// Refs of live instructions outside `target` itself whose operands mention
+  /// `target`, either as a value (`Ref::Instr`) or a branch target
+  /// (`Ref::Block`). References from inside `target` die with the block and
+  /// are excluded. Nop instructions carry no operands and are skipped.
   pub fn block_ref_users(&self, target: BlockRef) -> Vec<Ref> {
     let mut users = vec![];
     for b in self.iter_blocks() {
+      if b == target {
+        continue;
+      }
       for r in self.iter_instrs(b) {
         let instr = self.instr(r).unwrap();
         if instr.opcode == Opcode::Nop {
