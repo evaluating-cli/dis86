@@ -644,6 +644,15 @@ impl IRBuilder<'_> {
     }
   }
 
+  /// Segment register of a string memory operand (falling back to the
+  /// instruction's implied segment).
+  fn string_operand_seg(oper: &instr::Operand, fallback: instr::Reg) -> instr::Reg {
+    match oper {
+      instr::Operand::Mem(m) => m.sreg,
+      _ => fallback,
+    }
+  }
+
   /// Lower a `rep` MOVS/STOS (direction provably clear): emit the runtime
   /// bulk macro over the pre-update values, then model the deterministic
   /// register updates in the SSA (`CX -> 0`, `SI/DI += CX0*size`). The
@@ -651,17 +660,13 @@ impl IRBuilder<'_> {
   fn lower_rep_string_op(&mut self, ins: &instr::Instr) {
     let cx = self.ir.get_var(instr::Reg::CX, self.cur);
     let zero = self.ir.const_new(0);
-    let seg_of = |oper: &instr::Operand, fallback: instr::Reg| match oper {
-      instr::Operand::Mem(m) => m.sreg,
-      _ => fallback,
-    };
     match ins.opcode {
       instr::Opcode::OP_MOVS => {
         let dst = &ins.operands[0]; // ES:DI
         let src = &ins.operands[1]; // DS:SI (segment may be overridden)
         let size = Self::string_operand_size(dst);
-        let ds = self.ir.get_var(seg_of(src, instr::Reg::DS), self.cur);
-        let es = self.ir.get_var(seg_of(dst, instr::Reg::ES), self.cur);
+        let ds = self.ir.get_var(Self::string_operand_seg(src, instr::Reg::DS), self.cur);
+        let es = self.ir.get_var(Self::string_operand_seg(dst, instr::Reg::ES), self.cur);
         let si = self.ir.get_var(instr::Reg::SI, self.cur);
         let di = self.ir.get_var(instr::Reg::DI, self.cur);
         let size_c = self.ir.const_new(size);
@@ -676,7 +681,7 @@ impl IRBuilder<'_> {
       instr::Opcode::OP_STOS => {
         let dst = &ins.operands[0]; // ES:DI
         let size = Self::string_operand_size(dst);
-        let es = self.ir.get_var(seg_of(dst, instr::Reg::ES), self.cur);
+        let es = self.ir.get_var(Self::string_operand_seg(dst, instr::Reg::ES), self.cur);
         let di = self.ir.get_var(instr::Reg::DI, self.cur);
         let val = self.append_asm_src_operand(&ins.operands[1]); // AL/AX
         let size_c = self.ir.const_new(size);
@@ -693,13 +698,43 @@ impl IRBuilder<'_> {
         let src = &ins.operands[1];
         let size = Self::string_operand_size(src);
         let typ = if size == 2 { Type::U16 } else { Type::U8 };
-        let ds = self.ir.get_var(seg_of(src, instr::Reg::DS), self.cur);
+        let ds = self.ir.get_var(Self::string_operand_seg(src, instr::Reg::DS), self.cur);
         let si = self.ir.get_var(instr::Reg::SI, self.cur);
         let cur = self.append_asm_src_operand(dst);
         // The helper reads the last element (or returns `cur` when CX==0).
         let val = self.append_instr(typ, Opcode::RepLods, vec![ds, si, cx, cur]);
         self.append_asm_dst_operand(dst, val);
         let size_c = self.ir.const_new(size);
+        let off = self.append_instr(Type::U16, Opcode::UMul, vec![cx, size_c]);
+        let si_n = self.append_instr(Type::U16, Opcode::Add, vec![si, off]);
+        self.append_asm_dst_reg(&instr::OperandReg(instr::Reg::SI), si_n);
+        self.append_asm_dst_reg(&instr::OperandReg(instr::Reg::CX), zero);
+      }
+      instr::Opcode::OP_INS => {
+        // rep ins: operands [ES:DI, DX]. The helper executes the raw rep
+        // instruction (port read -> ES:DI); DI += CX0*size, CX -> 0.
+        let dst = &ins.operands[0]; // ES:DI
+        let size = Self::string_operand_size(dst);
+        let es = self.ir.get_var(Self::string_operand_seg(dst, instr::Reg::ES), self.cur);
+        let di = self.ir.get_var(instr::Reg::DI, self.cur);
+        let port = self.append_asm_src_operand(&ins.operands[1]); // DX
+        let size_c = self.ir.const_new(size);
+        self.append_instr(Type::Void, Opcode::RepIns, vec![es, di, cx, port, size_c]);
+        let off = self.append_instr(Type::U16, Opcode::UMul, vec![cx, size_c]);
+        let di_n = self.append_instr(Type::U16, Opcode::Add, vec![di, off]);
+        self.append_asm_dst_reg(&instr::OperandReg(instr::Reg::DI), di_n);
+        self.append_asm_dst_reg(&instr::OperandReg(instr::Reg::CX), zero);
+      }
+      instr::Opcode::OP_OUTS => {
+        // rep outs: operands [DX, DS:SI]. The helper executes the raw rep
+        // instruction (DS:SI -> port); SI += CX0*size, CX -> 0.
+        let src = &ins.operands[1]; // DS:SI
+        let size = Self::string_operand_size(src);
+        let ds = self.ir.get_var(Self::string_operand_seg(src, instr::Reg::DS), self.cur);
+        let si = self.ir.get_var(instr::Reg::SI, self.cur);
+        let port = self.append_asm_src_operand(&ins.operands[0]); // DX
+        let size_c = self.ir.const_new(size);
+        self.append_instr(Type::Void, Opcode::RepOuts, vec![ds, si, cx, port, size_c]);
         let off = self.append_instr(Type::U16, Opcode::UMul, vec![cx, size_c]);
         let si_n = self.append_instr(Type::U16, Opcode::Add, vec![si, off]);
         self.append_asm_dst_reg(&instr::OperandReg(instr::Reg::SI), si_n);
@@ -717,14 +752,14 @@ impl IRBuilder<'_> {
         let ret = if is_cmps {
           let dst = &ins.operands[0]; // ES:DI
           let src = &ins.operands[1]; // DS:SI
-          let ds = self.ir.get_var(seg_of(src, instr::Reg::DS), self.cur);
+          let ds = self.ir.get_var(Self::string_operand_seg(src, instr::Reg::DS), self.cur);
           let si = self.ir.get_var(instr::Reg::SI, self.cur);
-          let es = self.ir.get_var(seg_of(dst, instr::Reg::ES), self.cur);
+          let es = self.ir.get_var(Self::string_operand_seg(dst, instr::Reg::ES), self.cur);
           let di = self.ir.get_var(instr::Reg::DI, self.cur);
           self.append_instr(Type::U16, Opcode::RepCmps, vec![ds, si, es, di, cx, size_c, cond_c])
         } else {
           let dst = &ins.operands[1]; // ES:DI
-          let es = self.ir.get_var(seg_of(dst, instr::Reg::ES), self.cur);
+          let es = self.ir.get_var(Self::string_operand_seg(dst, instr::Reg::ES), self.cur);
           let di = self.ir.get_var(instr::Reg::DI, self.cur);
           let val = self.append_asm_src_operand(&ins.operands[0]); // AL/AX
           self.append_instr(Type::U16, Opcode::RepScas, vec![es, di, cx, val, size_c, cond_c])
@@ -1144,22 +1179,23 @@ impl IRBuilder<'_> {
     let special = self.special.take();
 
     // REP-prefixed string instructions execute a counted loop. MOVS/STOS/
-    // LODS are modeled exactly (runtime helper + deterministic register
-    // updates); CMPS/SCAS model CX/SI/DI exactly but clobber flags (the
-    // final comparison is data-dependent). The remaining rep forms and any
-    // rep with a possibly-set direction flag stay loud.
+    // LODS/INS/OUTS are modeled exactly (runtime helper + deterministic
+    // register updates); CMPS/SCAS model CX/SI/DI exactly but clobber flags
+    // (the final comparison is data-dependent). Any rep with a possibly-set
+    // direction flag stays loud.
     if ins.rep.is_some() {
-      // Only 8/16-bit MOVS/STOS/LODS/CMPS/SCAS are modeled; a wider
+      // Only 8/16-bit MOVS/STOS/LODS/CMPS/SCAS/INS/OUTS are modeled; a wider
       // (unreachable) form falls back to the loud marker rather than
-      // emitting the wrong-width macro. LODS/SCAS carry the memory operand
-      // second, the others first.
+      // emitting the wrong-width macro. LODS/SCAS/OUTS carry the memory
+      // operand second, the others first.
       let size_oper = match ins.opcode {
-        instr::Opcode::OP_LODS | instr::Opcode::OP_SCAS => &ins.operands[1],
+        instr::Opcode::OP_LODS | instr::Opcode::OP_SCAS | instr::Opcode::OP_OUTS => &ins.operands[1],
         _ => &ins.operands[0],
       };
       let modeled = matches!(ins.opcode,
           instr::Opcode::OP_MOVS | instr::Opcode::OP_STOS | instr::Opcode::OP_LODS |
-          instr::Opcode::OP_CMPS | instr::Opcode::OP_SCAS)
+          instr::Opcode::OP_CMPS | instr::Opcode::OP_SCAS |
+          instr::Opcode::OP_INS | instr::Opcode::OP_OUTS)
         && matches!(size_oper,
           instr::Operand::Mem(m) if matches!(m.sz, instr::Size::Size8 | instr::Size::Size16));
       if !modeled || self.df_may_be_set {
@@ -1721,12 +1757,40 @@ impl IRBuilder<'_> {
         self.string_op_advance(None, Some(&ins.operands[1]));
       }
       instr::Opcode::OP_INS => {
-        // Neither the value nor the SI/DI update is modeled; INS does not
-        // affect flags, so the flags value must be left intact.
-        self.append_instr(Type::Void, Opcode::Unimpl, vec![]);
+        // ins: operands [ES:DI, DX]. The helper executes the raw instruction
+        // (port read -> ES:DI); DI advances by size. A possibly-set direction
+        // flag makes the advance direction unknown, so stay loud.
+        if self.df_may_be_set {
+          self.append_instr(Type::Void, Opcode::Unimpl, vec![]);
+        } else {
+          let dst = &ins.operands[0]; // ES:DI
+          let size = Self::string_operand_size(dst);
+          let es = self.ir.get_var(Self::string_operand_seg(dst, instr::Reg::ES), self.cur);
+          let di = self.ir.get_var(instr::Reg::DI, self.cur);
+          let port = self.append_asm_src_operand(&ins.operands[1]); // DX
+          let size_c = self.ir.const_new(size);
+          self.append_instr(Type::Void, Opcode::Ins, vec![es, di, port, size_c]);
+          let di_n = self.append_instr(Type::U16, Opcode::Add, vec![di, size_c]);
+          self.append_asm_dst_reg(&instr::OperandReg(instr::Reg::DI), di_n);
+        }
       }
       instr::Opcode::OP_OUTS => {
-        self.append_instr(Type::Void, Opcode::Unimpl, vec![]);
+        // outs: operands [DX, DS:SI]. The helper executes the raw instruction
+        // (DS:SI -> port); SI advances by size. A possibly-set direction flag
+        // makes the advance direction unknown, so stay loud.
+        if self.df_may_be_set {
+          self.append_instr(Type::Void, Opcode::Unimpl, vec![]);
+        } else {
+          let src = &ins.operands[1]; // DS:SI
+          let size = Self::string_operand_size(src);
+          let ds = self.ir.get_var(Self::string_operand_seg(src, instr::Reg::DS), self.cur);
+          let si = self.ir.get_var(instr::Reg::SI, self.cur);
+          let port = self.append_asm_src_operand(&ins.operands[0]); // DX
+          let size_c = self.ir.const_new(size);
+          self.append_instr(Type::Void, Opcode::Outs, vec![ds, si, port, size_c]);
+          let si_n = self.append_instr(Type::U16, Opcode::Add, vec![si, size_c]);
+          self.append_asm_dst_reg(&instr::OperandReg(instr::Reg::SI), si_n);
+        }
       }
       instr::Opcode::OP_STD => {
         // Direction flag is not modeled at all; no modeled value is affected.
@@ -2670,10 +2734,11 @@ mod tests {
   #[test]
   fn may_clobber_memory_covers_calls_int_and_rep() {
     for op in [Opcode::CallFar, Opcode::CallNear, Opcode::CallPtr, Opcode::CallArgs,
-               Opcode::Int, Opcode::RepMovs, Opcode::RepStos] {
+               Opcode::Int, Opcode::RepMovs, Opcode::RepStos, Opcode::Ins, Opcode::RepIns] {
       assert!(op.may_clobber_memory(), "{op:?} must be a memory barrier");
     }
-    for op in [Opcode::Load8, Opcode::Store8, Opcode::Add, Opcode::RetNear, Opcode::Unimpl] {
+    for op in [Opcode::Load8, Opcode::Store8, Opcode::Add, Opcode::RetNear, Opcode::Unimpl,
+               Opcode::Outs, Opcode::RepOuts] {
       assert!(!op.may_clobber_memory(), "{op:?} must not be a memory barrier");
     }
   }

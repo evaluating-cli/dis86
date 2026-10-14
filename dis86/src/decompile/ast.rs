@@ -635,6 +635,32 @@ impl<'a> Builder<'a> {
         let exprs: Vec<_> = instr.operands.iter().map(|r| self.ref_to_expr(*r, depth+1)).collect();
         Expr::Abstract(name, exprs)
       }
+      ir::Opcode::Ins | ir::Opcode::Outs => {
+        // ins [es, di, port, size]; outs [ds, si, port, size]. The raw
+        // instruction is executed by the helper; the size operand selects
+        // the byte/word macro and is not a call argument.
+        let size = self.ir.const_lookup(instr.operands[3]);
+        let name: &'static str = match (instr.opcode, size) {
+          (ir::Opcode::Ins, Some(2)) => "INSW",
+          (ir::Opcode::Ins, _) => "INSB",
+          (_, Some(2)) => "OUTSW",
+          (_, _) => "OUTSB",
+        };
+        let exprs: Vec<_> = instr.operands[..3].iter().map(|r| self.ref_to_expr(*r, depth+1)).collect();
+        Expr::Abstract(name, exprs)
+      }
+      ir::Opcode::RepIns | ir::Opcode::RepOuts => {
+        // rep ins [es, di, cx, port, size]; rep outs [ds, si, cx, port, size].
+        let size = self.ir.const_lookup(instr.operands[4]);
+        let name: &'static str = match (instr.opcode, size) {
+          (ir::Opcode::RepIns, Some(2)) => "REP_INSW",
+          (ir::Opcode::RepIns, _) => "REP_INSB",
+          (_, Some(2)) => "REP_OUTSW",
+          (_, _) => "REP_OUTSB",
+        };
+        let exprs: Vec<_> = instr.operands[..4].iter().map(|r| self.ref_to_expr(*r, depth+1)).collect();
+        Expr::Abstract(name, exprs)
+      }
       ir::Opcode::Phi => {
         // generally handled by jmp, but other expressions that use a phi might end up here
         // so, we can simply return our refname

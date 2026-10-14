@@ -47,6 +47,7 @@ pub enum Oper {
   OPER_SREG,   // Second register field from ModRM byte (interpreted as an SREG)
 
   // Explicit memory operands
+  #[allow(dead_code)] // memory-only r/m8; kept for symmetry with M16/M32 (no current table entry)
   OPER_M8,     // Memory operand to address 8-bit from ModRM (no reg allowed)
   OPER_M16,    // Memory operand to address 16-bit from ModRM (no reg allowed)
   OPER_M32,    // Memory operand to address 32-bit from ModRM (no reg allowed)
@@ -462,10 +463,10 @@ const INSTR_TBL: &[InstrFmt] = &[
   InstrFmt {  op: Opcode::OP_IMUL_TRUNC,op1: 0x69,     op2: -1,   oper: [Oper::OPER_R16,     Oper::OPER_RM16,    Oper::OPER_IMM16],     hidden: 0x0 },
   InstrFmt {  op: Opcode::OP_PUSH,      op1: 0x6a,     op2: -1,   oper: [Oper::OPER_IMM8,    Oper::OPER_NONE,    Oper::OPER_NONE],      hidden: 0x0 },
   InstrFmt {  op: Opcode::OP_IMUL_TRUNC,op1: 0x6b,     op2: -1,   oper: [Oper::OPER_R16,     Oper::OPER_RM16,    Oper::OPER_IMM8],      hidden: 0x0 },
-  InstrFmt {  op: Opcode::OP_INS,       op1: 0x6c,     op2: -1,   oper: [Oper::OPER_M8,      Oper::OPER_DX,      Oper::OPER_NONE],      hidden: 0x0 },
-  InstrFmt {  op: Opcode::OP_INS,       op1: 0x6d,     op2: -1,   oper: [Oper::OPER_M16,     Oper::OPER_DX,      Oper::OPER_NONE],      hidden: 0x0 },
-  InstrFmt {  op: Opcode::OP_OUTS,      op1: 0x6e,     op2: -1,   oper: [Oper::OPER_DX,      Oper::OPER_M8,      Oper::OPER_NONE],      hidden: 0x0 },
-  InstrFmt {  op: Opcode::OP_OUTS,      op1: 0x6f,     op2: -1,   oper: [Oper::OPER_DX,      Oper::OPER_M16,     Oper::OPER_NONE],      hidden: 0x0 },
+  InstrFmt {  op: Opcode::OP_INS,       op1: 0x6c,     op2: -1,   oper: [Oper::OPER_DST8,    Oper::OPER_DX,      Oper::OPER_NONE],      hidden: 0x0 },
+  InstrFmt {  op: Opcode::OP_INS,       op1: 0x6d,     op2: -1,   oper: [Oper::OPER_DST16,   Oper::OPER_DX,      Oper::OPER_NONE],      hidden: 0x0 },
+  InstrFmt {  op: Opcode::OP_OUTS,      op1: 0x6e,     op2: -1,   oper: [Oper::OPER_DX,      Oper::OPER_SRC8,    Oper::OPER_NONE],      hidden: 0x0 },
+  InstrFmt {  op: Opcode::OP_OUTS,      op1: 0x6f,     op2: -1,   oper: [Oper::OPER_DX,      Oper::OPER_SRC16,   Oper::OPER_NONE],      hidden: 0x0 },
   InstrFmt {  op: Opcode::OP_JO,        op1: 0x70,     op2: -1,   oper: [Oper::OPER_REL8,    Oper::OPER_NONE,    Oper::OPER_NONE],      hidden: 0x0 },
   InstrFmt {  op: Opcode::OP_JNO,       op1: 0x71,     op2: -1,   oper: [Oper::OPER_REL8,    Oper::OPER_NONE,    Oper::OPER_NONE],      hidden: 0x0 },
   InstrFmt {  op: Opcode::OP_JB,        op1: 0x72,     op2: -1,   oper: [Oper::OPER_REL8,    Oper::OPER_NONE,    Oper::OPER_NONE],      hidden: 0x0 },

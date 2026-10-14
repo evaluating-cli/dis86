@@ -45,10 +45,19 @@ static const uint8_t raw_marker[]   = "HYDRA_RAW_SLOT!!"; /* 16 bytes + C NUL */
 static uint32_t g_hookcnt_phys;
 static uint32_t g_result_phys;
 static uint32_t g_res4_phys;
+static uint32_t g_iobuf_phys;
 static uint16_t g_call_rel_seg;
 static uint16_t g_helper_off;
 static uint16_t g_helper2_off;
 static int g_fails;
+
+/* One-shot INS/OUTS end-to-end results, filled by H_myfunc and checked in
+ * main() (like the other hook results, which round-trip through the guest). */
+static u16 g_io_ran;
+static u16 g_io_roundtrip;   /* OUTSB then INSB of the same port (expect 0xfd) */
+static u16 g_io_rep_ins_lo;  /* REP_INSB first byte (expect 0xff) */
+static u16 g_io_rep_ins_hi;  /* REP_INSB second byte (expect 0xff) */
+static u16 g_io_rep_out;     /* REP_OUTSB last byte read back (expect 0xfd) */
 
 #define CHECK(cond, ...) do {                                      \
   if (!(cond)) {                                                   \
@@ -79,6 +88,43 @@ HYDRA_FUNC(H_myfunc)
   INT(0x28);
   u8 t = INB(0x40);
   OUTB(0x80, t);
+
+  /* One-shot INS/OUTS end-to-end check. The helpers execute the raw string
+   * instruction on the emulated CPU, so this must run here (inside a hook
+   * with a live guest) rather than host-side. Use the 8259 PIC1 IMR (0x21)
+   * as a deterministic read/write byte port and restore it afterwards; only
+   * bit 1 (keyboard) is ever transiently unmasked, never bit 0 (timer). */
+  static int ins_outs_done = 0;
+  if (!ins_outs_done) {
+    ins_outs_done = 1;
+    const u16 ioport = 0x21;
+    u16 ioseg = (u16)(g_iobuf_phys >> 4);
+    u16 iooff = (u16)(g_iobuf_phys & 0xf);
+    u8 imr0 = INB(ioport);
+
+    /* OUTSB then INSB round-trip: 0xFD out, read back into the scratch. */
+    m->hardware->mem_write8(m->hardware->ctx, g_iobuf_phys + 0, 0xfd);
+    OUTSB(ioseg, (u16)(iooff + 0), ioport);
+    INSB(ioseg, (u16)(iooff + 1), ioport);
+    g_io_roundtrip = m->hardware->mem_read8(m->hardware->ctx, g_iobuf_phys + 1);
+
+    /* REP_INSB reads the (all-masked) IMR twice. */
+    OUTB(ioport, 0xff);
+    REP_INSB(ioseg, (u16)(iooff + 2), 2, ioport);
+    g_io_rep_ins_lo = m->hardware->mem_read8(m->hardware->ctx, g_iobuf_phys + 2);
+    g_io_rep_ins_hi = m->hardware->mem_read8(m->hardware->ctx, g_iobuf_phys + 3);
+
+    /* REP_OUTSB writes two bytes; the last (0xFD) is left in the IMR and
+     * read back with a following INSB. */
+    m->hardware->mem_write8(m->hardware->ctx, g_iobuf_phys + 4, 0xff);
+    m->hardware->mem_write8(m->hardware->ctx, g_iobuf_phys + 5, 0xfd);
+    REP_OUTSB(ioseg, (u16)(iooff + 4), 2, ioport);
+    INSB(ioseg, (u16)(iooff + 6), ioport);
+    g_io_rep_out = m->hardware->mem_read8(m->hardware->ctx, g_iobuf_phys + 6);
+
+    OUTB(ioport, imr0);
+    g_io_ran = 1;
+  }
 
   u16 cnt = m->hardware->mem_read16(m->hardware->ctx, g_hookcnt_phys);
   m->hardware->mem_write16(m->hardware->ctx, g_hookcnt_phys, (u16)(cnt + 1));
@@ -398,6 +444,9 @@ uint32_t com_phys = (uint32_t)com_seg << 4;
   g_hookcnt_phys = com_phys + HOOKCNT_OFF;
   g_result_phys = com_phys + RESULT_OFF;
   g_res4_phys = com_phys + RES4_OFF;
+  /* INS/OUTS scratch: reuse guest RAM just past the 8 KiB raw-code
+   * reservation (never a raw slot, never guest data the test inspects). */
+  g_iobuf_phys = scratch_phys + RAW_SCRATCH_SIZE;
   g_call_rel_seg = hook_rel_seg;
   g_helper_off = (uint16_t)(0x100 + helper_pos);
   g_helper2_off = (uint16_t)(0x100 + helper2_pos);
@@ -441,12 +490,22 @@ uint32_t com_phys = (uint32_t)com_seg << 4;
         (unsigned long)stats.raw_code_returns,
         (unsigned long)stats.raw_code_runs);
 
+  /* INS/OUTS end-to-end (one-shot inside hook1). */
+  CHECK(g_io_ran, "INSB/OUTSB/REP_INSB/REP_OUTSB executed on the guest CPU");
+  CHECK(g_io_roundtrip == 0xfd,
+        "OUTSB->INSB byte round-trip through port 0x21 (got %02x)", g_io_roundtrip);
+  CHECK(g_io_rep_ins_lo == 0xff && g_io_rep_ins_hi == 0xff,
+        "REP_INSB read the masked IMR twice (got %02x %02x)",
+        g_io_rep_ins_lo, g_io_rep_ins_hi);
+  CHECK(g_io_rep_out == 0xfd,
+        "REP_OUTSB left its last byte in the IMR (got %02x)", g_io_rep_out);
+
   /* Four complete iterations precede the fifth hook1 stop. Each complete
    * iteration now dispatches hook1 + two direct hook2 calls + hook3 + nested
    * hook2 = 5 hooks. */
   {
     uint64_t want_dispatches = 1 + 5 * (target - 1); /* 21 for target=5 */
-    uint64_t want_raws = 5 * target + 5 * (target - 1); /* 45 */
+    uint64_t want_raws = 5 * target + 5 * (target - 1) + 8; /* 45 + 8 (one-shot INS/OUTS) */
     CHECK(stats.hook_dispatches == want_dispatches,
           "hook dispatches == %lu (got %lu)",
           (unsigned long)want_dispatches,
