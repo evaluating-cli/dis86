@@ -16,6 +16,14 @@ fn operand_is_stack_reg(operand: &instr::Operand) -> bool {
   reg == &instr::Reg::SP || reg == &instr::Reg::BP
 }
 
+/// Whether an instruction may leave the direction flag set: STD sets it
+/// explicitly, and POPF/IRET restore it from a popped flags value. (The
+/// latter are not lowered yet — they panic — but including them keeps the
+/// string-op direction guard sound if/when they are.)
+fn opcode_may_set_df(op: instr::Opcode) -> bool {
+  matches!(op, instr::Opcode::OP_STD | instr::Opcode::OP_POPF | instr::Opcode::OP_IRET)
+}
+
 fn simple_binary_operation(opcode: instr::Opcode) -> Option<Opcode> {
   match opcode {
     instr::Opcode::OP_ADD => Some(Opcode::Add),
@@ -55,6 +63,15 @@ struct IRBuilder<'a> {
 
   overlay: bool,
   pin_all: bool,
+
+  // Whether the decoded function may leave the direction flag set/unknown.
+  // DF is written only by CLD/STD (and by the flag-restoring POPF/IRET,
+  // which are not lowered yet but must be covered when they are). With
+  // none present the direction is provably clear (DF=0, the DOS ABI
+  // entry/exit convention) and string-op pointer updates advance;
+  // otherwise the direction is unknown and those updates degrade to a
+  // loud marker rather than silently running the wrong way.
+  df_may_be_set: bool,
 }
 
 impl<'a> IRBuilder<'a> {
@@ -73,6 +90,8 @@ impl<'a> IRBuilder<'a> {
 
       overlay,
       pin_all,
+
+      df_may_be_set: false,
     };
 
     // Create and seal the entry block
@@ -469,6 +488,46 @@ impl IRBuilder<'_> {
     let old_flags = self.get_flags();
     let new_flags = self.append_instr(Type::U16, Opcode::UpdateFlags, vec![old_flags, vref]);
     self.set_flags(new_flags);
+  }
+
+  /// String-op pointer auto-update (`SI`/`DI` += element size), assuming
+  /// the direction flag is clear (increment). Only called when
+  /// `!df_may_be_set`, so the direction is provably clear (DOS ABI).
+  fn advance_string_ptr(&mut self, reg: instr::Reg, size: i16) {
+    let cur = self.ir.get_var(reg, self.cur);
+    let step = self.ir.const_new(size);
+    let next = self.append_instr(Type::U16, Opcode::Add, vec![cur, step]);
+    self.append_asm_dst_reg(&instr::OperandReg(reg), next);
+  }
+
+  /// Finish a single-step string op: advance the pointers the op updates
+  /// (with DF=0), or, when the function contains a `std`, degrade to a
+  /// loud marker instead of a possibly-wrong-direction update.
+  fn string_op_advance(&mut self, si: Option<&instr::Operand>, di: Option<&instr::Operand>) {
+    if self.df_may_be_set {
+      self.append_instr(Type::Void, Opcode::Unimpl, vec![]);
+      return;
+    }
+    if let Some(oper) = si {
+      let sz = Self::string_operand_size(oper);
+      self.advance_string_ptr(instr::Reg::SI, sz);
+    }
+    if let Some(oper) = di {
+      let sz = Self::string_operand_size(oper);
+      self.advance_string_ptr(instr::Reg::DI, sz);
+    }
+  }
+
+  /// Element size (bytes) of a string operand.
+  fn string_operand_size(oper: &instr::Operand) -> i16 {
+    match oper {
+      instr::Operand::Mem(m) => match m.sz {
+        instr::Size::Size8 => 1,
+        instr::Size::Size16 => 2,
+        instr::Size::Size32 => 4,
+      },
+      _ => 1,
+    }
   }
 
   fn pin_register(&mut self, reg: instr::Reg) {
@@ -1297,12 +1356,15 @@ impl IRBuilder<'_> {
       instr::Opcode::OP_STOS => {
         let src = self.append_asm_src_operand(&ins.operands[1]);
         self.append_asm_dst_operand(&ins.operands[0], src);
+        self.string_op_advance(None, Some(&ins.operands[0]));
       }
       instr::Opcode::OP_MOVS => {
-        // Single-step move string (REP form is handled above). Like STOS/LODS,
-        // the SI/DI auto-update is not modeled.
+        // Single-step move string (REP form is handled above). The SI/DI
+        // auto-update is modeled with DF=0; a hand-written `movsb` loop
+        // would otherwise copy the same byte forever.
         let src = self.append_asm_src_operand(&ins.operands[1]);
         self.append_asm_dst_operand(&ins.operands[0], src);
+        self.string_op_advance(Some(&ins.operands[1]), Some(&ins.operands[0]));
       }
       instr::Opcode::OP_CMPS => {
         // Compare DS:SI against ES:DI (i.e. operands[1] minus operands[0]).
@@ -1311,6 +1373,7 @@ impl IRBuilder<'_> {
         let typ = self.deduce_type_binary(src, dst);
         let vref = self.append_instr(typ, Opcode::Sub, vec![src, dst]);
         self.append_update_flags(vref);
+        self.string_op_advance(Some(&ins.operands[1]), Some(&ins.operands[0]));
       }
       instr::Opcode::OP_SCAS => {
         // Compare AL/AX against ES:DI (i.e. operands[0] minus operands[1]).
@@ -1319,6 +1382,7 @@ impl IRBuilder<'_> {
         let typ = self.deduce_type_binary(a, b);
         let vref = self.append_instr(typ, Opcode::Sub, vec![a, b]);
         self.append_update_flags(vref);
+        self.string_op_advance(None, Some(&ins.operands[1]));
       }
       instr::Opcode::OP_INS => {
         // Neither the value nor the SI/DI update is modeled; INS does not
@@ -1342,6 +1406,7 @@ impl IRBuilder<'_> {
       instr::Opcode::OP_LODS => {
         let src = self.append_asm_src_operand(&ins.operands[1]);
         self.append_asm_dst_operand(&ins.operands[0], src);
+        self.string_op_advance(Some(&ins.operands[1]), None);
       }
       instr::Opcode::OP_STI => {
         self.append_instr(Type::Void, Opcode::Unimpl, vec![]);
@@ -1368,6 +1433,11 @@ impl IRBuilder<'_> {
   }
 
   fn build(&mut self) {
+    // Step 0: Direction-flag guard. DF is written only by CLD/STD and the
+    // flag-restoring POPF/IRET; with none present the direction is provably
+    // clear (see the df_may_be_set field).
+    self.df_may_be_set = self.instrs.iter().any(|i| opcode_may_set_df(i.opcode));
+
     // Step 1: Infer basic-block boundaries
     let mut block_start = HashSet::new();
     let mut last_was_jump = false;
@@ -1959,5 +2029,163 @@ mod tests {
     assert_eq!(b.ir.get_var(instr::Reg::AX, cur), unimpl, "RCL still yields Unimpl");
     assert!(b.ir.iter_instrs(cur).all(|r| b.ir.instr(r).unwrap().opcode != Opcode::Or),
       "RCL must not use the exact ROL/ROR shape");
+  }
+
+  fn string_mem(sz: instr::Size, sreg: instr::Reg, ptr: instr::Reg) -> instr::Operand {
+    instr::Operand::Mem(instr::OperandMem { sz, sreg, reg1: Some(ptr), reg2: None, off: None })
+  }
+
+  fn string_instr(opcode: instr::Opcode, operands: Vec<instr::Operand>) -> instr::Instr {
+    let mut o = ArrayVec::new();
+    for oper in operands { o.push(oper); }
+    instr::Instr {
+      rep: None,
+      opcode,
+      operands: o,
+      addr: SegOff { seg: Seg::Normal(0), off: Off(0) },
+      n_bytes: 1,
+      intel_hidden_operand_bitmask: 0,
+    }
+  }
+
+  /// The `Add` ref that `get_var(reg)` resolves to, if it is the
+  /// string-op increment by `size`.
+  fn assert_advanced(b: &mut IRBuilder<'_>, reg: instr::Reg, size: i16) {
+    let v = b.ir.get_var(reg, b.cur);
+    let i = b.ir.instr(v).expect("pointer must be a computed value");
+    assert_eq!(i.opcode, Opcode::Add, "{reg:?} must be advanced by Add");
+    assert_eq!(i.operands[0], Ref::Init(reg), "{reg:?} advances from its incoming value");
+    assert_eq!(b.ir.const_lookup(i.operands[1]), Some(size), "{reg:?} must advance by the element size");
+  }
+
+  #[test]
+  fn movs_advances_si_and_di_by_element_size() {
+    // `movsw`: the silent-wrongness fix (#69 slice 2). Without the update
+    // a hand-written movs loop copies the same byte forever.
+    let (_types, cfg, binary, spec) = bit_test_builder(&[0xC3]);
+    let instrs: &[instr::Instr] = &[];
+    let mut b = test_builder(&cfg, instrs, &spec, &binary);
+    let ins = string_instr(instr::Opcode::OP_MOVS, vec![
+      string_mem(instr::Size::Size16, instr::Reg::ES, instr::Reg::DI),
+      string_mem(instr::Size::Size16, instr::Reg::DS, instr::Reg::SI),
+    ]);
+    b.append_asm_instr(&ins);
+    assert_advanced(&mut b, instr::Reg::SI, 2);
+    assert_advanced(&mut b, instr::Reg::DI, 2);
+  }
+
+  #[test]
+  fn movsb_advances_by_one() {
+    let (_types, cfg, binary, spec) = bit_test_builder(&[0xC3]);
+    let instrs: &[instr::Instr] = &[];
+    let mut b = test_builder(&cfg, instrs, &spec, &binary);
+    let ins = string_instr(instr::Opcode::OP_MOVS, vec![
+      string_mem(instr::Size::Size8, instr::Reg::ES, instr::Reg::DI),
+      string_mem(instr::Size::Size8, instr::Reg::DS, instr::Reg::SI),
+    ]);
+    b.append_asm_instr(&ins);
+    assert_advanced(&mut b, instr::Reg::SI, 1);
+    assert_advanced(&mut b, instr::Reg::DI, 1);
+  }
+
+  #[test]
+  fn stos_advances_only_di() {
+    let (_types, cfg, binary, spec) = bit_test_builder(&[0xC3]);
+    let instrs: &[instr::Instr] = &[];
+    let mut b = test_builder(&cfg, instrs, &spec, &binary);
+    let ins = string_instr(instr::Opcode::OP_STOS, vec![
+      string_mem(instr::Size::Size16, instr::Reg::ES, instr::Reg::DI),
+      instr::Operand::Reg(instr::OperandReg(instr::Reg::AX)),
+    ]);
+    b.append_asm_instr(&ins);
+    assert_advanced(&mut b, instr::Reg::DI, 2);
+    assert_eq!(b.ir.get_var(instr::Reg::SI, b.cur), Ref::Init(instr::Reg::SI), "STOS must not touch SI");
+  }
+
+  #[test]
+  fn lods_advances_only_si() {
+    let (_types, cfg, binary, spec) = bit_test_builder(&[0xC3]);
+    let instrs: &[instr::Instr] = &[];
+    let mut b = test_builder(&cfg, instrs, &spec, &binary);
+    let ins = string_instr(instr::Opcode::OP_LODS, vec![
+      instr::Operand::Reg(instr::OperandReg(instr::Reg::AX)),
+      string_mem(instr::Size::Size16, instr::Reg::DS, instr::Reg::SI),
+    ]);
+    b.append_asm_instr(&ins);
+    assert_advanced(&mut b, instr::Reg::SI, 2);
+    assert_eq!(b.ir.get_var(instr::Reg::DI, b.cur), Ref::Init(instr::Reg::DI), "LODS must not touch DI");
+  }
+
+  #[test]
+  fn scas_advances_only_di() {
+    let (_types, cfg, binary, spec) = bit_test_builder(&[0xC3]);
+    let instrs: &[instr::Instr] = &[];
+    let mut b = test_builder(&cfg, instrs, &spec, &binary);
+    let ins = string_instr(instr::Opcode::OP_SCAS, vec![
+      instr::Operand::Reg(instr::OperandReg(instr::Reg::AX)),
+      string_mem(instr::Size::Size16, instr::Reg::ES, instr::Reg::DI),
+    ]);
+    b.append_asm_instr(&ins);
+    assert_advanced(&mut b, instr::Reg::DI, 2);
+    assert_eq!(b.ir.get_var(instr::Reg::SI, b.cur), Ref::Init(instr::Reg::SI), "SCAS must not touch SI");
+  }
+
+  #[test]
+  fn cmps_advances_si_and_di() {
+    let (_types, cfg, binary, spec) = bit_test_builder(&[0xC3]);
+    let instrs: &[instr::Instr] = &[];
+    let mut b = test_builder(&cfg, instrs, &spec, &binary);
+    let ins = string_instr(instr::Opcode::OP_CMPS, vec![
+      string_mem(instr::Size::Size16, instr::Reg::ES, instr::Reg::DI),
+      string_mem(instr::Size::Size16, instr::Reg::DS, instr::Reg::SI),
+    ]);
+    b.append_asm_instr(&ins);
+    assert_advanced(&mut b, instr::Reg::SI, 2);
+    assert_advanced(&mut b, instr::Reg::DI, 2);
+  }
+
+  #[test]
+  fn string_op_with_std_degrades_loud_without_guessing_direction() {
+    // DF may be set by a `std` elsewhere in the function, so the
+    // direction is not provably clear: advance nothing and emit the
+    // loud marker instead of a possibly-wrong-direction update.
+    let (_types, cfg, binary, spec) = bit_test_builder(&[0xC3]);
+    let instrs: &[instr::Instr] = &[];
+    let mut b = test_builder(&cfg, instrs, &spec, &binary);
+    b.df_may_be_set = true;
+    let ins = string_instr(instr::Opcode::OP_MOVS, vec![
+      string_mem(instr::Size::Size16, instr::Reg::ES, instr::Reg::DI),
+      string_mem(instr::Size::Size16, instr::Reg::DS, instr::Reg::SI),
+    ]);
+    b.append_asm_instr(&ins);
+    assert_eq!(b.ir.get_var(instr::Reg::SI, b.cur), Ref::Init(instr::Reg::SI), "must not guess the direction");
+    assert_eq!(b.ir.get_var(instr::Reg::DI, b.cur), Ref::Init(instr::Reg::DI));
+    let _ = only_instr(&b.ir, b.cur, Opcode::Unimpl);
+  }
+
+  #[test]
+  fn build_marks_df_may_be_set_from_decoded_instructions() {
+    // `std; ret` decoded: build() must set the guard so string ops in
+    // this function degrade loud. Without std, the guard stays clear.
+    let (_types, cfg, binary, spec) = bit_test_builder(&[0xFD, 0xC3]);
+    let mut ins = string_instr(instr::Opcode::OP_STD, vec![]);
+    ins.n_bytes = 1;
+    let ret = string_instr(instr::Opcode::OP_RET, vec![]);
+    let instrs = [ins, ret];
+    let mut b = test_builder(&cfg, &instrs, &spec, &binary);
+    b.build();
+    assert!(b.df_may_be_set, "build must detect STD in the decoded function");
+  }
+
+  #[test]
+  fn may_set_df_covers_std_popf_and_iret() {
+    // STD sets DF; POPF/IRET restore it. If any of those gain lowering,
+    // the string-op direction guard must already treat them as DF writers.
+    assert!(opcode_may_set_df(instr::Opcode::OP_STD));
+    assert!(opcode_may_set_df(instr::Opcode::OP_POPF));
+    assert!(opcode_may_set_df(instr::Opcode::OP_IRET));
+    assert!(!opcode_may_set_df(instr::Opcode::OP_CLD), "CLD clears DF");
+    assert!(!opcode_may_set_df(instr::Opcode::OP_MOVS));
+    assert!(!opcode_may_set_df(instr::Opcode::OP_RET));
   }
 }
