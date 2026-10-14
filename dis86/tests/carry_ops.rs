@@ -1,7 +1,7 @@
-// Regression tests for carry-in lowering (issue #69, slice 4). ADC/SBB are
-// lowered exactly when the incoming carry is a tracked carry-out of a
-// previous instruction in the same basic block and the operands are 16-bit;
-// byte operands and cross-block carries stay loud.
+// Regression tests for carry-in lowering (issue #69). ADC/SBB are lowered
+// exactly when the incoming carry is a tracked carry-out of a previous
+// instruction in the same basic block, for both byte and word operands;
+// cross-block carries stay loud.
 use dis86::asm::decode::Decoder;
 use dis86::asm::instr::Instr;
 use dis86::config::Config;
@@ -98,13 +98,26 @@ fn stc_then_adc_uses_known_carry() {
 }
 
 // add al,bl; adc al,cl; ret
-// Byte ADC needs the 8-bit carry, which the IR cannot express: stay loud.
+// Byte ADC lowers with the 8-bit carry read off a widened sum: the carry is
+// `0xFF < (AL + BL)` (a+b promoted to int), so it is not the 16-bit carry.
 #[test]
-fn byte_adc_stays_loud() {
+fn byte_adc_is_exact() {
   let code = [0x00, 0xD8, 0x10, 0xC8, 0xC3];
   let source = decompile_raw(&code);
 
-  assert!(source.contains("UNIMPL(("), "byte ADC must stay loud:\n{source}");
+  assert!(!source.contains("UNIMPL"), "byte ADC must be exact:\n{source}");
+  assert!(source.contains("255 <"), "byte carry must use the 8-bit bound:\n{source}");
+}
+
+// sub al,bl; sbb al,cl; ret
+// Byte SBB lowers with the width-independent borrow.
+#[test]
+fn byte_sbb_is_exact() {
+  let code = [0x28, 0xD8, 0x18, 0xC8, 0xC3];
+  let source = decompile_raw(&code);
+
+  assert!(!source.contains("UNIMPL"), "byte SBB must be exact:\n{source}");
+  assert!(source.contains("AL < BL"), "byte borrow must come from the sub:\n{source}");
 }
 
 // add ax,bx; jz +1; nop; adc cx,dx; mov ax,cx; ret

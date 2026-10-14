@@ -661,6 +661,17 @@ impl<'a> Builder<'a> {
         let exprs: Vec<_> = instr.operands[..4].iter().map(|r| self.ref_to_expr(*r, depth+1)).collect();
         Expr::Abstract(name, exprs)
       }
+      ir::Opcode::Cld | ir::Opcode::Std | ir::Opcode::Cli | ir::Opcode::Sti => {
+        // Zero-operand flag-control macros (hydra machine.h). DF/IF are not
+        // modeled as SSA values, so these are pure side effects.
+        let name = match instr.opcode {
+          ir::Opcode::Cld => "CLD",
+          ir::Opcode::Std => "STD",
+          ir::Opcode::Cli => "CLI",
+          _ => "STI",
+        };
+        Expr::Abstract(name, vec![])
+      }
       ir::Opcode::Phi => {
         // generally handled by jmp, but other expressions that use a phi might end up here
         // so, we can simply return our refname
