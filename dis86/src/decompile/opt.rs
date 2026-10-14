@@ -448,16 +448,43 @@ pub fn deadcode_elimination(ir: &mut IR) {
 }
 
 /// Instructions that may be erased when a block they (transitively) depend on
-/// is removed: pure data producers with no control-flow role. Anything else —
-/// side effects, Phi nodes, terminators — keeps the block alive instead.
-fn is_nopable_consumer(opcode: Opcode) -> bool {
-  if opcode.has_side_effects() {
+/// is removed: pure data producers with no control-flow role and no PIN
+/// marker. Anything else — side effects, pinned values, Phi nodes,
+/// terminators — keeps the block alive instead.
+fn is_nopable_consumer(instr: &Instr) -> bool {
+  if instr.opcode.has_side_effects() {
     return false;
   }
-  !matches!(opcode,
+  // Pinned values are live roots by design (see deadcode_elimination);
+  // erasing one would violate the PIN contract.
+  if (instr.attrs & Attribute::PIN) != 0 {
+    return false;
+  }
+  !matches!(instr.opcode,
     Opcode::Nop | Opcode::Phi |
     Opcode::Jmp | Opcode::Jne | Opcode::JmpTbl |
     Opcode::RetFar | Opcode::RetNear)
+}
+
+/// Remove `blkref` as a predecessor of `exit`, returning the dropped Phi
+/// operands so the repair can be restored exactly (see deadblock_elimination).
+fn repair_exit(ir: &mut IR, exit: BlockRef, pred_idx: usize) -> Vec<(Ref, Ref)> {
+  let mut removed = vec![];
+  ir.block_mut(exit).preds.remove(pred_idx);
+  for r in ir.iter_instrs(exit) {
+    let instr = ir.instr_mut(r).unwrap();
+    if instr.opcode != Opcode::Phi { continue; }
+    removed.push((r, instr.operands.remove(pred_idx)));
+  }
+  removed
+}
+
+/// Exact inverse of `repair_exit`: re-insert the predecessor and Phi operands.
+fn restore_exit(ir: &mut IR, blkref: BlockRef, exit: BlockRef, pred_idx: usize, removed: Vec<(Ref, Ref)>) {
+  ir.block_mut(exit).preds.insert(pred_idx, blkref);
+  for (r, op) in removed {
+    ir.instr_mut(r).unwrap().operands.insert(pred_idx, op);
+  }
 }
 
 pub fn deadblock_elimination(ir: &mut IR) {
@@ -467,44 +494,41 @@ pub fn deadblock_elimination(ir: &mut IR) {
     if blkref == BlockRef(0) { continue; } // entry block is always alive
     if blk.preds.len() > 0 { continue; }
 
-    // Need to remove ourself as a pred from any target blocks
+    // Snapshot the outgoing edges up front: if the sweep below decides to
+    // keep the block, the exit repair is restored exactly, so successors'
+    // preds/Phis never drift out of sync with the block's own edges.
+    let mut exits = vec![];
     for exit in ir.block_exits(blkref) {
       // Find pred_idx
-      let exit_blk = ir.block_mut(exit);
       let mut pred_idx = None;
-      for (i, p) in exit_blk.preds.iter().enumerate() {
+      for (i, p) in ir.block(exit).preds.iter().enumerate() {
         if *p == blkref {
           pred_idx = Some(i);
           break;
         }
       }
-      let pred_idx = pred_idx.unwrap();
-
-      // Remove index from pred and all phis
-      exit_blk.preds.remove(pred_idx);
-      for r in ir.iter_instrs(exit) {
-        let instr = ir.instr_mut(r).unwrap();
-        if instr.opcode != Opcode::Phi { continue; }
-        instr.operands.remove(pred_idx);
-      }
+      exits.push((exit, pred_idx.unwrap()));
+    }
+    let mut removed_phis = vec![];
+    for (exit, pred_idx) in &exits {
+      removed_phis.push(repair_exit(ir, *exit, *pred_idx));
     }
 
     // Sweep any remaining references into the removed block. Pure-data
     // consumers are erased transitively (their users join the walk); if
     // anything observable still depends on the block, the block is kept and
     // diagnosed instead of violating `block_remove`'s no-references contract.
-    // NOTE: the exit repair above already ran, so a keep-decision here leaves
-    // the exits' preds/Phis repaired while the block's own outgoing edge
-    // remains. That asymmetry is benign (the block is unreachable and never
-    // scheduled) and the WARN below points at the real problem.
     let mut to_nop = vec![];
     let mut seen = HashSet::new();
     let mut worklist = ir.block_ref_users(blkref);
     let mut keep = false;
     while let Some(r) = worklist.pop() {
       if !seen.insert(r) { continue; }
+      // NOTE: `instr()` panics on refs into removed blocks rather than
+      // returning None, so this only skips non-instruction refs, which never
+      // enter the worklist; kept as defense in depth.
       let Some(instr) = ir.instr(r) else { continue };
-      if !is_nopable_consumer(instr.opcode) {
+      if !is_nopable_consumer(instr) {
         keep = true;
         break;
       }
@@ -521,6 +545,9 @@ pub fn deadblock_elimination(ir: &mut IR) {
     }
     let still_pred = ir.iter_blocks().any(|b| ir.block(b).preds.contains(&blkref));
     if keep || still_pred {
+      for ((exit, pred_idx), removed) in exits.into_iter().zip(removed_phis) {
+        restore_exit(ir, blkref, exit, pred_idx, removed);
+      }
       let users = ir.block_ref_users(blkref);
       eprintln!("WARN: deadblock_elimination: keeping unreachable '{}' ({:?}): still referenced by {} instruction(s) (e.g. {:?}); skipping removal",
         ir.block(blkref).name, blkref, users.len(), users.first());
@@ -1574,5 +1601,68 @@ mod tests {
     assert!(ir.blocks[dead.0].is_none(), "dead block must have been removed");
     assert!(!ir.block(entry).defs.values().any(|v| *v == dead_val),
       "mapping into the removed block must be dropped");
+  }
+
+  #[test]
+  fn deadblock_erases_transitive_pure_consumers() {
+    // dead -> A (pure) -> B (pure): the whole cone is erased with the block.
+    let (mut ir, entry) = test_ir();
+    let dead = ir.add_block("dead"); // zero preds
+    let seven = ir.const_new(7);
+    let dead_val = append(&mut ir, dead, Opcode::Add, vec![seven, seven]);
+    let k = ir.const_new(4);
+    let a = append(&mut ir, entry, Opcode::Add, vec![dead_val, k]);
+    let b = append(&mut ir, entry, Opcode::Xor, vec![a, a]);
+
+    deadblock_elimination(&mut ir);
+
+    assert!(ir.blocks[dead.0].is_none(), "dead block must have been removed");
+    assert_eq!(ir.instr(a).unwrap().opcode, Opcode::Nop, "direct consumer must be erased");
+    assert_eq!(ir.instr(b).unwrap().opcode, Opcode::Nop, "transitive consumer must be erased");
+    optimize(&mut ir);
+  }
+
+  #[test]
+  fn deadblock_keep_path_restores_exit_repair() {
+    // A kept block must leave its successors' preds/Phis exactly as found:
+    // the exit repair is restored, not left half-applied.
+    let (mut ir, entry) = test_ir();
+    let dead = ir.add_block("dead"); // zero preds
+    let seven = ir.const_new(7);
+    let dead_val = append(&mut ir, dead, Opcode::Add, vec![seven, seven]);
+    let target = ir.add_block("target");
+    ir.block_mut(target).preds.push(dead);
+    append_typed(&mut ir, dead, Type::Void, Opcode::Jmp, vec![Ref::Block(target)]);
+    let seg = Ref::Init(crate::asm::instr::Reg::SS);
+    let off = ir.const_new(0x10);
+    append_typed(&mut ir, entry, Type::Void, Opcode::Store16, vec![seg, off, dead_val]);
+
+    deadblock_elimination(&mut ir);
+
+    assert!(ir.blocks[dead.0].is_some(), "referenced dead block must be kept");
+    assert_eq!(ir.block(target).preds, vec![dead],
+      "exit repair must be restored on the keep path");
+    optimize(&mut ir);
+  }
+
+  #[test]
+  fn deadblock_keeps_block_with_transitive_side_effecting_consumer() {
+    // dead -> A (pure) -> B (store): the observable tail keeps the block.
+    let (mut ir, entry) = test_ir();
+    let dead = ir.add_block("dead"); // zero preds
+    let seven = ir.const_new(7);
+    let dead_val = append(&mut ir, dead, Opcode::Add, vec![seven, seven]);
+    let k = ir.const_new(4);
+    let a = append(&mut ir, entry, Opcode::Add, vec![dead_val, k]);
+    let seg = Ref::Init(crate::asm::instr::Reg::SS);
+    let off = ir.const_new(0x10);
+    let store = append_typed(&mut ir, entry, Type::Void, Opcode::Store16, vec![seg, off, a]);
+
+    deadblock_elimination(&mut ir);
+
+    assert!(ir.blocks[dead.0].is_some(), "referenced dead block must be kept");
+    assert_eq!(ir.instr(a).unwrap().opcode, Opcode::Add, "nothing may be erased on the keep path");
+    assert_eq!(ir.instr(store).unwrap().opcode, Opcode::Store16);
+    optimize(&mut ir);
   }
 }

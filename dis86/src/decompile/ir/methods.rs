@@ -108,6 +108,12 @@ impl IR {
         "IR::block_remove: BlockRef({}) is still listed as a predecessor",
         blkref.0,
       );
+      assert!(
+        !self.iter_blocks().any(|b| self.block(b).incomplete_phis.iter()
+          .any(|(_, r)| matches!(r, Ref::Instr(t, _) if *t == blkref))),
+        "IR::block_remove: BlockRef({}) is still referenced by incomplete phis",
+        blkref.0,
+      );
     }
     self.blocks[blkref.0] = None;
   }
