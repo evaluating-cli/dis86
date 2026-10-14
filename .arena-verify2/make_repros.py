@@ -97,3 +97,25 @@ raw("t78a", bytes([0x89, 0xC3, 0xB4, 0x06, 0xCD, 0x21, 0x89, 0xD8, 0xC3, 0x90, 0
 raw("t78b", bytes([0x89, 0xD8, 0xB7, 0x01, 0xCD, 0x21, 0xC3]), {"test": (0x0, 0x7)})
 # Variant (dest materialized last): mov si,cx; mov ch,1; int 21h; ret
 raw("t78c", bytes([0x89, 0xCE, 0xB5, 0x01, 0xCD, 0x21, 0xC3]), {"test": (0x0, 0x7)})
+# Same hazard via a call's regargs materialization:
+#   mov bx,ax; mov ah,6; call f (regargs AX,BX); mov ax,bx; ret
+(D / "t78d.bin").write_bytes(bytes([
+    0x89, 0xC3,             # 0: mov bx,ax
+    0xB4, 0x06,             # 2: mov ah,6
+    0xE8, 0x03, 0x00,       # 4: call f (0x000a)
+    0x89, 0xD8,             # 7: mov ax,bx
+    0xC3,                   # 9: ret
+    0xC3,                   # a: f: ret
+]))
+(D / "t78d.bsl").write_text(
+    "dis86 {\n"
+    "  code_segments { _0000 { seg 0 name CODE } }\n"
+    "  functions {\n"
+    "    main { start 0000:0000 end 0000:000a mode near ret None args None }\n"
+    "    f { start 0000:000a end 0000:000b mode near ret None args None regargs \"AX,BX\" }\n"
+    "  }\n"
+    "  structures {}\n"
+    "  globals {}\n"
+    "  text_section {}\n"
+    "}\n")
+print("t78d: 11 bytes -> t78d.bin + t78d.bsl (call-site regargs AX,BX)")

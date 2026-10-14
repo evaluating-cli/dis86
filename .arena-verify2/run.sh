@@ -54,23 +54,31 @@ run 66-emit "$BIN" --config /tmp/repro/r66.bsl --binary-exe /tmp/repro/synth_a.e
     --name main --emit-code /tmp/repro/66.c
 show 66-emit /tmp/repro/66.c
 run 66-ir "$BIN" --config /tmp/repro/r66.bsl --binary-exe /tmp/repro/synth_a.exe \
-    --name main --emit-ir-final
+    --name main --emit-ir-final /tmp/repro/66.ir
+show 66-ir /tmp/repro/66.ir
 run 66-flags "$BIN" --config /tmp/repro/t66b.bsl --binary-raw /tmp/repro/t66b.bin \
     --name test --emit-code /tmp/repro/66b.c --codegen-hydra
 show 66-flags /tmp/repro/66b.c
+run 66-flags-ir "$BIN" --config /tmp/repro/t66b.bsl --binary-raw /tmp/repro/t66b.bin \
+    --name test --emit-ir-final /tmp/repro/66b.ir
+show 66-flags-ir /tmp/repro/66b.ir
 
 # --------------------------------------------------------------- #67 --------
 run 67-emit "$BIN" --config /tmp/repro/r67.bsl --binary-exe /tmp/repro/synth_b.exe \
     --name A --emit-code /tmp/repro/67.c
 show 67-emit /tmp/repro/67.c
 run 67-ctrlflow "$BIN" --config /tmp/repro/r67.bsl --binary-exe /tmp/repro/synth_b.exe \
-    --name A --emit-ctrlflow
+    --name A --emit-ctrlflow /tmp/repro/67.cf
+show 67-ctrlflow /tmp/repro/67.cf
 
 # --------------------------------------------------------------- #77 --------
 for case in t77a t77b t77c; do
   run "77-$case" "$BIN" --config "/tmp/repro/$case.bsl" --binary-raw "/tmp/repro/$case.bin" \
       --name test --emit-code "/tmp/repro/$case.c" --codegen-hydra
   show "77-$case" "/tmp/repro/$case.c"
+  run "77-$case-ir" "$BIN" --config "/tmp/repro/$case.bsl" --binary-raw "/tmp/repro/$case.bin" \
+      --name test --emit-ir-final "/tmp/repro/$case.ir"
+  show "77-$case-ir" "/tmp/repro/$case.ir"
 done
 {
   echo "numeric check for the issue's two cases:"
@@ -82,13 +90,14 @@ print('  77c emitted (u16)(0x1234 >> 16) =', hex((0x1234 >> 16) & 0xffff), ' exp
 } > "$OUT/77-numeric.txt" 2>&1
 
 # --------------------------------------------------------------- #78 --------
-for case in t78a t78b t78c; do
+for case in t78a t78b t78c t78d; do
   run "78-$case" "$BIN" --config "/tmp/repro/$case.bsl" --binary-raw "/tmp/repro/$case.bin" \
       --name test --emit-code "/tmp/repro/$case.c" --codegen-hydra
   show "78-$case" "/tmp/repro/$case.c"
+  run "78-$case-ir" "$BIN" --config "/tmp/repro/$case.bsl" --binary-raw "/tmp/repro/$case.bin" \
+      --name test --emit-ir-final "/tmp/repro/$case.ir"
+  show "78-$case-ir" "/tmp/repro/$case.ir"
 done
-run 78-ir "$BIN" --config /tmp/repro/t78a.bsl --binary-raw /tmp/repro/t78a.bin \
-    --name test --emit-ir-final
 
 # ------------------------------------------------------- #69 status ---------
 {
