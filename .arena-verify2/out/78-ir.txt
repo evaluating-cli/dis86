@@ -1,3 +1,0 @@
-$ /tmp/main/build/bin/dis86 --config /tmp/repro/t78a.bsl --binary-raw /tmp/repro/t78a.bin --name test --emit-ir-final
-Error: the '--emit-ir-final' option doesn't have an associated value.
-exit=1

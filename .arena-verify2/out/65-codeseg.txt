@@ -1,5 +1,0 @@
-$ /tmp/main/build/bin/dis86 --config /tmp/repro/r65.bsl --binary-exe /tmp/repro/synth_65.exe --codeseg-name CODE --emit-code /tmp/repro/65.c
-Error: Failed to decode instruction: Unsupported or invalid instruction at 0000:0003
-Error: Failed to decompile main; continuing with the rest.
-Error: Failed to decompile 1 function(s).
-exit=1

@@ -1,8 +1,0 @@
-$ /tmp/main/build/bin/dis86 --config /tmp/repro/r65.bsl --binary-exe /tmp/repro/synth_65.exe --analyze
-
-    ##################################################################################################################
-    ## Section 0000: CODE
-    # UNDECODABLE GAP | main | 0000:0000 | linear decode of [0000:0000, 0000:000b) fails at 0000:0003; the suggested range spans non-code bytes - audit/shorten the range before use
-    # RET KIND UNKNOWN | main | 0000:0000 | no return instruction observed (noreturn helper or tail-jump exit) (keeping configured near); resolve the call mode from the call sites: near calls need flags = "NEAR", far calls need no flag
-    F( "main",                        None,   None,        "0000:0000", "0000:000b", flags = "RET_UNKNOWN_CONFIG_NEAR" ),
-exit=1
