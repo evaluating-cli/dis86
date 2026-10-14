@@ -1,7 +1,9 @@
 // Regression tests for carry-in lowering (issue #69). ADC/SBB are lowered
 // exactly when the incoming carry is a tracked carry-out of a previous
-// instruction in the same basic block, for both byte and word operands;
-// cross-block carries stay loud.
+// instruction, for both byte and word operands. A carry is tracked within a
+// basic block, and across a branch merge when every path to the merge
+// preserves it (threaded through a CF SSA value); a merge whose arms do not
+// all preserve the carry stays loud.
 use dis86::asm::decode::Decoder;
 use dis86::asm::instr::Instr;
 use dis86::config::Config;
@@ -155,13 +157,51 @@ fn byte_sbb_is_exact() {
 }
 
 // add ax,bx; jz +1; nop; adc cx,dx; mov ax,cx; ret
-// The carry does not cross the control-flow merge: stay loud.
+// Both paths to the ADC preserve the ADD's carry (the jz/nop only branch),
+// so the carry is threaded across the merge through a CF phi: exact.
 #[test]
-fn cross_block_adc_stays_loud() {
+fn cross_block_adc_is_exact() {
   let code = [0x01, 0xD8, 0x74, 0x01, 0x90, 0x11, 0xD1, 0x89, 0xC8, 0xC3];
   let source = decompile_raw(&code);
 
-  assert!(source.contains("UNIMPL("), "cross-block ADC must stay loud:\n{source}");
+  assert!(!source.contains("UNIMPL"), "cross-block ADC must be exact:\n{source}");
+  assert!(
+    source.contains("< AX"),
+    "the carry from the add must survive the merge:\n{source}"
+  );
+}
+
+// add ax,bx; jz +2; neg dx; adc cx,dx; mov ax,cx; ret
+// One arm clobbers CF (neg), so the merged carry is unknown: stay loud.
+#[test]
+fn cross_block_clobbering_arm_stays_loud() {
+  let code = [0x01, 0xD8, 0x74, 0x02, 0xF7, 0xDA, 0x11, 0xD1, 0x89, 0xC8, 0xC3];
+  let source = decompile_raw(&code);
+
+  assert!(source.contains("UNIMPL"), "a clobbered arm must stay loud:\n{source}");
+}
+
+// stc; jz +1; nop; adc cx,dx; mov ax,cx; ret
+// A known carry (CF=1 from STC) also survives the branch merge.
+#[test]
+fn known_carry_survives_merge() {
+  let code = [0xF9, 0x74, 0x01, 0x90, 0x11, 0xD1, 0x89, 0xC8, 0xC3];
+  let source = decompile_raw(&code);
+
+  assert!(!source.contains("UNIMPL("), "the ADC must be exact (the branch flags may be loud):\n{source}");
+  assert!(source.contains("(CX + DX) + 1"), "the STC carry must reach the ADC:\n{source}");
+}
+
+// cmp ax,bx; jz +2; add cx,dx; adc si,di; mov ax,si; ret
+// Each arm produces a *different* known carry (cmp's borrow vs the add's
+// carry-out), so the merge materializes a CF phi and the ADC stays exact.
+#[test]
+fn divergent_carry_merge_is_exact() {
+  let code = [0x39, 0xD8, 0x74, 0x02, 0x01, 0xD1, 0x11, 0xFE, 0x89, 0xF0, 0xC3];
+  let source = decompile_raw(&code);
+
+  assert!(!source.contains("UNIMPL"), "divergent known carries must merge exactly:\n{source}");
+  assert!(source.contains("SI + DI"), "ADC value must include the merged carry:\n{source}");
 }
 
 // add ax,bx; mov cx,dx; adc si,di; mov ax,si; ret
