@@ -1,0 +1,17 @@
+$ /tmp/main/build/bin/dis86 --config /tmp/repro/t77a.bsl --binary-raw /tmp/repro/t77a.bin --name test --emit-ir-final /tmp/repro/t77a.ir
+exit=0
+
+===== /tmp/repro/t77a.ir =====
+
+b0: () entry
+1   |   al.2     = u16      lower16    #0x607              
+1   |   t0       = u16      shl        #0x4a                #8                  
+1   |   ax.3     = u16      or         t0                   al.2                
+0   |   sp.2     = void     pin        SP                  
+0   |   bp.2     = void     pin        BP                  
+0   |   si.2     = void     pin        SI                  
+0   |   di.2     = void     pin        DI                  
+0   |   ss.2     = void     pin        SS                  
+0   |   ds.2     = void     pin        DS                  
+0   |              void     retn       ax.3                 DX                  
+

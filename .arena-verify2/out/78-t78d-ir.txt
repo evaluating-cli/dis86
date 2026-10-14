@@ -1,0 +1,6 @@
+$ /tmp/main/build/bin/dis86 --config /tmp/repro/t78d.bsl --binary-raw /tmp/repro/t78d.bin --name test --emit-ir-final /tmp/repro/t78d.ir
+Error: Failed to lookup function named: test
+exit=1
+
+===== /tmp/repro/t78d.ir =====
+cat: /tmp/repro/t78d.ir: No such file or directory

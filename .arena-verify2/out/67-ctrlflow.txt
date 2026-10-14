@@ -1,3 +1,9 @@
-$ /tmp/main/build/bin/dis86 --config /tmp/repro/r67.bsl --binary-exe /tmp/repro/synth_b.exe --name A --emit-ctrlflow
-Error: the '--emit-ctrlflow' option doesn't have an associated value.
-exit=1
+$ /tmp/main/build/bin/dis86 --config /tmp/repro/r67.bsl --binary-exe /tmp/repro/synth_b.exe --name A --emit-ctrlflow /tmp/repro/67.cf
+WARN: A: branch at 0000:0006 targets 0000:000a outside function range [0000:0000, 0000:0009); the edge is dropped from the output
+WARN: Could not find global for DS:0100
+exit=0
+
+===== /tmp/repro/67.cf =====
+ElemId(0) | BasicBlock(0)
+ElemId(1) | BasicBlock(1)
+
