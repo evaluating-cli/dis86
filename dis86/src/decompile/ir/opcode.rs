@@ -83,6 +83,13 @@ pub enum Opcode {
   CallArgs,
   Int,
 
+  // REP-prefixed string ops beyond the single-step forms. Each renders as
+  // a runtime bulk macro (REP_MOVSB/... in hydra's machine.h) and is a
+  // side effect; the deterministic register updates (CX->0, SI/DI +=
+  // CX0*size) are modeled separately as ordinary IR values.
+  RepMovs,
+  RepStos,
+
   RetFar,
   RetNear,
 
@@ -170,6 +177,8 @@ impl Opcode {
       Opcode::CallPtr     => "callptr",
       Opcode::CallArgs    => "callargs",
       Opcode::Int         => "int",
+      Opcode::RepMovs     => "repmovs",
+      Opcode::RepStos     => "repstos",
       Opcode::RetFar      => "retf",
       Opcode::RetNear     => "retn",
       Opcode::Jmp         => "jmp",
@@ -197,6 +206,21 @@ impl Opcode {
       Opcode::Store8 => true,
       Opcode::Store16 => true,
       Opcode::Store32 => true,
+      _ => false,
+    }
+  }
+
+  /// Whether this op may write arbitrary memory without carrying a
+  /// `Store` operand: calls (callee side effects), interrupts (handlers),
+  /// and the REP bulk string macros. Memory-reasoning passes
+  /// (store-to-load forwarding, symbol SSA lifting) must treat these as
+  /// barriers, otherwise an intervening write is invisible and a stale
+  /// value propagates.
+  pub fn may_clobber_memory(&self) -> bool {
+    match self {
+      Opcode::CallFar | Opcode::CallNear | Opcode::CallPtr | Opcode::CallArgs => true,
+      Opcode::Int => true,
+      Opcode::RepMovs | Opcode::RepStos => true,
       _ => false,
     }
   }
@@ -291,6 +315,8 @@ impl Opcode {
       Opcode::CallPtr => true,
       Opcode::CallArgs => true,
       Opcode::Int => true,
+      Opcode::RepMovs => true,
+      Opcode::RepStos => true,
       Opcode::RetFar => true,
       Opcode::RetNear => true,
       Opcode::Jmp => true,

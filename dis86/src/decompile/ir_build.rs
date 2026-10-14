@@ -530,6 +530,52 @@ impl IRBuilder<'_> {
     }
   }
 
+  /// Lower a `rep` MOVS/STOS (direction provably clear): emit the runtime
+  /// bulk macro over the pre-update values, then model the deterministic
+  /// register updates in the SSA (`CX -> 0`, `SI/DI += CX0*size`). The
+  /// macro takes value copies, so it never mutates the SSA pointers.
+  fn lower_rep_string_op(&mut self, ins: &instr::Instr) {
+    let cx = self.ir.get_var(instr::Reg::CX, self.cur);
+    let zero = self.ir.const_new(0);
+    let seg_of = |oper: &instr::Operand, fallback: instr::Reg| match oper {
+      instr::Operand::Mem(m) => m.sreg,
+      _ => fallback,
+    };
+    match ins.opcode {
+      instr::Opcode::OP_MOVS => {
+        let dst = &ins.operands[0]; // ES:DI
+        let src = &ins.operands[1]; // DS:SI (segment may be overridden)
+        let size = Self::string_operand_size(dst);
+        let ds = self.ir.get_var(seg_of(src, instr::Reg::DS), self.cur);
+        let es = self.ir.get_var(seg_of(dst, instr::Reg::ES), self.cur);
+        let si = self.ir.get_var(instr::Reg::SI, self.cur);
+        let di = self.ir.get_var(instr::Reg::DI, self.cur);
+        let size_c = self.ir.const_new(size);
+        self.append_instr(Type::Void, Opcode::RepMovs, vec![ds, si, es, di, cx, size_c]);
+        let off = self.append_instr(Type::U16, Opcode::UMul, vec![cx, size_c]);
+        let si_n = self.append_instr(Type::U16, Opcode::Add, vec![si, off]);
+        let di_n = self.append_instr(Type::U16, Opcode::Add, vec![di, off]);
+        self.append_asm_dst_reg(&instr::OperandReg(instr::Reg::SI), si_n);
+        self.append_asm_dst_reg(&instr::OperandReg(instr::Reg::DI), di_n);
+        self.append_asm_dst_reg(&instr::OperandReg(instr::Reg::CX), zero);
+      }
+      instr::Opcode::OP_STOS => {
+        let dst = &ins.operands[0]; // ES:DI
+        let size = Self::string_operand_size(dst);
+        let es = self.ir.get_var(seg_of(dst, instr::Reg::ES), self.cur);
+        let di = self.ir.get_var(instr::Reg::DI, self.cur);
+        let val = self.append_asm_src_operand(&ins.operands[1]); // AL/AX
+        let size_c = self.ir.const_new(size);
+        self.append_instr(Type::Void, Opcode::RepStos, vec![es, di, cx, val, size_c]);
+        let off = self.append_instr(Type::U16, Opcode::UMul, vec![cx, size_c]);
+        let di_n = self.append_instr(Type::U16, Opcode::Add, vec![di, off]);
+        self.append_asm_dst_reg(&instr::OperandReg(instr::Reg::DI), di_n);
+        self.append_asm_dst_reg(&instr::OperandReg(instr::Reg::CX), zero);
+      }
+      _ => unreachable!("lower_rep_string_op called for {:?}", ins.opcode),
+    }
+  }
+
   fn pin_register(&mut self, reg: instr::Reg) {
     let vref = self.ir.get_var(reg, self.cur);
     let pin = self.append_instr(Type::Void, Opcode::Pin, vec![vref]);
@@ -923,14 +969,26 @@ impl IRBuilder<'_> {
     // `push cs; rep movs; call near` from misclassifying the later call.
     let special = self.special.take();
 
-    // REP-prefixed string instructions execute a counted loop with memory
-    // effects we don't model yet. Lower to Unimpl (like RCL/SBB above) so
-    // real binaries using `rep movs/stos/...` decompile with an explicit
-    // imprecision marker instead of aborting. Flags are conservatively
-    // clobbered because e.g. `repe scasb` defines the flags its caller tests.
+    // REP-prefixed string instructions execute a counted loop. MOVS/STOS
+    // are modeled exactly (runtime bulk macro + CX->0 and SI/DI += CX0*size
+    // updates); LODS/CMPS/SCAS/INS/OUTS still lower to Unimpl (their
+    // result is data-dependent). Any of them with a possibly-set direction
+    // flag stays loud rather than guessing the direction.
     if ins.rep.is_some() {
-      let vref = self.append_instr(Type::U16, Opcode::Unimpl, vec![]);
-      self.append_update_flags(vref);
+      // Only 8/16-bit MOVS/STOS are modeled; a wider (unreachable) form
+      // falls back to the loud marker rather than emitting the wrong-width
+      // macro.
+      let modeled = matches!(ins.opcode, instr::Opcode::OP_MOVS | instr::Opcode::OP_STOS)
+        && matches!(&ins.operands[0],
+          instr::Operand::Mem(m) if matches!(m.sz, instr::Size::Size8 | instr::Size::Size16));
+      if !modeled || self.df_may_be_set {
+        // Flags are conservatively clobbered because e.g. `repe scasb`
+        // defines the flags its caller tests.
+        let vref = self.append_instr(Type::U16, Opcode::Unimpl, vec![]);
+        self.append_update_flags(vref);
+        return;
+      }
+      self.lower_rep_string_op(ins);
       return;
     }
 
@@ -2187,5 +2245,113 @@ mod tests {
     assert!(!opcode_may_set_df(instr::Opcode::OP_CLD), "CLD clears DF");
     assert!(!opcode_may_set_df(instr::Opcode::OP_MOVS));
     assert!(!opcode_may_set_df(instr::Opcode::OP_RET));
+  }
+
+  #[test]
+  fn may_clobber_memory_covers_calls_int_and_rep() {
+    for op in [Opcode::CallFar, Opcode::CallNear, Opcode::CallPtr, Opcode::CallArgs,
+               Opcode::Int, Opcode::RepMovs, Opcode::RepStos] {
+      assert!(op.may_clobber_memory(), "{op:?} must be a memory barrier");
+    }
+    for op in [Opcode::Load8, Opcode::Store8, Opcode::Add, Opcode::RetNear, Opcode::Unimpl] {
+      assert!(!op.may_clobber_memory(), "{op:?} must not be a memory barrier");
+    }
+  }
+
+  fn rep_string_instr(opcode: instr::Opcode, operands: Vec<instr::Operand>) -> instr::Instr {
+    let mut ins = string_instr(opcode, operands);
+    ins.rep = Some(instr::Rep::EQ);
+    ins
+  }
+
+  /// The `Add(dst, UMul(count, size))` value that `get_var(reg)` resolves
+  /// to, and the count it multiplies.
+  fn assert_rep_advanced(b: &mut IRBuilder<'_>, reg: instr::Reg, size: i16) -> Ref {
+    let v = b.ir.get_var(reg, b.cur);
+    let add = b.ir.instr(v).expect("pointer must be recomputed");
+    assert_eq!(add.opcode, Opcode::Add, "{reg:?} must advance by Add");
+    assert_eq!(add.operands[0], Ref::Init(reg));
+    let mul = add.operands[1];
+    let mul_i = b.ir.instr(mul).unwrap();
+    assert_eq!(mul_i.opcode, Opcode::UMul, "advance is count*size");
+    assert_eq!(b.ir.const_lookup(mul_i.operands[1]), Some(size));
+    mul_i.operands[0]
+  }
+
+  #[test]
+  fn rep_movs_models_cx_zero_and_pointer_advance() {
+    let (_types, cfg, binary, spec) = bit_test_builder(&[0xC3]);
+    let instrs: &[instr::Instr] = &[];
+    let mut b = test_builder(&cfg, instrs, &spec, &binary);
+    let cx = b.ir.const_new(5);
+    b.ir.set_var(instr::Reg::CX, b.cur, cx);
+    let ins = rep_string_instr(instr::Opcode::OP_MOVS, vec![
+      string_mem(instr::Size::Size16, instr::Reg::ES, instr::Reg::DI),
+      string_mem(instr::Size::Size16, instr::Reg::DS, instr::Reg::SI),
+    ]);
+    b.append_asm_instr(&ins);
+
+    let _ = only_instr(&b.ir, b.cur, Opcode::RepMovs);
+    let cx_after = b.ir.get_var(instr::Reg::CX, b.cur);
+    assert_eq!(b.ir.const_lookup(cx_after), Some(0), "CX must be consumed to 0");
+    let si_mul = assert_rep_advanced(&mut b, instr::Reg::SI, 2);
+    let di_mul = assert_rep_advanced(&mut b, instr::Reg::DI, 2);
+    assert_eq!(si_mul, cx, "SI advance must be the pre-update count");
+    assert_eq!(di_mul, cx, "DI advance must be the pre-update count");
+  }
+
+  #[test]
+  fn rep_stos_models_di_advance_without_touching_si() {
+    let (_types, cfg, binary, spec) = bit_test_builder(&[0xC3]);
+    let instrs: &[instr::Instr] = &[];
+    let mut b = test_builder(&cfg, instrs, &spec, &binary);
+    let cx = b.ir.const_new(3);
+    b.ir.set_var(instr::Reg::CX, b.cur, cx);
+    let ins = rep_string_instr(instr::Opcode::OP_STOS, vec![
+      string_mem(instr::Size::Size16, instr::Reg::ES, instr::Reg::DI),
+      instr::Operand::Reg(instr::OperandReg(instr::Reg::AX)),
+    ]);
+    b.append_asm_instr(&ins);
+
+    let _ = only_instr(&b.ir, b.cur, Opcode::RepStos);
+    let cx_after = b.ir.get_var(instr::Reg::CX, b.cur);
+    assert_eq!(b.ir.const_lookup(cx_after), Some(0));
+    let di_mul = assert_rep_advanced(&mut b, instr::Reg::DI, 2);
+    assert_eq!(di_mul, cx);
+    assert_eq!(b.ir.get_var(instr::Reg::SI, b.cur), Ref::Init(instr::Reg::SI), "STOS must not touch SI");
+  }
+
+  #[test]
+  fn rep_with_possible_std_degrades_loud() {
+    let (_types, cfg, binary, spec) = bit_test_builder(&[0xC3]);
+    let instrs: &[instr::Instr] = &[];
+    let mut b = test_builder(&cfg, instrs, &spec, &binary);
+    b.df_may_be_set = true;
+    let cx = b.ir.const_new(5);
+    b.ir.set_var(instr::Reg::CX, b.cur, cx);
+    let ins = rep_string_instr(instr::Opcode::OP_MOVS, vec![
+      string_mem(instr::Size::Size16, instr::Reg::ES, instr::Reg::DI),
+      string_mem(instr::Size::Size16, instr::Reg::DS, instr::Reg::SI),
+    ]);
+    b.append_asm_instr(&ins);
+
+    let _ = only_instr(&b.ir, b.cur, Opcode::Unimpl);
+    assert!(b.ir.iter_instrs(b.cur).all(|r| b.ir.instr(r).unwrap().opcode != Opcode::RepMovs),
+      "must not emit the assumed-direction macro");
+    assert_eq!(b.ir.get_var(instr::Reg::CX, b.cur), cx, "CX must be left untouched");
+  }
+
+  #[test]
+  fn rep_lods_stays_loud() {
+    let (_types, cfg, binary, spec) = bit_test_builder(&[0xC3]);
+    let instrs: &[instr::Instr] = &[];
+    let mut b = test_builder(&cfg, instrs, &spec, &binary);
+    let ins = rep_string_instr(instr::Opcode::OP_LODS, vec![
+      instr::Operand::Reg(instr::OperandReg(instr::Reg::AX)),
+      string_mem(instr::Size::Size16, instr::Reg::DS, instr::Reg::SI),
+    ]);
+    b.append_asm_instr(&ins);
+
+    let _ = only_instr(&b.ir, b.cur, Opcode::Unimpl);
   }
 }
