@@ -1,0 +1,166 @@
+#!/usr/bin/env python3
+"""Build the synthetic inputs for the round-3 verification run.
+
+Three groups, all raw binaries run with `--name test --codegen-hydra`:
+
+  * #85 — the decoded-but-unlowered opcode list (panic survey) plus a
+    two-function batch that mixes a good function with a panicking one.
+  * #86 — the function-wide `df_may_be_set` guard (STD/POPF/IRET poisoning
+    string ops) with CLD-only controls.
+  * #69 — the closure claim: every instruction class the issue listed, which
+    PRs #75/#76/#79-#84 say is now modeled or loud-but-non-fatal.
+
+Everything lands in /tmp/repro.
+"""
+import pathlib
+
+D = pathlib.Path("/tmp/repro")
+D.mkdir(exist_ok=True)
+
+
+def cfg(path, funcs, seg="CODE"):
+    out = f"dis86 {{\n  code_segments {{ _0000 {{ seg 0 name {seg} }} }}\n  functions {{\n"
+    for name, (start, end) in funcs.items():
+        out += f"    {name} {{ start 0000:{start:04x} end 0000:{end:04x} mode near ret None args None }}\n"
+    out += "  }\n  structures {}\n  globals {}\n  text_section {}\n}\n"
+    pathlib.Path(path).write_text(out)
+
+
+def raw(name: str, data: bytes, end: int = None, start: int = 0, fn="test"):
+    (D / f"{name}.bin").write_bytes(data)
+    cfg(D / f"{name}.bsl", {fn: (start, end if end is not None else len(data))})
+    print(f"{name}: {len(data)} bytes -> {name}.bin + {name}.bsl")
+
+
+# ------------------------------------------------------------------ #85 -----
+# Each is `opcode; ret` (ret so the function range ends cleanly).
+PANIC_CASES = {
+    "t85-xlat":  ([0xD7, 0xC3], "xlat; ret"),
+    "t85-lahf":  ([0x9F, 0xC3], "lahf; ret"),
+    "t85-sahf":  ([0x9E, 0xC3], "sahf; ret"),
+    "t85-pushf": ([0x9C, 0xC3], "pushf; ret"),
+    "t85-idiv":  ([0xF7, 0xF9, 0xC3], "idiv cx; ret"),
+    "t85-enter": ([0xC8, 0x00, 0x00, 0x00, 0xC3], "enter 0,0; ret"),
+    "t85-aaa":   ([0x37, 0xC3], "aaa; ret"),
+    "t85-aas":   ([0x3F, 0xC3], "aas; ret"),
+    "t85-daa":   ([0x27, 0xC3], "daa; ret"),
+    "t85-das":   ([0x2F, 0xC3], "das; ret"),
+    "t85-hlt":   ([0xF4, 0xC3], "hlt; ret"),
+    "t85-into":  ([0xCE, 0xC3], "into; ret"),
+    "t85-seto":  ([0x0F, 0x90, 0xC0, 0xC3], "seto al; ret"),
+    "t85-setp":  ([0x0F, 0x9A, 0xC0, 0xC3], "setp al; ret"),
+}
+CONTROL_CASES = {           # decodable AND already lowered -> must not panic
+    "t85-popf-ctl":  ([0x9D, 0xC3], "popf; ret"),
+    "t85-leave-ctl": ([0xC9, 0xC3], "leave; ret"),
+    "t85-cwd-ctl":   ([0x99, 0xC3], "cwd; ret"),
+    "t85-ret-ctl":   ([0xB8, 0x01, 0x00, 0xC3], "mov ax,1; ret"),
+}
+(pathlib.Path("/tmp/repro") / "85-cases.txt").write_text(
+    "".join(f"{n}: {d}\n" for n, (_, d) in {**PANIC_CASES, **CONTROL_CASES}.items()))
+for name, (data, _desc) in {**PANIC_CASES, **CONTROL_CASES}.items():
+    raw(name, bytes(data))
+
+# Batch: one good function and one that panics, in the same code segment.
+# Asks the question the issue does not: does the good function still get
+# emitted when a sibling function hits the panic?
+raw("t85batch", bytes([
+    0xB8, 0x01, 0x00, 0xC3,   # 0000 good: mov ax,1; ret
+    0xD7, 0xC3,               # 0004 bad:  xlat; ret
+]))
+(D / "t85batch.bsl").write_text(
+    "dis86 {\n"
+    "  code_segments { _0000 { seg 0 name CODE } }\n"
+    "  functions {\n"
+    "    good { start 0000:0000 end 0000:0004 mode near ret None args None }\n"
+    "    bad { start 0000:0004 end 0000:0006 mode near ret None args None }\n"
+    "  }\n"
+    "  structures {}\n"
+    "  globals {}\n"
+    "  text_section {}\n"
+    "}\n")
+print("t85batch: good(0000:0000-0004) + bad(0000:0004-0006, xlat)")
+
+# ------------------------------------------------------------------ #86 -----
+DF_CASES = {
+    # name: (bytes, description)
+    "d1-cld-movsb":     ([0xFC, 0xA4, 0xC3], "cld; movsb; ret            (control: modeled)"),
+    "d2-std-cld-movsb": ([0xFD, 0xFC, 0xA4, 0xC3], "std; cld; movsb; ret  (issue's example)"),
+    "d3-std-movsb":     ([0xFD, 0xA4, 0xC3], "std; movsb; ret"),
+    "d4-popf-movsb":    ([0x9D, 0xA4, 0xC3], "popf; movsb; ret"),
+    "d5-iret-movsb":    ([0xCF, 0xA4, 0xC3], "iret; movsb; ret"),
+    "d6-cld-repmovsb":  ([0xFC, 0xF3, 0xA4, 0xC3], "cld; rep movsb; ret   (control)"),
+    "d7-std-cld-repmovsb": ([0xFD, 0xFC, 0xF3, 0xA4, 0xC3], "std; cld; rep movsb; ret"),
+    "d8-cld-lodsb":     ([0xFC, 0xAC, 0xC3], "cld; lodsb; ret        (control)"),
+    "d9-std-cld-lodsb": ([0xFD, 0xFC, 0xAC, 0xC3], "std; cld; lodsb; ret"),
+    "d10-cld-outsb":    ([0xFC, 0x6E, 0xC3], "cld; outsb; ret        (control)"),
+    "d11-std-cld-outsb": ([0xFD, 0xFC, 0x6E, 0xC3], "std; cld; outsb; ret"),
+    "d12-cld-scasb":    ([0xFC, 0xAE, 0xC3], "cld; scasb; ret        (control)"),
+    "d13-std-cld-scasb": ([0xFD, 0xFC, 0xAE, 0xC3], "std; cld; scasb; ret"),
+    "d14-cld-stosb":    ([0xFC, 0xAA, 0xC3], "cld; stosb; ret        (control)"),
+    "d15-std-cld-stosb": ([0xFD, 0xFC, 0xAA, 0xC3], "std; cld; stosb; ret"),
+    # A std that lives on an unrelated path (never falls through to the movsb).
+    "d16-std-on-side-path": ([
+        0xEB, 0x01,       # 0000: jmp 0003
+        0xFD,             # 0002: std      (skipped)
+        0xFC, 0xA4, 0xC3  # 0003: cld; movsb; ret
+    ], "jmp over a std; cld; movsb"),
+}
+(D / "86-cases.txt").write_text(
+    "".join(f"{n}: {d}\n" for n, (_, d) in DF_CASES.items()))
+for name, (data, _d) in DF_CASES.items():
+    raw(name, bytes(data))
+
+# ------------------------------------------------------------------ #69 -----
+# The closure claim: every class the issue listed now has a real or partial
+# lowering. Controls are ordered (opcode, description).
+ISSUE69_CASES = {
+    "r-rol":        ([0xD1, 0xC0, 0xC3], "rol ax,1"),
+    "r-ror":        ([0xD1, 0xC8, 0xC3], "ror ax,1"),
+    "r-rcl-stc":    ([0xF9, 0xD1, 0xD0, 0xC3], "stc; rcl ax,1      (carry known)"),
+    "r-rcl-nocf":   ([0xD1, 0xD0, 0xC3], "rcl ax,1           (carry unknown)"),
+    "r-rcr-stc":    ([0xF9, 0xD1, 0xD8, 0xC3], "stc; rcr ax,1      (carry known)"),
+    "r-rcr-nocf":   ([0xD1, 0xD8, 0xC3], "rcr ax,1           (carry unknown)"),
+    "r-adc8-clc":   ([0xF8, 0xB0, 0x01, 0x14, 0x02, 0xC3], "clc; mov al,1; adc al,2"),
+    "r-adc8-stc":   ([0xF9, 0xB0, 0x01, 0x14, 0x02, 0xC3], "stc; mov al,1; adc al,2"),
+    "r-sbb8-clc":   ([0xF8, 0xB0, 0x05, 0x1C, 0x02, 0xC3], "clc; mov al,5; sbb al,2"),
+    "r-adc16-stc":  ([0xF9, 0xB8, 0x01, 0x00, 0x15, 0x02, 0x00, 0xC3], "stc; mov ax,1; adc ax,2"),
+    "r-sbb16-clc":  ([0xF8, 0xB8, 0x05, 0x00, 0x1D, 0x02, 0x00, 0xC3], "clc; mov ax,5; sbb ax,2"),
+    # Cross-block carry (#84): the producer (stc) is in block 0, the consumer
+    # (adc) in block 1.
+    "r-xblock-carry": ([
+        0xF9,                   # 0000: stc
+        0x74, 0x03,             # 0001: jz 0006   (two blocks)
+        0xB8, 0x01, 0x00,       # 0003: mov ax,1
+        0x15, 0x02, 0x00,       # 0006: adc ax,2   <- block 1, carry from block 0
+        0xC3,                   # 0009: ret
+    ], "stc; jz +3; mov ax,1; adc ax,2 (cross-block carry)"),
+    "r-repmovsb":   ([0xF3, 0xA4, 0xC3], "rep movsb"),
+    "r-repmovsw":   ([0xF3, 0xA5, 0xC3], "rep movsw"),
+    "r-repstosb":   ([0xF3, 0xAA, 0xC3], "rep stosb"),
+    "r-replodsb":   ([0xF3, 0xAC, 0xC3], "rep lodsb"),
+    "r-repcmpsb":   ([0xF3, 0xA6, 0xC3], "rep cmpsb"),
+    "r-repscasb":   ([0xF3, 0xAE, 0xC3], "rep scasb"),
+    "r-insb":       ([0x6C, 0xC3], "insb"),
+    "r-outsb":      ([0x6E, 0xC3], "outsb"),
+    "r-in-al-imm":  ([0xE4, 0x21, 0xC3], "in al,21h"),
+    "r-out-imm-al": ([0xE6, 0x21, 0xC3], "out 21h,al"),
+    "r-sti":        ([0xFB, 0xC3], "sti"),
+    "r-cli":        ([0xFA, 0xC3], "cli"),
+    "r-cld":        ([0xFC, 0xC3], "cld"),
+    "r-std":        ([0xFD, 0xC3], "std"),
+    "r-stc":        ([0xF9, 0xC3], "stc"),
+    "r-clc":        ([0xF8, 0xC3], "clc"),
+    "r-cmc":        ([0xF5, 0xC3], "cmc"),
+    "r-cbw":        ([0x98, 0xC3], "cbw"),
+    # The "Related (optional)" item in #86: shift carry-out feeding an ADC.
+    "r-shl-adc":    ([0xB8, 0xFF, 0x00, 0xD1, 0xE0, 0x15, 0x00, 0x00, 0xC3],
+                     "mov ax,0x00ff; shl ax,1; adc ax,0"),
+}
+(D / "69-cases.txt").write_text(
+    "".join(f"{n}: {d}\n" for n, (_, d) in ISSUE69_CASES.items()))
+for name, (data, _d) in ISSUE69_CASES.items():
+    raw(name, bytes(data))
+
+print(f"\n{len(PANIC_CASES) + len(CONTROL_CASES)} #85 cases, {len(DF_CASES)} #86 cases, "
+      f"{len(ISSUE69_CASES)} #69 cases")
