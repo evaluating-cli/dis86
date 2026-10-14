@@ -25,7 +25,7 @@ fn empty_config(types: std::rc::Rc<TypeDatabase>) -> Config {
   }
 }
 
-fn decode_all(code: &[u8]) -> (Vec<Instr>, dis86::binary::Binary, Spec) {
+fn decode_all(code: &[u8]) -> (Vec<Instr>, dis86::binary::Binary, Spec<'_>) {
   let binary = dis86::binary::Binary::from_raw(code, None);
   let spec = Spec::from_start_and_end(
     Some(SegOff { seg: Seg::Normal(0), off: Off(0) }),

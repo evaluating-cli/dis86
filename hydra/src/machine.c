@@ -252,8 +252,9 @@ void hydra_impl_outw(u16 port, u16 val)
 }
 
 /* String port I/O. Each helper sets the addressing/port registers, executes
- * the raw instruction (with the direction flag assumed clear), then restores
- * the registers: the decompiler models the SI/DI/CX updates itself. */
+ * the raw instruction prefixed with CLD (forcing the forward direction the
+ * decompiler models, as the other string helpers do), then restores the
+ * registers: the decompiler models the SI/DI/CX updates itself. */
 void hydra_impl_insb(u16 es, u16 di, u16 port)
 {
   hydra_exec_ctx_t *exec = execution_context_get(NULL);
@@ -266,7 +267,7 @@ void hydra_impl_insb(u16 es, u16 di, u16 port)
   m->registers->di = di;
   m->registers->dx = port;
 
-  u8 machine_code[] = {0x6c, 0xcb}; // insb; ret
+  u8 machine_code[] = {0xfc, 0x6c, 0xcb}; // cld; insb; ret
   hydra_impl_raw_code(machine_code, ARRAY_SIZE(machine_code));
 
   m->registers->es = save_es;
@@ -286,7 +287,7 @@ void hydra_impl_insw(u16 es, u16 di, u16 port)
   m->registers->di = di;
   m->registers->dx = port;
 
-  u8 machine_code[] = {0x6d, 0xcb}; // insw; ret
+  u8 machine_code[] = {0xfc, 0x6d, 0xcb}; // cld; insw; ret
   hydra_impl_raw_code(machine_code, ARRAY_SIZE(machine_code));
 
   m->registers->es = save_es;
@@ -306,7 +307,7 @@ void hydra_impl_outsb(u16 ds, u16 si, u16 port)
   m->registers->si = si;
   m->registers->dx = port;
 
-  u8 machine_code[] = {0x6e, 0xcb}; // outsb; ret
+  u8 machine_code[] = {0xfc, 0x6e, 0xcb}; // cld; outsb; ret
   hydra_impl_raw_code(machine_code, ARRAY_SIZE(machine_code));
 
   m->registers->ds = save_ds;
@@ -326,7 +327,7 @@ void hydra_impl_outsw(u16 ds, u16 si, u16 port)
   m->registers->si = si;
   m->registers->dx = port;
 
-  u8 machine_code[] = {0x6f, 0xcb}; // outsw; ret
+  u8 machine_code[] = {0xfc, 0x6f, 0xcb}; // cld; outsw; ret
   hydra_impl_raw_code(machine_code, ARRAY_SIZE(machine_code));
 
   m->registers->ds = save_ds;
@@ -348,7 +349,7 @@ void hydra_impl_rep_insb(u16 es, u16 di, u16 cx, u16 port)
   m->registers->cx = cx;
   m->registers->dx = port;
 
-  u8 machine_code[] = {0xf3, 0x6c, 0xcb}; // rep insb; ret
+  u8 machine_code[] = {0xfc, 0xf3, 0x6c, 0xcb}; // cld; rep insb; ret
   hydra_impl_raw_code(machine_code, ARRAY_SIZE(machine_code));
 
   m->registers->es = save_es;
@@ -371,7 +372,7 @@ void hydra_impl_rep_insw(u16 es, u16 di, u16 cx, u16 port)
   m->registers->cx = cx;
   m->registers->dx = port;
 
-  u8 machine_code[] = {0xf3, 0x6d, 0xcb}; // rep insw; ret
+  u8 machine_code[] = {0xfc, 0xf3, 0x6d, 0xcb}; // cld; rep insw; ret
   hydra_impl_raw_code(machine_code, ARRAY_SIZE(machine_code));
 
   m->registers->es = save_es;
@@ -394,7 +395,7 @@ void hydra_impl_rep_outsb(u16 ds, u16 si, u16 cx, u16 port)
   m->registers->cx = cx;
   m->registers->dx = port;
 
-  u8 machine_code[] = {0xf3, 0x6e, 0xcb}; // rep outsb; ret
+  u8 machine_code[] = {0xfc, 0xf3, 0x6e, 0xcb}; // cld; rep outsb; ret
   hydra_impl_raw_code(machine_code, ARRAY_SIZE(machine_code));
 
   m->registers->ds = save_ds;
@@ -417,7 +418,7 @@ void hydra_impl_rep_outsw(u16 ds, u16 si, u16 cx, u16 port)
   m->registers->cx = cx;
   m->registers->dx = port;
 
-  u8 machine_code[] = {0xf3, 0x6f, 0xcb}; // rep outsw; ret
+  u8 machine_code[] = {0xfc, 0xf3, 0x6f, 0xcb}; // cld; rep outsw; ret
   hydra_impl_raw_code(machine_code, ARRAY_SIZE(machine_code));
 
   m->registers->ds = save_ds;

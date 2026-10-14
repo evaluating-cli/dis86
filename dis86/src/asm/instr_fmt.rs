@@ -47,6 +47,7 @@ pub enum Oper {
   OPER_SREG,   // Second register field from ModRM byte (interpreted as an SREG)
 
   // Explicit memory operands
+  #[allow(dead_code)] // memory-only r/m8; kept for symmetry with M16/M32 (no current table entry)
   OPER_M8,     // Memory operand to address 8-bit from ModRM (no reg allowed)
   OPER_M16,    // Memory operand to address 16-bit from ModRM (no reg allowed)
   OPER_M32,    // Memory operand to address 32-bit from ModRM (no reg allowed)

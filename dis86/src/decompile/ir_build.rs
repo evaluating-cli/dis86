@@ -2734,10 +2734,11 @@ mod tests {
   #[test]
   fn may_clobber_memory_covers_calls_int_and_rep() {
     for op in [Opcode::CallFar, Opcode::CallNear, Opcode::CallPtr, Opcode::CallArgs,
-               Opcode::Int, Opcode::RepMovs, Opcode::RepStos] {
+               Opcode::Int, Opcode::RepMovs, Opcode::RepStos, Opcode::Ins, Opcode::RepIns] {
       assert!(op.may_clobber_memory(), "{op:?} must be a memory barrier");
     }
-    for op in [Opcode::Load8, Opcode::Store8, Opcode::Add, Opcode::RetNear, Opcode::Unimpl] {
+    for op in [Opcode::Load8, Opcode::Store8, Opcode::Add, Opcode::RetNear, Opcode::Unimpl,
+               Opcode::Outs, Opcode::RepOuts] {
       assert!(!op.may_clobber_memory(), "{op:?} must not be a memory barrier");
     }
   }
