@@ -86,11 +86,21 @@ struct IRBuilder<'a> {
   // synthetic `Name::Var`, so the phi machinery merges it at control-flow
   // joins. Only the carry-out *definition* is stored here; whether a given
   // block's entry carry is provably known is computed by a must-analysis
-  // (see derive_carry_entry_known) and cached in `carry_known_entry`.
-  // `exit_known` records, from the most recent build pass, whether each
-  // block provably leaves a known carry; the two drive the fixpoint.
+  // (see `build`) and cached in `carry_known_entry`. `exit_known` records,
+  // from the most recent build pass, whether each block provably leaves a
+  // known carry; the two drive the analysis.
   carry_known_entry: HashMap<BlockRef, bool>,
   exit_known: HashMap<BlockRef, bool>,
+
+  // Fallback entry-knownness for blocks absent from `carry_known_entry`.
+  // `build` runs one probe pass with this false and one with it true to
+  // extract each block's carry transfer; the retained build leaves it false.
+  entry_known_default: bool,
+
+  // Diagnostics produced during a build pass. A pass is speculative (it runs
+  // two or three times to fixpoint the carry analysis), so messages are
+  // buffered and only the retained pass's warnings are printed, exactly once.
+  warnings: Vec<String>,
 }
 
 /// The SSA variable name under which CF is threaded across blocks. It renders
@@ -122,6 +132,8 @@ impl<'a> IRBuilder<'a> {
       carry_known: false,
       carry_known_entry: HashMap::new(),
       exit_known: HashMap::new(),
+      entry_known_default: false,
+      warnings: Vec::new(),
     };
 
     // Create and seal the entry block
@@ -328,7 +340,7 @@ impl<'a> IRBuilder<'a> {
     // SSA value here — get_var would prepend a phi and break the builder's
     // "new block is empty" invariant. `get_cf` pulls it on first use.
     self.last_cf = None;
-    self.carry_known = self.carry_known_entry.get(&bref).copied().unwrap_or(false);
+    self.carry_known = self.carry_known_entry.get(&bref).copied().unwrap_or(self.entry_known_default);
   }
 
   /// Whether a branch target lies inside the function's decoded
@@ -547,6 +559,13 @@ impl IRBuilder<'_> {
   fn clear_carry(&mut self) {
     self.last_cf = None;
     self.carry_known = false;
+  }
+
+  /// Buffer a diagnostic for the current build pass. The carry analysis runs
+  /// the build speculatively, so warnings are collected per pass and only the
+  /// retained pass's are emitted (see `build`/`emit_warnings`).
+  fn warn(&mut self, msg: String) {
+    self.warnings.push(msg);
   }
 
   fn append_update_flags(&mut self, vref: Ref) {
@@ -946,7 +965,7 @@ impl IRBuilder<'_> {
 
   // Try to infer the number of args by looking at the surrounding context for
   // typical stack manipulation associated with the 8086 dos calling conventions
-  fn heuristic_infer_call_arguments_by_context(&self, ins: &instr::Instr, warn_msg: &str) -> u16 {
+  fn heuristic_infer_call_arguments_by_context(&mut self, ins: &instr::Instr, warn_msg: &str) -> u16 {
     let idx = offset_from(self.instrs, ins);
 
     let mut bytes_pushed_before = 0;
@@ -980,12 +999,12 @@ impl IRBuilder<'_> {
     if bytes_pushed_before >= bytes_cleanup_after {
       assert!(bytes_cleanup_after%2 == 0);
       let n = bytes_cleanup_after/2;
-      eprintln!("WARN: {}, inferred {} arg(s)... possibly erroneously", warn_msg, n);
+      self.warn(format!("WARN: {}, inferred {} arg(s)... possibly erroneously", warn_msg, n));
       n
     } else {
       // If more bytes are cleaned up then pushed.. pessimize
       let n = 0;
-      eprintln!("WARN: {}, failed to infer, assuming {} arg(s)...very likely erroneously", warn_msg, n);
+      self.warn(format!("WARN: {}, failed to infer, assuming {} arg(s)...very likely erroneously", warn_msg, n));
       n
     }
   }
@@ -1970,51 +1989,110 @@ impl IRBuilder<'_> {
   }
 
   fn build(&mut self) {
-    // CF threading across blocks is a must-analysis mutually recursive with
-    // the build: a producer's carry-out is known only if its own carry-in
-    // was, and a block's entry carry is known only if *every* predecessor's
-    // exit carry is. Iterate the whole build to a fixpoint: each pass records
-    // per-block exit-known, and the next pass seeds block entries from the AND
-    // over predecessor exits. Unknown starts false and only grows true, so
-    // this terminates in at most (#blocks + 1) passes.
+    // CF threading across blocks is a must-analysis: a producer's carry-out
+    // is known only if its own carry-in was, and a block's entry carry is
+    // known only if *every* predecessor's exit carry is. The result feeds the
+    // IR (a known carry lowers an ADC/SBB exactly, an unknown one stays loud),
+    // so the IR must be built with the converged entry-knownness.
+    //
+    // Rebuilding the whole IR once per CFG hop would be O(blocks^2). Instead,
+    // extract each block's carry transfer from two extreme passes — every
+    // entry unknown, then every entry known. A block whose exit flips with the
+    // assumption merely forwards its entry (identity); otherwise its exit is
+    // constant. The must-analysis then runs over these summaries alone, and
+    // the IR is rebuilt at most once more with the converged seed. The
+    // unknown-to-true monotonicity of the per-block transfer guarantees these
+    // two samples pin it exactly.
     let cfg = self.cfg;
     let instrs = self.instrs;
     let spec = self.spec;
     let binary = self.binary;
     let overlay = self.overlay;
     let pin_all = self.pin_all;
-    let mut entry_known: HashMap<BlockRef, bool> = HashMap::new();
-    let mut passes = 0usize;
-    loop {
+
+    // Fast path: entry-knownness only reaches the IR through get_cf, which
+    // only ADC/SBB/RCL/RCR/CMC call. Without any of those the carry analysis
+    // cannot change the output, so build once (as before the feature).
+    let has_carry_consumer = instrs.iter().any(|i| matches!(i.opcode,
+      instr::Opcode::OP_ADC | instr::Opcode::OP_SBB |
+      instr::Opcode::OP_RCL | instr::Opcode::OP_RCR |
+      instr::Opcode::OP_CMC));
+    if !has_carry_consumer {
       *self = IRBuilder::new(cfg, instrs, spec, binary, overlay, pin_all);
-      self.carry_known_entry = entry_known.clone();
       self.build_once();
-      let next = self.derive_carry_entry_known();
-      if next == entry_known {
+      self.emit_warnings();
+      return;
+    }
+
+    // Pass 1: assume no block entry carries a known value (the conservative
+    // default). Its IR is kept when the analysis converges to all-unknown.
+    *self = IRBuilder::new(cfg, instrs, spec, binary, overlay, pin_all);
+    self.build_once();
+    let exit_unknown = self.exit_known.clone();
+    let blocks: Vec<BlockRef> = self.ir.iter_blocks().collect();
+    let preds: HashMap<BlockRef, Vec<BlockRef>> = blocks
+      .iter()
+      .map(|b| (*b, self.ir.block(*b).preds.clone()))
+      .collect();
+
+    // Pass 2: assume every block entry carries a known value, to distinguish
+    // an identity transfer from a constant one.
+    let mut probe = IRBuilder::new(cfg, instrs, spec, binary, overlay, pin_all);
+    probe.entry_known_default = true;
+    probe.build_once();
+    let exit_known = probe.exit_known.clone();
+
+    // Must-analysis over the per-block summaries (no IR rebuilds). Constant
+    // transfers drop out immediately; identity transfers forward the
+    // predecessor's entry knownness. Unknown starts false and only grows, so
+    // the fixpoint terminates.
+    let mut in_known: HashMap<BlockRef, bool> = blocks.iter().map(|b| (*b, false)).collect();
+    loop {
+      let mut changed = false;
+      for b in &blocks {
+        // The function entry block has no CF predecessor; its carry-in is
+        // always unknown.
+        let known = if *b == BlockRef(0) {
+          false
+        } else {
+          let ps = &preds[b];
+          !ps.is_empty() && ps.iter().all(|p| {
+            let base = exit_unknown.get(p).copied().unwrap_or(false);
+            if Some(&base) == exit_known.get(p) {
+              base // constant transfer
+            } else {
+              in_known.get(p).copied().unwrap_or(false) // identity transfer
+            }
+          })
+        };
+        if in_known[b] != known {
+          in_known.insert(*b, known);
+          changed = true;
+        }
+      }
+      if !changed {
         break;
       }
-      entry_known = next;
-      passes += 1;
-      assert!(passes <= self.ir.iter_blocks().count() + 1, "carry fixpoint did not converge");
     }
+
+    // Nothing inherits a known carry: pass 1 is already the correct build.
+    if !in_known.values().any(|&k| k) {
+      self.emit_warnings();
+      return;
+    }
+
+    // Otherwise rebuild once with the converged seed.
+    *self = IRBuilder::new(cfg, instrs, spec, binary, overlay, pin_all);
+    self.carry_known_entry = in_known;
+    self.build_once();
+    self.emit_warnings();
   }
 
-  /// Seed for the next pass: a block's entry carry is known iff it has a
-  /// predecessor and every predecessor's exit carry was known. The function
-  /// entry block has no predecessor and CF is unknown there.
-  fn derive_carry_entry_known(&self) -> HashMap<BlockRef, bool> {
-    let mut map = HashMap::new();
-    for bref in self.ir.iter_blocks() {
-      let known = if bref == BlockRef(0) {
-        false
-      } else {
-        let preds = &self.ir.block(bref).preds;
-        !preds.is_empty()
-          && preds.iter().all(|p| self.exit_known.get(p).copied().unwrap_or(false))
-      };
-      map.insert(bref, known);
+  /// Emit the retained build pass's buffered diagnostics (see `warn`).
+  fn emit_warnings(&self) {
+    for w in &self.warnings {
+      eprintln!("{}", w);
     }
-    map
   }
 
   fn build_once(&mut self) {
@@ -2045,8 +2123,8 @@ impl IRBuilder<'_> {
       // instead of hiding the lost edge; the drop semantics are unchanged.
       for tgt in &explicit {
         if self.out_of_range_edge(*tgt, fallthrough) {
-          eprintln!("WARN: {}: branch at {} targets {} outside function range [{}, {}); the edge is dropped from the output",
-            self.spec.name, ins.addr, tgt, self.spec.start, self.spec.end);
+          self.warn(format!("WARN: {}: branch at {} targets {} outside function range [{}, {}); the edge is dropped from the output",
+            self.spec.name, ins.addr, tgt, self.spec.start, self.spec.end));
         }
       }
       last_was_jump = true;
@@ -2400,10 +2478,31 @@ mod tests {
     let mut b = test_builder(&cfg, &instrs, &spec, &binary);
     assert!(!b.target_in_range(SegOff { seg: Seg::Normal(0), off: Off(0x000a) }));
     b.build();
+    // The carry analysis runs the build speculatively; each diagnostic must
+    // still be reported exactly once, not once per pass.
+    assert_eq!(b.warnings.len(), 1, "the out-of-range WARN must be emitted once: {:?}", b.warnings);
+    assert!(b.warnings[0].contains("outside function range"));
     let tgt = SegOff { seg: Seg::Normal(0), off: Off(0x000a) };
     let blk = *b.addrmap.get(&tgt).expect("out-of-range target still gets a block");
     assert_eq!(b.ir.block_instr_count(blk), 0, "target block must stay empty (drop semantics preserved)");
     assert!(b.ir.block_exits(blk).is_empty());
+  }
+
+  #[test]
+  fn warnings_are_not_duplicated_across_analysis_passes() {
+    // A carry consumer (the ADC) forces the speculative multi-pass build, so
+    // each diagnostic must still be reported once, not once per pass.
+    let (_types, cfg, binary, spec) = test_spec(0x0000, 0x0006, &[0xC3]);
+    let instrs = [
+      alu_instr(instr::Opcode::OP_ADC, instr::Reg::AX, instr::Reg::BX),
+      // JMP at 0x0002, 3 bytes: end 0x0005 + rel 1 -> target 0x0006 (out of range).
+      jmp_instr(instr::Opcode::OP_JMP, 0x0002, 3, 1),
+    ];
+    let mut b = test_builder(&cfg, &instrs, &spec, &binary);
+    b.build();
+    assert_eq!(
+      b.warnings.iter().filter(|w| w.contains("outside function range")).count(), 1,
+      "the out-of-range WARN must be emitted once across analysis passes: {:?}", b.warnings);
   }
 
   #[test]

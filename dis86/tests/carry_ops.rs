@@ -1,7 +1,9 @@
 // Regression tests for carry-in lowering (issue #69). ADC/SBB are lowered
 // exactly when the incoming carry is a tracked carry-out of a previous
-// instruction in the same basic block, for both byte and word operands;
-// cross-block carries stay loud.
+// instruction, for both byte and word operands. A carry is tracked within a
+// basic block, and across a branch merge when every path to the merge
+// preserves it (threaded through a CF SSA value); a merge whose arms do not
+// all preserve the carry stays loud.
 use dis86::asm::decode::Decoder;
 use dis86::asm::instr::Instr;
 use dis86::config::Config;
