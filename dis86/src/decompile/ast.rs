@@ -578,6 +578,22 @@ impl<'a> Builder<'a> {
         let exprs: Vec<_> = instr.operands.iter().map(|r| self.ref_to_expr_hex(*r, depth+1, true)).collect();
         Expr::Abstract("CALL_FAR_INDIRECT", exprs)
       }
+      ir::Opcode::RepMovs => {
+        // operands: [ds, si, es, di, cx, size]. A runtime bulk macro loops
+        // over value copies (hydra machine.h); the pointer/count updates
+        // are modeled separately in IR.
+        let size = self.ir.const_lookup(instr.operands[5]);
+        let name = if size == Some(2) { "REP_MOVSW" } else { "REP_MOVSB" };
+        let exprs: Vec<_> = instr.operands[..5].iter().map(|r| self.ref_to_expr(*r, depth+1)).collect();
+        Expr::Abstract(name, exprs)
+      }
+      ir::Opcode::RepStos => {
+        // operands: [es, di, cx, val, size].
+        let size = self.ir.const_lookup(instr.operands[4]);
+        let name = if size == Some(2) { "REP_STOSW" } else { "REP_STOSB" };
+        let exprs: Vec<_> = instr.operands[..4].iter().map(|r| self.ref_to_expr(*r, depth+1)).collect();
+        Expr::Abstract(name, exprs)
+      }
       ir::Opcode::Phi => {
         // generally handled by jmp, but other expressions that use a phi might end up here
         // so, we can simply return our refname

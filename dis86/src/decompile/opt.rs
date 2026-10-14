@@ -686,6 +686,12 @@ pub fn forward_store_to_load(ir: &mut IR) {
     let mut prev_stores = vec![];
     for r in ir.iter_instrs(b) {
       let instr = ir.instr(r).unwrap();
+      // A call/INT/REP may write memory without a Store operand: drop any
+      // pending stores so a later load is not forwarded to a pre-clobber
+      // value.
+      if instr.opcode.may_clobber_memory() {
+        prev_stores.clear();
+      }
       if instr.opcode.is_store() {
         prev_stores.push(r);
       }
@@ -710,6 +716,13 @@ pub fn mem_symbol_to_ref(ir: &mut IR) {
 
   // Pass 1: Write -> Ref
   for b in ir.iter_blocks() {
+    // A block containing a memory-clobbering op (call/INT/REP) may write a
+    // local's backing memory behind the SSA value, so lifting ReadVar/
+    // WriteVar to refs there would be unsound. Leave them as real variable
+    // accesses (they already render as symbol reads/writes).
+    let clobbers = ir.iter_instrs(b).any(|r| ir.instr(r).unwrap().opcode.may_clobber_memory());
+    if clobbers { continue; }
+
     for r in ir.iter_instrs(b) {
       let instr = ir.instr(r).unwrap();
 
