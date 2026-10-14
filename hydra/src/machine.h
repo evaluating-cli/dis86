@@ -214,8 +214,10 @@
 #define CLI() hydra_impl_cli()
 #define STI() hydra_impl_sti()
 
-#define INB(port) hydra_impl_inb(port);
+#define INB(port) hydra_impl_inb(port)
 #define OUTB(port, val) hydra_impl_outb(port, val)
+#define INW(port) hydra_impl_inw(port)
+#define OUTW(port, val) hydra_impl_outw(port, val)
 
 #define INT(num) hydra_impl_int(num);
 
@@ -282,6 +284,8 @@ void     hydra_impl_cli(void);
 void     hydra_impl_sti(void);
 u8       hydra_impl_inb(u16 port);
 void     hydra_impl_outb(u16 port, u8 val);
+u16      hydra_impl_inw(u16 port);
+void     hydra_impl_outw(u16 port, u16 val);
 void     hydra_impl_int(u8 num);
 void     hydra_impl_nop(void);
 void     hydra_impl_raw_code_reset(void); /* host driver: reset slot counter at hook boundary */

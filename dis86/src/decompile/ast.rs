@@ -594,6 +594,18 @@ impl<'a> Builder<'a> {
         let exprs: Vec<_> = instr.operands[..4].iter().map(|r| self.ref_to_expr(*r, depth+1)).collect();
         Expr::Abstract(name, exprs)
       }
+      ir::Opcode::In8 | ir::Opcode::In16 => {
+        // operand: [port]. Reads a port (hardware side effect).
+        let name = if instr.opcode == ir::Opcode::In16 { "INW" } else { "INB" };
+        let port = self.ref_to_expr(instr.operands[0], depth+1);
+        Expr::Abstract(name, vec![port])
+      }
+      ir::Opcode::Out8 | ir::Opcode::Out16 => {
+        // operands: [port, val].
+        let name = if instr.opcode == ir::Opcode::Out16 { "OUTW" } else { "OUTB" };
+        let exprs: Vec<_> = instr.operands.iter().map(|r| self.ref_to_expr(*r, depth+1)).collect();
+        Expr::Abstract(name, exprs)
+      }
       ir::Opcode::Phi => {
         // generally handled by jmp, but other expressions that use a phi might end up here
         // so, we can simply return our refname

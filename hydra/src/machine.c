@@ -214,6 +214,43 @@ void hydra_impl_int(u8 num)
   hydra_impl_raw_code(machine_code, ARRAY_SIZE(machine_code));
 }
 
+u16 hydra_impl_inw(u16 port)
+{
+  hydra_exec_ctx_t *exec = execution_context_get(NULL);
+  hydra_machine_t *m = &exec->machine;
+
+  u16 save_ax = m->registers->ax;
+  u16 save_dx = m->registers->dx;
+  m->registers->dx = port;
+
+  // in ax, dx; ret
+  u8 machine_code[] = {0xed, 0xcb};
+  hydra_impl_raw_code(machine_code, ARRAY_SIZE(machine_code));
+
+  u16 ret = m->registers->ax;
+  m->registers->ax = save_ax;
+  m->registers->dx = save_dx;
+  return ret;
+}
+
+void hydra_impl_outw(u16 port, u16 val)
+{
+  hydra_exec_ctx_t *exec = execution_context_get(NULL);
+  hydra_machine_t *m = &exec->machine;
+
+  u16 save_ax = m->registers->ax;
+  u16 save_dx = m->registers->dx;
+  m->registers->ax = val;
+  m->registers->dx = port;
+
+  // out dx, ax; ret
+  u8 machine_code[] = {0xef, 0xcb};
+  hydra_impl_raw_code(machine_code, ARRAY_SIZE(machine_code));
+
+  m->registers->ax = save_ax;
+  m->registers->dx = save_dx;
+}
+
 uint32_t hydra_impl_ptr_to_flataddr(hydra_machine_t *m, void *_ptr)
 {
   uint8_t * ptr = (uint8_t*)_ptr;

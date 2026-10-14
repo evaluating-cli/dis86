@@ -90,6 +90,14 @@ pub enum Opcode {
   RepMovs,
   RepStos,
 
+  // Port I/O. In* read a port into AL/AX (a value), Out* write a value to a
+  // port (a side effect). They render as hydra's INB/INW/OUTB/OUTW macros
+  // and do not touch guest memory or FLAGS.
+  In8,
+  In16,
+  Out8,
+  Out16,
+
   RetFar,
   RetNear,
 
@@ -179,6 +187,10 @@ impl Opcode {
       Opcode::Int         => "int",
       Opcode::RepMovs     => "repmovs",
       Opcode::RepStos     => "repstos",
+      Opcode::In8         => "in8",
+      Opcode::In16        => "in16",
+      Opcode::Out8        => "out8",
+      Opcode::Out16       => "out16",
       Opcode::RetFar      => "retf",
       Opcode::RetNear     => "retn",
       Opcode::Jmp         => "jmp",
@@ -317,6 +329,10 @@ impl Opcode {
       Opcode::Int => true,
       Opcode::RepMovs => true,
       Opcode::RepStos => true,
+      Opcode::In8 => true,
+      Opcode::In16 => true,
+      Opcode::Out8 => true,
+      Opcode::Out16 => true,
       Opcode::RetFar => true,
       Opcode::RetNear => true,
       Opcode::Jmp => true,

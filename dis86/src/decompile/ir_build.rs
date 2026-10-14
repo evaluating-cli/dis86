@@ -1625,10 +1625,27 @@ impl IRBuilder<'_> {
         self.append_instr(Type::Void, Opcode::Unimpl, vec![]);
       }
       instr::Opcode::OP_IN => {
-        self.append_instr(Type::U8, Opcode::Unimpl, vec![]);
+        // `in AL/AX, port`: operands[0] = destination, operands[1] = port
+        // (immediate or DX). Reads a port; no FLAGS/memory effect.
+        let port = self.append_asm_src_operand(&ins.operands[1]);
+        let (typ, op) = match &ins.operands[0] {
+          instr::Operand::Reg(instr::OperandReg(instr::Reg::AL)) => (Type::U8, Opcode::In8),
+          instr::Operand::Reg(instr::OperandReg(instr::Reg::AX)) => (Type::U16, Opcode::In16),
+          other => panic!("Unsupported IN destination: {:?}", other),
+        };
+        let v = self.append_instr(typ, op, vec![port]);
+        self.append_asm_dst_operand(&ins.operands[0], v);
       }
       instr::Opcode::OP_OUT => {
-        self.append_instr(Type::Void, Opcode::Unimpl, vec![]);
+        // `out port, AL/AX`: operands[0] = port, operands[1] = source.
+        let port = self.append_asm_src_operand(&ins.operands[0]);
+        let val = self.append_asm_src_operand(&ins.operands[1]);
+        let op = match &ins.operands[1] {
+          instr::Operand::Reg(instr::OperandReg(instr::Reg::AL)) => Opcode::Out8,
+          instr::Operand::Reg(instr::OperandReg(instr::Reg::AX)) => Opcode::Out16,
+          other => panic!("Unsupported OUT source: {:?}", other),
+        };
+        self.append_instr(Type::Void, op, vec![port, val]);
       }
       instr::Opcode::OP_CLD => {
         self.append_instr(Type::Void, Opcode::Unimpl, vec![]);
