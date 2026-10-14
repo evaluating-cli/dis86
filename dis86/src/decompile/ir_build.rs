@@ -975,7 +975,12 @@ impl IRBuilder<'_> {
     // result is data-dependent). Any of them with a possibly-set direction
     // flag stays loud rather than guessing the direction.
     if ins.rep.is_some() {
-      let modeled = matches!(ins.opcode, instr::Opcode::OP_MOVS | instr::Opcode::OP_STOS);
+      // Only 8/16-bit MOVS/STOS are modeled; a wider (unreachable) form
+      // falls back to the loud marker rather than emitting the wrong-width
+      // macro.
+      let modeled = matches!(ins.opcode, instr::Opcode::OP_MOVS | instr::Opcode::OP_STOS)
+        && matches!(&ins.operands[0],
+          instr::Operand::Mem(m) if matches!(m.sz, instr::Size::Size8 | instr::Size::Size16));
       if !modeled || self.df_may_be_set {
         // Flags are conservatively clobbered because e.g. `repe scasb`
         // defines the flags its caller tests.
@@ -2240,6 +2245,17 @@ mod tests {
     assert!(!opcode_may_set_df(instr::Opcode::OP_CLD), "CLD clears DF");
     assert!(!opcode_may_set_df(instr::Opcode::OP_MOVS));
     assert!(!opcode_may_set_df(instr::Opcode::OP_RET));
+  }
+
+  #[test]
+  fn may_clobber_memory_covers_calls_int_and_rep() {
+    for op in [Opcode::CallFar, Opcode::CallNear, Opcode::CallPtr, Opcode::CallArgs,
+               Opcode::Int, Opcode::RepMovs, Opcode::RepStos] {
+      assert!(op.may_clobber_memory(), "{op:?} must be a memory barrier");
+    }
+    for op in [Opcode::Load8, Opcode::Store8, Opcode::Add, Opcode::RetNear, Opcode::Unimpl] {
+      assert!(!op.may_clobber_memory(), "{op:?} must not be a memory barrier");
+    }
   }
 
   fn rep_string_instr(opcode: instr::Opcode, operands: Vec<instr::Operand>) -> instr::Instr {

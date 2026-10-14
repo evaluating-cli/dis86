@@ -136,3 +136,45 @@ fn modeled_rep_preserves_flags() {
     "the branch must fold against the pre-rep `sub ax,ax` producer:\n{source}"
   );
 }
+
+// mov word ptr [0x100],0x1234; mov cx,2; rep stosw; mov ax,[0x100]; ret
+// The rep writes memory with no Store operand, so the earlier store must
+// not be forwarded to the post-rep load (which now may see the rep's write).
+#[test]
+fn rep_blocks_store_to_load_forwarding() {
+  let code = [
+    0xC7, 0x06, 0x00, 0x01, 0x34, 0x12, // mov word ptr [0x100],0x1234
+    0xB9, 0x02, 0x00,                   // mov cx,2
+    0xF3, 0xAB,                         // rep stosw
+    0xA1, 0x00, 0x01,                   // mov ax,[0x100]
+    0xC3,                               // ret
+  ];
+  let source = decompile_raw(&code);
+
+  assert!(
+    source.contains("REP_STOSW(ES, DI, 2, AX);"),
+    "the rep must still be modeled:\n{source}"
+  );
+  assert!(
+    !source.contains("MAKE_32(DX, 0x1234)"),
+    "the post-rep load must not be forwarded to the pre-rep constant:\n{source}"
+  );
+}
+
+// mov word ptr [0x100],0x1234; mov ax,[0x100]; ret
+// Control: without the rep, the load is still forwarded to the constant
+// (the barrier only affects clobbering ops).
+#[test]
+fn store_to_load_forwarding_still_works_without_clobber() {
+  let code = [
+    0xC7, 0x06, 0x00, 0x01, 0x34, 0x12, // mov word ptr [0x100],0x1234
+    0xA1, 0x00, 0x01,                   // mov ax,[0x100]
+    0xC3,                               // ret
+  ];
+  let source = decompile_raw(&code);
+
+  assert!(
+    source.contains("MAKE_32(DX, 0x1234)"),
+    "a normal store-to-load forward must still fold:\n{source}"
+  );
+}

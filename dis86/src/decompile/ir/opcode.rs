@@ -210,6 +210,21 @@ impl Opcode {
     }
   }
 
+  /// Whether this op may write arbitrary memory without carrying a
+  /// `Store` operand: calls (callee side effects), interrupts (handlers),
+  /// and the REP bulk string macros. Memory-reasoning passes
+  /// (store-to-load forwarding, symbol SSA lifting) must treat these as
+  /// barriers, otherwise an intervening write is invisible and a stale
+  /// value propagates.
+  pub fn may_clobber_memory(&self) -> bool {
+    match self {
+      Opcode::CallFar | Opcode::CallNear | Opcode::CallPtr | Opcode::CallArgs => true,
+      Opcode::Int => true,
+      Opcode::RepMovs | Opcode::RepStos => true,
+      _ => false,
+    }
+  }
+
   pub fn is_mem_op(&self) -> bool {
     match self {
       Opcode::Load8 => true,
