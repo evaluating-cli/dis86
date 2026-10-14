@@ -111,7 +111,7 @@ raw("t78c", bytes([0x89, 0xCE, 0xB5, 0x01, 0xCD, 0x21, 0xC3]), {"test": (0x0, 0x
     "dis86 {\n"
     "  code_segments { _0000 { seg 0 name CODE } }\n"
     "  functions {\n"
-    "    main { start 0000:0000 end 0000:000a mode near ret None args None }\n"
+    "    test { start 0000:0000 end 0000:000a mode near ret None args None }\n"
     "    f { start 0000:000a end 0000:000b mode near ret None args None regargs \"AX,BX\" }\n"
     "  }\n"
     "  structures {}\n"
