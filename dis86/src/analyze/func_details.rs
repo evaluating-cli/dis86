@@ -314,6 +314,18 @@ mod tests {
   }
 
   #[test]
+  fn first_undecodable_addr_is_total_on_bad_ranges() {
+    // Out-of-contract ranges report nothing instead of panicking in
+    // Binary::region: inverted ranges have nothing to decode, and a
+    // cross-segment range is not linearly decodable as one segment.
+    use crate::segoff::Off;
+    let binary = gap_binary();
+    assert_eq!(first_undecodable_addr(&binary, segoff(6), segoff(3)), None);
+    let cross = SegOff { seg: Seg::Normal(1), off: Off(12) };
+    assert_eq!(first_undecodable_addr(&binary, segoff(0), cross), None);
+  }
+
+  #[test]
   fn inferred_end_spans_gap_that_linear_decode_rejects() {
     // Analysis follows control flow past the data, so the inferred end
     // spans it — while the linear decode that --codeseg-name performs
@@ -343,6 +355,12 @@ fn decode_one_instr(binary: &Binary, loc: SegOff, end: SegOff) -> Result<Instr, 
 /// declared range linearly. The operator signal is to audit/shorten the
 /// suggested range around the reported address (#65).
 pub fn first_undecodable_addr(binary: &Binary, start: SegOff, end: SegOff) -> Option<SegOff> {
+  // Total on out-of-contract inputs instead of panicking in
+  // Binary::region: an empty/inverted range has nothing to decode, and
+  // a cross-segment range is not linearly decodable as one segment.
+  if start.seg != end.seg || end <= start {
+    return None;
+  }
   let mut decoder = Decoder::new(binary.region_iter(start, end));
   let mut addr = start;
   loop {
