@@ -75,16 +75,40 @@ impl IR {
 ////////////////////////////////////////////////////////////////////////////////////
 impl IR {
   pub fn block(&self, blkref: BlockRef) -> &Block {
-    self.blocks[blkref.0].as_ref().unwrap()
+    self.blocks[blkref.0].as_ref().unwrap_or_else(|| {
+      panic!("IR::block: BlockRef({}) was removed but is still referenced", blkref.0)
+    })
   }
 
   pub fn block_mut(&mut self, blkref: BlockRef) -> &mut Block {
-    self.blocks[blkref.0].as_mut().unwrap()
+    self.blocks[blkref.0].as_mut().unwrap_or_else(|| {
+      panic!("IR::block_mut: BlockRef({}) was removed but is still referenced", blkref.0)
+    })
   }
 
   pub fn block_remove(&mut self, blkref: BlockRef) {
     // Caller is responsible for ensuring there are no references to this block elsewhere in the IR
     assert!(self.blocks[blkref.0].is_some());
+    // Report contract violations at the removal site (debug builds) instead
+    // of panicking in an unrelated pass when the dangling ref is dereferenced.
+    #[cfg(debug_assertions)]
+    {
+      assert!(
+        self.block_ref_users(blkref).is_empty(),
+        "IR::block_remove: BlockRef({}) is still referenced by instructions",
+        blkref.0,
+      );
+      assert!(
+        self.block_ref_defs(blkref).is_empty(),
+        "IR::block_remove: BlockRef({}) is still referenced by var mappings",
+        blkref.0,
+      );
+      assert!(
+        !self.iter_blocks().any(|b| self.block(b).preds.contains(&blkref)),
+        "IR::block_remove: BlockRef({}) is still listed as a predecessor",
+        blkref.0,
+      );
+    }
     self.blocks[blkref.0] = None;
   }
 
@@ -155,6 +179,51 @@ impl IR {
 
   pub fn block_instr_insert_before(&mut self, blkref: BlockRef, before: Ref, instr: Instr) -> Ref {
     self.block_mut(blkref).data.insert(instr, block_data::Loc::Before(before))
+  }
+
+  fn ref_mentions_block(o: &Ref, target: BlockRef) -> bool {
+    matches!(o, Ref::Instr(t, _) if *t == target)
+      || matches!(o, Ref::Block(t) if *t == target)
+  }
+
+  /// Refs of live instructions whose operands mention `target`, either as a
+  /// value (`Ref::Instr`) or a branch target (`Ref::Block`). Nop instructions
+  /// carry no operands and are skipped.
+  pub fn block_ref_users(&self, target: BlockRef) -> Vec<Ref> {
+    let mut users = vec![];
+    for b in self.iter_blocks() {
+      for r in self.iter_instrs(b) {
+        let instr = self.instr(r).unwrap();
+        if instr.opcode == Opcode::Nop {
+          continue;
+        }
+        if instr.operands.iter().any(|o| Self::ref_mentions_block(o, target)) {
+          users.push(r);
+        }
+      }
+    }
+    users
+  }
+
+  /// Var mappings `(block, name)` whose value mentions `target`.
+  pub fn block_ref_defs(&self, target: BlockRef) -> Vec<(BlockRef, Name)> {
+    let mut defs = vec![];
+    for b in self.iter_blocks() {
+      for (name, val) in &self.block(b).defs {
+        if Self::ref_mentions_block(val, target) {
+          defs.push((b, name.clone()));
+        }
+      }
+    }
+    defs
+  }
+
+  /// Drop var mappings whose value points into `target`, so `get_var` can
+  /// never resolve to a dangling ref after the block is erased.
+  pub fn drop_defs_into_block(&mut self, target: BlockRef) {
+    for b in self.iter_blocks() {
+      self.block_mut(b).defs.retain(|_, val| !Self::ref_mentions_block(val, target));
+    }
   }
 }
 
