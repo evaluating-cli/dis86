@@ -1405,10 +1405,21 @@ impl IRBuilder<'_> {
             let t = self.append_instr(Type::U16, Opcode::Add, vec![a, b]);
             let vref = self.append_instr(Type::U16, Opcode::Add, vec![t, cf]);
             self.append_asm_dst_operand(&ins.operands[0], vref);
-            // carry_out = (t < a) | (vref < t)
-            let c1 = self.add_carry_out(t, a).unwrap();
-            let c2 = self.add_carry_out(vref, t).unwrap();
-            let carry = self.append_instr(Type::U16, Opcode::Or, vec![c1, c2]);
+            // The carry-out bit depends on the operand width, not the u16 the
+            // sum is computed in: word operands carry out of bit 16, byte
+            // operands out of bit 8. Using the bit-16 form for bytes would
+            // always yield 0 (a + b + cf <= 511), silently dropping the
+            // carry into a following ADC/SBB.
+            let carry = if Self::operand_is_word(&ins.operands[0]) {
+              // carry_out = (t < a) | (vref < t)
+              let c1 = self.add_carry_out(t, a).unwrap();
+              let c2 = self.add_carry_out(vref, t).unwrap();
+              self.append_instr(Type::U16, Opcode::Or, vec![c1, c2])
+            } else {
+              // carry_out = 0xFF < vref
+              let max = self.ir.const_new(0xFF);
+              self.append_instr(Type::U16, Opcode::ULt, vec![max, vref])
+            };
             self.append_update_flags_carry(vref, carry);
           }
           None => {
@@ -2692,6 +2703,24 @@ mod tests {
     let sum = b.ir.instr(cmp.operands[1]).unwrap();
     assert_eq!(sum.opcode, Opcode::Add);
     assert!(matches!(sum.typ, Type::U16), "the summed operands must be widened to u16");
+  }
+
+  #[test]
+  fn byte_adc_tracks_bit8_carry() {
+    // A byte ADC's carry-out is bit 8 (`0xFF < a + b + cf`), NOT the bit-16
+    // `(t < a) | (vref < t)` form used for word operands: with byte inputs
+    // that form is always 0, silently dropping the carry into a following
+    // ADC/SBB in a carry chain.
+    let (_types, cfg, binary, spec) = bit_test_builder(&[0xC3]);
+    let instrs: &[instr::Instr] = &[];
+    let mut b = test_builder(&cfg, instrs, &spec, &binary);
+    // Seed a known carry so the ADC takes the exact path, then consume it.
+    b.append_asm_instr(&alu_instr(instr::Opcode::OP_ADD, instr::Reg::AL, instr::Reg::BL));
+    b.append_asm_instr(&alu_instr(instr::Opcode::OP_ADC, instr::Reg::AL, instr::Reg::CL));
+    let cf = b.last_cf.expect("byte adc must track a carry");
+    let cmp = b.ir.instr(cf).unwrap();
+    assert_eq!(cmp.opcode, Opcode::ULt, "byte ADC carry-out must be `0xFF < sum`, not an Or");
+    assert_eq!(b.ir.const_lookup(cmp.operands[0]), Some(0xFF), "carry is `0xFF < sum`");
   }
 
   #[test]

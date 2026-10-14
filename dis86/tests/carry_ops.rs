@@ -109,6 +109,22 @@ fn byte_adc_is_exact() {
   assert!(source.contains("255 <"), "byte carry must use the 8-bit bound:\n{source}");
 }
 
+// add al,bl; adc al,cl; adc al,dl; ret
+// The middle ADC's carry-out must feed the last ADC as bit 8 (`0xFF < sum`),
+// not the bit-16 form that is always 0 for byte operands. Two distinct 8-bit
+// carry comparisons must appear (the add's and the middle adc's).
+#[test]
+fn byte_adc_carry_chain_is_exact() {
+  let code = [0x00, 0xD8, 0x10, 0xC8, 0x10, 0xD0, 0xC3];
+  let source = decompile_raw(&code);
+
+  assert!(!source.contains("UNIMPL"), "byte ADC chain must be exact:\n{source}");
+  assert!(
+    source.matches("255 <").count() >= 2,
+    "the chained byte carry must be bit 8, not the always-0 bit-16 form:\n{source}"
+  );
+}
+
 // sub al,bl; sbb al,cl; ret
 // Byte SBB lowers with the width-independent borrow.
 #[test]
