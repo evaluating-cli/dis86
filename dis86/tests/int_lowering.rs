@@ -87,6 +87,29 @@ fn int_register_setup_survives_dce() {
   );
 }
 
+// mov cx,0x1234; int 21h; mov ax,cx; ret
+// The handler may clobber any GPR (e.g. AH=2Ch returns time in CX/DX), so a
+// post-INT read must resolve to the live register, not stale pre-INT setup.
+#[test]
+fn post_int_register_reads_see_live_values() {
+  let code = [
+    0xB9, 0x34, 0x12, // mov cx,0x1234
+    0xCD, 0x21,       // int 21h
+    0x89, 0xC8,       // mov ax,cx
+    0xC3,             // ret
+  ];
+  let source = decompile_raw(&code);
+
+  assert!(source.contains("INT(0x21)"), "interrupt must be emitted:\n{source}");
+  assert!(
+    source.contains("CX = 0x1234"),
+    "the pre-INT CX setup must reach the handler as a guest write:\n{source}"
+  );
+  assert!(
+    source.contains("MAKE_32(DX, CX)"),
+    "the post-INT `mov ax,cx` must read the live CX, not the stale 0x1234:\n{source}"
+  );
+}
 // sub ax,ax; int 21h; jz; nop; ret
 // The flags after INT belong to the handler, so the branch must not fold
 // against the pre-INT `sub`.

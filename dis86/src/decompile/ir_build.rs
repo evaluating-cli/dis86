@@ -777,13 +777,20 @@ impl IRBuilder<'_> {
     let num = self.append_asm_src_operand(&ins.operands[0]);
     self.append_instr(Type::Void, Opcode::Int, vec![num]);
 
-    // The handler clobbers AX and leaves FLAGS undefined to the decompiler.
-    // Reset AX (and its byte fragments) to the initial/unknown register value
-    // so post-INT reads see the live register rather than stale pre-INT setup,
-    // and reset FLAGS to the same unknown marker a function entry uses: a
-    // following branch then degrades to the loud UNIMPL_FLAGS marker instead
-    // of silently folding against pre-INT flags (e.g. `sub ax,ax; int 21h; jz`).
-    for reg in [instr::Reg::AX, instr::Reg::AL, instr::Reg::AH, instr::Reg::FLAGS] {
+    // The handler may clobber any general-purpose register and leaves FLAGS
+    // undefined to the decompiler, so reset the full consumed set (plus the
+    // byte fragments, mirroring the entry seeding) to the initial/unknown
+    // register value: post-INT reads then see the live register rather than
+    // stale pre-INT setup (e.g. AH=2Ch returns the time in CX/DX), and a
+    // following branch degrades to the loud UNIMPL_FLAGS marker instead of
+    // silently folding against pre-INT flags (e.g. `sub ax,ax; int 21h; jz`).
+    // SP/BP/SS/CS/IP are frame/machine state an INT preserves, so they are
+    // left intact.
+    for reg in [instr::Reg::AX, instr::Reg::BX, instr::Reg::CX, instr::Reg::DX,
+                instr::Reg::SI, instr::Reg::DI, instr::Reg::DS, instr::Reg::ES,
+                instr::Reg::AL, instr::Reg::AH, instr::Reg::BL, instr::Reg::BH,
+                instr::Reg::CL, instr::Reg::CH, instr::Reg::DL, instr::Reg::DH,
+                instr::Reg::FLAGS] {
       self.ir.set_var(reg, self.cur, Ref::Init(reg));
     }
   }
@@ -1529,11 +1536,15 @@ mod tests {
 
     b.append_asm_instr(&int_instr(0x21));
 
-    // Clobbers reset to the initial/unknown marker (AX + its fragments, FLAGS).
-    assert_eq!(b.ir.get_var(instr::Reg::AX, cur), Ref::Init(instr::Reg::AX));
-    assert_eq!(b.ir.get_var(instr::Reg::AL, cur), Ref::Init(instr::Reg::AL));
-    assert_eq!(b.ir.get_var(instr::Reg::AH, cur), Ref::Init(instr::Reg::AH));
-    assert_eq!(b.ir.get_var(instr::Reg::FLAGS, cur), Ref::Init(instr::Reg::FLAGS));
+    // Clobbers reset to the initial/unknown marker: every consumed GPR, the
+    // byte fragments, and FLAGS.
+    for reg in [instr::Reg::AX, instr::Reg::BX, instr::Reg::CX, instr::Reg::DX,
+                instr::Reg::SI, instr::Reg::DI, instr::Reg::DS, instr::Reg::ES,
+                instr::Reg::AL, instr::Reg::AH, instr::Reg::BL, instr::Reg::BH,
+                instr::Reg::CL, instr::Reg::CH, instr::Reg::DL, instr::Reg::DH,
+                instr::Reg::FLAGS] {
+      assert_eq!(b.ir.get_var(reg, cur), Ref::Init(reg), "{reg:?} must be unknown after INT");
+    }
 
     // The setup is materialized as pinned guest register writes.
     let mut writes = vec![];
