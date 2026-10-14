@@ -1,0 +1,20 @@
+$ dis86 --config .bsl --binary-raw .bin --name test --emit-code r-adc16-stc.c --codegen-hydra
+relocatable segments: []
+exit=0
+OUTPUT FILE: present (118 bytes)
+----- r-adc16-stc.c -----
+HYDRA_FUNC(H_test)
+{
+  u16 SP0 = SP;
+
+  FRAME_ENTER(0);
+
+
+  DX = DX;
+  AX = 4;
+  FRAME_LEAVE();
+  RETURN_NEAR();
+
+}
+
+

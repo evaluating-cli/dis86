@@ -1,0 +1,5 @@
+main sha: bae36b0da43a127eecf95d80aa1eb54fe07735b9
+main subj: Merge pull request #84 from evaluating-cli/codex/issue69-cross-block-carry
+dis86:    46229f6eb37b0343  (/tmp/main/build/bin/dis86)
+rustc 1.99.0 (b940084d7 2026-09-28)
+cargo 1.99.0 (5f94df478 2026-08-27)
