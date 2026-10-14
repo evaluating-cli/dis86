@@ -758,6 +758,43 @@ impl IRBuilder<'_> {
     }
   }
 
+  fn process_int(&mut self, ins: &instr::Instr) {
+    // An INT handler may read any general-purpose register, so first make the
+    // live register values explicit as pinned guest writes. Unlike appending
+    // them as operands of `Int` (its emitter renders only operands[0]; see
+    // ast.rs), WriteVar16 against the Register symbol renders as a real guest
+    // write and keeps each setup value live through DCE. Registers still at
+    // their initial (unknown) value are skipped: writing them would emit a
+    // no-op `BX = BX`.
+    for reg in [instr::Reg::AX, instr::Reg::BX, instr::Reg::CX, instr::Reg::DX,
+                instr::Reg::SI, instr::Reg::DI, instr::Reg::DS, instr::Reg::ES] {
+      let vref = self.ir.get_var(reg, self.cur);
+      if vref == Ref::Init(reg) { continue; }
+      let sym = self.ir.symbols.find_ref_by_name(sym::Table::Register, reg.info().name).unwrap();
+      self.append_instr_with_attrs(Type::U16, Attribute::PIN, Opcode::WriteVar16, vec![Ref::Symbol(sym), vref]);
+    }
+
+    let num = self.append_asm_src_operand(&ins.operands[0]);
+    self.append_instr(Type::Void, Opcode::Int, vec![num]);
+
+    // The handler may clobber any general-purpose register and leaves FLAGS
+    // undefined to the decompiler, so reset the full consumed set (plus the
+    // byte fragments, mirroring the entry seeding) to the initial/unknown
+    // register value: post-INT reads then see the live register rather than
+    // stale pre-INT setup (e.g. AH=2Ch returns the time in CX/DX), and a
+    // following branch degrades to the loud UNIMPL_FLAGS marker instead of
+    // silently folding against pre-INT flags (e.g. `sub ax,ax; int 21h; jz`).
+    // SP/BP/SS/CS/IP are frame/machine state an INT preserves, so they are
+    // left intact.
+    for reg in [instr::Reg::AX, instr::Reg::BX, instr::Reg::CX, instr::Reg::DX,
+                instr::Reg::SI, instr::Reg::DI, instr::Reg::DS, instr::Reg::ES,
+                instr::Reg::AL, instr::Reg::AH, instr::Reg::BL, instr::Reg::BH,
+                instr::Reg::CL, instr::Reg::CH, instr::Reg::DL, instr::Reg::DH,
+                instr::Reg::FLAGS] {
+      self.ir.set_var(reg, self.cur, Ref::Init(reg));
+    }
+  }
+
   fn append_cond_jump(&mut self, ins: &instr::Instr, compare_opcode: Opcode) {
     let instr::Operand::Rel(rel) = &ins.operands[0] else { panic!("Expected relative offset operand for JMP") };
 
@@ -1129,8 +1166,7 @@ impl IRBuilder<'_> {
         self.process_calln(ins, cs_pushed);
       }
       instr::Opcode::OP_INT => {
-        let num = self.append_asm_src_operand(&ins.operands[0]);
-        self.append_instr(Type::Void, Opcode::Int, vec![num]);
+        self.process_int(ins);
       }
       instr::Opcode::OP_LEA => {
         let instr::Operand::Mem(mem) = &ins.operands[1] else {
@@ -1324,10 +1360,24 @@ pub fn build_from_instrs(instrs: &[instr::Instr], cfg: &Config, spec: &spec::Spe
 mod tests {
   use super::*;
   use crate::types::TypeDatabase;
+  use crate::util::arrayvec::ArrayVec;
   use std::rc::Rc;
 
   fn test_builder<'a>(cfg: &'a Config, instrs: &'a [instr::Instr], spec: &'a spec::Spec<'a>, binary: &'a binary::Binary) -> IRBuilder<'a> {
     IRBuilder::new(cfg, instrs, spec, binary, false, false)
+  }
+
+  fn int_instr(num: u16) -> instr::Instr {
+    let mut operands = ArrayVec::new();
+    operands.push(instr::Operand::Imm(instr::OperandImm { sz: instr::Size::Size8, val: num }));
+    instr::Instr {
+      rep: None,
+      opcode: instr::Opcode::OP_INT,
+      operands,
+      addr: SegOff { seg: Seg::Normal(0), off: Off(0) },
+      n_bytes: 2,
+      intel_hidden_operand_bitmask: 0,
+    }
   }
 
   #[test]
@@ -1459,5 +1509,62 @@ mod tests {
     let ah_instr = b.ir.instr(ah).expect("AH must be refreshed post-call, not stale");
     assert_eq!(ah_instr.opcode, Opcode::Upper16);
     assert_eq!(ah_instr.operands, vec![ret]);
+  }
+
+  #[test]
+  fn int_materializes_register_setup_and_resets_clobbers() {
+    // Issue #66: an INT handler may read registers, so their live values must
+    // become pinned guest writes (keeping the setup alive through DCE), and
+    // AX/FLAGS must be invalidated afterwards.
+    let types = Rc::new(TypeDatabase::new());
+    let cfg = Config { types: types.clone(), structs: vec![], code_segs: vec![], funcs: vec![], indirects: vec![], globals: vec![], text_section: vec![] };
+    let binary = binary::Binary::from_raw(&[0xC3], None);
+    let spec = spec::Spec::from_start_and_end(Some(SegOff { seg: Seg::Normal(0), off: Off(0) }), Some(SegOff { seg: Seg::Normal(0), off: Off(1) }));
+    let instrs: &[instr::Instr] = &[];
+    let mut b = test_builder(&cfg, instrs, &spec, &binary);
+    let cur = b.cur;
+
+    // mov ah, 9 (recomposes AX) and mov bx, 0xbeef, plus a flags producer so
+    // the pre-INT flags are not the initial value.
+    let nine = b.ir.const_new(9);
+    b.append_asm_dst_reg(&instr::OperandReg(instr::Reg::AH), nine);
+    let beef = b.ir.const_new(0xbeefu16 as i16);
+    b.append_asm_dst_reg(&instr::OperandReg(instr::Reg::BX), beef);
+    let k = b.ir.const_new(0x1234);
+    b.append_update_flags(k);
+    assert_ne!(b.ir.get_var(instr::Reg::FLAGS, cur), Ref::Init(instr::Reg::FLAGS));
+
+    b.append_asm_instr(&int_instr(0x21));
+
+    // Clobbers reset to the initial/unknown marker: every consumed GPR, the
+    // byte fragments, and FLAGS.
+    for reg in [instr::Reg::AX, instr::Reg::BX, instr::Reg::CX, instr::Reg::DX,
+                instr::Reg::SI, instr::Reg::DI, instr::Reg::DS, instr::Reg::ES,
+                instr::Reg::AL, instr::Reg::AH, instr::Reg::BL, instr::Reg::BH,
+                instr::Reg::CL, instr::Reg::CH, instr::Reg::DL, instr::Reg::DH,
+                instr::Reg::FLAGS] {
+      assert_eq!(b.ir.get_var(reg, cur), Ref::Init(reg), "{reg:?} must be unknown after INT");
+    }
+
+    // The setup is materialized as pinned guest register writes.
+    let mut writes = vec![];
+    for r in b.ir.iter_instrs(cur) {
+      let i = b.ir.instr(r).unwrap();
+      if i.opcode != Opcode::WriteVar16 { continue; }
+      if let Ref::Symbol(s) = i.operands[0] {
+        let name = s.name(&b.ir.symbols);
+        if name == "AX" || name == "BX" {
+          writes.push((name.to_string(), r));
+        }
+      }
+    }
+    assert!(writes.iter().any(|(n, _)| n == "AX"), "INT must write the AX setup to the guest register");
+    assert!(writes.iter().any(|(n, _)| n == "BX"), "INT must write the BX setup to the guest register");
+
+    // And those writes survive DCE: this is the #66 bug.
+    crate::decompile::opt::deadcode_elimination(&mut b.ir);
+    for (name, r) in &writes {
+      assert_ne!(b.ir.instr(*r).unwrap().opcode, Opcode::Nop, "{name} guest write must survive DCE");
+    }
   }
 }
