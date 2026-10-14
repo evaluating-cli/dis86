@@ -1,7 +1,7 @@
-// Regression tests for carry-in lowering (issue #69, slice 4). ADC/SBB are
-// lowered exactly when the incoming carry is a tracked carry-out of a
-// previous instruction in the same basic block and the operands are 16-bit;
-// byte operands and cross-block carries stay loud.
+// Regression tests for carry-in lowering (issue #69). ADC/SBB are lowered
+// exactly when the incoming carry is a tracked carry-out of a previous
+// instruction in the same basic block, for both byte and word operands;
+// cross-block carries stay loud.
 use dis86::asm::decode::Decoder;
 use dis86::asm::instr::Instr;
 use dis86::config::Config;
@@ -98,13 +98,60 @@ fn stc_then_adc_uses_known_carry() {
 }
 
 // add al,bl; adc al,cl; ret
-// Byte ADC needs the 8-bit carry, which the IR cannot express: stay loud.
+// Byte ADC lowers with the 8-bit carry read off a widened sum: the carry is
+// `0xFF < (AL + BL)` (a+b promoted to int), so it is not the 16-bit carry.
 #[test]
-fn byte_adc_stays_loud() {
+fn byte_adc_is_exact() {
   let code = [0x00, 0xD8, 0x10, 0xC8, 0xC3];
   let source = decompile_raw(&code);
 
-  assert!(source.contains("UNIMPL(("), "byte ADC must stay loud:\n{source}");
+  assert!(!source.contains("UNIMPL"), "byte ADC must be exact:\n{source}");
+  assert!(source.contains("255 <"), "byte carry must use the 8-bit bound:\n{source}");
+}
+
+// mov ax,0x1234; add al,0x00; adc al,0x00; ret
+// A byte fragment from a 16-bit write holds the full parent value in the IR
+// (AL = Lower16(AX) = 0x1234), so the byte carry must mask it to 8 bits:
+// otherwise `255 < al` sees 0x1234 and wrongly reports a carry, making the
+// ADC add 1 (0x35 instead of 0x34).
+#[test]
+fn byte_carry_masks_wide_fragment() {
+  let code = [0xB8, 0x34, 0x12, 0x04, 0x00, 0x14, 0x00, 0xC3];
+  let source = decompile_raw(&code);
+
+  assert!(!source.contains("UNIMPL"), "must be exact:\n{source}");
+  assert!(
+    !source.contains("255 < al_2"),
+    "byte carry must not compare the full 16-bit fragment:\n{source}"
+  );
+  assert!(source.contains("& 255"), "byte carry must mask the operand:\n{source}");
+}
+
+// add al,bl; adc al,cl; adc al,dl; ret
+// The middle ADC's carry-out must feed the last ADC as bit 8 (`0xFF < sum`),
+// not the bit-16 form that is always 0 for byte operands. Two distinct 8-bit
+// carry comparisons must appear (the add's and the middle adc's).
+#[test]
+fn byte_adc_carry_chain_is_exact() {
+  let code = [0x00, 0xD8, 0x10, 0xC8, 0x10, 0xD0, 0xC3];
+  let source = decompile_raw(&code);
+
+  assert!(!source.contains("UNIMPL"), "byte ADC chain must be exact:\n{source}");
+  assert!(
+    source.matches("255 <").count() >= 2,
+    "the chained byte carry must be bit 8, not the always-0 bit-16 form:\n{source}"
+  );
+}
+
+// sub al,bl; sbb al,cl; ret
+// Byte SBB lowers with the width-independent borrow.
+#[test]
+fn byte_sbb_is_exact() {
+  let code = [0x28, 0xD8, 0x18, 0xC8, 0xC3];
+  let source = decompile_raw(&code);
+
+  assert!(!source.contains("UNIMPL"), "byte SBB must be exact:\n{source}");
+  assert!(source.contains("AL < BL"), "byte borrow must come from the sub:\n{source}");
 }
 
 // add ax,bx; jz +1; nop; adc cx,dx; mov ax,cx; ret

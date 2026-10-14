@@ -566,18 +566,32 @@ impl IRBuilder<'_> {
     }
   }
 
-  /// Carry-out of a word ADD: `(a + b) < a`. `None` for byte operands,
-  /// where the carry bit is not representable without a wider add (no
-  /// zero-extend in the IR), so callers fall back to the loud marker.
+  /// Carry-out of an ADD whose result is a full-width (u16) sum:
+  /// `(a + b) < a`. `None` when `res` is not a u16 (byte ADD handles its
+  /// carry off a widened sum in `set_flags_for_binary`).
   fn add_carry_out(&mut self, res: Ref, a: Ref) -> Option<Ref> {
     if !Self::is_word(res, &self.ir) { return None; }
     Some(self.append_instr(Type::U16, Opcode::ULt, vec![res, a]))
   }
 
-  /// Borrow-out of a SUB/CMP: `a < b` (unsigned). Width-independent: the
-  /// comparison needs no extra bit, so this works for byte and word.
+  /// Borrow-out of a SUB/CMP: `a < b` (unsigned). The comparison itself
+  /// needs no extra bit, so it is width-independent *provided the operands
+  /// fit their width* — callers mask byte operands with `to_byte` first.
   fn sub_borrow_out(&mut self, a: Ref, b: Ref) -> Ref {
     self.append_instr(Type::U16, Opcode::ULt, vec![a, b])
+  }
+
+  /// Reduce a byte-register read to its low 8 bits before a width-sensitive
+  /// compare. A byte fragment can hold the full parent-register value: a
+  /// 16-bit write splits AX into AL/AH via `Lower16`, which is not 8-bit
+  /// masked, and `forward_store_to_load` forwards values without regard to
+  /// width. ALU results re-mask on the byte write, but carries and borrows
+  /// compare the raw operand, so mask here. A never-written register (`Init`)
+  /// and an 8-bit immediate (`Const`) are already within 8 bits.
+  fn to_byte(&mut self, r: Ref) -> Ref {
+    if matches!(r, Ref::Init(_) | Ref::Const(_)) { return r; }
+    let mask = self.ir.const_new(0xFF);
+    self.append_instr(Type::U16, Opcode::And, vec![r, mask])
   }
 
   /// Update flags for a simple ALU binary op, tracking the carry-out where
@@ -589,9 +603,22 @@ impl IRBuilder<'_> {
         Some(cf) => self.append_update_flags_carry(res, cf),
         None => self.append_update_flags(res),
       },
+      Opcode::Add => {
+        // Byte ADD: the byte-typed result cannot express the carry (there is
+        // no narrower compare), so read it off a widened u16 sum. Byte
+        // operands may hold a full parent-register value, so mask to 8 bits
+        // first; then `0xFF < a + b` is exactly the carry-out bit.
+        let a = self.to_byte(a);
+        let b = self.to_byte(b);
+        let wide = self.append_instr(Type::U16, Opcode::Add, vec![a, b]);
+        let max = self.ir.const_new(0xFF);
+        let cf = self.append_instr(Type::U16, Opcode::ULt, vec![max, wide]);
+        self.append_update_flags_carry(res, cf);
+      }
       Opcode::Sub => {
-        // The borrow comparison is width-independent (same-width unsigned
-        // compare), so it is correct for both byte and word.
+        // Byte operands may hold a full parent-register value, so mask them
+        // to 8 bits before the unsigned borrow compare.
+        let (a, b) = if word { (a, b) } else { (self.to_byte(a), self.to_byte(b)) };
         let cf = self.sub_borrow_out(a, b);
         self.append_update_flags_carry(res, cf);
       }
@@ -1241,14 +1268,16 @@ impl IRBuilder<'_> {
       instr::Opcode::OP_NOP => (),
       instr::Opcode::OP_SBB => {
         // SBB consumes the incoming carry (borrow). When the CF producer is
-        // a tracked carry in this block and the operands are 16-bit, lower
-        // exactly as `a - b - cf`; otherwise stay loud rather than guess.
+        // a tracked carry in this block, lower exactly as `a - b - cf`;
+        // byte operands are masked to 8 bits (see to_byte). An unknown carry
+        // stays loud rather than guessing.
         let a = self.append_asm_src_operand(&ins.operands[0]);
         let b = self.append_asm_src_operand(&ins.operands[1]);
         let typ = self.deduce_type_binary(a, b);
-        let word = Self::operand_is_word(&ins.operands[0]);
-        match (word, self.last_cf) {
-          (true, Some(cf)) => {
+        match self.last_cf {
+          Some(cf) => {
+            let word = Self::operand_is_word(&ins.operands[0]);
+            let (a, b) = if word { (a, b) } else { (self.to_byte(a), self.to_byte(b)) };
             let t = self.append_instr(Type::U16, Opcode::Sub, vec![a, b]);
             let vref = self.append_instr(Type::U16, Opcode::Sub, vec![t, cf]);
             self.append_asm_dst_operand(&ins.operands[0], vref);
@@ -1258,7 +1287,7 @@ impl IRBuilder<'_> {
             let borrow = self.append_instr(Type::U16, Opcode::Or, vec![b1, b2]);
             self.append_update_flags_carry(vref, borrow);
           }
-          _ => {
+          None => {
             let vref = self.append_instr(typ, Opcode::Unimpl, vec![a, b]);
             self.append_asm_dst_operand(&ins.operands[0], vref);
             self.append_update_flags(vref);
@@ -1382,24 +1411,38 @@ impl IRBuilder<'_> {
       }
       instr::Opcode::OP_ADC => {
         // ADC consumes the incoming carry. When the CF producer is a tracked
-        // carry in this block and the operands are 16-bit, lower exactly as
-        // `a + b + cf`; byte operands and unknown carries stay loud.
+        // carry in this block, lower exactly as `a + b + cf`; operands of
+        // either width work because the sum is computed in a u16 (the byte
+        // result assigned to a byte destination truncates). Byte operands are
+        // masked to 8 bits first (see to_byte). An unknown carry stays loud.
         let a = self.append_asm_src_operand(&ins.operands[0]);
         let b = self.append_asm_src_operand(&ins.operands[1]);
         let typ = self.deduce_type_binary(a, b);
-        let word = Self::operand_is_word(&ins.operands[0]);
-        match (word, self.last_cf) {
-          (true, Some(cf)) => {
+        match self.last_cf {
+          Some(cf) => {
+            let word = Self::operand_is_word(&ins.operands[0]);
+            let (a, b) = if word { (a, b) } else { (self.to_byte(a), self.to_byte(b)) };
             let t = self.append_instr(Type::U16, Opcode::Add, vec![a, b]);
             let vref = self.append_instr(Type::U16, Opcode::Add, vec![t, cf]);
             self.append_asm_dst_operand(&ins.operands[0], vref);
-            // carry_out = (t < a) | (vref < t)
-            let c1 = self.add_carry_out(t, a).unwrap();
-            let c2 = self.add_carry_out(vref, t).unwrap();
-            let carry = self.append_instr(Type::U16, Opcode::Or, vec![c1, c2]);
+            // The carry-out bit depends on the operand width, not the u16 the
+            // sum is computed in: word operands carry out of bit 16, byte
+            // operands out of bit 8. Using the bit-16 form for bytes would
+            // always yield 0 (a + b + cf <= 511), silently dropping the
+            // carry into a following ADC/SBB.
+            let carry = if word {
+              // carry_out = (t < a) | (vref < t)
+              let c1 = self.add_carry_out(t, a).unwrap();
+              let c2 = self.add_carry_out(vref, t).unwrap();
+              self.append_instr(Type::U16, Opcode::Or, vec![c1, c2])
+            } else {
+              // carry_out = 0xFF < vref
+              let max = self.ir.const_new(0xFF);
+              self.append_instr(Type::U16, Opcode::ULt, vec![max, vref])
+            };
             self.append_update_flags_carry(vref, carry);
           }
-          _ => {
+          None => {
             let vref = self.append_instr(typ, Opcode::Unimpl, vec![a, b]);
             self.append_asm_dst_operand(&ins.operands[0], vref);
             self.append_update_flags(vref);
@@ -1705,6 +1748,8 @@ impl IRBuilder<'_> {
         let b = self.append_asm_src_operand(&ins.operands[1]);
         let typ = self.deduce_type_binary(a, b);
         let vref = self.append_instr(typ, Opcode::Sub, vec![a, b]);
+        let word = Self::operand_is_word(&ins.operands[0]);
+        let (a, b) = if word { (a, b) } else { (self.to_byte(a), self.to_byte(b)) };
         let cf = self.sub_borrow_out(a, b);
         self.append_update_flags_carry(vref, cf);
       }
@@ -1793,8 +1838,10 @@ impl IRBuilder<'_> {
         }
       }
       instr::Opcode::OP_STD => {
-        // Direction flag is not modeled at all; no modeled value is affected.
-        self.append_instr(Type::Void, Opcode::Unimpl, vec![]);
+        // Sets DF. DF is not modeled as a value, but the whole-function
+        // `df_may_be_set` guard already keeps any REP/string model loud when
+        // a STD is present, so this only needs to be a non-fatal side effect.
+        self.append_instr(Type::Void, Opcode::Std, vec![]);
       }
       instr::Opcode::OP_STC | instr::Opcode::OP_CLC | instr::Opcode::OP_CMC => {
         // These set/clear/complement CF. The IR carries one opaque flags
@@ -1824,10 +1871,10 @@ impl IRBuilder<'_> {
         self.string_op_advance(Some(&ins.operands[1]), None);
       }
       instr::Opcode::OP_STI => {
-        self.append_instr(Type::Void, Opcode::Unimpl, vec![]);
+        self.append_instr(Type::Void, Opcode::Sti, vec![]);
       }
       instr::Opcode::OP_CLI => {
-        self.append_instr(Type::Void, Opcode::Unimpl, vec![]);
+        self.append_instr(Type::Void, Opcode::Cli, vec![]);
       }
       instr::Opcode::OP_IN => {
         // `in AL/AX, port`: operands[0] = destination, operands[1] = port
@@ -1853,7 +1900,7 @@ impl IRBuilder<'_> {
         self.append_instr(Type::Void, op, vec![port, val]);
       }
       instr::Opcode::OP_CLD => {
-        self.append_instr(Type::Void, Opcode::Unimpl, vec![]);
+        self.append_instr(Type::Void, Opcode::Cld, vec![]);
       }
       instr::Opcode::OP_CBW => {
         let src = self.append_asm_src_operand(&ins.operands[1]);
@@ -2663,15 +2710,62 @@ mod tests {
   }
 
   #[test]
-  fn byte_add_does_not_track_carry() {
-    // The 8-bit carry is not representable in the IR (no zero-extend), so
-    // a byte add must leave the carry unknown rather than compute a wrong
-    // width-16 carry.
+  fn byte_add_tracks_carry_via_widened_sum() {
+    // The byte result cannot express the 8-bit carry, so the carry is read
+    // off a widened (u16) sum: `0xFF < (a + b)` (the operands are
+    // C-integer-promoted, so the sum is the full value, not the byte).
     let (_types, cfg, binary, spec) = bit_test_builder(&[0xC3]);
     let instrs: &[instr::Instr] = &[];
     let mut b = test_builder(&cfg, instrs, &spec, &binary);
     b.append_asm_instr(&alu_instr(instr::Opcode::OP_ADD, instr::Reg::AL, instr::Reg::BL));
-    assert!(b.last_cf.is_none(), "byte add carry must stay unknown");
+    let cf = b.last_cf.expect("byte add must track a carry");
+    let cmp = b.ir.instr(cf).unwrap();
+    assert_eq!(cmp.opcode, Opcode::ULt);
+    assert_eq!(b.ir.const_lookup(cmp.operands[0]), Some(0xFF), "carry is `0xFF < sum`");
+    let sum = b.ir.instr(cmp.operands[1]).unwrap();
+    assert_eq!(sum.opcode, Opcode::Add);
+    assert!(matches!(sum.typ, Type::U16), "the summed operands must be widened to u16");
+  }
+
+  #[test]
+  fn byte_adc_tracks_bit8_carry() {
+    // A byte ADC's carry-out is bit 8 (`0xFF < a + b + cf`), NOT the bit-16
+    // `(t < a) | (vref < t)` form used for word operands: with byte inputs
+    // that form is always 0, silently dropping the carry into a following
+    // ADC/SBB in a carry chain.
+    let (_types, cfg, binary, spec) = bit_test_builder(&[0xC3]);
+    let instrs: &[instr::Instr] = &[];
+    let mut b = test_builder(&cfg, instrs, &spec, &binary);
+    // Seed a known carry so the ADC takes the exact path, then consume it.
+    b.append_asm_instr(&alu_instr(instr::Opcode::OP_ADD, instr::Reg::AL, instr::Reg::BL));
+    b.append_asm_instr(&alu_instr(instr::Opcode::OP_ADC, instr::Reg::AL, instr::Reg::CL));
+    let cf = b.last_cf.expect("byte adc must track a carry");
+    let cmp = b.ir.instr(cf).unwrap();
+    assert_eq!(cmp.opcode, Opcode::ULt, "byte ADC carry-out must be `0xFF < sum`, not an Or");
+    assert_eq!(b.ir.const_lookup(cmp.operands[0]), Some(0xFF), "carry is `0xFF < sum`");
+  }
+
+  #[test]
+  fn byte_add_carry_masks_wide_fragment() {
+    // After a 16-bit write, a byte fragment holds the full parent value
+    // (append_asm_dst_reg splits AX via Lower16, not 8-bit masked). The byte
+    // ADD carry widens `a + b` and compares against 0xFF, so the operand
+    // must be masked to 8 bits or `0xFF < a + b` is wrong whenever the high
+    // bits are set (`mov ax,0x1234; add al,0` would report a carry).
+    let (_types, cfg, binary, spec) = bit_test_builder(&[0xC3]);
+    let instrs: &[instr::Instr] = &[];
+    let mut b = test_builder(&cfg, instrs, &spec, &binary);
+    b.append_asm_instr(&alu_instr(instr::Opcode::OP_MOV, instr::Reg::AX, instr::Reg::BX));
+    b.append_asm_instr(&alu_instr(instr::Opcode::OP_ADD, instr::Reg::AL, instr::Reg::BL));
+    let cf = b.last_cf.expect("byte add must track a carry");
+    let cmp = b.ir.instr(cf).unwrap();
+    assert_eq!(cmp.opcode, Opcode::ULt);
+    let wide = b.ir.instr(cmp.operands[1]).expect("widened sum");
+    assert_eq!(wide.opcode, Opcode::Add);
+    // The `a` operand is the wide AL fragment; it must be masked to 8 bits.
+    let am = b.ir.instr(wide.operands[0]).expect("byte operand must be masked");
+    assert_eq!(am.opcode, Opcode::And, "wide byte fragment must be masked with 0xFF");
+    assert_eq!(b.ir.const_lookup(am.operands[1]), Some(0xFF));
   }
 
   #[test]

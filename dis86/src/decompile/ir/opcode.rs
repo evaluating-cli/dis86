@@ -117,6 +117,16 @@ pub enum Opcode {
   RepIns,
   RepOuts,
 
+  // Direction/interrupt flag control. These change DF/IF only — never the
+  // arithmetic flags (CF/ZF/SF/OF/PF) — so they render as hydra's
+  // CLD/STD/CLI/STI macros and are side effects, without touching the opaque
+  // FLAGS value the rest of the IR models. DF is tracked separately by the
+  // whole-function `df_may_be_set` guard, so CLD/STD need no value here.
+  Cld,
+  Std,
+  Cli,
+  Sti,
+
   RetFar,
   RetNear,
 
@@ -217,6 +227,10 @@ impl Opcode {
       Opcode::Outs        => "outs",
       Opcode::RepIns      => "repins",
       Opcode::RepOuts     => "repouts",
+      Opcode::Cld         => "cld",
+      Opcode::Std         => "std",
+      Opcode::Cli         => "cli",
+      Opcode::Sti         => "sti",
       Opcode::RetFar      => "retf",
       Opcode::RetNear     => "retn",
       Opcode::Jmp         => "jmp",
@@ -313,6 +327,10 @@ impl Opcode {
       Opcode::Outs => true,
       Opcode::RepIns => true,
       Opcode::RepOuts => true,
+      Opcode::Cld => true,
+      Opcode::Std => true,
+      Opcode::Cli => true,
+      Opcode::Sti => true,
       Opcode::WriteVar8 => true,
       Opcode::WriteVar16 => true,
       Opcode::WriteVar32 => true,
@@ -371,6 +389,10 @@ impl Opcode {
       Opcode::Outs => true,
       Opcode::RepIns => true,
       Opcode::RepOuts => true,
+      Opcode::Cld => true,
+      Opcode::Std => true,
+      Opcode::Cli => true,
+      Opcode::Sti => true,
       Opcode::RetFar => true,
       Opcode::RetNear => true,
       Opcode::Jmp => true,
