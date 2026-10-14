@@ -107,6 +107,16 @@ pub enum Opcode {
   Out8,
   Out16,
 
+  // String port I/O. INS* read a port into ES:DI (a memory write); OUTS*
+  // write DS:SI to a port (a port side effect, memory read only). The
+  // deterministic SI/DI/CX updates are modeled separately, as with the
+  // other string ops. The helpers execute the raw instruction, so the data
+  // value is never materialized in the IR.
+  Ins,
+  Outs,
+  RepIns,
+  RepOuts,
+
   RetFar,
   RetNear,
 
@@ -203,6 +213,10 @@ impl Opcode {
       Opcode::In16        => "in16",
       Opcode::Out8        => "out8",
       Opcode::Out16       => "out16",
+      Opcode::Ins         => "ins",
+      Opcode::Outs        => "outs",
+      Opcode::RepIns      => "repins",
+      Opcode::RepOuts     => "repouts",
       Opcode::RetFar      => "retf",
       Opcode::RetNear     => "retn",
       Opcode::Jmp         => "jmp",
@@ -245,6 +259,8 @@ impl Opcode {
       Opcode::CallFar | Opcode::CallNear | Opcode::CallPtr | Opcode::CallArgs => true,
       Opcode::Int => true,
       Opcode::RepMovs | Opcode::RepStos => true,
+      // INS writes guest memory (the port's data is stored at ES:DI).
+      Opcode::Ins | Opcode::RepIns => true,
       _ => false,
     }
   }
@@ -293,6 +309,10 @@ impl Opcode {
       Opcode::Store16 => true,
       Opcode::Out8 => true,
       Opcode::Out16 => true,
+      Opcode::Ins => true,
+      Opcode::Outs => true,
+      Opcode::RepIns => true,
+      Opcode::RepOuts => true,
       Opcode::WriteVar8 => true,
       Opcode::WriteVar16 => true,
       Opcode::WriteVar32 => true,
@@ -347,6 +367,10 @@ impl Opcode {
       Opcode::In16 => true,
       Opcode::Out8 => true,
       Opcode::Out16 => true,
+      Opcode::Ins => true,
+      Opcode::Outs => true,
+      Opcode::RepIns => true,
+      Opcode::RepOuts => true,
       Opcode::RetFar => true,
       Opcode::RetNear => true,
       Opcode::Jmp => true,

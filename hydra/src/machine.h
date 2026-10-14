@@ -270,6 +270,19 @@
 #define INW(port) hydra_impl_inw(port)
 #define OUTW(port, val) hydra_impl_outw(port, val)
 
+/* String port I/O (INS/OUTS). The helpers execute the raw instruction
+ * against the emulated CPU, so the transferred value never appears in the
+ * IR; the decompiler models the SI/DI/CX updates itself. Direction flag is
+ * assumed clear (the decompiler emits UNIMPL instead when it may be set). */
+#define INSB(es, di, port) hydra_impl_insb(es, di, port)
+#define INSW(es, di, port) hydra_impl_insw(es, di, port)
+#define OUTSB(ds, si, port) hydra_impl_outsb(ds, si, port)
+#define OUTSW(ds, si, port) hydra_impl_outsw(ds, si, port)
+#define REP_INSB(es, di, cx, port) hydra_impl_rep_insb(es, di, cx, port)
+#define REP_INSW(es, di, cx, port) hydra_impl_rep_insw(es, di, cx, port)
+#define REP_OUTSB(ds, si, cx, port) hydra_impl_rep_outsb(ds, si, cx, port)
+#define REP_OUTSW(ds, si, cx, port) hydra_impl_rep_outsw(ds, si, cx, port)
+
 #define INT(num) hydra_impl_int(num);
 
 #define FRAME_ENTER(n) ({ PUSH(BP); BP = SP; SP -= n; })
@@ -337,6 +350,14 @@ u8       hydra_impl_inb(u16 port);
 void     hydra_impl_outb(u16 port, u8 val);
 u16      hydra_impl_inw(u16 port);
 void     hydra_impl_outw(u16 port, u16 val);
+void     hydra_impl_insb(u16 es, u16 di, u16 port);
+void     hydra_impl_insw(u16 es, u16 di, u16 port);
+void     hydra_impl_outsb(u16 ds, u16 si, u16 port);
+void     hydra_impl_outsw(u16 ds, u16 si, u16 port);
+void     hydra_impl_rep_insb(u16 es, u16 di, u16 cx, u16 port);
+void     hydra_impl_rep_insw(u16 es, u16 di, u16 cx, u16 port);
+void     hydra_impl_rep_outsb(u16 ds, u16 si, u16 cx, u16 port);
+void     hydra_impl_rep_outsw(u16 ds, u16 si, u16 cx, u16 port);
 void     hydra_impl_int(u8 num);
 void     hydra_impl_nop(void);
 void     hydra_impl_raw_code_reset(void); /* host driver: reset slot counter at hook boundary */
