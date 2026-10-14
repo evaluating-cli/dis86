@@ -125,6 +125,57 @@
     while (_n--) { STORE_16(es, _di, _v); _di += 2; } \
   } while(0)
 
+/* REP LODS: a counted load loop returning the final accumulator (`cur`
+ * when CX==0). Reads only; the decompiler models the SI/CX updates. */
+#define REP_LODSB(ds, si, cx, cur) ({ \
+    u16 _n = (cx); \
+    u16 _si = (si); \
+    u8 _r = (u8)(cur); \
+    if (_n) { _si += _n - 1; _r = LOAD_8(ds, _si); } \
+    _r; })
+#define REP_LODSW(ds, si, cx, cur) ({ \
+    u16 _n = (cx); \
+    u16 _si = (si); \
+    u16 _r = (cur); \
+    if (_n) { _si += (_n - 1) * 2; _r = LOAD_16(ds, _si); } \
+    _r; })
+
+/* REP CMPS/SCAS: counted compare loops returning the remaining CX. REPE
+ * stops on inequality, REPNE on equality. The decompiler models the CX/SI/DI
+ * updates itself and clobbers the comparison flags. Reads only. */
+#define REPE_CMPSB(ds, si, es, di, cx) ({ \
+    u16 _n = (cx); u16 _si = (si), _di = (di); \
+    while (_n) { u8 _a = LOAD_8(ds, _si), _b = LOAD_8(es, _di); _si++; _di++; _n--; if (_a != _b) break; } \
+    _n; })
+#define REPNE_CMPSB(ds, si, es, di, cx) ({ \
+    u16 _n = (cx); u16 _si = (si), _di = (di); \
+    while (_n) { u8 _a = LOAD_8(ds, _si), _b = LOAD_8(es, _di); _si++; _di++; _n--; if (_a == _b) break; } \
+    _n; })
+#define REPE_CMPSW(ds, si, es, di, cx) ({ \
+    u16 _n = (cx); u16 _si = (si), _di = (di); \
+    while (_n) { u16 _a = LOAD_16(ds, _si), _b = LOAD_16(es, _di); _si += 2; _di += 2; _n--; if (_a != _b) break; } \
+    _n; })
+#define REPNE_CMPSW(ds, si, es, di, cx) ({ \
+    u16 _n = (cx); u16 _si = (si), _di = (di); \
+    while (_n) { u16 _a = LOAD_16(ds, _si), _b = LOAD_16(es, _di); _si += 2; _di += 2; _n--; if (_a == _b) break; } \
+    _n; })
+#define REPE_SCASB(es, di, cx, val) ({ \
+    u16 _n = (cx); u16 _di = (di); u8 _v = (u8)(val); \
+    while (_n) { u8 _b = LOAD_8(es, _di); _di++; _n--; if (_v != _b) break; } \
+    _n; })
+#define REPNE_SCASB(es, di, cx, val) ({ \
+    u16 _n = (cx); u16 _di = (di); u8 _v = (u8)(val); \
+    while (_n) { u8 _b = LOAD_8(es, _di); _di++; _n--; if (_v == _b) break; } \
+    _n; })
+#define REPE_SCASW(es, di, cx, val) ({ \
+    u16 _n = (cx); u16 _di = (di); u16 _v = (u16)(val); \
+    while (_n) { u16 _b = LOAD_16(es, _di); _di += 2; _n--; if (_v != _b) break; } \
+    _n; })
+#define REPNE_SCASW(es, di, cx, val) ({ \
+    u16 _n = (cx); u16 _di = (di); u16 _v = (u16)(val); \
+    while (_n) { u16 _b = LOAD_16(es, _di); _di += 2; _n--; if (_v == _b) break; } \
+    _n; })
+
 #define PTR_8_FROM_32(_u32)  ({ STATIC_ASSERT_U32(_u32); u32 v = (_u32); PTR_8(v>>16, v); })
 #define PTR_16_FROM_32(_u32) ({ STATIC_ASSERT_U32(_u32); u32 v = (_u32); PTR_16(v>>16, v); })
 #define PTR_32_FROM_32(_u32) ({ STATIC_ASSERT_U32(_u32); u32 v = (_u32); PTR_32(v>>16, v); })
@@ -214,8 +265,10 @@
 #define CLI() hydra_impl_cli()
 #define STI() hydra_impl_sti()
 
-#define INB(port) hydra_impl_inb(port);
+#define INB(port) hydra_impl_inb(port)
 #define OUTB(port, val) hydra_impl_outb(port, val)
+#define INW(port) hydra_impl_inw(port)
+#define OUTW(port, val) hydra_impl_outw(port, val)
 
 #define INT(num) hydra_impl_int(num);
 
@@ -282,6 +335,8 @@ void     hydra_impl_cli(void);
 void     hydra_impl_sti(void);
 u8       hydra_impl_inb(u16 port);
 void     hydra_impl_outb(u16 port, u8 val);
+u16      hydra_impl_inw(u16 port);
+void     hydra_impl_outw(u16 port, u16 val);
 void     hydra_impl_int(u8 num);
 void     hydra_impl_nop(void);
 void     hydra_impl_raw_code_reset(void); /* host driver: reset slot counter at hook boundary */

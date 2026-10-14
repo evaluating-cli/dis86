@@ -89,6 +89,23 @@ pub enum Opcode {
   // CX0*size) are modeled separately as ordinary IR values.
   RepMovs,
   RepStos,
+  // REP LODS: a counted load loop that only reads memory; the value is the
+  // final accumulator, and SI/CX updates are modeled separately.
+  RepLods,
+  // REP CMPS/SCAS: counted compare loops; the value is the final CX (the
+  // loop stops on a match/mismatch or CX==0). The final comparison's flags
+  // are data-dependent, so the flags are clobbered (loud). SI/DI updates are
+  // modeled separately.
+  RepCmps,
+  RepScas,
+
+  // Port I/O. In* read a port into AL/AX (a value), Out* write a value to a
+  // port (a side effect). They render as hydra's INB/INW/OUTB/OUTW macros
+  // and do not touch guest memory or FLAGS.
+  In8,
+  In16,
+  Out8,
+  Out16,
 
   RetFar,
   RetNear,
@@ -179,6 +196,13 @@ impl Opcode {
       Opcode::Int         => "int",
       Opcode::RepMovs     => "repmovs",
       Opcode::RepStos     => "repstos",
+      Opcode::RepLods     => "replods",
+      Opcode::RepCmps     => "repcmps",
+      Opcode::RepScas     => "repscas",
+      Opcode::In8         => "in8",
+      Opcode::In16        => "in16",
+      Opcode::Out8        => "out8",
+      Opcode::Out16       => "out16",
       Opcode::RetFar      => "retf",
       Opcode::RetNear     => "retn",
       Opcode::Jmp         => "jmp",
@@ -267,6 +291,8 @@ impl Opcode {
       //Opcode::Pin => true,
       Opcode::Store8 => true,
       Opcode::Store16 => true,
+      Opcode::Out8 => true,
+      Opcode::Out16 => true,
       Opcode::WriteVar8 => true,
       Opcode::WriteVar16 => true,
       Opcode::WriteVar32 => true,
@@ -317,6 +343,10 @@ impl Opcode {
       Opcode::Int => true,
       Opcode::RepMovs => true,
       Opcode::RepStos => true,
+      Opcode::In8 => true,
+      Opcode::In16 => true,
+      Opcode::Out8 => true,
+      Opcode::Out16 => true,
       Opcode::RetFar => true,
       Opcode::RetNear => true,
       Opcode::Jmp => true,

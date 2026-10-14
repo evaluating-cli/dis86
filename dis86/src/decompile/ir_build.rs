@@ -516,6 +516,22 @@ impl IRBuilder<'_> {
     self.last_cf = Some(cf);
   }
 
+  /// Clobber the opaque FLAGS value with the unknown initial flags, so a
+  /// later flag-consuming branch degrades to the loud but non-fatal
+  /// UNIMPL_FLAGS marker (mirrors the post-INT reset). Passing a `Void`
+  /// `Unimpl` as the flags operand instead would emit a fatal `UNIMPL()`
+  /// abort, which is not the "rather than aborting" contract (see ast.rs).
+  fn clobber_flags(&mut self) {
+    self.set_flags(Ref::Init(instr::Reg::FLAGS));
+    self.last_cf = None;
+  }
+
+  /// Like `clobber_flags`, but preserves a known carry-out (RCL/RCR/STC).
+  fn clobber_flags_carry(&mut self, cf: Ref) {
+    self.set_flags(Ref::Init(instr::Reg::FLAGS));
+    self.last_cf = Some(cf);
+  }
+
   fn is_word(r: Ref, ir: &IR) -> bool {
     matches!(ir.instr(r).map(|i| i.typ.clone()), Some(Type::U16) | Some(Type::I16))
   }
@@ -532,6 +548,21 @@ impl IRBuilder<'_> {
         instr::Reg::AH | instr::Reg::CH | instr::Reg::DH | instr::Reg::BH),
       instr::Operand::Mem(m) => matches!(m.sz, instr::Size::Size16),
       _ => false,
+    }
+  }
+
+  /// Operand width in bits (8 or 16) for a rotate destination, read from
+  /// the instruction (the IR type cannot distinguish `al` from `ax`).
+  /// `None` for a size the decoder never produces for rotates.
+  fn operand_width_bits(oper: &instr::Operand) -> Option<i16> {
+    match oper {
+      instr::Operand::Reg(r) => Some(if Self::operand_is_word(&instr::Operand::Reg(*r)) { 16 } else { 8 }),
+      instr::Operand::Mem(m) => match m.sz {
+        instr::Size::Size8 => Some(8),
+        instr::Size::Size16 => Some(16),
+        _ => None,
+      },
+      _ => None,
     }
   }
 
@@ -654,6 +685,64 @@ impl IRBuilder<'_> {
         let di_n = self.append_instr(Type::U16, Opcode::Add, vec![di, off]);
         self.append_asm_dst_reg(&instr::OperandReg(instr::Reg::DI), di_n);
         self.append_asm_dst_reg(&instr::OperandReg(instr::Reg::CX), zero);
+      }
+      instr::Opcode::OP_LODS => {
+        // operands: [AL/AX, DS:SI]. Only reads memory: the result value is
+        // the final accumulator, and SI/CX are updated deterministically.
+        let dst = &ins.operands[0];
+        let src = &ins.operands[1];
+        let size = Self::string_operand_size(src);
+        let typ = if size == 2 { Type::U16 } else { Type::U8 };
+        let ds = self.ir.get_var(seg_of(src, instr::Reg::DS), self.cur);
+        let si = self.ir.get_var(instr::Reg::SI, self.cur);
+        let cur = self.append_asm_src_operand(dst);
+        // The helper reads the last element (or returns `cur` when CX==0).
+        let val = self.append_instr(typ, Opcode::RepLods, vec![ds, si, cx, cur]);
+        self.append_asm_dst_operand(dst, val);
+        let size_c = self.ir.const_new(size);
+        let off = self.append_instr(Type::U16, Opcode::UMul, vec![cx, size_c]);
+        let si_n = self.append_instr(Type::U16, Opcode::Add, vec![si, off]);
+        self.append_asm_dst_reg(&instr::OperandReg(instr::Reg::SI), si_n);
+        self.append_asm_dst_reg(&instr::OperandReg(instr::Reg::CX), zero);
+      }
+      instr::Opcode::OP_CMPS | instr::Opcode::OP_SCAS => {
+        // The helper runs the compare loop and returns the remaining CX;
+        // SI/DI advance by (CX0 - cx_final)*size. The final comparison's
+        // flags are data-dependent, so the flags are clobbered (loud).
+        let cond = match ins.rep { Some(instr::Rep::NE) => 1i16, _ => 0 };
+        let cond_c = self.ir.const_new(cond);
+        let is_cmps = ins.opcode == instr::Opcode::OP_CMPS;
+        let size = Self::string_operand_size(if is_cmps { &ins.operands[0] } else { &ins.operands[1] });
+        let size_c = self.ir.const_new(size);
+        let ret = if is_cmps {
+          let dst = &ins.operands[0]; // ES:DI
+          let src = &ins.operands[1]; // DS:SI
+          let ds = self.ir.get_var(seg_of(src, instr::Reg::DS), self.cur);
+          let si = self.ir.get_var(instr::Reg::SI, self.cur);
+          let es = self.ir.get_var(seg_of(dst, instr::Reg::ES), self.cur);
+          let di = self.ir.get_var(instr::Reg::DI, self.cur);
+          self.append_instr(Type::U16, Opcode::RepCmps, vec![ds, si, es, di, cx, size_c, cond_c])
+        } else {
+          let dst = &ins.operands[1]; // ES:DI
+          let es = self.ir.get_var(seg_of(dst, instr::Reg::ES), self.cur);
+          let di = self.ir.get_var(instr::Reg::DI, self.cur);
+          let val = self.append_asm_src_operand(&ins.operands[0]); // AL/AX
+          self.append_instr(Type::U16, Opcode::RepScas, vec![es, di, cx, val, size_c, cond_c])
+        };
+        // iterated = CX0 - cx_final; SI/DI += iterated*size.
+        let iterated = self.append_instr(Type::U16, Opcode::Sub, vec![cx, ret]);
+        let off = self.append_instr(Type::U16, Opcode::UMul, vec![iterated, size_c]);
+        if is_cmps {
+          let si = self.ir.get_var(instr::Reg::SI, self.cur);
+          let si_n = self.append_instr(Type::U16, Opcode::Add, vec![si, off]);
+          self.append_asm_dst_reg(&instr::OperandReg(instr::Reg::SI), si_n);
+        }
+        let di = self.ir.get_var(instr::Reg::DI, self.cur);
+        let di_n = self.append_instr(Type::U16, Opcode::Add, vec![di, off]);
+        self.append_asm_dst_reg(&instr::OperandReg(instr::Reg::DI), di_n);
+        self.append_asm_dst_reg(&instr::OperandReg(instr::Reg::CX), ret);
+        // The comparison flags are unknown.
+        self.clobber_flags();
       }
       _ => unreachable!("lower_rep_string_op called for {:?}", ins.opcode),
     }
@@ -1054,17 +1143,24 @@ impl IRBuilder<'_> {
     // `push cs; rep movs; call near` from misclassifying the later call.
     let special = self.special.take();
 
-    // REP-prefixed string instructions execute a counted loop. MOVS/STOS
-    // are modeled exactly (runtime bulk macro + CX->0 and SI/DI += CX0*size
-    // updates); LODS/CMPS/SCAS/INS/OUTS still lower to Unimpl (their
-    // result is data-dependent). Any of them with a possibly-set direction
-    // flag stays loud rather than guessing the direction.
+    // REP-prefixed string instructions execute a counted loop. MOVS/STOS/
+    // LODS are modeled exactly (runtime helper + deterministic register
+    // updates); CMPS/SCAS model CX/SI/DI exactly but clobber flags (the
+    // final comparison is data-dependent). The remaining rep forms and any
+    // rep with a possibly-set direction flag stay loud.
     if ins.rep.is_some() {
-      // Only 8/16-bit MOVS/STOS are modeled; a wider (unreachable) form
-      // falls back to the loud marker rather than emitting the wrong-width
-      // macro.
-      let modeled = matches!(ins.opcode, instr::Opcode::OP_MOVS | instr::Opcode::OP_STOS)
-        && matches!(&ins.operands[0],
+      // Only 8/16-bit MOVS/STOS/LODS/CMPS/SCAS are modeled; a wider
+      // (unreachable) form falls back to the loud marker rather than
+      // emitting the wrong-width macro. LODS/SCAS carry the memory operand
+      // second, the others first.
+      let size_oper = match ins.opcode {
+        instr::Opcode::OP_LODS | instr::Opcode::OP_SCAS => &ins.operands[1],
+        _ => &ins.operands[0],
+      };
+      let modeled = matches!(ins.opcode,
+          instr::Opcode::OP_MOVS | instr::Opcode::OP_STOS | instr::Opcode::OP_LODS |
+          instr::Opcode::OP_CMPS | instr::Opcode::OP_SCAS)
+        && matches!(size_oper,
           instr::Operand::Mem(m) if matches!(m.sz, instr::Size::Size8 | instr::Size::Size16));
       if !modeled || self.df_may_be_set {
         // Flags are conservatively clobbered because e.g. `repe scasb`
@@ -1134,15 +1230,62 @@ impl IRBuilder<'_> {
         }
       }
       instr::Opcode::OP_RCL | instr::Opcode::OP_RCR => {
-        // FIXME: RCL/RCR rotate *through* carry, so the value needs the
-        // incoming CF from the opaque flags value (#69 follow-up slice).
-        // ROL/ROR below take no carry in and are lowered exactly.
-        let a = self.append_asm_src_operand(&ins.operands[0]);
-        let b = self.append_asm_src_operand(&ins.operands[1]);
-        let typ = self.deduce_type_binary(a, b);
-        let vref = self.append_instr(typ, Opcode::Unimpl, vec![a, b]);
-        self.append_asm_dst_operand(&ins.operands[0], vref);
-        self.append_update_flags(vref);
+        // RCL/RCR rotate *through* carry. With a constant count and a known
+        // carry-in the value is exact via a (w+1)-bit rotate built on u32
+        // ops: X = (cf<<w)|v, X' = rotated, result = X' & mask,
+        // cf_out = bit w. Variable counts (CL), unknown carries, and
+        // counts above w (where the CPU's count masking/modulo is
+        // ambiguous to model) stay loud.
+        let is_rcl = ins.opcode == instr::Opcode::OP_RCL;
+        let width = Self::operand_width_bits(&ins.operands[0]);
+        let count = match &ins.operands[1] {
+          instr::Operand::Imm(imm) => Some(imm.val as i32),
+          _ => None,
+        };
+        match (width, count, self.last_cf) {
+          (Some(w), Some(raw), Some(cf_in)) if (0..=w as i32).contains(&raw) => {
+            let v = self.append_asm_src_operand(&ins.operands[0]);
+            if raw == 0 {
+              // Full no-op: result unchanged, CF preserved.
+              self.append_asm_dst_operand(&ins.operands[0], v);
+              self.clobber_flags_carry(cf_in);
+            } else {
+              let n = raw as i16;
+              let zero = self.ir.const_new(0);
+              let w_c = self.ir.const_new(w);
+              // X = (cf << w) | v  (u32)
+              let cf_wide = self.append_instr(Type::U32, Opcode::Make32, vec![zero, cf_in]);
+              let cf_at_w = self.append_instr(Type::U32, Opcode::Shl, vec![cf_wide, w_c]);
+              let v_wide = self.append_instr(Type::U32, Opcode::Make32, vec![zero, v]);
+              let x = self.append_instr(Type::U32, Opcode::Or, vec![v_wide, cf_at_w]);
+              let n_c = self.ir.const_new(n);
+              let comp = self.ir.const_new((w + 1) - n);
+              let (a, b) = if is_rcl {
+                (self.append_instr(Type::U32, Opcode::Shl, vec![x, n_c]),
+                 self.append_instr(Type::U32, Opcode::UShr, vec![x, comp]))
+              } else {
+                (self.append_instr(Type::U32, Opcode::UShr, vec![x, n_c]),
+                 self.append_instr(Type::U32, Opcode::Shl, vec![x, comp]))
+              };
+              let xp = self.append_instr(Type::U32, Opcode::Or, vec![a, b]);
+              let result = self.append_instr(Type::U16, Opcode::Lower16, vec![xp]);
+              self.append_asm_dst_operand(&ins.operands[0], result);
+              let hi = self.append_instr(Type::U32, Opcode::UShr, vec![xp, w_c]);
+              let hi_lo = self.append_instr(Type::U16, Opcode::Lower16, vec![hi]);
+              let one = self.ir.const_new(1);
+              let cf_out = self.append_instr(Type::U16, Opcode::And, vec![hi_lo, one]);
+              self.clobber_flags_carry(cf_out);
+            }
+          }
+          _ => {
+            let a = self.append_asm_src_operand(&ins.operands[0]);
+            let b = self.append_asm_src_operand(&ins.operands[1]);
+            let typ = self.deduce_type_binary(a, b);
+            let vref = self.append_instr(typ, Opcode::Unimpl, vec![a, b]);
+            self.append_asm_dst_operand(&ins.operands[0], vref);
+            self.append_update_flags(vref);
+          }
+        }
       }
       instr::Opcode::OP_ROL | instr::Opcode::OP_ROR => {
         // #69 slice 1: ROL/ROR take no carry *in*, so the value is exact
@@ -1199,8 +1342,7 @@ impl IRBuilder<'_> {
         };
         let vref = self.append_instr(typ, Opcode::Or, vec![fwd, bwd]);
         self.append_asm_dst_operand(&ins.operands[0], vref);
-        let marker = self.append_instr(Type::Void, Opcode::Unimpl, vec![]);
-        self.append_update_flags(marker);
+        self.clobber_flags();
       }
       instr::Opcode::OP_ADC => {
         // ADC consumes the incoming carry. When the CF producer is a tracked
@@ -1595,7 +1737,6 @@ impl IRBuilder<'_> {
         // value, so redefining it here makes a subsequent jb/jae degrade to
         // UNIMPL_FLAGS rather than silently reading a stale carry. The
         // known carry-out is still tracked for a following ADC/SBB.
-        let marker = self.append_instr(Type::Void, Opcode::Unimpl, vec![]);
         let cf = match ins.opcode {
           instr::Opcode::OP_STC => Some(self.ir.const_new(1)),
           instr::Opcode::OP_CLC => Some(self.ir.const_new(0)),
@@ -1609,8 +1750,8 @@ impl IRBuilder<'_> {
           },
         };
         match cf {
-          Some(cf) => self.append_update_flags_carry(marker, cf),
-          None => self.append_update_flags(marker),
+          Some(cf) => self.clobber_flags_carry(cf),
+          None => self.clobber_flags(),
         }
       }
       instr::Opcode::OP_LODS => {
@@ -1625,10 +1766,27 @@ impl IRBuilder<'_> {
         self.append_instr(Type::Void, Opcode::Unimpl, vec![]);
       }
       instr::Opcode::OP_IN => {
-        self.append_instr(Type::U8, Opcode::Unimpl, vec![]);
+        // `in AL/AX, port`: operands[0] = destination, operands[1] = port
+        // (immediate or DX). Reads a port; no FLAGS/memory effect.
+        let port = self.append_asm_src_operand(&ins.operands[1]);
+        let (typ, op) = match &ins.operands[0] {
+          instr::Operand::Reg(instr::OperandReg(instr::Reg::AL)) => (Type::U8, Opcode::In8),
+          instr::Operand::Reg(instr::OperandReg(instr::Reg::AX)) => (Type::U16, Opcode::In16),
+          other => panic!("Unsupported IN destination: {:?}", other),
+        };
+        let v = self.append_instr(typ, op, vec![port]);
+        self.append_asm_dst_operand(&ins.operands[0], v);
       }
       instr::Opcode::OP_OUT => {
-        self.append_instr(Type::Void, Opcode::Unimpl, vec![]);
+        // `out port, AL/AX`: operands[0] = port, operands[1] = source.
+        let port = self.append_asm_src_operand(&ins.operands[0]);
+        let val = self.append_asm_src_operand(&ins.operands[1]);
+        let op = match &ins.operands[1] {
+          instr::Operand::Reg(instr::OperandReg(instr::Reg::AL)) => Opcode::Out8,
+          instr::Operand::Reg(instr::OperandReg(instr::Reg::AX)) => Opcode::Out16,
+          other => panic!("Unsupported OUT source: {:?}", other),
+        };
+        self.append_instr(Type::Void, op, vec![port, val]);
       }
       instr::Opcode::OP_CLD => {
         self.append_instr(Type::Void, Opcode::Unimpl, vec![]);
@@ -2165,14 +2323,11 @@ mod tests {
     assert_eq!(b.ir.const_lookup(m_instr.operands[1]), Some(15), "complementary shift is masked too");
     assert_eq!(shl.operands[1], n);
     assert_eq!(ushr.operands[1], m);
-    // Destination and flags.
+    // Destination and flags. The flags are clobbered to the unknown initial
+    // value (not an Unimpl marker), so a later flag branch degrades to the
+    // non-fatal UNIMPL_FLAGS rather than a fatal UNIMPL abort.
     assert_eq!(b.ir.get_var(instr::Reg::AX, cur), or, "ROL writes the Or back to AX");
-    let f = b.get_flags();
-    let flags = b.ir.instr(f).unwrap();
-    assert_eq!(flags.opcode, Opcode::UpdateFlags);
-    let marker = b.ir.instr(flags.operands[1]).unwrap();
-    assert_eq!(marker.opcode, Opcode::Unimpl);
-    assert!(marker.operands.is_empty(), "flags clobber is an operand-less marker");
+    assert_eq!(b.get_flags(), Ref::Init(instr::Reg::FLAGS), "ROT clobbers flags to unknown");
   }
 
   #[test]
@@ -2607,16 +2762,21 @@ mod tests {
   }
 
   #[test]
-  fn rep_lods_stays_loud() {
+  fn rep_lods_is_modeled() {
     let (_types, cfg, binary, spec) = bit_test_builder(&[0xC3]);
     let instrs: &[instr::Instr] = &[];
     let mut b = test_builder(&cfg, instrs, &spec, &binary);
+    let cx = b.ir.const_new(3);
+    b.ir.set_var(instr::Reg::CX, b.cur, cx);
     let ins = rep_string_instr(instr::Opcode::OP_LODS, vec![
       instr::Operand::Reg(instr::OperandReg(instr::Reg::AX)),
       string_mem(instr::Size::Size16, instr::Reg::DS, instr::Reg::SI),
     ]);
     b.append_asm_instr(&ins);
 
-    let _ = only_instr(&b.ir, b.cur, Opcode::Unimpl);
+    let _ = only_instr(&b.ir, b.cur, Opcode::RepLods);
+    let cx_after = b.ir.get_var(instr::Reg::CX, b.cur);
+    assert_eq!(b.ir.const_lookup(cx_after), Some(0), "CX consumed to 0");
+    let _ = assert_rep_advanced(&mut b, instr::Reg::SI, 2);
   }
 }

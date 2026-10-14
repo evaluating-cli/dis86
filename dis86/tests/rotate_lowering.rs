@@ -1,7 +1,7 @@
-// Regression tests for ROL/ROR lowering (issue #69, slice 1): rotates
-// without carry-in lower value-exactly to shifts+or instead of the
-// abort-class UNIMPL macro, while flags stay an opaque (loud) marker.
-// RCL/RCR still need carry dataflow and stay UNIMPL (pinned below).
+// Regression tests for ROL/ROR lowering (issue #69): rotates without
+// carry-in lower value-exactly to shifts+or. The flags clobber is the
+// non-fatal unknown-flags value, so no abort marker is emitted; RCL/RCR
+// without a known carry-in stay loud (pinned below).
 use dis86::asm::decode::Decoder;
 use dis86::asm::instr::Instr;
 use dis86::config::Config;
@@ -71,13 +71,7 @@ fn rol_imm_decompiles_without_unimpl() {
   ];
   let source = decompile_raw(&code);
 
-  // gen.rs renders both the abort-class value UNIMPL and the loud
-  // flags marker as `UNIMPL(...)`: strip the exact bare-marker
-  // statement, then no `UNIMPL(` may remain in value position.
-  assert!(!source.replace("UNIMPL()", "").contains("UNIMPL("),
-    "ROL value must not be UNIMPL:\n{source}");
-  assert!(source.contains("UNIMPL() /* UNIMPL op */;"),
-    "ROL must clobber flags with the loud marker statement:\n{source}");
+  assert!(!source.contains("UNIMPL"), "ROL must not emit any abort marker:\n{source}");
   assert!(source.contains("<<"), "ROL must lower to a left shift:\n{source}");
   assert!(source.contains(">>"), "ROL must lower to a right shift:\n{source}");
 }
@@ -94,18 +88,15 @@ fn ror_cl_decompiles_without_unimpl() {
   ];
   let source = decompile_raw(&code);
 
-  assert!(!source.replace("UNIMPL()", "").contains("UNIMPL("),
-    "ROR value must not be UNIMPL:\n{source}");
-  assert!(source.contains("UNIMPL() /* UNIMPL op */;"),
-    "ROR must clobber flags with the loud marker statement:\n{source}");
+  assert!(!source.contains("UNIMPL"), "ROR must not emit any abort marker:\n{source}");
   assert!(source.contains("<<"), "ROR must lower to a left shift:\n{source}");
   assert!(source.contains(">>"), "ROR must lower to a right shift:\n{source}");
 }
 
 // mov ax,0x1234; rcl ax,1; ret
-// RCL rotates through carry (needs CF dataflow): still UNIMPL.
+// With no known carry-in, RCL stays loud (the carry slice needs a producer).
 #[test]
-fn rcl_still_emits_unimpl() {
+fn rcl_unknown_carry_stays_loud() {
   let code = [
     0xB8, 0x34, 0x12, // mov ax,0x1234
     0xC1, 0xD0, 0x01, // rcl ax,1
@@ -113,8 +104,7 @@ fn rcl_still_emits_unimpl() {
   ];
   let source = decompile_raw(&code);
 
-  assert!(source.contains("/* UNIMPL op */"), "RCL still needs the carry slice:\n{source}");
-  assert!(!source.contains("/* UNIMPL flags */"), "RCL carries no flags marker:\n{source}");
+  assert!(source.contains("/* UNIMPL op */"), "RCL with unknown carry must stay loud:\n{source}");
 }
 
 // rol byte ptr [0x100],1; ret
@@ -129,10 +119,7 @@ fn rol_mem_byte_decompiles_without_unimpl_op() {
   ];
   let source = decompile_raw(&code);
 
-  assert!(!source.replace("UNIMPL()", "").contains("UNIMPL("),
-    "ROL value must not be UNIMPL:\n{source}");
-  assert!(source.contains("UNIMPL() /* UNIMPL op */;"),
-    "ROL must clobber flags with the loud marker statement:\n{source}");
+  assert!(!source.contains("UNIMPL"), "ROL must not emit any abort marker:\n{source}");
   assert!(source.contains("<<"), "ROL must lower to a left shift:\n{source}");
   assert!(source.contains(">>"), "ROL must lower to a right shift:\n{source}");
   assert!(source.contains("PTR_8"), "read-modify-write must store a byte:\n{source}");
