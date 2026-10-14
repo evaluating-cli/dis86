@@ -516,6 +516,22 @@ impl IRBuilder<'_> {
     self.last_cf = Some(cf);
   }
 
+  /// Clobber the opaque FLAGS value with the unknown initial flags, so a
+  /// later flag-consuming branch degrades to the loud but non-fatal
+  /// UNIMPL_FLAGS marker (mirrors the post-INT reset). Passing a `Void`
+  /// `Unimpl` as the flags operand instead would emit a fatal `UNIMPL()`
+  /// abort, which is not the "rather than aborting" contract (see ast.rs).
+  fn clobber_flags(&mut self) {
+    self.set_flags(Ref::Init(instr::Reg::FLAGS));
+    self.last_cf = None;
+  }
+
+  /// Like `clobber_flags`, but preserves a known carry-out (RCL/RCR/STC).
+  fn clobber_flags_carry(&mut self, cf: Ref) {
+    self.set_flags(Ref::Init(instr::Reg::FLAGS));
+    self.last_cf = Some(cf);
+  }
+
   fn is_word(r: Ref, ir: &IR) -> bool {
     matches!(ir.instr(r).map(|i| i.typ.clone()), Some(Type::U16) | Some(Type::I16))
   }
@@ -532,6 +548,21 @@ impl IRBuilder<'_> {
         instr::Reg::AH | instr::Reg::CH | instr::Reg::DH | instr::Reg::BH),
       instr::Operand::Mem(m) => matches!(m.sz, instr::Size::Size16),
       _ => false,
+    }
+  }
+
+  /// Operand width in bits (8 or 16) for a rotate destination, read from
+  /// the instruction (the IR type cannot distinguish `al` from `ax`).
+  /// `None` for a size the decoder never produces for rotates.
+  fn operand_width_bits(oper: &instr::Operand) -> Option<i16> {
+    match oper {
+      instr::Operand::Reg(r) => Some(if Self::operand_is_word(&instr::Operand::Reg(*r)) { 16 } else { 8 }),
+      instr::Operand::Mem(m) => match m.sz {
+        instr::Size::Size8 => Some(8),
+        instr::Size::Size16 => Some(16),
+        _ => None,
+      },
+      _ => None,
     }
   }
 
@@ -1134,15 +1165,62 @@ impl IRBuilder<'_> {
         }
       }
       instr::Opcode::OP_RCL | instr::Opcode::OP_RCR => {
-        // FIXME: RCL/RCR rotate *through* carry, so the value needs the
-        // incoming CF from the opaque flags value (#69 follow-up slice).
-        // ROL/ROR below take no carry in and are lowered exactly.
-        let a = self.append_asm_src_operand(&ins.operands[0]);
-        let b = self.append_asm_src_operand(&ins.operands[1]);
-        let typ = self.deduce_type_binary(a, b);
-        let vref = self.append_instr(typ, Opcode::Unimpl, vec![a, b]);
-        self.append_asm_dst_operand(&ins.operands[0], vref);
-        self.append_update_flags(vref);
+        // RCL/RCR rotate *through* carry. With a constant count and a known
+        // carry-in the value is exact via a (w+1)-bit rotate built on u32
+        // ops: X = (cf<<w)|v, X' = rotated, result = X' & mask,
+        // cf_out = bit w. Variable counts (CL), unknown carries, and
+        // counts above w (where the CPU's count masking/modulo is
+        // ambiguous to model) stay loud.
+        let is_rcl = ins.opcode == instr::Opcode::OP_RCL;
+        let width = Self::operand_width_bits(&ins.operands[0]);
+        let count = match &ins.operands[1] {
+          instr::Operand::Imm(imm) => Some(imm.val as i32),
+          _ => None,
+        };
+        match (width, count, self.last_cf) {
+          (Some(w), Some(raw), Some(cf_in)) if (0..=w as i32).contains(&raw) => {
+            let v = self.append_asm_src_operand(&ins.operands[0]);
+            if raw == 0 {
+              // Full no-op: result unchanged, CF preserved.
+              self.append_asm_dst_operand(&ins.operands[0], v);
+              self.clobber_flags_carry(cf_in);
+            } else {
+              let n = raw as i16;
+              let zero = self.ir.const_new(0);
+              let w_c = self.ir.const_new(w);
+              // X = (cf << w) | v  (u32)
+              let cf_wide = self.append_instr(Type::U32, Opcode::Make32, vec![zero, cf_in]);
+              let cf_at_w = self.append_instr(Type::U32, Opcode::Shl, vec![cf_wide, w_c]);
+              let v_wide = self.append_instr(Type::U32, Opcode::Make32, vec![zero, v]);
+              let x = self.append_instr(Type::U32, Opcode::Or, vec![v_wide, cf_at_w]);
+              let n_c = self.ir.const_new(n);
+              let comp = self.ir.const_new((w + 1) - n);
+              let (a, b) = if is_rcl {
+                (self.append_instr(Type::U32, Opcode::Shl, vec![x, n_c]),
+                 self.append_instr(Type::U32, Opcode::UShr, vec![x, comp]))
+              } else {
+                (self.append_instr(Type::U32, Opcode::UShr, vec![x, n_c]),
+                 self.append_instr(Type::U32, Opcode::Shl, vec![x, comp]))
+              };
+              let xp = self.append_instr(Type::U32, Opcode::Or, vec![a, b]);
+              let result = self.append_instr(Type::U16, Opcode::Lower16, vec![xp]);
+              self.append_asm_dst_operand(&ins.operands[0], result);
+              let hi = self.append_instr(Type::U32, Opcode::UShr, vec![xp, w_c]);
+              let hi_lo = self.append_instr(Type::U16, Opcode::Lower16, vec![hi]);
+              let one = self.ir.const_new(1);
+              let cf_out = self.append_instr(Type::U16, Opcode::And, vec![hi_lo, one]);
+              self.clobber_flags_carry(cf_out);
+            }
+          }
+          _ => {
+            let a = self.append_asm_src_operand(&ins.operands[0]);
+            let b = self.append_asm_src_operand(&ins.operands[1]);
+            let typ = self.deduce_type_binary(a, b);
+            let vref = self.append_instr(typ, Opcode::Unimpl, vec![a, b]);
+            self.append_asm_dst_operand(&ins.operands[0], vref);
+            self.append_update_flags(vref);
+          }
+        }
       }
       instr::Opcode::OP_ROL | instr::Opcode::OP_ROR => {
         // #69 slice 1: ROL/ROR take no carry *in*, so the value is exact
@@ -1199,8 +1277,7 @@ impl IRBuilder<'_> {
         };
         let vref = self.append_instr(typ, Opcode::Or, vec![fwd, bwd]);
         self.append_asm_dst_operand(&ins.operands[0], vref);
-        let marker = self.append_instr(Type::Void, Opcode::Unimpl, vec![]);
-        self.append_update_flags(marker);
+        self.clobber_flags();
       }
       instr::Opcode::OP_ADC => {
         // ADC consumes the incoming carry. When the CF producer is a tracked
@@ -1595,7 +1672,6 @@ impl IRBuilder<'_> {
         // value, so redefining it here makes a subsequent jb/jae degrade to
         // UNIMPL_FLAGS rather than silently reading a stale carry. The
         // known carry-out is still tracked for a following ADC/SBB.
-        let marker = self.append_instr(Type::Void, Opcode::Unimpl, vec![]);
         let cf = match ins.opcode {
           instr::Opcode::OP_STC => Some(self.ir.const_new(1)),
           instr::Opcode::OP_CLC => Some(self.ir.const_new(0)),
@@ -1609,8 +1685,8 @@ impl IRBuilder<'_> {
           },
         };
         match cf {
-          Some(cf) => self.append_update_flags_carry(marker, cf),
-          None => self.append_update_flags(marker),
+          Some(cf) => self.clobber_flags_carry(cf),
+          None => self.clobber_flags(),
         }
       }
       instr::Opcode::OP_LODS => {
@@ -2182,14 +2258,11 @@ mod tests {
     assert_eq!(b.ir.const_lookup(m_instr.operands[1]), Some(15), "complementary shift is masked too");
     assert_eq!(shl.operands[1], n);
     assert_eq!(ushr.operands[1], m);
-    // Destination and flags.
+    // Destination and flags. The flags are clobbered to the unknown initial
+    // value (not an Unimpl marker), so a later flag branch degrades to the
+    // non-fatal UNIMPL_FLAGS rather than a fatal UNIMPL abort.
     assert_eq!(b.ir.get_var(instr::Reg::AX, cur), or, "ROL writes the Or back to AX");
-    let f = b.get_flags();
-    let flags = b.ir.instr(f).unwrap();
-    assert_eq!(flags.opcode, Opcode::UpdateFlags);
-    let marker = b.ir.instr(flags.operands[1]).unwrap();
-    assert_eq!(marker.opcode, Opcode::Unimpl);
-    assert!(marker.operands.is_empty(), "flags clobber is an operand-less marker");
+    assert_eq!(b.get_flags(), Ref::Init(instr::Reg::FLAGS), "ROT clobbers flags to unknown");
   }
 
   #[test]
