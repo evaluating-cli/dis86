@@ -297,6 +297,46 @@ mod tests {
     assert_eq!(details.return_kind, Some(ReturnKind::Near));
     assert!(details.ignored_return_kinds.is_empty());
   }
+
+  // #65 shape: entry jumps over embedded data bytes.
+  // `jmp 0006; db 63,63,63; mov ax,4c00; int 21h; ret`.
+  fn gap_binary() -> Binary {
+    Binary::from_raw(&[0xE9, 0x03, 0x00, 0x63, 0x63, 0x63,
+                       0xB8, 0x00, 0x4C, 0xCD, 0x21, 0xC3], None)
+  }
+
+  #[test]
+  fn first_undecodable_addr_flags_jumped_over_data() {
+    let binary = gap_binary();
+    assert_eq!(first_undecodable_addr(&binary, segoff(0), segoff(12)), Some(segoff(3)));
+    assert_eq!(first_undecodable_addr(&binary, segoff(6), segoff(12)), None);
+    assert_eq!(first_undecodable_addr(&binary, segoff(6), segoff(6)), None, "empty range decodes cleanly");
+  }
+
+  #[test]
+  fn first_undecodable_addr_is_total_on_bad_ranges() {
+    // Out-of-contract ranges report nothing instead of panicking in
+    // Binary::region: inverted ranges have nothing to decode, and a
+    // cross-segment range is not linearly decodable as one segment.
+    use crate::segoff::Off;
+    let binary = gap_binary();
+    assert_eq!(first_undecodable_addr(&binary, segoff(6), segoff(3)), None);
+    let cross = SegOff { seg: Seg::Normal(1), off: Off(12) };
+    assert_eq!(first_undecodable_addr(&binary, segoff(0), cross), None);
+  }
+
+  #[test]
+  fn inferred_end_spans_gap_that_linear_decode_rejects() {
+    // Analysis follows control flow past the data, so the inferred end
+    // spans it — while the linear decode that --codeseg-name performs
+    // over the same range fails at the gap. This is the #65 mismatch
+    // the UNDECODABLE GAP diagnostic reports.
+    let binary = gap_binary();
+    let details = FuncDetails::build(segoff(0), None, &test_seg(12), &binary).unwrap();
+    assert_eq!(details.end_addr_inferred, segoff(12));
+    assert_eq!(first_undecodable_addr(&binary, details.start_addr, details.end_addr_inferred),
+      Some(segoff(3)));
+  }
 }
 
 // FIXME: THIS FUNCTION IS WAY TOO COMPLICATED FOR ITS SIMPLE TASK: APIs NEED IMPROVEMENT
@@ -304,4 +344,30 @@ fn decode_one_instr(binary: &Binary, loc: SegOff, end: SegOff) -> Result<Instr, 
   let mut decoder = Decoder::new(binary.region_iter(loc, end));
   let (instr, _raw) = decoder.try_next()?.unwrap();
   Ok(instr)
+}
+
+/// First address in `[start, end)` that fails a linear decode, or `None`
+/// when the whole range decodes. This mirrors `decompile_spec`'s decode
+/// loop over the same range, so anything reported here is guaranteed to
+/// abort `--codeseg-name` today: analysis follows control flow and its
+/// inferred end can span bytes that are not code (embedded banners,
+/// tables, or padding jumped over), while decompilation decodes the
+/// declared range linearly. The operator signal is to audit/shorten the
+/// suggested range around the reported address (#65).
+pub fn first_undecodable_addr(binary: &Binary, start: SegOff, end: SegOff) -> Option<SegOff> {
+  // Total on out-of-contract inputs instead of panicking in
+  // Binary::region: an empty/inverted range has nothing to decode, and
+  // a cross-segment range is not linearly decodable as one segment.
+  if start.seg != end.seg || end <= start {
+    return None;
+  }
+  let mut decoder = Decoder::new(binary.region_iter(start, end));
+  let mut addr = start;
+  loop {
+    match decoder.try_next() {
+      Ok(Some((instr, _raw))) => addr = instr.end_addr(),
+      Ok(None) => return None,
+      Err(_) => return Some(addr),
+    }
+  }
 }

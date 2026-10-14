@@ -5,7 +5,7 @@ use crate::util::range_set::RangeSet;
 
 use super::workqueue::WorkQueue;
 use super::code_segment::{CodeSegments};
-use super::func_details::{FuncDetails, ReturnKind};
+use super::func_details::{FuncDetails, ReturnKind, first_undecodable_addr};
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -145,7 +145,7 @@ impl Analyze {
 
     if emit_annotation_format {
       // Synthesize annotations
-      generate_annotations(&functions, &self.cfg);
+      generate_annotations(&functions, &self.cfg, &self.binary);
     } else {
       // Print out a report
       dump_functions(&functions, &self.cfg);
@@ -320,7 +320,16 @@ fn render_ignored_error(name: &str, addr: SegOff, err: &str) -> String {
   format!("    # IGNORED ERROR | {} | {} | error: '{}'", name, addr, err)
 }
 
-fn generate_annotations(functions: &BTreeMap<SegOff, Result<FuncDetails, String>>, cfg: &Config) {
+/// Renders the #65 diagnostic: the suggested `[start, end)` spans bytes
+/// that fail a linear decode (embedded data jumped over), so a config
+/// built verbatim from the suggestion aborts `--codeseg-name` with
+/// "Unsupported or invalid instruction" at `gap`. Pure for testability.
+fn render_undecodable_gap(name: &str, addr: SegOff, start: SegOff, end: SegOff, gap: SegOff) -> String {
+  format!("    # UNDECODABLE GAP | {} | {} | linear decode of [{}, {}) fails at {}; the suggested range spans non-code bytes - audit/shorten the range before use",
+    name, addr, start, end, gap)
+}
+
+fn generate_annotations(functions: &BTreeMap<SegOff, Result<FuncDetails, String>>, cfg: &Config, binary: &Binary) {
   let mut function_names = FunctionNames::from_cfg(cfg);
 
   let mut current_seg = None;
@@ -347,6 +356,13 @@ fn generate_annotations(functions: &BTreeMap<SegOff, Result<FuncDetails, String>
 
     match result {
       Ok(details) => {
+        // #65: analysis follows control flow, so the inferred end can
+        // span bytes that are not code; decompilation decodes the range
+        // linearly and aborts there. Flag it before the suggestion (and
+        // before the IGNORED line, which also carries the range).
+        if let Some(gap) = first_undecodable_addr(binary, details.start_addr, details.end_addr_inferred) {
+          println!("{}", render_undecodable_gap(&name, *addr, details.start_addr, details.end_addr_inferred, gap));
+        }
         if details.indirect_calls > 0 {
           println!("{}", render_ignored_indirect(&name, *addr, details.start_addr, details.end_addr_inferred, details.indirect_calls));
         } else {
@@ -519,6 +535,19 @@ mod tests {
       "unexpected mixed diagnostic: {:?}", lines);
     assert_eq!(lines.len(), 2);
   }
+  #[test]
+  fn suggestion_flags_undecodable_gap() {
+    // #65: the diagnostic names the function, its start, the suggested
+    // range, and the failing address, and tells the operator to
+    // audit/shorten the range before use.
+    let line = render_undecodable_gap("F_gap", segoff(0), segoff(0), segoff(0x0b), segoff(3));
+    assert!(line.starts_with("    # UNDECODABLE GAP | F_gap | 0000:0000 |"),
+      "unexpected diagnostic: {}", line);
+    assert!(line.contains("[0000:0000, 0000:000b)"), "unexpected diagnostic: {}", line);
+    assert!(line.contains("fails at 0000:0003"), "unexpected diagnostic: {}", line);
+    assert!(line.contains("audit/shorten"), "unexpected diagnostic: {}", line);
+  }
+
   #[test]
   fn ignored_branches_emit_no_suggestion_line() {
     // Documents the incomplete-inventory caveat: these branches emit only
