@@ -108,6 +108,26 @@ for case in r-rcl-stc r-rcl-nocf r-adc8-clc r-adc16-stc r-xblock-carry r-repcmps
   ir "69-$case-ir" "$case"
 done
 
+
+# ----------------------------------------------------------- round 3b -------
+for case in $(listcases "$R/3b-cases.txt"); do
+  emit "3b-$case" "$case"
+done
+for case in p-scasb-di p-cmpsb-di p-lodsb-si p-stosb-di p-movsb-then-std \
+            p-std-cld-repstosb p-std-cld-replodsb; do
+  ir "3b-$case-ir" "$case"
+done
+
+rm -f "$R/p-batch-df.c"
+{
+  printf '$ dis86 --config p-batch-df.bsl --binary-raw p-batch-df.bin '
+  printf -- '--codeseg-name CODE --emit-code p-batch-df.c --codegen-hydra\n'
+  "$BIN" --config "$R/p-batch-df.bsl" --binary-raw "$R/p-batch-df.bin" \
+      --codeseg-name CODE --emit-code "$R/p-batch-df.c" --codegen-hydra 2>&1
+  printf 'exit=%s\n' "$?"
+  [ -f "$R/p-batch-df.c" ] && { printf -- '----- p-batch-df.c -----\n'; cat "$R/p-batch-df.c"; }
+} > "$OUT/3b-batch-df.txt" 2>&1
+
 # ------------------------------------------------------- static inventory ----
 {
   echo "=== Opcode::Unimpl sites in ir_build.rs (main) ==="

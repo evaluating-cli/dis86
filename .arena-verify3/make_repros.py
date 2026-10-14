@@ -164,3 +164,48 @@ for name, (data, _d) in ISSUE69_CASES.items():
 
 print(f"\n{len(PANIC_CASES) + len(CONTROL_CASES)} #85 cases, {len(DF_CASES)} #86 cases, "
       f"{len(ISSUE69_CASES)} #69 cases")
+
+# ----------------------------------------------------------- round 3b -------
+# Follow-up probes: (a) are REP SCAS/CMPS/LODS/STOS lowered at all, or was the
+# empty output just DCE? (make DI/SI live); (b) do the remaining SETcc forms
+# panic? (c) does an STD *after* the string op poison it too? (d) is the DF
+# guard per function?
+PROBE_CASES = {
+    "p-scasb-di":    ([0xF3, 0xAE, 0x89, 0xF8, 0xC3], "rep scasb; mov ax,di; ret"),
+    "p-cmpsb-di":    ([0xF3, 0xA6, 0x89, 0xF8, 0xC3], "rep cmpsb; mov ax,di; ret"),
+    "p-lodsb-si":    ([0xF3, 0xAC, 0x89, 0xF0, 0xC3], "rep lodsb; mov ax,si; ret"),
+    "p-stosb-di":    ([0xF3, 0xAA, 0x89, 0xF8, 0xC3], "rep stosb; mov ax,di; ret"),
+    "p-cmpsb-si":    ([0xF3, 0xA6, 0x89, 0xF0, 0xC3], "rep cmpsb; mov ax,si; ret"),
+    "p-sets":        ([0x0F, 0x98, 0xC0, 0xC3], "sets al; ret"),
+    "p-setns":       ([0x0F, 0x99, 0xC0, 0xC3], "setns al; ret"),
+    "p-setno":       ([0x0F, 0x91, 0xC0, 0xC3], "setno al; ret"),
+    "p-setnp":       ([0x0F, 0x9B, 0xC0, 0xC3], "setnp al; ret"),
+    "p-seta":        ([0x0F, 0x97, 0xC0, 0xC3], "seta al; ret   (lowered control)"),
+    "p-movsb-then-std": ([0xA4, 0xFD, 0xC3], "movsb; std; ret  (STD AFTER the op)"),
+    "p-std-cld-repstosb": ([0xFD, 0xFC, 0xF3, 0xAA, 0xC3], "std; cld; rep stosb; ret"),
+    "p-std-cld-repcmpsb": ([0xFD, 0xFC, 0xF3, 0xA6, 0xC3], "std; cld; rep cmpsb; ret"),
+    "p-std-cld-replodsb": ([0xFD, 0xFC, 0xF3, 0xAC, 0xC3], "std; cld; rep lodsb; ret"),
+}
+(D / "3b-cases.txt").write_text(
+    "".join(f"{n}: {d}\n" for n, (_, d) in PROBE_CASES.items()))
+for name, (data, _d) in PROBE_CASES.items():
+    raw(name, bytes(data))
+
+# Per-function blast radius: f1 has no STD, f2 does. Codeseg-wide run asks
+# whether f2's STD poisons f1.
+raw("p-batch-df", bytes([
+    0xFC, 0xA4, 0xC3,   # 0000 f1: cld; movsb; ret
+    0xFD, 0xC3,         # 0003 f2: std; ret
+]))
+(D / "p-batch-df.bsl").write_text(
+    "dis86 {\n"
+    "  code_segments { _0000 { seg 0 name CODE } }\n"
+    "  functions {\n"
+    "    f1 { start 0000:0000 end 0000:0003 mode near ret None args None }\n"
+    "    f2 { start 0000:0003 end 0000:0005 mode near ret None args None }\n"
+    "  }\n"
+    "  structures {}\n"
+    "  globals {}\n"
+    "  text_section {}\n"
+    "}\n")
+print("p-batch-df: f1(cld; movsb) + f2(std) — per-function blast-radius probe")
