@@ -1025,6 +1025,11 @@ impl IRBuilder<'_> {
       let typ = self.deduce_type_unary(a);
       let vref = self.append_instr(typ, opcode, vec![a]);
       self.append_asm_dst_operand(&ins.operands[0], vref);
+      // NEG writes CF (= operand != 0); NOT leaves the flags intact. A
+      // following ADC/SBB must not consume a pre-NEG carry.
+      if ins.opcode == instr::Opcode::OP_NEG {
+        self.last_cf = None;
+      }
       return;
     }
 
@@ -1280,6 +1285,7 @@ impl IRBuilder<'_> {
         let typ = self.deduce_type_binary(lhs, rhs);
         let res = self.append_instr(typ, Opcode::IMul, vec![lhs, rhs]);
         self.append_asm_dst_operand(&ins.operands[0], res);
+        self.last_cf = None; // MUL/IMUL write CF/OF; no modeled carry
       }
       instr::Opcode::OP_IMUL => {
         // IMUL has many forms, let's be conservative for now and hard sanity check the version we need
@@ -1294,6 +1300,7 @@ impl IRBuilder<'_> {
         let (upper, lower) = self.append_upper_lower_split(res);
         self.append_asm_dst_operand(&ins.operands[0], upper);
         self.append_asm_dst_operand(&ins.operands[1], lower);
+        self.last_cf = None; // MUL/IMUL write CF/OF; no modeled carry
       }
       instr::Opcode::OP_MUL => {
         // Sanity check the form we have
@@ -1307,6 +1314,7 @@ impl IRBuilder<'_> {
         let (upper, lower) = self.append_upper_lower_split(res);
         self.append_asm_dst_operand(&ins.operands[0], upper);
         self.append_asm_dst_operand(&ins.operands[1], lower);
+        self.last_cf = None; // MUL/IMUL write CF/OF; no modeled carry
      }
       instr::Opcode::OP_INC => {
         let attr = if operand_is_stack_reg(&ins.operands[0]) { Attribute::STACK_PTR } else { Attribute::NONE };
@@ -1315,7 +1323,10 @@ impl IRBuilder<'_> {
         let typ = self.deduce_type_binary(vref, one);
         let vref = self.append_instr_with_attrs(typ, attr, Opcode::Add, vec![vref, one]);
         self.append_asm_dst_operand(&ins.operands[0], vref);
+        // INC/DEC update ZF/SF/OF/AF but leave CF intact.
+        let cf = self.last_cf;
         self.append_update_flags(vref);
+        self.last_cf = cf;
       }
       instr::Opcode::OP_DEC => {
         let attr = if operand_is_stack_reg(&ins.operands[0]) { Attribute::STACK_PTR } else { Attribute::NONE };
@@ -1324,7 +1335,9 @@ impl IRBuilder<'_> {
         let typ = self.deduce_type_binary(vref, one);
         let vref = self.append_instr_with_attrs(typ, attr, Opcode::Sub, vec![vref, one]);
         self.append_asm_dst_operand(&ins.operands[0], vref);
+        let cf = self.last_cf;
         self.append_update_flags(vref);
+        self.last_cf = cf;
       }
       instr::Opcode::OP_JMP => {
         match &ins.operands[0] {
@@ -1474,6 +1487,7 @@ impl IRBuilder<'_> {
         let (upper_out, lower_out) = self.append_upper_lower_split(quotient);
         self.append_asm_dst_operand(&ins.operands[0], upper_out);
         self.append_asm_dst_operand(&ins.operands[1], lower_out);
+        self.last_cf = None; // DIV writes CF/OF; no modeled carry
       }
       instr::Opcode::OP_STOS => {
         let src = self.append_asm_src_operand(&ins.operands[1]);
@@ -2393,5 +2407,50 @@ mod tests {
     let next = b.ir.add_block("next");
     b.switch_blk(next);
     assert!(b.last_cf.is_none(), "a new block must invalidate the tracked carry");
+  }
+
+  fn mul_instr() -> instr::Instr {
+    // `mul bx` = DX:AX = AX * BX.
+    let mut operands = ArrayVec::new();
+    operands.push(instr::Operand::Reg(instr::OperandReg(instr::Reg::DX)));
+    operands.push(instr::Operand::Reg(instr::OperandReg(instr::Reg::AX)));
+    operands.push(instr::Operand::Reg(instr::OperandReg(instr::Reg::BX)));
+    instr::Instr {
+      rep: None,
+      opcode: instr::Opcode::OP_MUL,
+      operands,
+      addr: SegOff { seg: Seg::Normal(0), off: Off(0) },
+      n_bytes: 2,
+      intel_hidden_operand_bitmask: 0,
+    }
+  }
+
+  #[test]
+  fn carry_writers_without_a_modeled_carry_invalidate_it() {
+    let (_types, cfg, binary, spec) = bit_test_builder(&[0xC3]);
+    let instrs: &[instr::Instr] = &[];
+    let mut b = test_builder(&cfg, instrs, &spec, &binary);
+
+    // NEG writes CF: a following ADC/SBB must not reuse the pre-NEG carry.
+    b.append_asm_instr(&alu_instr(instr::Opcode::OP_ADD, instr::Reg::AX, instr::Reg::BX));
+    assert!(b.last_cf.is_some());
+    b.append_asm_instr(&alu_instr(instr::Opcode::OP_NEG, instr::Reg::AX, instr::Reg::AX));
+    assert!(b.last_cf.is_none(), "neg writes CF");
+
+    // MUL writes CF: same.
+    b.append_asm_instr(&alu_instr(instr::Opcode::OP_ADD, instr::Reg::AX, instr::Reg::BX));
+    assert!(b.last_cf.is_some());
+    b.append_asm_instr(&mul_instr());
+    assert!(b.last_cf.is_none(), "mul writes CF");
+
+    // NOT does not touch flags: the carry is preserved.
+    b.append_asm_instr(&alu_instr(instr::Opcode::OP_ADD, instr::Reg::AX, instr::Reg::BX));
+    let cf = b.last_cf.unwrap();
+    b.append_asm_instr(&alu_instr(instr::Opcode::OP_NOT, instr::Reg::AX, instr::Reg::AX));
+    assert_eq!(b.last_cf, Some(cf), "not leaves flags intact");
+
+    // INC does not touch CF either: preserved.
+    b.append_asm_instr(&alu_instr(instr::Opcode::OP_INC, instr::Reg::AX, instr::Reg::AX));
+    assert_eq!(b.last_cf, Some(cf), "inc preserves CF");
   }
 }

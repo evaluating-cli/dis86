@@ -133,3 +133,21 @@ fn non_flag_instruction_preserves_carry() {
   assert!(!source.contains("UNIMPL"), "mov must preserve the tracked carry:\n{source}");
   assert!(source.contains("(AX + BX) < AX"), "the carry must still come from the add:\n{source}");
 }
+
+// add ax,bx; neg dx; sbb cx,dx; mov ax,cx; ret
+// NEG writes CF, so the tracked carry from the ADD is stale: the SBB must
+// stay loud rather than silently subtract the ADD's carry.
+#[test]
+fn neg_invalidates_tracked_carry() {
+  let code = [
+    0x01, 0xD8,             // add ax,bx
+    0xF7, 0xDA,             // neg dx
+    0x19, 0xD1,             // sbb cx,dx
+    0x89, 0xC8,             // mov ax,cx
+    0xC3,                   // ret
+  ];
+  let source = decompile_raw(&code);
+
+  assert!(source.contains("UNIMPL("), "a stale carry after neg must stay loud:\n{source}");
+  assert!(!source.contains("(AX + BX) < AX"), "must not reuse the pre-neg carry:\n{source}");
+}
