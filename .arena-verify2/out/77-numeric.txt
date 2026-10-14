@@ -1,0 +1,4 @@
+numeric check for the issue's two cases:
+  77a emitted (0x4A << 8) | 0x0607 = 0x4e07  expected 0x4A07
+  77b emitted ((u16)(0x1234 >> 16) << 8) | 0x56 = 0x56  expected 0x1256
+  77c emitted (u16)(0x1234 >> 16) = 0x0  expected 0x12

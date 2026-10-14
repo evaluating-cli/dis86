@@ -1,0 +1,17 @@
+$ /tmp/main/build/bin/dis86 --config /tmp/repro/r67.bsl --binary-exe /tmp/repro/synth_b.exe --name A --emit-code /tmp/repro/67.c
+WARN: A: branch at 0000:0006 targets 0000:000a outside function range [0000:0000, 0000:0009); the edge is dropped from the output
+WARN: Could not find global for DS:0100
+exit=0
+
+===== /tmp/repro/67.c =====
+u32 A(void)
+{
+  u16 SP0 = SP;
+
+
+
+  *PTR_16(DS, 0x100) = 1;
+
+}
+
+

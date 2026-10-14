@@ -1,0 +1,3 @@
+$ /tmp/main/build/bin/dis86 --config /tmp/repro/r67.bsl --binary-exe /tmp/repro/synth_b.exe --name A --emit-ctrlflow
+Error: the '--emit-ctrlflow' option doesn't have an associated value.
+exit=1

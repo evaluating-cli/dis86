@@ -1,0 +1,16 @@
+$ /tmp/main/build/bin/dis86 --config /tmp/repro/r65_fixed.bsl --binary-exe /tmp/repro/synth_65.exe --codeseg-name CODE --emit-code /tmp/repro/65f.c
+exit=0
+
+===== /tmp/repro/65f.c =====
+u32 main(void)
+{
+  u16 SP0 = SP;
+
+
+
+  AX = 0x4c00;
+  INT(0x21);
+
+}
+
+

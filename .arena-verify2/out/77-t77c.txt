@@ -1,0 +1,22 @@
+$ /tmp/main/build/bin/dis86 --config /tmp/repro/t77c.bsl --binary-raw /tmp/repro/t77c.bin --name test --emit-code /tmp/repro/t77c.c --codegen-hydra
+relocatable segments: []
+WARN: Could not find global for DS:0100
+exit=0
+
+===== /tmp/repro/t77c.c =====
+HYDRA_FUNC(H_test)
+{
+  u16 SP0 = SP;
+
+  FRAME_ENTER(0);
+
+
+  *PTR_8(DS, 0x100) = (u16)(0x1234 >> 16);
+  DX = DX;
+  AX = 0x1234;
+  FRAME_LEAVE();
+  RETURN_NEAR();
+
+}
+
+

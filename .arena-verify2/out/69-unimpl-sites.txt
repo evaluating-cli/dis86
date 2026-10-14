@@ -1,0 +1,23 @@
+Unimpl sites left in ir_build.rs on main:
+591:      self.append_instr(Type::Void, Opcode::Unimpl, vec![]);
+1072:        let vref = self.append_instr(Type::U16, Opcode::Unimpl, vec![]);
+1130:            let vref = self.append_instr(typ, Opcode::Unimpl, vec![a, b]);
+1143:        let vref = self.append_instr(typ, Opcode::Unimpl, vec![a, b]);
+1180:          let vref = self.append_instr(typ, Opcode::Unimpl, vec![a, b]);
+1202:        let marker = self.append_instr(Type::Void, Opcode::Unimpl, vec![]);
+1225:            let vref = self.append_instr(typ, Opcode::Unimpl, vec![a, b]);
+1584:        self.append_instr(Type::Void, Opcode::Unimpl, vec![]);
+1587:        self.append_instr(Type::Void, Opcode::Unimpl, vec![]);
+1591:        self.append_instr(Type::Void, Opcode::Unimpl, vec![]);
+1598:        let marker = self.append_instr(Type::Void, Opcode::Unimpl, vec![]);
+1622:        self.append_instr(Type::Void, Opcode::Unimpl, vec![]);
+1625:        self.append_instr(Type::Void, Opcode::Unimpl, vec![]);
+1628:        self.append_instr(Type::U8, Opcode::Unimpl, vec![]);
+1631:        self.append_instr(Type::Void, Opcode::Unimpl, vec![]);
+1634:        self.append_instr(Type::Void, Opcode::Unimpl, vec![]);
+2174:    assert_eq!(marker.opcode, Opcode::Unimpl);
+2238:    let unimpl = only_instr(&b.ir, cur, Opcode::Unimpl);
+2373:    let _ = only_instr(&b.ir, b.cur, Opcode::Unimpl);
+2521:    for op in [Opcode::Load8, Opcode::Store8, Opcode::Add, Opcode::RetNear, Opcode::Unimpl] {
+2603:    let _ = only_instr(&b.ir, b.cur, Opcode::Unimpl);
+2620:    let _ = only_instr(&b.ir, b.cur, Opcode::Unimpl);

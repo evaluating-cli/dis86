@@ -1,0 +1,4 @@
+main sha: ca4981bf30828c57ac774bbc21d3ec90d7f5e044
+dis86:    d74285395263c097  (/tmp/main/build/bin/dis86)
+rustc 1.99.0 (b940084d7 2026-09-28)
+cargo 1.99.0 (5f94df478 2026-08-27)

@@ -1,0 +1,19 @@
+$ /tmp/main/build/bin/dis86 --config /tmp/repro/r66.bsl --binary-exe /tmp/repro/synth_a.exe --name main --emit-code /tmp/repro/66.c
+exit=0
+
+===== /tmp/repro/66.c =====
+u32 main(void)
+{
+  u16 SP0 = SP;
+
+
+
+  AX = (9 << 8) | AL;
+  DX = 11;
+  INT(0x21);
+  AX = 0x4c00;
+  INT(0x21);
+
+}
+
+

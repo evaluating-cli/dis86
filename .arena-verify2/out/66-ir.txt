@@ -1,0 +1,3 @@
+$ /tmp/main/build/bin/dis86 --config /tmp/repro/r66.bsl --binary-exe /tmp/repro/synth_a.exe --name main --emit-ir-final
+Error: the '--emit-ir-final' option doesn't have an associated value.
+exit=1

@@ -1,0 +1,23 @@
+$ /tmp/main/build/bin/dis86 --config /tmp/repro/t78a.bsl --binary-raw /tmp/repro/t78a.bin --name test --emit-code /tmp/repro/t78a.c --codegen-hydra
+relocatable segments: []
+exit=0
+
+===== /tmp/repro/t78a.c =====
+HYDRA_FUNC(H_test)
+{
+  u16 SP0 = SP;
+
+  FRAME_ENTER(0);
+
+
+  AX = (6 << 8) | AL;
+  BX = AX;
+  INT(0x21);
+  DX = DX;
+  AX = BX;
+  FRAME_LEAVE();
+  RETURN_NEAR();
+
+}
+
+
