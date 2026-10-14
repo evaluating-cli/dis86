@@ -601,6 +601,28 @@ impl<'a> Builder<'a> {
         let exprs: Vec<_> = instr.operands.iter().map(|r| self.ref_to_expr(*r, depth+1)).collect();
         Expr::Abstract(name, exprs)
       }
+      ir::Opcode::RepCmps | ir::Opcode::RepScas => {
+        // operands: cmps [ds, si, es, di, cx, size, cond];
+        //           scas [es, di, cx, val, size, cond].
+        // cond: 0 = REPE (F3), 1 = REPNE (F2). The value is the final CX.
+        let n = if instr.opcode == ir::Opcode::RepCmps { 5 } else { 4 };
+        let size = self.ir.const_lookup(instr.operands[n]);
+        let cond = self.ir.const_lookup(instr.operands[n + 1]);
+        let word = size == Some(2);
+        let eq = cond == Some(0);
+        let name: &'static str = match (instr.opcode, word, eq) {
+          (ir::Opcode::RepCmps, true, true) => "REPE_CMPSW",
+          (ir::Opcode::RepCmps, true, false) => "REPNE_CMPSW",
+          (ir::Opcode::RepCmps, false, true) => "REPE_CMPSB",
+          (ir::Opcode::RepCmps, false, false) => "REPNE_CMPSB",
+          (_, true, true) => "REPE_SCASW",
+          (_, true, false) => "REPNE_SCASW",
+          (_, false, true) => "REPE_SCASB",
+          (_, false, false) => "REPNE_SCASB",
+        };
+        let exprs: Vec<_> = instr.operands[..n].iter().map(|r| self.ref_to_expr(*r, depth+1)).collect();
+        Expr::Abstract(name, exprs)
+      }
       ir::Opcode::In8 | ir::Opcode::In16 => {
         // operand: [port]. Reads a port (hardware side effect).
         let name = if instr.opcode == ir::Opcode::In16 { "INW" } else { "INB" };

@@ -92,6 +92,12 @@ pub enum Opcode {
   // REP LODS: a counted load loop that only reads memory; the value is the
   // final accumulator, and SI/CX updates are modeled separately.
   RepLods,
+  // REP CMPS/SCAS: counted compare loops; the value is the final CX (the
+  // loop stops on a match/mismatch or CX==0). The final comparison's flags
+  // are data-dependent, so the flags are clobbered (loud). SI/DI updates are
+  // modeled separately.
+  RepCmps,
+  RepScas,
 
   // Port I/O. In* read a port into AL/AX (a value), Out* write a value to a
   // port (a side effect). They render as hydra's INB/INW/OUTB/OUTW macros
@@ -191,6 +197,8 @@ impl Opcode {
       Opcode::RepMovs     => "repmovs",
       Opcode::RepStos     => "repstos",
       Opcode::RepLods     => "replods",
+      Opcode::RepCmps     => "repcmps",
+      Opcode::RepScas     => "repscas",
       Opcode::In8         => "in8",
       Opcode::In16        => "in16",
       Opcode::Out8        => "out8",

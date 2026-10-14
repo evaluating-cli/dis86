@@ -705,6 +705,45 @@ impl IRBuilder<'_> {
         self.append_asm_dst_reg(&instr::OperandReg(instr::Reg::SI), si_n);
         self.append_asm_dst_reg(&instr::OperandReg(instr::Reg::CX), zero);
       }
+      instr::Opcode::OP_CMPS | instr::Opcode::OP_SCAS => {
+        // The helper runs the compare loop and returns the remaining CX;
+        // SI/DI advance by (CX0 - cx_final)*size. The final comparison's
+        // flags are data-dependent, so the flags are clobbered (loud).
+        let cond = match ins.rep { Some(instr::Rep::NE) => 1i16, _ => 0 };
+        let cond_c = self.ir.const_new(cond);
+        let is_cmps = ins.opcode == instr::Opcode::OP_CMPS;
+        let size = Self::string_operand_size(if is_cmps { &ins.operands[0] } else { &ins.operands[1] });
+        let size_c = self.ir.const_new(size);
+        let ret = if is_cmps {
+          let dst = &ins.operands[0]; // ES:DI
+          let src = &ins.operands[1]; // DS:SI
+          let ds = self.ir.get_var(seg_of(src, instr::Reg::DS), self.cur);
+          let si = self.ir.get_var(instr::Reg::SI, self.cur);
+          let es = self.ir.get_var(seg_of(dst, instr::Reg::ES), self.cur);
+          let di = self.ir.get_var(instr::Reg::DI, self.cur);
+          self.append_instr(Type::U16, Opcode::RepCmps, vec![ds, si, es, di, cx, size_c, cond_c])
+        } else {
+          let dst = &ins.operands[1]; // ES:DI
+          let es = self.ir.get_var(seg_of(dst, instr::Reg::ES), self.cur);
+          let di = self.ir.get_var(instr::Reg::DI, self.cur);
+          let val = self.append_asm_src_operand(&ins.operands[0]); // AL/AX
+          self.append_instr(Type::U16, Opcode::RepScas, vec![es, di, cx, val, size_c, cond_c])
+        };
+        // iterated = CX0 - cx_final; SI/DI += iterated*size.
+        let iterated = self.append_instr(Type::U16, Opcode::Sub, vec![cx, ret]);
+        let off = self.append_instr(Type::U16, Opcode::UMul, vec![iterated, size_c]);
+        if is_cmps {
+          let si = self.ir.get_var(instr::Reg::SI, self.cur);
+          let si_n = self.append_instr(Type::U16, Opcode::Add, vec![si, off]);
+          self.append_asm_dst_reg(&instr::OperandReg(instr::Reg::SI), si_n);
+        }
+        let di = self.ir.get_var(instr::Reg::DI, self.cur);
+        let di_n = self.append_instr(Type::U16, Opcode::Add, vec![di, off]);
+        self.append_asm_dst_reg(&instr::OperandReg(instr::Reg::DI), di_n);
+        self.append_asm_dst_reg(&instr::OperandReg(instr::Reg::CX), ret);
+        // The comparison flags are unknown.
+        self.clobber_flags();
+      }
       _ => unreachable!("lower_rep_string_op called for {:?}", ins.opcode),
     }
   }
@@ -1104,17 +1143,23 @@ impl IRBuilder<'_> {
     // `push cs; rep movs; call near` from misclassifying the later call.
     let special = self.special.take();
 
-    // REP-prefixed string instructions execute a counted loop. MOVS/STOS
-    // are modeled exactly (runtime bulk macro + CX->0 and SI/DI += CX0*size
-    // updates); LODS/CMPS/SCAS/INS/OUTS still lower to Unimpl (their
-    // result is data-dependent). Any of them with a possibly-set direction
-    // flag stays loud rather than guessing the direction.
+    // REP-prefixed string instructions execute a counted loop. MOVS/STOS/
+    // LODS are modeled exactly (runtime helper + deterministic register
+    // updates); CMPS/SCAS model CX/SI/DI exactly but clobber flags (the
+    // final comparison is data-dependent). The remaining rep forms and any
+    // rep with a possibly-set direction flag stay loud.
     if ins.rep.is_some() {
-      // Only 8/16-bit MOVS/STOS/LODS are modeled; a wider (unreachable)
-      // form falls back to the loud marker rather than emitting the
-      // wrong-width macro. LODS's memory operand is the source.
-      let size_oper = if ins.opcode == instr::Opcode::OP_LODS { &ins.operands[1] } else { &ins.operands[0] };
-      let modeled = matches!(ins.opcode, instr::Opcode::OP_MOVS | instr::Opcode::OP_STOS | instr::Opcode::OP_LODS)
+      // Only 8/16-bit MOVS/STOS/LODS/CMPS/SCAS are modeled; a wider
+      // (unreachable) form falls back to the loud marker rather than
+      // emitting the wrong-width macro. LODS/SCAS carry the memory operand
+      // second, the others first.
+      let size_oper = match ins.opcode {
+        instr::Opcode::OP_LODS | instr::Opcode::OP_SCAS => &ins.operands[1],
+        _ => &ins.operands[0],
+      };
+      let modeled = matches!(ins.opcode,
+          instr::Opcode::OP_MOVS | instr::Opcode::OP_STOS | instr::Opcode::OP_LODS |
+          instr::Opcode::OP_CMPS | instr::Opcode::OP_SCAS)
         && matches!(size_oper,
           instr::Operand::Mem(m) if matches!(m.sz, instr::Size::Size8 | instr::Size::Size16));
       if !modeled || self.df_may_be_set {

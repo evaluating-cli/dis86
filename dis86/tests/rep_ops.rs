@@ -1,7 +1,7 @@
-// Regression tests for REP-prefixed MOVS/STOS lowering (issue #69, slice 3).
+// Regression tests for REP-prefixed MOVS/STOS lowering (issue #69).
 // These are modeled exactly (runtime bulk macro + deterministic CX/SI/DI
-// updates); REP LODS/CMPS/SCAS and any rep with a possibly-set direction
-// flag stay loud.
+// updates); a rep with a possibly-set direction flag stays loud. REP LODS
+// and CMPS/SCAS have their own test files.
 use dis86::asm::decode::Decoder;
 use dis86::asm::instr::Instr;
 use dis86::config::Config;
