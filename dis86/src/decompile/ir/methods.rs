@@ -235,6 +235,15 @@ impl IR {
       self.block_mut(b).defs.retain(|_, val| !Self::ref_mentions_block(val, target));
     }
   }
+
+  /// Drop pending-phi entries referencing `target`. Phi refs are always local
+  /// to their own block, so this is vacuous once all blocks are sealed, but
+  /// it keeps the removal-time invariant structural rather than incidental.
+  pub fn drop_incomplete_phis_into_block(&mut self, target: BlockRef) {
+    for b in self.iter_blocks() {
+      self.block_mut(b).incomplete_phis.retain(|(_, r)| !Self::ref_mentions_block(r, target));
+    }
+  }
 }
 
 ////////////////////////////////////////////////////////////////////////////////////
