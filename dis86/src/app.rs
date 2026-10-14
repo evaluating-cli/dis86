@@ -52,7 +52,10 @@ fn print_help() {
   println!("  --emit-code       path to emit c code (optional)");
   println!("");
   println!("IR BUILD FLAGS:");
-  println!("  --build-pin-all");
+  println!("  --build-pin-all   keep every value alive as a versioned local (a DCE");
+  println!("                    diagnostic; NOT a correctness knob: pinning a value does");
+  println!("                    not write it to the guest register, so the emulator can");
+  println!("                    still observe stale register state)");
   println!("");
   println!("CODEGEN FLAGS:");
   println!("  --codegen-hydra   emit code that integrates well with the hydra runtime (optional)");

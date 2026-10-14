@@ -651,7 +651,9 @@ pub fn simplify_sign_conds(ir: &mut IR) {
       // if sign_instr.opcode != Opcode::SignFlags { continue; }
 
       let upd_ref = instr.operands[0];
-      let upd_instr = ir.instr(upd_ref).unwrap();
+      // Flags can be a non-instruction ref (e.g. the initial FLAGS value, which
+      // a post-INT reset restores): such a sign source is unknown, not foldable.
+      let Some(upd_instr) = ir.instr(upd_ref) else { continue };
       if upd_instr.opcode != Opcode::UpdateFlags { continue; }
 
       let lhs = upd_instr.operands[1];
@@ -1397,5 +1399,20 @@ mod tests {
 
       assert_eq!(ir.instr(condition).unwrap().opcode, Opcode::EqFlags, "{producer:?} producer");
     }
+  }
+
+  #[test]
+  fn sign_cond_on_initial_flags_is_not_folded() {
+    // Flags can be a non-instruction ref: the initial FLAGS value, which a
+    // post-INT reset restores (issue #66). A `js` over such a source is
+    // unknown, so it must stay a SignFlags marker rather than panicking on
+    // the removed UpdateFlags assumption.
+    let (mut ir, blk) = test_ir();
+    let condition = append_typed(
+      &mut ir, blk, Type::U16, Opcode::SignFlags, vec![Ref::Init(crate::asm::instr::Reg::FLAGS)]);
+
+    simplify_sign_conds(&mut ir);
+
+    assert_eq!(ir.instr(condition).unwrap().opcode, Opcode::SignFlags);
   }
 }
