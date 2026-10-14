@@ -165,12 +165,14 @@ impl<'a> IRBuilder<'a> {
     Some(tgts)
   }
 
-  fn jump_targets(&self, ins: &instr::Instr) -> Option<Vec<SegOff>> {
+  /// Branch targets of `ins`, plus whether the last entry is the implicit
+  /// fallthrough (rather than an explicit branch target).
+  fn jump_targets(&self, ins: &instr::Instr) -> Option<(Vec<SegOff>, bool)> {
     // Special handling for some indirect jumps
     if ins.opcode == instr::Opcode::OP_JMP {
       if let instr::Operand::Mem(m) = &ins.operands[0] {
         if let Some(targets) = self.jump_indirect_targets(ins, m) {
-          return Some(targets);
+          return Some((targets, false));
         }
         // If none.. we want to fall through so we hit the panic below
       }
@@ -216,7 +218,7 @@ impl<'a> IRBuilder<'a> {
       targets.push(ins.end_addr());
     }
 
-    Some(targets)
+    Some((targets, fallthrough))
   }
 
   fn append_instr(&mut self, typ: Type, opcode: Opcode, operands: Vec<Ref>) -> Ref {
@@ -271,7 +273,15 @@ impl<'a> IRBuilder<'a> {
     self.cur = bref;
   }
 
+  /// Whether a branch target lies inside the function's decoded
+  /// `[start, end)` range. Anything outside (including another segment)
+  /// decodes to zero instructions and is dropped from the output.
+  fn target_in_range(&self, tgt: SegOff) -> bool {
+    tgt.seg == self.spec.start.seg && tgt.off >= self.spec.start.off && tgt.off < self.spec.end.off
+  }
+
   fn start_next_blk(&mut self, next: SegOff) {
+
     let next_bref = self.get_block(next);
 
     // Make sure the last instruction is a jump or ret
@@ -1299,9 +1309,19 @@ impl IRBuilder<'_> {
         block_start.insert(ins.addr);
         last_was_jump = false;
       }
-      let Some(targets) = self.jump_targets(ins) else { continue };
-      for tgt in targets {
-        block_start.insert(tgt);
+      let Some((targets, fallthrough)) = self.jump_targets(ins) else { continue };
+      // Explicit branch targets (everything but a trailing fallthrough)
+      // must lie inside the function's [start, end): anything outside
+      // decodes to zero instructions, becomes an empty block, and is
+      // silently dropped from the output. Warn loudly instead of hiding
+      // the lost edge; the drop semantics are unchanged.
+      let explicit = targets.len() - usize::from(fallthrough);
+      for tgt in &targets[..explicit] {
+        block_start.insert(*tgt);
+        if !self.target_in_range(*tgt) {
+          eprintln!("WARN: {}: branch at {} targets {} outside function range [{}, {}); the edge is dropped from the output",
+            self.spec.name, ins.addr, tgt, self.spec.start, self.spec.end);
+        }
       }
       last_was_jump = true;
     }
@@ -1566,5 +1586,104 @@ mod tests {
     for (name, r) in &writes {
       assert_ne!(b.ir.instr(*r).unwrap().opcode, Opcode::Nop, "{name} guest write must survive DCE");
     }
+  }
+
+  fn jmp_instr(addr_off: u16, n_bytes: u16, rel: u16) -> instr::Instr {
+    let mut operands = ArrayVec::new();
+    operands.push(instr::Operand::Rel(instr::OperandRel { val: rel }));
+    instr::Instr {
+      rep: None,
+      opcode: instr::Opcode::OP_JMP,
+      operands,
+      addr: SegOff { seg: Seg::Normal(0), off: Off(addr_off) },
+      n_bytes,
+      intel_hidden_operand_bitmask: 0,
+    }
+  }
+
+  fn test_spec(start: u16, end: u16, code: &[u8]) -> (Rc<TypeDatabase>, Config, binary::Binary, spec::Spec<'static>) {
+    let types = Rc::new(TypeDatabase::new());
+    let cfg = Config { types: types.clone(), structs: vec![], code_segs: vec![], funcs: vec![], indirects: vec![], globals: vec![], text_section: vec![] };
+    let binary = binary::Binary::from_raw(code, None);
+    let spec = spec::Spec::from_start_and_end(
+      Some(SegOff { seg: Seg::Normal(0), off: Off(start) }),
+      Some(SegOff { seg: Seg::Normal(0), off: Off(end) }));
+    (types, cfg, binary, spec)
+  }
+
+  #[test]
+  fn target_in_range_accepts_start_and_rejects_end_and_other_seg() {
+    let (_types, cfg, binary, spec) = test_spec(0x10, 0x20, &[0xC3]);
+    let b = test_builder(&cfg, &[], &spec, &binary);
+    let in_range = SegOff { seg: Seg::Normal(0), off: Off(0x10) };
+    let mid = SegOff { seg: Seg::Normal(0), off: Off(0x1A) };
+    let end = SegOff { seg: Seg::Normal(0), off: Off(0x20) };
+    let past = SegOff { seg: Seg::Normal(0), off: Off(0x21) };
+    let other_seg = SegOff { seg: Seg::Normal(1), off: Off(0x12) };
+    assert!(b.target_in_range(in_range), "range start is inclusive");
+    assert!(b.target_in_range(mid));
+    assert!(!b.target_in_range(end), "range end is exclusive");
+    assert!(!b.target_in_range(past));
+    assert!(!b.target_in_range(other_seg), "far targets are outside the range");
+  }
+
+  #[test]
+  fn out_of_range_branch_target_warns_but_still_builds() {
+    // #67: `jmp 0x000a` from inside [0x0000, 0x0009) decodes to zero
+    // instructions, so its block is empty and the edge is dropped from
+    // the output. build() must now WARN (stderr, exercised here) while
+    // preserving the drop: no panic, empty target block, no exits.
+    let (_types, cfg, binary, spec) = test_spec(0x0000, 0x0009, &[0xC3]);
+    // JMP at 0x0006, 3 bytes: end 0x0009 + rel 1 -> target 0x000a.
+    let instrs = [jmp_instr(0x0006, 3, 1)];
+    let mut b = test_builder(&cfg, &instrs, &spec, &binary);
+    assert!(!b.target_in_range(SegOff { seg: Seg::Normal(0), off: Off(0x000a) }));
+    b.build();
+    let tgt = SegOff { seg: Seg::Normal(0), off: Off(0x000a) };
+    let blk = *b.addrmap.get(&tgt).expect("out-of-range target still gets a block");
+    assert_eq!(b.ir.block_instr_count(blk), 0, "target block must stay empty (drop semantics preserved)");
+    assert!(b.ir.block_exits(blk).is_empty());
+  }
+
+  #[test]
+  fn in_range_branch_target_builds_without_warning_path() {
+    // Control: a JMP whose target lies inside the range takes the same
+    // code path with target_in_range true and links the edge normally.
+    let (_types, cfg, binary, spec) = test_spec(0x0000, 0x0008, &[0xC3]);
+    // JMP at 0x0000, 2 bytes: rel 2 -> target 0x0004.
+    let instrs = [jmp_instr(0x0000, 2, 2)];
+    let mut b = test_builder(&cfg, &instrs, &spec, &binary);
+    assert!(b.target_in_range(SegOff { seg: Seg::Normal(0), off: Off(0x0004) }));
+    b.build();
+    let tgt = SegOff { seg: Seg::Normal(0), off: Off(0x0004) };
+    let blk = *b.addrmap.get(&tgt).expect("in-range target gets a block");
+    // The single JMP ran in the entry block (b.cur never moved), so the
+    // target's sole predecessor must be the entry block.
+    assert_eq!(b.ir.block(blk).preds, vec![b.cur], "in-range edge links normally");
+  }
+
+  #[test]
+  fn decoded_out_of_range_jmp_warns_and_builds() {
+    // The #67 shape through the real decoder: `mov ax,1; jmp 0x000a`
+    // with the function range ending at 0x0006. The WARN fires on
+    // stderr (exercised here, not asserted); the build and a full
+    // optimize must complete without panicking.
+    use crate::asm::decode::Decoder;
+    let code: &[u8] = &[0xB8, 0x01, 0x00, 0xE9, 0x04, 0x00];
+    let (_types, cfg, binary, spec) = test_spec(0x0000, 0x0006, code);
+    let mut decoder = Decoder::new(binary.region_iter(spec.start, spec.end));
+    let mut instr_list: Vec<instr::Instr> = vec![];
+    while let Some((ins, _raw)) = decoder.try_next().expect("decode") {
+      instr_list.push(ins);
+    }
+    assert_eq!(instr_list.len(), 2);
+    assert_eq!(instr_list[1].opcode, instr::Opcode::OP_JMP);
+    let instr::Operand::Rel(rel) = instr_list[1].operands[0] else {
+      panic!("JMP must carry a relative target");
+    };
+    assert_eq!(instr_list[1].rel_addr(&rel),
+      SegOff { seg: Seg::Normal(0), off: Off(0x000a) }, "repro shape: jmp targets 0x000a");
+    let mut ir = build_from_instrs(&instr_list, &cfg, &spec, &binary, false, false);
+    crate::decompile::opt::optimize(&mut ir);
   }
 }
