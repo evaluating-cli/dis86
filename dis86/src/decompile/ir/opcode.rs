@@ -291,6 +291,8 @@ impl Opcode {
       //Opcode::Pin => true,
       Opcode::Store8 => true,
       Opcode::Store16 => true,
+      Opcode::Out8 => true,
+      Opcode::Out16 => true,
       Opcode::WriteVar8 => true,
       Opcode::WriteVar16 => true,
       Opcode::WriteVar32 => true,

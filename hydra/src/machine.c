@@ -178,8 +178,8 @@ u8 hydra_impl_inb(u16 port)
   hydra_exec_ctx_t *exec = execution_context_get(NULL);
   hydra_machine_t *m = &exec->machine;
 
-  u8 save_ax = m->registers->ax;
-  u8 save_dx = m->registers->dx;
+  u16 save_ax = m->registers->ax;
+  u16 save_dx = m->registers->dx;
   m->registers->dx = port;
 
   u8 machine_code[] = {0xec, 0xcb};
@@ -196,8 +196,8 @@ void hydra_impl_outb(u16 port, u8 val)
   hydra_exec_ctx_t *exec = execution_context_get(NULL);
   hydra_machine_t *m = &exec->machine;
 
-  u8 save_ax = m->registers->ax;
-  u8 save_dx = m->registers->dx;
+  u16 save_ax = m->registers->ax;
+  u16 save_dx = m->registers->dx;
   m->registers->ax = (u16)val;
   m->registers->dx = port;
 
