@@ -447,6 +447,63 @@ pub fn deadcode_elimination(ir: &mut IR) {
   }
 }
 
+/// Instructions that may be erased when a block they (transitively) depend on
+/// is removed: pure data producers with no control-flow role and no PIN
+/// marker. Anything else — side effects, pinned values, Phi nodes,
+/// terminators — keeps the block alive instead.
+fn is_nopable_consumer(instr: &Instr) -> bool {
+  if instr.opcode.has_side_effects() {
+    return false;
+  }
+  // Pinned values are live roots by design (see deadcode_elimination);
+  // erasing one would violate the PIN contract.
+  if (instr.attrs & Attribute::PIN) != 0 {
+    return false;
+  }
+  // WriteArr* is not covered by has_side_effects (the same gap exists in
+  // deadcode_elimination's root set) but performs an observable write; never
+  // erase one. ReadArr* stays erasable, consistent with Load*.
+  if matches!(instr.opcode,
+    Opcode::WriteArr8 | Opcode::WriteArr16) {
+    return false;
+  }
+  !matches!(instr.opcode,
+    Opcode::Nop | Opcode::Phi |
+    Opcode::Jmp | Opcode::Jne | Opcode::JmpTbl |
+    Opcode::RetFar | Opcode::RetNear)
+}
+
+/// Remove `blkref` as a predecessor of `exit` at every recorded index,
+/// returning the dropped Phi operands as `(phi, idx, operand)` so the repair
+/// can be restored exactly (see deadblock_elimination). Indices must arrive
+/// in descending order so earlier removals never shift later positions.
+/// Phis shorter than the predecessor list (malformed input) are left alone.
+fn repair_exit(ir: &mut IR, exit: BlockRef, idxs: &[usize]) -> Vec<(Ref, usize, Ref)> {
+  let mut removed = vec![];
+  for &idx in idxs {
+    ir.block_mut(exit).preds.remove(idx);
+    for r in ir.iter_instrs(exit) {
+      let instr = ir.instr_mut(r).unwrap();
+      if instr.opcode != Opcode::Phi { continue; }
+      if instr.operands.len() <= idx { continue; }
+      removed.push((r, idx, instr.operands.remove(idx)));
+    }
+  }
+  removed
+}
+
+/// Exact inverse of `repair_exit`: re-insert predecessors and Phi operands in
+/// ascending index order.
+fn restore_exit(ir: &mut IR, blkref: BlockRef, exit: BlockRef, idxs: &[usize], mut removed: Vec<(Ref, usize, Ref)>) {
+  for &idx in idxs.iter().rev() {
+    ir.block_mut(exit).preds.insert(idx, blkref);
+  }
+  removed.sort_by_key(|(_, idx, _)| *idx);
+  for (r, idx, op) in removed {
+    ir.instr_mut(r).unwrap().operands.insert(idx, op);
+  }
+}
+
 pub fn deadblock_elimination(ir: &mut IR) {
   // A dead block is one with no preds
   for blkref in ir.iter_blocks() {
@@ -454,28 +511,94 @@ pub fn deadblock_elimination(ir: &mut IR) {
     if blkref == BlockRef(0) { continue; } // entry block is always alive
     if blk.preds.len() > 0 { continue; }
 
-    // Need to remove ourself as a pred from any target blocks
+    // Snapshot the outgoing edges up front: if the sweep below decides to
+    // keep the block, the exit repair is restored exactly, so successors'
+    // preds/Phis never drift out of sync with the block's own edges. An exit
+    // that is already gone (removed earlier in this pass) or that does not
+    // list us (truncated edge, stale CFG) has nothing to repair and is
+    // skipped with a diagnostic. Duplicate edges to one exit (e.g. JmpTbl)
+    // share a single entry holding every predecessor index, descending, so
+    // removal never shifts positions.
+    let mut exits: Vec<(BlockRef, Vec<usize>)> = vec![];
     for exit in ir.block_exits(blkref) {
-      // Find pred_idx
-      let exit_blk = ir.block_mut(exit);
-      let mut pred_idx = None;
-      for (i, p) in exit_blk.preds.iter().enumerate() {
-        if *p == blkref {
-          pred_idx = Some(i);
-          break;
-        }
+      if ir.blocks[exit.0].is_none() {
+        eprintln!("WARN: deadblock_elimination: unreachable '{}' ({:?}) targets removed '{}' ({:?}); skipping repair",
+          ir.block(blkref).name, blkref, exit.0, exit);
+        continue;
       }
-      let pred_idx = pred_idx.unwrap();
-
-      // Remove index from pred and all phis
-      exit_blk.preds.remove(pred_idx);
-      for r in ir.iter_instrs(exit) {
-        let instr = ir.instr_mut(r).unwrap();
-        if instr.opcode != Opcode::Phi { continue; }
-        instr.operands.remove(pred_idx);
+      if exits.iter().any(|(e, _)| *e == exit) {
+        continue;
       }
+      // Find all pred_idx
+      let mut idxs: Vec<usize> = ir.block(exit).preds.iter().enumerate()
+        .filter_map(|(i, p)| (*p == blkref).then_some(i)).collect();
+      if idxs.is_empty() {
+        eprintln!("WARN: deadblock_elimination: unreachable '{}' ({:?}) targets '{}' ({:?}) without a recorded edge; skipping repair",
+          ir.block(blkref).name, blkref, ir.block(exit).name, exit);
+        continue;
+      }
+      idxs.sort_by(|a, b| b.cmp(a));
+      exits.push((exit, idxs));
+    }
+    let mut removed_phis = vec![];
+    for (exit, idxs) in &exits {
+      removed_phis.push(repair_exit(ir, *exit, idxs));
     }
 
+    // Sweep any remaining references into the removed block. Pure-data
+    // consumers are erased transitively (their users join the walk); if
+    // anything observable still depends on the block, the block is kept and
+    // diagnosed instead of violating `block_remove`'s no-references contract.
+    // NOTE: single-pass and order-dependent by design: a consumer living in
+    // another dead block removed later in this loop still forces a keep (a
+    // missed optimization, never a correctness issue).
+    let mut to_nop = vec![];
+    let mut seen = HashSet::new();
+    let mut worklist = ir.block_ref_users(blkref);
+    let mut keep = false;
+    while let Some(r) = worklist.pop() {
+      if !seen.insert(r) { continue; }
+      // NOTE: `instr()` panics on refs into removed blocks rather than
+      // returning None, so this only skips non-instruction refs, which never
+      // enter the worklist; kept as defense in depth.
+      let Some(instr) = ir.instr(r) else { continue };
+      if !is_nopable_consumer(instr) {
+        keep = true;
+        break;
+      }
+      to_nop.push(r);
+      for b in ir.iter_blocks() {
+        // Self-block references die with the block; only outside users matter.
+        if b == blkref {
+          continue;
+        }
+        for u in ir.iter_instrs(b) {
+          let Some(ui) = ir.instr(u) else { continue };
+          if ui.opcode == Opcode::Nop { continue; }
+          if ui.operands.contains(&r) {
+            worklist.push(u);
+          }
+        }
+      }
+    }
+    let still_pred = ir.iter_blocks().any(|b| ir.block(b).preds.contains(&blkref));
+    if keep || still_pred {
+      for ((exit, idxs), removed) in exits.into_iter().zip(removed_phis) {
+        restore_exit(ir, blkref, exit, &idxs, removed);
+      }
+      let users = ir.block_ref_users(blkref);
+      eprintln!("WARN: deadblock_elimination: keeping unreachable '{}' ({:?}): still referenced by {} instruction(s) (e.g. {:?}); skipping removal",
+        ir.block(blkref).name, blkref, users.len(), users.first());
+      continue;
+    }
+
+    for r in &to_nop {
+      let instr = ir.instr_mut(*r).unwrap();
+      instr.opcode = Opcode::Nop;
+      instr.operands = vec![];
+    }
+    ir.drop_defs_into_block(blkref);
+    ir.drop_incomplete_phis_into_block(blkref);
     ir.block_remove(blkref);
   }
 }
@@ -1414,5 +1537,302 @@ mod tests {
     simplify_sign_conds(&mut ir);
 
     assert_eq!(ir.instr(condition).unwrap().opcode, Opcode::SignFlags);
+  }
+
+  // Builds the issue #64 fixture: a live pure-data consumer holding an
+  // operand into a block with zero preds. Returns (ir, entry, dead, consumer).
+  fn dangling_ref_fixture() -> (IR, BlockRef, BlockRef, Ref) {
+    let (mut ir, entry) = test_ir();
+    let dead = ir.add_block("dead"); // never targeted: zero preds
+    let seven = ir.const_new(7);
+    let dead_val = append_typed(&mut ir, dead, Type::U16, Opcode::Add, vec![seven, seven]);
+    let k = ir.const_new(4);
+    let consumer = ir.block_instr_append(entry, Instr {
+      typ: Type::U16,
+      compare_width: None,
+      attrs: Attribute::STACK_PTR,
+      opcode: Opcode::Add,
+      operands: vec![dead_val, k],
+    });
+    (ir, entry, dead, consumer)
+  }
+
+  #[test]
+  fn deadblock_elimination_repairs_dangling_data_refs() {
+    // Issue #64: a live pure-data consumer of a removed block must be erased,
+    // not left dangling to panic a later pass in IR::block.
+    let (mut ir, _entry, dead, consumer) = dangling_ref_fixture();
+
+    deadblock_elimination(&mut ir);
+
+    assert!(ir.blocks[dead.0].is_none(), "dead block must have been removed");
+    assert_eq!(ir.instr(consumer).unwrap().opcode, Opcode::Nop,
+      "consumer of the removed block must be erased");
+
+    // The exact issue backtrace: stack_ptr_accumulation dereferenced the
+    // dangling ref through IR::instr -> IR::block.
+    stack_ptr_accumulation(&mut ir);
+  }
+
+  #[test]
+  fn deadblock_dangling_ref_survives_full_optimize() {
+    let (mut ir, _entry, dead, _consumer) = dangling_ref_fixture();
+
+    optimize(&mut ir);
+
+    assert!(ir.blocks[dead.0].is_none(), "dead block must have been removed");
+  }
+
+  #[test]
+  fn deadblock_keeps_block_with_side_effecting_consumer() {
+    // A store consuming a dead block's value is observable: the block must be
+    // kept (with a WARN) rather than removed, leaving no dangling refs.
+    let (mut ir, entry) = test_ir();
+    let dead = ir.add_block("dead"); // zero preds
+    let seven = ir.const_new(7);
+    let dead_val = append(&mut ir, dead, Opcode::Add, vec![seven, seven]);
+    let seg = Ref::Init(crate::asm::instr::Reg::SS);
+    let off = ir.const_new(0x10);
+    let store = append_typed(&mut ir, entry, Type::Void, Opcode::Store16, vec![seg, off, dead_val]);
+
+    deadblock_elimination(&mut ir);
+
+    assert!(ir.blocks[dead.0].is_some(), "referenced dead block must be kept");
+    assert_eq!(ir.instr(store).unwrap().opcode, Opcode::Store16);
+    // Kept blocks leave valid refs behind for later passes.
+    stack_ptr_accumulation(&mut ir);
+    optimize(&mut ir);
+  }
+
+  #[test]
+  fn deadblock_keeps_block_with_branch_consumer() {
+    // A branch condition consuming a dead block's value is observable.
+    let (mut ir, entry) = test_ir();
+    let dead = ir.add_block("dead"); // zero preds
+    let seven = ir.const_new(7);
+    let dead_val = append(&mut ir, dead, Opcode::Add, vec![seven, seven]);
+    let taken = ir.add_block("taken");
+    let fall = ir.add_block("fall");
+    ir.block_mut(taken).preds.push(entry);
+    ir.block_mut(fall).preds.push(entry);
+    let jne = append_typed(&mut ir, entry, Type::Void, Opcode::Jne,
+      vec![dead_val, Ref::Block(taken), Ref::Block(fall)]);
+
+    deadblock_elimination(&mut ir);
+
+    assert!(ir.blocks[dead.0].is_some(), "referenced dead block must be kept");
+    assert_eq!(ir.instr(jne).unwrap().opcode, Opcode::Jne);
+    optimize(&mut ir);
+  }
+
+  #[test]
+  fn deadblock_drops_var_mappings_into_removed_block() {
+    // A var mapping resolving into a removed block must be dropped so get_var
+    // can never return a dangling ref.
+    let (mut ir, entry) = test_ir();
+    let dead = ir.add_block("dead"); // zero preds
+    let seven = ir.const_new(7);
+    let dead_val = append(&mut ir, dead, Opcode::Add, vec![seven, seven]);
+    ir.set_var(crate::asm::instr::Reg::AX, entry, dead_val);
+
+    deadblock_elimination(&mut ir);
+
+    assert!(ir.blocks[dead.0].is_none(), "dead block must have been removed");
+    assert!(!ir.block(entry).defs.values().any(|v| *v == dead_val),
+      "mapping into the removed block must be dropped");
+  }
+
+  #[test]
+  fn deadblock_erases_transitive_pure_consumers() {
+    // dead -> A (pure) -> B (pure): the whole cone is erased with the block.
+    let (mut ir, entry) = test_ir();
+    let dead = ir.add_block("dead"); // zero preds
+    let seven = ir.const_new(7);
+    let dead_val = append(&mut ir, dead, Opcode::Add, vec![seven, seven]);
+    let k = ir.const_new(4);
+    let a = append(&mut ir, entry, Opcode::Add, vec![dead_val, k]);
+    let b = append(&mut ir, entry, Opcode::Xor, vec![a, a]);
+
+    deadblock_elimination(&mut ir);
+
+    assert!(ir.blocks[dead.0].is_none(), "dead block must have been removed");
+    assert_eq!(ir.instr(a).unwrap().opcode, Opcode::Nop, "direct consumer must be erased");
+    assert_eq!(ir.instr(b).unwrap().opcode, Opcode::Nop, "transitive consumer must be erased");
+    optimize(&mut ir);
+  }
+
+  #[test]
+  fn deadblock_keep_path_restores_exit_repair() {
+
+    // A kept block must leave its successors' preds/Phis exactly as found:
+    // the exit repair is restored, not left half-applied.
+    let (mut ir, entry) = test_ir();
+    let dead = ir.add_block("dead"); // zero preds
+    let seven = ir.const_new(7);
+    let dead_val = append(&mut ir, dead, Opcode::Add, vec![seven, seven]);
+    let target = ir.add_block("target");
+    ir.block_mut(target).preds.push(dead);
+    append_typed(&mut ir, dead, Type::Void, Opcode::Jmp, vec![Ref::Block(target)]);
+    let seg = Ref::Init(crate::asm::instr::Reg::SS);
+    let off = ir.const_new(0x10);
+    append_typed(&mut ir, entry, Type::Void, Opcode::Store16, vec![seg, off, dead_val]);
+
+    deadblock_elimination(&mut ir);
+
+    assert!(ir.blocks[dead.0].is_some(), "referenced dead block must be kept");
+    assert_eq!(ir.block(target).preds, vec![dead],
+      "exit repair must be restored on the keep path");
+    optimize(&mut ir);
+  }
+
+  #[test]
+  fn deadblock_keeps_block_with_transitive_side_effecting_consumer() {
+    // dead -> A (pure) -> B (store): the observable tail keeps the block.
+    let (mut ir, entry) = test_ir();
+    let dead = ir.add_block("dead"); // zero preds
+    let seven = ir.const_new(7);
+    let dead_val = append(&mut ir, dead, Opcode::Add, vec![seven, seven]);
+    let k = ir.const_new(4);
+    let a = append(&mut ir, entry, Opcode::Add, vec![dead_val, k]);
+    let seg = Ref::Init(crate::asm::instr::Reg::SS);
+    let off = ir.const_new(0x10);
+    let store = append_typed(&mut ir, entry, Type::Void, Opcode::Store16, vec![seg, off, a]);
+
+    deadblock_elimination(&mut ir);
+
+    assert!(ir.blocks[dead.0].is_some(), "referenced dead block must be kept");
+    assert_eq!(ir.instr(a).unwrap().opcode, Opcode::Add, "nothing may be erased on the keep path");
+    assert_eq!(ir.instr(store).unwrap().opcode, Opcode::Store16);
+    optimize(&mut ir);
+  }
+
+  #[test]
+  fn deadblock_removes_self_referencing_block() {
+    // References from inside the dead block itself die with the block and
+    // must not force a keep: a self-looping unreachable block is removed.
+    let (mut ir, _entry) = test_ir();
+    let dead = ir.add_block("dead"); // zero preds
+    let seven = ir.const_new(7);
+    append(&mut ir, dead, Opcode::Add, vec![seven, seven]);
+    append_typed(&mut ir, dead, Type::Void, Opcode::Jmp, vec![Ref::Block(dead)]);
+
+    deadblock_elimination(&mut ir);
+
+    assert!(ir.blocks[dead.0].is_none(), "self-referencing dead block must be removed");
+    optimize(&mut ir);
+  }
+
+  #[test]
+  fn deadblock_skips_exit_without_recorded_edge() {
+    // A dead block jumping to a block that does not list it as a predecessor
+    // (truncated edge, stale CFG) must not panic on the missing pred index.
+    let (mut ir, _entry) = test_ir();
+    let dead = ir.add_block("dead"); // zero preds
+    let seven = ir.const_new(7);
+    append(&mut ir, dead, Opcode::Add, vec![seven, seven]);
+    let ghost = ir.add_block("ghost"); // no preds recorded
+    append_typed(&mut ir, dead, Type::Void, Opcode::Jmp, vec![Ref::Block(ghost)]);
+
+    deadblock_elimination(&mut ir);
+
+    assert!(ir.blocks[dead.0].is_none(), "dead block must be removed");
+    optimize(&mut ir);
+  }
+
+  #[test]
+  fn deadblock_skips_short_phi_operands() {
+
+    // A Phi shorter than the predecessor list (malformed input) must not
+    // panic the operand removal; it is left alone.
+    let (mut ir, entry) = test_ir();
+    let dead = ir.add_block("dead"); // zero preds
+    let seven = ir.const_new(7);
+    let dead_val = append(&mut ir, dead, Opcode::Add, vec![seven, seven]);
+    let exit = ir.add_block("exit");
+    ir.block_mut(exit).preds.push(entry);
+    ir.block_mut(exit).preds.push(dead);
+    let x = ir.const_new(0x11);
+    let phi = append_typed(&mut ir, exit, Type::U16, Opcode::Phi, vec![x]);
+    append_typed(&mut ir, dead, Type::Void, Opcode::Jmp, vec![Ref::Block(exit)]);
+    // Keep dead_val referenced only by the block itself so removal proceeds.
+    let _ = dead_val;
+
+    deadblock_elimination(&mut ir);
+
+    assert!(ir.blocks[dead.0].is_none(), "dead block must be removed");
+    assert_eq!(ir.block(exit).preds, vec![entry]);
+    assert_eq!(ir.instr(phi).unwrap().operands, vec![x], "short Phi must be left alone");
+    optimize(&mut ir);
+  }
+
+  #[test]
+  fn deadblock_repairs_duplicate_edges_together() {
+    // Duplicate edges to one exit (e.g. JmpTbl) share a single repair entry:
+    // repairing each occurrence independently would corrupt the survivor.
+    // The exit itself stays alive via its other predecessor.
+    let (mut ir, entry) = test_ir();
+    let dead = ir.add_block("dead"); // zero preds
+    let seven = ir.const_new(7);
+    append(&mut ir, dead, Opcode::Add, vec![seven, seven]);
+    let exit = ir.add_block("exit");
+    ir.block_mut(exit).preds.push(entry);
+    ir.block_mut(exit).preds.push(dead);
+    ir.block_mut(exit).preds.push(dead);
+    // Phi positions mirror preds ([entry, dead, dead]), so the surviving
+    // operand must be the entry's own.
+    let en = ir.const_new(0x11);
+    let d0 = ir.const_new(0x22);
+    let d1 = ir.const_new(0x33);
+    let phi = append_typed(&mut ir, exit, Type::U16, Opcode::Phi, vec![en, d0, d1]);
+    let idx = ir.const_new(0);
+    append_typed(&mut ir, dead, Type::Void, Opcode::JmpTbl, vec![idx, Ref::Block(exit), Ref::Block(exit)]);
+
+    deadblock_elimination(&mut ir);
+
+    assert!(ir.blocks[dead.0].is_none(), "dead block must be removed");
+    assert_eq!(ir.block(exit).preds, vec![entry], "both duplicate preds must be repaired");
+    assert_eq!(ir.instr(phi).unwrap().operands, vec![en], "both duplicate Phi operands must be repaired");
+    optimize(&mut ir);
+  }
+
+  #[test]
+  fn exit_repair_restore_roundtrips_interleaved_duplicates() {
+    // Direct repair/restore check with interleaved preds: removal runs
+    // descending so positions never shift; restore runs ascending.
+    let (mut ir, entry) = test_ir();
+    let dead = ir.add_block("dead");
+    let exit = ir.add_block("exit");
+    ir.block_mut(exit).preds.push(dead);
+    ir.block_mut(exit).preds.push(entry);
+    ir.block_mut(exit).preds.push(dead);
+    let d0 = ir.const_new(0x11);
+    let e = ir.const_new(0x22);
+    let d1 = ir.const_new(0x33);
+    let phi = append_typed(&mut ir, exit, Type::U16, Opcode::Phi, vec![d0, e, d1]);
+
+    let removed = repair_exit(&mut ir, exit, &[2, 0]);
+    assert_eq!(ir.block(exit).preds, vec![entry]);
+    assert_eq!(ir.instr(phi).unwrap().operands, vec![e]);
+    restore_exit(&mut ir, dead, exit, &[2, 0], removed);
+    assert_eq!(ir.block(exit).preds, vec![dead, entry, dead]);
+    assert_eq!(ir.instr(phi).unwrap().operands, vec![d0, e, d1]);
+  }
+
+  #[test]
+  fn deadblock_keeps_block_with_writearr_consumer() {
+    // WriteArr performs an observable write (not covered by
+    // has_side_effects): it must keep the block, like Store.
+    let (mut ir, entry) = test_ir();
+    let dead = ir.add_block("dead"); // zero preds
+    let seven = ir.const_new(7);
+    let dead_val = append(&mut ir, dead, Opcode::Add, vec![seven, seven]);
+    let arr = Ref::Init(crate::asm::instr::Reg::SI);
+    let off = ir.const_new(0x10);
+    let write = append_typed(&mut ir, entry, Type::Void, Opcode::WriteArr16, vec![arr, off, dead_val]);
+
+    deadblock_elimination(&mut ir);
+
+    assert!(ir.blocks[dead.0].is_some(), "referenced dead block must be kept");
+    assert_eq!(ir.instr(write).unwrap().opcode, Opcode::WriteArr16);
   }
 }
