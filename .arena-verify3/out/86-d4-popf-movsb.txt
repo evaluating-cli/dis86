@@ -1,7 +1,7 @@
 $ dis86 --config .bsl --binary-raw .bin --name test --emit-code d4-popf-movsb.c --codegen-hydra
 relocatable segments: []
 
-thread 'main' (3440) panicked at src/decompile/ir_build.rs:1987:12:
+thread 'main' (3317) panicked at src/decompile/ir_build.rs:1987:12:
 Unimpl opcode: OP_POPF
 note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
 Error: Panicked while decompiling test; continuing with the rest.

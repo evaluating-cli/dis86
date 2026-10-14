@@ -1,0 +1,22 @@
+$ dis86 --config .bsl --binary-raw .bin --name test --emit-code p-lodsb-si.c --codegen-hydra
+relocatable segments: []
+exit=0
+OUTPUT FILE: present (157 bytes)
+----- p-lodsb-si.c -----
+HYDRA_FUNC(H_test)
+{
+  u16 SP0 = SP;
+
+  FRAME_ENTER(0);
+
+  u16 ax_3;
+
+  ax_3 = SI + (CX * 1);
+  DX = DX;
+  AX = ax_3;
+  FRAME_LEAVE();
+  RETURN_NEAR();
+
+}
+
+

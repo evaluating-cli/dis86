@@ -1,7 +1,7 @@
 $ dis86 --config .bsl --binary-raw .bin --name test --emit-code t85-aaa.c --codegen-hydra
 relocatable segments: []
 
-thread 'main' (3389) panicked at src/decompile/ir_build.rs:1987:12:
+thread 'main' (3266) panicked at src/decompile/ir_build.rs:1987:12:
 Unimpl opcode: OP_AAA
 note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
 Error: Panicked while decompiling test; continuing with the rest.
