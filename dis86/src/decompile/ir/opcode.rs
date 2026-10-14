@@ -83,6 +83,13 @@ pub enum Opcode {
   CallArgs,
   Int,
 
+  // REP-prefixed string ops beyond the single-step forms. Each renders as
+  // a runtime bulk macro (REP_MOVSB/... in hydra's machine.h) and is a
+  // side effect; the deterministic register updates (CX->0, SI/DI +=
+  // CX0*size) are modeled separately as ordinary IR values.
+  RepMovs,
+  RepStos,
+
   RetFar,
   RetNear,
 
@@ -170,6 +177,8 @@ impl Opcode {
       Opcode::CallPtr     => "callptr",
       Opcode::CallArgs    => "callargs",
       Opcode::Int         => "int",
+      Opcode::RepMovs     => "repmovs",
+      Opcode::RepStos     => "repstos",
       Opcode::RetFar      => "retf",
       Opcode::RetNear     => "retn",
       Opcode::Jmp         => "jmp",
@@ -291,6 +300,8 @@ impl Opcode {
       Opcode::CallPtr => true,
       Opcode::CallArgs => true,
       Opcode::Int => true,
+      Opcode::RepMovs => true,
+      Opcode::RepStos => true,
       Opcode::RetFar => true,
       Opcode::RetNear => true,
       Opcode::Jmp => true,

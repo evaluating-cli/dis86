@@ -98,6 +98,33 @@
 #define PTR_16(seg, off) ((u16*)m->hardware->mem_hostaddr(m->hardware->ctx, ADDR(seg, off)))
 #define PTR_32(seg, off) ((u32*)m->hardware->mem_hostaddr(m->hardware->ctx, ADDR(seg, off)))
 
+/* REP-prefixed MOVS/STOS: counted bulk operations. The decompiler passes
+ * value copies of the pointers and count (it models the register updates
+ * itself), so these never touch the machine registers. Direction flag is
+ * assumed clear (the decompiler emits UNIMPL instead when it may be set). */
+#define REP_MOVSB(ds, si, es, di, cx) do { \
+    u16 _n = (cx); \
+    u16 _si = (si), _di = (di); \
+    while (_n--) { STORE_8(es, _di, LOAD_8(ds, _si)); _si++; _di++; } \
+  } while(0)
+#define REP_MOVSW(ds, si, es, di, cx) do { \
+    u16 _n = (cx); \
+    u16 _si = (si), _di = (di); \
+    while (_n--) { STORE_16(es, _di, LOAD_16(ds, _si)); _si += 2; _di += 2; } \
+  } while(0)
+#define REP_STOSB(es, di, cx, val) do { \
+    u16 _n = (cx); \
+    u16 _di = (di); \
+    u8 _v = (u8)(val); \
+    while (_n--) { STORE_8(es, _di, _v); _di++; } \
+  } while(0)
+#define REP_STOSW(es, di, cx, val) do { \
+    u16 _n = (cx); \
+    u16 _di = (di); \
+    u16 _v = (u16)(val); \
+    while (_n--) { STORE_16(es, _di, _v); _di += 2; } \
+  } while(0)
+
 #define PTR_8_FROM_32(_u32)  ({ STATIC_ASSERT_U32(_u32); u32 v = (_u32); PTR_8(v>>16, v); })
 #define PTR_16_FROM_32(_u32) ({ STATIC_ASSERT_U32(_u32); u32 v = (_u32); PTR_16(v>>16, v); })
 #define PTR_32_FROM_32(_u32) ({ STATIC_ASSERT_U32(_u32); u32 v = (_u32); PTR_32(v>>16, v); })
