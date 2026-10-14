@@ -72,6 +72,16 @@ struct IRBuilder<'a> {
   // otherwise the direction is unknown and those updates degrade to a
   // loud marker rather than silently running the wrong way.
   df_may_be_set: bool,
+
+  // Carry-out value (a 0/1 u16 Ref) of the most recent flag-writing
+  // instruction *in the current basic block*, or None when it is unknown.
+  // Cleared at every block boundary and by any flag writer that does not
+  // model its carry (see append_update_flags), and set explicitly by the
+  // producers we understand. ADC/SBB consume it to lower carry-in exactly;
+  // when it is None they stay loud rather than guess. This is only sound
+  // within a block (a carry across a control-flow merge would need a real
+  // CF SSA value); cross-block chains degrade loudly.
+  last_cf: Option<Ref>,
 }
 
 impl<'a> IRBuilder<'a> {
@@ -92,6 +102,7 @@ impl<'a> IRBuilder<'a> {
       pin_all,
 
       df_may_be_set: false,
+      last_cf: None,
     };
 
     // Create and seal the entry block
@@ -290,6 +301,9 @@ impl<'a> IRBuilder<'a> {
 
   fn switch_blk(&mut self, bref: BlockRef) {
     self.cur = bref;
+    // A carry does not survive a control-flow merge without a real CF SSA
+    // value: invalidate the tracked carry at every block boundary.
+    self.last_cf = None;
   }
 
   /// Whether a branch target lies inside the function's decoded
@@ -488,6 +502,75 @@ impl IRBuilder<'_> {
     let old_flags = self.get_flags();
     let new_flags = self.append_instr(Type::U16, Opcode::UpdateFlags, vec![old_flags, vref]);
     self.set_flags(new_flags);
+    // A flag write we do not model a carry for invalidates the tracked
+    // carry; the producers below opt back in via append_update_flags_carry.
+    self.last_cf = None;
+  }
+
+  /// Like `append_update_flags`, but records the carry-out so a following
+  /// ADC/SBB in the same block can consume it (see `last_cf`).
+  fn append_update_flags_carry(&mut self, vref: Ref, cf: Ref) {
+    let old_flags = self.get_flags();
+    let new_flags = self.append_instr(Type::U16, Opcode::UpdateFlags, vec![old_flags, vref]);
+    self.set_flags(new_flags);
+    self.last_cf = Some(cf);
+  }
+
+  fn is_word(r: Ref, ir: &IR) -> bool {
+    matches!(ir.instr(r).map(|i| i.typ.clone()), Some(Type::U16) | Some(Type::I16))
+  }
+
+  /// True when the ALU operand is 16-bit (word). Byte registers and
+  /// `byte ptr` memory are 8-bit. This is read from the *instruction*, not
+  /// the IR type: a byte register's incoming value is `Init`, which is
+  /// typed `U16`, so the IR type cannot distinguish `add al,..` from
+  /// `add ax,..` — and the carry bit differs between them.
+  fn operand_is_word(oper: &instr::Operand) -> bool {
+    match oper {
+      instr::Operand::Reg(r) => !matches!(r.0,
+        instr::Reg::AL | instr::Reg::CL | instr::Reg::DL | instr::Reg::BL |
+        instr::Reg::AH | instr::Reg::CH | instr::Reg::DH | instr::Reg::BH),
+      instr::Operand::Mem(m) => matches!(m.sz, instr::Size::Size16),
+      _ => false,
+    }
+  }
+
+  /// Carry-out of a word ADD: `(a + b) < a`. `None` for byte operands,
+  /// where the carry bit is not representable without a wider add (no
+  /// zero-extend in the IR), so callers fall back to the loud marker.
+  fn add_carry_out(&mut self, res: Ref, a: Ref) -> Option<Ref> {
+    if !Self::is_word(res, &self.ir) { return None; }
+    Some(self.append_instr(Type::U16, Opcode::ULt, vec![res, a]))
+  }
+
+  /// Borrow-out of a SUB/CMP: `a < b` (unsigned). Width-independent: the
+  /// comparison needs no extra bit, so this works for byte and word.
+  fn sub_borrow_out(&mut self, a: Ref, b: Ref) -> Ref {
+    self.append_instr(Type::U16, Opcode::ULt, vec![a, b])
+  }
+
+  /// Update flags for a simple ALU binary op, tracking the carry-out where
+  /// known: word ADD and any-width SUB/CMP enable carry chains, the
+  /// logical ops clear CF, and shifts leave it unknown.
+  fn set_flags_for_binary(&mut self, opcode: Opcode, res: Ref, a: Ref, b: Ref, word: bool) {
+    match opcode {
+      Opcode::Add if word => match self.add_carry_out(res, a) {
+        Some(cf) => self.append_update_flags_carry(res, cf),
+        None => self.append_update_flags(res),
+      },
+      Opcode::Sub => {
+        // The borrow comparison is width-independent (same-width unsigned
+        // compare), so it is correct for both byte and word.
+        let cf = self.sub_borrow_out(a, b);
+        self.append_update_flags_carry(res, cf);
+      }
+      Opcode::And | Opcode::Or | Opcode::Xor => {
+        // The logical ops clear CF (and OF).
+        let zero = self.ir.const_new(0);
+        self.append_update_flags_carry(res, zero);
+      }
+      _ => self.append_update_flags(res), // word carry unknown / shifts
+    }
   }
 
   /// String-op pointer auto-update (`SI`/`DI` += element size), assuming
@@ -870,6 +953,8 @@ impl IRBuilder<'_> {
                 instr::Reg::FLAGS] {
       self.ir.set_var(reg, self.cur, Ref::Init(reg));
     }
+    // FLAGS is now unknown, so any tracked carry is invalid.
+    self.last_cf = None;
   }
 
   fn append_cond_jump(&mut self, ins: &instr::Instr, compare_opcode: Opcode) {
@@ -951,7 +1036,8 @@ impl IRBuilder<'_> {
       let typ = self.deduce_type_binary(a, b);
       let vref = self.append_instr_with_attrs(typ, attr, opcode, vec![a, b]);
       self.append_asm_dst_operand(&ins.operands[0], vref);
-      self.append_update_flags(vref);
+      let word = Self::operand_is_word(&ins.operands[0]);
+      self.set_flags_for_binary(opcode, vref, a, b, word);
       return;
     }
 
@@ -959,17 +1045,30 @@ impl IRBuilder<'_> {
     match &ins.opcode {
       instr::Opcode::OP_NOP => (),
       instr::Opcode::OP_SBB => {
-        // FIXME: WE DON'T HAVE  A GREAT WAY TO IMPL SBC AT THE MOMENT BECAUSE IT NEEDS TO CORRECTLY
-        // CONSUME THE CARRY FLAG FROM A PREVIOUS SUBTRACT THAT GENERATED A BORROW. BUT, AT THE MOMENT,
-        // WE USE "UpdateFlags" AS A PLACEHOLDER FOR ARBITRARY FLAGS UPDATES WITHOUT BREAKING DOWN INTO
-        // THE SPECIFIC FLAGS AFFECTED. SO FOR NOW, WE'LL JAM IT THROUGH "Unimpl" AND MAKE THE USER
-        // DEAL WITH IT MANUALLY
+        // SBB consumes the incoming carry (borrow). When the CF producer is
+        // a tracked carry in this block and the operands are 16-bit, lower
+        // exactly as `a - b - cf`; otherwise stay loud rather than guess.
         let a = self.append_asm_src_operand(&ins.operands[0]);
         let b = self.append_asm_src_operand(&ins.operands[1]);
         let typ = self.deduce_type_binary(a, b);
-        let vref = self.append_instr(typ, Opcode::Unimpl, vec![a, b]);
-        self.append_asm_dst_operand(&ins.operands[0], vref);
-        self.append_update_flags(vref);
+        let word = Self::operand_is_word(&ins.operands[0]);
+        match (word, self.last_cf) {
+          (true, Some(cf)) => {
+            let t = self.append_instr(Type::U16, Opcode::Sub, vec![a, b]);
+            let vref = self.append_instr(Type::U16, Opcode::Sub, vec![t, cf]);
+            self.append_asm_dst_operand(&ins.operands[0], vref);
+            // borrow_out = (a < b) | (t < cf)
+            let b1 = self.sub_borrow_out(a, b);
+            let b2 = self.sub_borrow_out(t, cf);
+            let borrow = self.append_instr(Type::U16, Opcode::Or, vec![b1, b2]);
+            self.append_update_flags_carry(vref, borrow);
+          }
+          _ => {
+            let vref = self.append_instr(typ, Opcode::Unimpl, vec![a, b]);
+            self.append_asm_dst_operand(&ins.operands[0], vref);
+            self.append_update_flags(vref);
+          }
+        }
       }
       instr::Opcode::OP_RCL | instr::Opcode::OP_RCR => {
         // FIXME: RCL/RCR rotate *through* carry, so the value needs the
@@ -1041,13 +1140,30 @@ impl IRBuilder<'_> {
         self.append_update_flags(marker);
       }
       instr::Opcode::OP_ADC => {
-        // FIXME: SIMILAR FOR ADC ... WE SIMPLY DON'T HAVE A GREAT WAY TO CAPTURE THE SEMANTICS
+        // ADC consumes the incoming carry. When the CF producer is a tracked
+        // carry in this block and the operands are 16-bit, lower exactly as
+        // `a + b + cf`; byte operands and unknown carries stay loud.
         let a = self.append_asm_src_operand(&ins.operands[0]);
         let b = self.append_asm_src_operand(&ins.operands[1]);
         let typ = self.deduce_type_binary(a, b);
-        let vref = self.append_instr(typ, Opcode::Unimpl, vec![a, b]);
-        self.append_asm_dst_operand(&ins.operands[0], vref);
-        self.append_update_flags(vref);
+        let word = Self::operand_is_word(&ins.operands[0]);
+        match (word, self.last_cf) {
+          (true, Some(cf)) => {
+            let t = self.append_instr(Type::U16, Opcode::Add, vec![a, b]);
+            let vref = self.append_instr(Type::U16, Opcode::Add, vec![t, cf]);
+            self.append_asm_dst_operand(&ins.operands[0], vref);
+            // carry_out = (t < a) | (vref < t)
+            let c1 = self.add_carry_out(t, a).unwrap();
+            let c2 = self.add_carry_out(vref, t).unwrap();
+            let carry = self.append_instr(Type::U16, Opcode::Or, vec![c1, c2]);
+            self.append_update_flags_carry(vref, carry);
+          }
+          _ => {
+            let vref = self.append_instr(typ, Opcode::Unimpl, vec![a, b]);
+            self.append_asm_dst_operand(&ins.operands[0], vref);
+            self.append_update_flags(vref);
+          }
+        }
       }
       instr::Opcode::OP_LOOP | instr::Opcode::OP_LOOPE | instr::Opcode::OP_LOOPNE => {
         // LOOPcc decrements CX without modifying FLAGS. LOOPE/LOOPNE test the
@@ -1295,10 +1411,13 @@ impl IRBuilder<'_> {
       instr::Opcode::OP_SETBE => self.append_cond_set(ins, Opcode::ULeqFlags),
 
       instr::Opcode::OP_CALLF => {
+        // A call may clobber flags (unmodeled): the tracked carry is invalid.
+        self.last_cf = None;
         self.process_callf(ins);
       }
       instr::Opcode::OP_CALL => {
         let cs_pushed = matches!(special, Some(SpecialState::PushCS));
+        self.last_cf = None;
         self.process_calln(ins, cs_pushed);
       }
       instr::Opcode::OP_INT => {
@@ -1328,14 +1447,17 @@ impl IRBuilder<'_> {
         let b = self.append_asm_src_operand(&ins.operands[1]);
         let typ = self.deduce_type_binary(a, b);
         let vref = self.append_instr(typ, Opcode::And, vec![a, b]);
-        self.append_update_flags(vref);
+        // TEST clears CF (like the logical ops).
+        let zero = self.ir.const_new(0);
+        self.append_update_flags_carry(vref, zero);
       }
       instr::Opcode::OP_CMP => {
         let a = self.append_asm_src_operand(&ins.operands[0]);
         let b = self.append_asm_src_operand(&ins.operands[1]);
         let typ = self.deduce_type_binary(a, b);
         let vref = self.append_instr(typ, Opcode::Sub, vec![a, b]);
-        self.append_update_flags(vref);
+        let cf = self.sub_borrow_out(a, b);
+        self.append_update_flags_carry(vref, cf);
       }
       instr::Opcode::OP_CWD => {
         let src = self.append_asm_src_operand(&ins.operands[1]);
@@ -1399,9 +1521,25 @@ impl IRBuilder<'_> {
       instr::Opcode::OP_STC | instr::Opcode::OP_CLC | instr::Opcode::OP_CMC => {
         // These set/clear/complement CF. The IR carries one opaque flags
         // value, so redefining it here makes a subsequent jb/jae degrade to
-        // UNIMPL_FLAGS rather than silently reading a stale carry.
+        // UNIMPL_FLAGS rather than silently reading a stale carry. The
+        // known carry-out is still tracked for a following ADC/SBB.
         let marker = self.append_instr(Type::Void, Opcode::Unimpl, vec![]);
-        self.append_update_flags(marker);
+        let cf = match ins.opcode {
+          instr::Opcode::OP_STC => Some(self.ir.const_new(1)),
+          instr::Opcode::OP_CLC => Some(self.ir.const_new(0)),
+          // CMC complements the tracked carry; an unknown carry stays unknown.
+          _ => match self.last_cf {
+            Some(prev) => {
+              let one = self.ir.const_new(1);
+              Some(self.append_instr(Type::U16, Opcode::Xor, vec![prev, one]))
+            }
+            None => None,
+          },
+        };
+        match cf {
+          Some(cf) => self.append_update_flags_carry(marker, cf),
+          None => self.append_update_flags(marker),
+        }
       }
       instr::Opcode::OP_LODS => {
         let src = self.append_asm_src_operand(&ins.operands[1]);
@@ -2187,5 +2325,73 @@ mod tests {
     assert!(!opcode_may_set_df(instr::Opcode::OP_CLD), "CLD clears DF");
     assert!(!opcode_may_set_df(instr::Opcode::OP_MOVS));
     assert!(!opcode_may_set_df(instr::Opcode::OP_RET));
+  }
+
+  fn alu_instr(opcode: instr::Opcode, dst: instr::Reg, src: instr::Reg) -> instr::Instr {
+    let mut operands = ArrayVec::new();
+    operands.push(instr::Operand::Reg(instr::OperandReg(dst)));
+    operands.push(instr::Operand::Reg(instr::OperandReg(src)));
+    instr::Instr {
+      rep: None,
+      opcode,
+      operands,
+      addr: SegOff { seg: Seg::Normal(0), off: Off(0) },
+      n_bytes: 2,
+      intel_hidden_operand_bitmask: 0,
+    }
+  }
+
+  #[test]
+  fn alu_carry_tracking_sets_uses_preserves_and_clears() {
+    let (_types, cfg, binary, spec) = bit_test_builder(&[0xC3]);
+    let instrs: &[instr::Instr] = &[];
+    let mut b = test_builder(&cfg, instrs, &spec, &binary);
+
+    // add ax,bx sets a known carry.
+    b.append_asm_instr(&alu_instr(instr::Opcode::OP_ADD, instr::Reg::AX, instr::Reg::BX));
+    assert!(b.last_cf.is_some(), "word add must set the carry");
+    let cf1 = b.last_cf.unwrap();
+
+    // adc cx,dx consumes it and re-derives a carry.
+    b.append_asm_instr(&alu_instr(instr::Opcode::OP_ADC, instr::Reg::CX, instr::Reg::DX));
+    assert!(b.last_cf.is_some(), "adc must re-derive the carry");
+    let cf2 = b.last_cf.unwrap();
+    assert_ne!(cf2, cf1);
+
+    // mov does not touch flags: the carry is preserved.
+    b.append_asm_instr(&alu_instr(instr::Opcode::OP_MOV, instr::Reg::AX, instr::Reg::BX));
+    assert_eq!(b.last_cf, Some(cf2), "mov must preserve the tracked carry");
+
+    // and clears CF to 0.
+    b.append_asm_instr(&alu_instr(instr::Opcode::OP_AND, instr::Reg::AX, instr::Reg::BX));
+    assert_eq!(b.ir.const_lookup(b.last_cf.unwrap()), Some(0), "and clears CF");
+
+    // a shift leaves the carry unknown.
+    b.append_asm_instr(&alu_instr(instr::Opcode::OP_SHL, instr::Reg::AX, instr::Reg::CX));
+    assert!(b.last_cf.is_none(), "shift leaves the carry unknown");
+  }
+
+  #[test]
+  fn byte_add_does_not_track_carry() {
+    // The 8-bit carry is not representable in the IR (no zero-extend), so
+    // a byte add must leave the carry unknown rather than compute a wrong
+    // width-16 carry.
+    let (_types, cfg, binary, spec) = bit_test_builder(&[0xC3]);
+    let instrs: &[instr::Instr] = &[];
+    let mut b = test_builder(&cfg, instrs, &spec, &binary);
+    b.append_asm_instr(&alu_instr(instr::Opcode::OP_ADD, instr::Reg::AL, instr::Reg::BL));
+    assert!(b.last_cf.is_none(), "byte add carry must stay unknown");
+  }
+
+  #[test]
+  fn block_boundary_clears_tracked_carry() {
+    let (_types, cfg, binary, spec) = bit_test_builder(&[0xC3]);
+    let instrs: &[instr::Instr] = &[];
+    let mut b = test_builder(&cfg, instrs, &spec, &binary);
+    b.append_asm_instr(&alu_instr(instr::Opcode::OP_ADD, instr::Reg::AX, instr::Reg::BX));
+    assert!(b.last_cf.is_some());
+    let next = b.ir.add_block("next");
+    b.switch_blk(next);
+    assert!(b.last_cf.is_none(), "a new block must invalidate the tracked carry");
   }
 }
