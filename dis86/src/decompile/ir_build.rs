@@ -16,6 +16,14 @@ fn operand_is_stack_reg(operand: &instr::Operand) -> bool {
   reg == &instr::Reg::SP || reg == &instr::Reg::BP
 }
 
+/// Whether an instruction may leave the direction flag set: STD sets it
+/// explicitly, and POPF/IRET restore it from a popped flags value. (The
+/// latter are not lowered yet — they panic — but including them keeps the
+/// string-op direction guard sound if/when they are.)
+fn opcode_may_set_df(op: instr::Opcode) -> bool {
+  matches!(op, instr::Opcode::OP_STD | instr::Opcode::OP_POPF | instr::Opcode::OP_IRET)
+}
+
 fn simple_binary_operation(opcode: instr::Opcode) -> Option<Opcode> {
   match opcode {
     instr::Opcode::OP_ADD => Some(Opcode::Add),
@@ -56,12 +64,14 @@ struct IRBuilder<'a> {
   overlay: bool,
   pin_all: bool,
 
-  // Whether the decoded function contains a `std`. DF is only ever set by
-  // CLD/STD, so when no STD is present the direction is provably clear
-  // (DF=0, the DOS ABI entry/exit convention) and string-op pointer
-  // updates advance; otherwise the direction is unknown and those updates
-  // degrade to a loud marker rather than silently running the wrong way.
-  has_std: bool,
+  // Whether the decoded function may leave the direction flag set/unknown.
+  // DF is written only by CLD/STD (and by the flag-restoring POPF/IRET,
+  // which are not lowered yet but must be covered when they are). With
+  // none present the direction is provably clear (DF=0, the DOS ABI
+  // entry/exit convention) and string-op pointer updates advance;
+  // otherwise the direction is unknown and those updates degrade to a
+  // loud marker rather than silently running the wrong way.
+  df_may_be_set: bool,
 }
 
 impl<'a> IRBuilder<'a> {
@@ -81,7 +91,7 @@ impl<'a> IRBuilder<'a> {
       overlay,
       pin_all,
 
-      has_std: false,
+      df_may_be_set: false,
     };
 
     // Create and seal the entry block
@@ -482,7 +492,7 @@ impl IRBuilder<'_> {
 
   /// String-op pointer auto-update (`SI`/`DI` += element size), assuming
   /// the direction flag is clear (increment). Only called when
-  /// `!has_std`, so the direction is provably clear (DOS ABI).
+  /// `!df_may_be_set`, so the direction is provably clear (DOS ABI).
   fn advance_string_ptr(&mut self, reg: instr::Reg, size: i16) {
     let cur = self.ir.get_var(reg, self.cur);
     let step = self.ir.const_new(size);
@@ -494,7 +504,7 @@ impl IRBuilder<'_> {
   /// (with DF=0), or, when the function contains a `std`, degrade to a
   /// loud marker instead of a possibly-wrong-direction update.
   fn string_op_advance(&mut self, si: Option<&instr::Operand>, di: Option<&instr::Operand>) {
-    if self.has_std {
+    if self.df_may_be_set {
       self.append_instr(Type::Void, Opcode::Unimpl, vec![]);
       return;
     }
@@ -514,7 +524,7 @@ impl IRBuilder<'_> {
       instr::Operand::Mem(m) => match m.sz {
         instr::Size::Size8 => 1,
         instr::Size::Size16 => 2,
-        _ => 1,
+        instr::Size::Size32 => 4,
       },
       _ => 1,
     }
@@ -1423,9 +1433,10 @@ impl IRBuilder<'_> {
   }
 
   fn build(&mut self) {
-    // Step 0: Direction-flag guard. DF is written only by CLD/STD; with no
-    // STD anywhere the direction is provably clear (see the has_std field).
-    self.has_std = self.instrs.iter().any(|i| i.opcode == instr::Opcode::OP_STD);
+    // Step 0: Direction-flag guard. DF is written only by CLD/STD and the
+    // flag-restoring POPF/IRET; with none present the direction is provably
+    // clear (see the df_may_be_set field).
+    self.df_may_be_set = self.instrs.iter().any(|i| opcode_may_set_df(i.opcode));
 
     // Step 1: Infer basic-block boundaries
     let mut block_start = HashSet::new();
@@ -2141,7 +2152,7 @@ mod tests {
     let (_types, cfg, binary, spec) = bit_test_builder(&[0xC3]);
     let instrs: &[instr::Instr] = &[];
     let mut b = test_builder(&cfg, instrs, &spec, &binary);
-    b.has_std = true;
+    b.df_may_be_set = true;
     let ins = string_instr(instr::Opcode::OP_MOVS, vec![
       string_mem(instr::Size::Size16, instr::Reg::ES, instr::Reg::DI),
       string_mem(instr::Size::Size16, instr::Reg::DS, instr::Reg::SI),
@@ -2153,7 +2164,7 @@ mod tests {
   }
 
   #[test]
-  fn build_marks_has_std_from_decoded_instructions() {
+  fn build_marks_df_may_be_set_from_decoded_instructions() {
     // `std; ret` decoded: build() must set the guard so string ops in
     // this function degrade loud. Without std, the guard stays clear.
     let (_types, cfg, binary, spec) = bit_test_builder(&[0xFD, 0xC3]);
@@ -2163,6 +2174,18 @@ mod tests {
     let instrs = [ins, ret];
     let mut b = test_builder(&cfg, &instrs, &spec, &binary);
     b.build();
-    assert!(b.has_std, "build must detect STD in the decoded function");
+    assert!(b.df_may_be_set, "build must detect STD in the decoded function");
+  }
+
+  #[test]
+  fn may_set_df_covers_std_popf_and_iret() {
+    // STD sets DF; POPF/IRET restore it. If any of those gain lowering,
+    // the string-op direction guard must already treat them as DF writers.
+    assert!(opcode_may_set_df(instr::Opcode::OP_STD));
+    assert!(opcode_may_set_df(instr::Opcode::OP_POPF));
+    assert!(opcode_may_set_df(instr::Opcode::OP_IRET));
+    assert!(!opcode_may_set_df(instr::Opcode::OP_CLD), "CLD clears DF");
+    assert!(!opcode_may_set_df(instr::Opcode::OP_MOVS));
+    assert!(!opcode_may_set_df(instr::Opcode::OP_RET));
   }
 }
