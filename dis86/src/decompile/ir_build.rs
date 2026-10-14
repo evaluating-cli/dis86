@@ -165,14 +165,16 @@ impl<'a> IRBuilder<'a> {
     Some(tgts)
   }
 
-  /// Branch targets of `ins`, plus whether the last entry is the implicit
-  /// fallthrough (rather than an explicit branch target).
-  fn jump_targets(&self, ins: &instr::Instr) -> Option<(Vec<SegOff>, bool)> {
+  /// Branch targets of `ins`: the explicit targets plus, for branches
+  /// that fall through, the implicit fallthrough address. The two are
+  /// returned separately (rather than "fallthrough is last") so callers
+  /// cannot range-check the wrong subset.
+  fn jump_targets(&self, ins: &instr::Instr) -> Option<(Vec<SegOff>, Option<SegOff>)> {
     // Special handling for some indirect jumps
     if ins.opcode == instr::Opcode::OP_JMP {
       if let instr::Operand::Mem(m) = &ins.operands[0] {
         if let Some(targets) = self.jump_indirect_targets(ins, m) {
-          return Some((targets, false));
+          return Some((targets, None));
         }
         // If none.. we want to fall through so we hit the panic below
       }
@@ -214,9 +216,7 @@ impl<'a> IRBuilder<'a> {
       _ => panic!("Unsupported branch instruction: '{}' | {:?}", instr_str(ins), ins.operands[oper_num]),
     };
 
-    if fallthrough {
-      targets.push(ins.end_addr());
-    }
+    let fallthrough = fallthrough.then(|| ins.end_addr());
 
     Some((targets, fallthrough))
   }
@@ -280,8 +280,16 @@ impl<'a> IRBuilder<'a> {
     tgt.seg == self.spec.start.seg && tgt.off >= self.spec.start.off && tgt.off < self.spec.end.off
   }
 
-  fn start_next_blk(&mut self, next: SegOff) {
+  /// Whether an explicit branch target deserves the out-of-range WARN:
+  /// outside `[start, end)` and not the branch's own fallthrough (a
+  /// branch-to-next like `jz $+2` links both arms to the existing
+  /// fallthrough block, so no edge is dropped). Pure so tests can pin
+  /// the warn/skip matrix without capturing stderr.
+  fn out_of_range_edge(&self, tgt: SegOff, fallthrough: Option<SegOff>) -> bool {
+    Some(tgt) != fallthrough && !self.target_in_range(tgt)
+  }
 
+  fn start_next_blk(&mut self, next: SegOff) {
     let next_bref = self.get_block(next);
 
     // Make sure the last instruction is a jump or ret
@@ -1309,22 +1317,20 @@ impl IRBuilder<'_> {
         block_start.insert(ins.addr);
         last_was_jump = false;
       }
-      let Some((targets, fallthrough)) = self.jump_targets(ins) else { continue };
+      let Some((explicit, fallthrough)) = self.jump_targets(ins) else { continue };
       // Every target — including an implicit fallthrough — needs a block:
       // conditional lowerings resolve ins.end_addr() via get_block, which
       // panics on a missing entry when the branch is the last decoded
       // instruction. Only explicit targets are range-checked below.
-      for tgt in &targets {
+      for tgt in explicit.iter().chain(fallthrough.iter()) {
         block_start.insert(*tgt);
       }
-      // Explicit branch targets (everything but a trailing fallthrough)
-      // must lie inside the function's [start, end): anything outside
-      // decodes to zero instructions, becomes an empty block, and is
-      // silently dropped from the output. Warn loudly instead of hiding
-      // the lost edge; the drop semantics are unchanged.
-      let explicit = targets.len().saturating_sub(usize::from(fallthrough));
-      for tgt in &targets[..explicit] {
-        if !self.target_in_range(*tgt) {
+      // Explicit branch targets must lie inside the function's [start,
+      // end): anything outside decodes to zero instructions, becomes an
+      // empty block, and is silently dropped from the output. Warn loudly
+      // instead of hiding the lost edge; the drop semantics are unchanged.
+      for tgt in &explicit {
+        if self.out_of_range_edge(*tgt, fallthrough) {
           eprintln!("WARN: {}: branch at {} targets {} outside function range [{}, {}); the edge is dropped from the output",
             self.spec.name, ins.addr, tgt, self.spec.start, self.spec.end);
         }
@@ -1631,6 +1637,39 @@ mod tests {
     assert!(!b.target_in_range(end), "range end is exclusive");
     assert!(!b.target_in_range(past));
     assert!(!b.target_in_range(other_seg), "far targets are outside the range");
+  }
+
+  #[test]
+  fn out_of_range_edge_skips_fallthrough_targets() {
+    // Warn/skip matrix for the #67 diagnostic: only genuinely dropped
+    // edges warn. A branch-to-next (`jz $+2` padding) links both arms to
+    // the existing fallthrough block, so it stays silent even at end.
+    let (_types, cfg, binary, spec) = test_spec(0x10, 0x20, &[0xC3]);
+    let b = test_builder(&cfg, &[], &spec, &binary);
+    let seg = Seg::Normal(0);
+    let at = |off| SegOff { seg, off: Off(off) };
+    assert!(!b.out_of_range_edge(at(0x10), None), "in-range start is silent");
+    assert!(!b.out_of_range_edge(at(0x1A), Some(at(0x1B))), "in-range target is silent");
+    assert!(b.out_of_range_edge(at(0x20), None), "end-exclusive target warns");
+    assert!(b.out_of_range_edge(at(0x25), Some(at(0x12))), "out-of-range target warns");
+    assert!(!b.out_of_range_edge(at(0x20), Some(at(0x20))), "branch-to-next at end is silent");
+    assert!(!b.out_of_range_edge(at(0x15), Some(at(0x15))), "branch-to-next mid-range is silent");
+    assert!(b.out_of_range_edge(SegOff { seg: Seg::Normal(1), off: Off(0x12) }, None), "far target warns");
+  }
+
+  #[test]
+  fn branch_to_next_at_end_links_both_arms_silently() {
+    // `jz $+2` padding as the last instruction: the explicit target
+    // equals the fallthrough (spec.end), so no edge is dropped — both
+    // arms link to the one fallthrough block.
+    let (_types, cfg, binary, spec) = test_spec(0x0000, 0x0004, &[0xC3]);
+    // JNE at 0x0002, 2 bytes: end 0x0004; rel 0 -> target == fallthrough.
+    let instrs = [jmp_instr(instr::Opcode::OP_JNE, 0x0002, 2, 0)];
+    let mut b = test_builder(&cfg, &instrs, &spec, &binary);
+    b.build();
+    let fall = SegOff { seg: Seg::Normal(0), off: Off(0x0004) };
+    let blk = *b.addrmap.get(&fall).expect("fallthrough block exists");
+    assert_eq!(b.ir.block(blk).preds.len(), 2, "both arms link to the fallthrough block");
   }
 
   #[test]
