@@ -71,10 +71,13 @@ fn rol_imm_decompiles_without_unimpl() {
   ];
   let source = decompile_raw(&code);
 
-  // The bare `UNIMPL()` *statement* is the intended loud flags marker
-  // (same as `stc` produces); what must be gone is an operand-carrying
-  // `UNIMPL(..)` in value position, which aborts the native run.
-  assert!(!source.contains("UNIMPL(("), "ROL value must not be UNIMPL:\n{source}");
+  // gen.rs renders both the abort-class value UNIMPL and the loud
+  // flags marker as `UNIMPL(...)`: strip the exact bare-marker
+  // statement, then no `UNIMPL(` may remain in value position.
+  assert!(!source.replace("UNIMPL()", "").contains("UNIMPL("),
+    "ROL value must not be UNIMPL:\n{source}");
+  assert!(source.contains("UNIMPL() /* UNIMPL op */;"),
+    "ROL must clobber flags with the loud marker statement:\n{source}");
   assert!(source.contains("<<"), "ROL must lower to a left shift:\n{source}");
   assert!(source.contains(">>"), "ROL must lower to a right shift:\n{source}");
 }
@@ -91,7 +94,10 @@ fn ror_cl_decompiles_without_unimpl() {
   ];
   let source = decompile_raw(&code);
 
-  assert!(!source.contains("UNIMPL(("), "ROR value must not be UNIMPL:\n{source}");
+  assert!(!source.replace("UNIMPL()", "").contains("UNIMPL("),
+    "ROR value must not be UNIMPL:\n{source}");
+  assert!(source.contains("UNIMPL() /* UNIMPL op */;"),
+    "ROR must clobber flags with the loud marker statement:\n{source}");
   assert!(source.contains("<<"), "ROR must lower to a left shift:\n{source}");
   assert!(source.contains(">>"), "ROR must lower to a right shift:\n{source}");
 }
@@ -107,5 +113,44 @@ fn rcl_still_emits_unimpl() {
   ];
   let source = decompile_raw(&code);
 
-  assert!(source.contains("UNIMPL("), "RCL still needs the carry slice:\n{source}");
+  assert!(source.contains("/* UNIMPL op */"), "RCL still needs the carry slice:\n{source}");
+  assert!(!source.contains("/* UNIMPL flags */"), "RCL carries no flags marker:\n{source}");
+}
+
+// rol byte ptr [0x100],1; ret
+// Memory destinations go through the Load8/Store8 + U8 path (not the
+// register-fragment path); the read-modify-write store keeps the value
+// observable on its own.
+#[test]
+fn rol_mem_byte_decompiles_without_unimpl_op() {
+  let code = [
+    0xC0, 0x06, 0x00, 0x01, 0x01, // rol byte ptr [0x100],1
+    0xC3,                         // ret
+  ];
+  let source = decompile_raw(&code);
+
+  assert!(!source.replace("UNIMPL()", "").contains("UNIMPL("),
+    "ROL value must not be UNIMPL:\n{source}");
+  assert!(source.contains("UNIMPL() /* UNIMPL op */;"),
+    "ROL must clobber flags with the loud marker statement:\n{source}");
+  assert!(source.contains("<<"), "ROL must lower to a left shift:\n{source}");
+  assert!(source.contains(">>"), "ROL must lower to a right shift:\n{source}");
+  assert!(source.contains("PTR_8"), "read-modify-write must store a byte:\n{source}");
+}
+
+// mov ax,0x1234; rol ax,1; jc +1; nop; ret
+// A branch on rotated flags must degrade to the loud non-fatal
+// UNIMPL_FLAGS marker, never to a folded or silent condition.
+#[test]
+fn branch_on_rotated_flags_degrades_loud() {
+  let code = [
+    0xB8, 0x34, 0x12, // mov ax,0x1234
+    0xC1, 0xC0, 0x01, // rol ax,1
+    0x72, 0x01,       // jc +1
+    0x90,             // nop
+    0xC3,             // ret
+  ];
+  let source = decompile_raw(&code);
+
+  assert!(source.contains("UNIMPL_FLAGS"), "branch on rotated flags must stay explicit:\n{source}");
 }

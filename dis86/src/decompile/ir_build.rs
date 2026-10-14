@@ -926,25 +926,40 @@ impl IRBuilder<'_> {
       instr::Opcode::OP_ROL | instr::Opcode::OP_ROR => {
         // #69 slice 1: ROL/ROR take no carry *in*, so the value is exact
         // as shifts+or: rol(v,c) = (v<<n)|(v>>(w-n)) with n = c&(w-1),
-        // which subsumes x86's 5-bit count mask (w is a power of 2).
+        // which subsumes x86's 5-bit count mask (w is a power of 2). The
+        // complementary shift is masked the same way so a zero count
+        // yields (v<<0)|(v>>0) = v without a shift-by-width, which IR
+        // reasoning cannot justify (only C promotion makes that defined).
         // Only the flags (CF/OF) are approximated: clobber them with an
         // opaque marker (STC/CLC/CMC precedent) so a following branch
         // degrades to loud UNIMPL_FLAGS, never silent. A zero count is
         // conservatively clobbered too (real HW preserves flags there,
         // but that shape is vanishingly rare outside padding).
         let is_rol = ins.opcode == instr::Opcode::OP_ROL;
-        let width: i16 = match &ins.operands[0] {
+        let width: Option<i16> = match &ins.operands[0] {
           instr::Operand::Reg(r) => match r.0 {
             instr::Reg::AL | instr::Reg::CL | instr::Reg::DL | instr::Reg::BL |
-            instr::Reg::AH | instr::Reg::CH | instr::Reg::DH | instr::Reg::BH => 8,
-            _ => 16,
+            instr::Reg::AH | instr::Reg::CH | instr::Reg::DH | instr::Reg::BH => Some(8),
+            _ => Some(16),
           },
           instr::Operand::Mem(m) => match m.sz {
-            instr::Size::Size8 => 8,
-            instr::Size::Size16 => 16,
-            _ => panic!("Unsupported rotate operand size for '{}'", instr_str(ins)),
+            instr::Size::Size8 => Some(8),
+            instr::Size::Size16 => Some(16),
+            // Unreachable via decode (no 0x66 operand-size prefix; the
+            // fmt table yields RM8/RM16 rotate dests only): degrade
+            // gracefully like RCL/RCR rather than panicking.
+            _ => None,
           },
-          _ => panic!("Unsupported rotate destination for '{}'", instr_str(ins)),
+          _ => None,
+        };
+        let Some(width) = width else {
+          let a = self.append_asm_src_operand(&ins.operands[0]);
+          let b = self.append_asm_src_operand(&ins.operands[1]);
+          let typ = self.deduce_type_binary(a, b);
+          let vref = self.append_instr(typ, Opcode::Unimpl, vec![a, b]);
+          self.append_asm_dst_operand(&ins.operands[0], vref);
+          self.append_update_flags(vref);
+          return;
         };
         let v = self.append_asm_src_operand(&ins.operands[0]);
         let c = self.append_asm_src_operand(&ins.operands[1]);
@@ -952,7 +967,8 @@ impl IRBuilder<'_> {
         let mask = self.ir.const_new(width - 1);
         let w = self.ir.const_new(width);
         let n = self.append_instr(Type::U16, Opcode::And, vec![c, mask]);
-        let m = self.append_instr(Type::U16, Opcode::Sub, vec![w, n]);
+        let diff = self.append_instr(Type::U16, Opcode::Sub, vec![w, n]);
+        let m = self.append_instr(Type::U16, Opcode::And, vec![diff, mask]);
         let (fwd, bwd) = if is_rol {
           (self.append_instr(typ.clone(), Opcode::Shl, vec![v, n]),
            self.append_instr(typ.clone(), Opcode::UShr, vec![v, m]))
@@ -1842,22 +1858,33 @@ mod tests {
     b.append_asm_instr(&ins);
 
     let or = only_instr(&b.ir, cur, Opcode::Or);
-    let or_instr = b.ir.instr(or).unwrap();
-    let shl = b.ir.instr(or_instr.operands[0]).unwrap();
-    let ushr = b.ir.instr(or_instr.operands[1]).unwrap();
+    let or_len = b.ir.instr(or).unwrap().operands.len();
+    let shl = b.ir.instr(b.ir.instr(or).unwrap().operands[0]).unwrap();
+    let ushr = b.ir.instr(b.ir.instr(or).unwrap().operands[1]).unwrap();
     assert_eq!(shl.opcode, Opcode::Shl, "ROL leads with Shl");
     assert_eq!(ushr.opcode, Opcode::UShr, "ROL trails with UShr");
-    // Both shifts read the initial AX; the complementary shift reuses
-    // the masked count via Sub (checked below).
+    // Both shifts read the initial AX. The count is masked twice: n
+    // masks the raw count, m masks the complementary shift so a zero
+    // count yields (v<<0)|(v>>0) without a shift-by-width.
     assert_eq!(shl.operands[0], Ref::Init(instr::Reg::AX));
     assert_eq!(ushr.operands[0], Ref::Init(instr::Reg::AX));
-    let and = b.ir.instr(shl.operands[1]).unwrap();
-    assert_eq!(and.opcode, Opcode::And);
-    assert_eq!(b.ir.const_lookup(and.operands[1]), Some(15), "16-bit rotate masks with 15");
-    let sub = b.ir.instr(ushr.operands[1]).unwrap();
+    let ands: Vec<Ref> = b.ir.iter_instrs(cur)
+      .filter(|r| b.ir.instr(*r).unwrap().opcode == Opcode::And)
+      .collect();
+    assert_eq!(ands.len(), 2, "count mask plus complementary-shift mask");
+    let n = *ands.iter().find(|r| {
+      let i = b.ir.instr(**r).unwrap();
+      b.ir.const_lookup(i.operands[0]) == Some(1) && b.ir.const_lookup(i.operands[1]) == Some(15)
+    }).expect("count mask And [1, 15] present");
+    let m = *ands.iter().find(|r| **r != n).expect("second And present");
+    let m_instr = b.ir.instr(m).unwrap();
+    let sub = b.ir.instr(m_instr.operands[0]).unwrap();
     assert_eq!(sub.opcode, Opcode::Sub);
     assert_eq!(b.ir.const_lookup(sub.operands[0]), Some(16));
-    assert_eq!(sub.operands[1], shl.operands[1], "complementary shift reuses the masked count");
+    assert_eq!(sub.operands[1], n, "complementary shift derives from the masked count");
+    assert_eq!(b.ir.const_lookup(m_instr.operands[1]), Some(15), "complementary shift is masked too");
+    assert_eq!(shl.operands[1], n);
+    assert_eq!(ushr.operands[1], m);
     // Destination and flags.
     assert_eq!(b.ir.get_var(instr::Reg::AX, cur), or, "ROL writes the Or back to AX");
     let f = b.get_flags();
@@ -1880,13 +1907,13 @@ mod tests {
     let ins = rotate_instr(instr::Opcode::OP_ROR, instr::Reg::BL, cl);
     b.append_asm_instr(&ins);
 
-    // Byte-dest writes recompose the full register, so the block holds
-    // two Ors: the rotate shape plus the BX recomposition. Pick the
-    // rotate one by its [UShr, Shl] operand pattern.
+    // Byte-dest writes recompose the full register, which adds its own
+    // Or/And shape to the block: pick the rotate instrs by operand
+    // pattern, not by count, so the test is robust to
+    // recomposition/CSE changes.
     let ors: Vec<Ref> = b.ir.iter_instrs(cur)
       .filter(|r| b.ir.instr(*r).unwrap().opcode == Opcode::Or)
       .collect();
-    assert_eq!(ors.len(), 2, "rotate Or plus BX fragment recomposition Or");
     let or = *ors.iter().find(|r| {
       let i = b.ir.instr(**r).unwrap();
       b.ir.instr(i.operands[0]).unwrap().opcode == Opcode::UShr
