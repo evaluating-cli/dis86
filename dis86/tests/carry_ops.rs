@@ -109,6 +109,24 @@ fn byte_adc_is_exact() {
   assert!(source.contains("255 <"), "byte carry must use the 8-bit bound:\n{source}");
 }
 
+// mov ax,0x1234; add al,0x00; adc al,0x00; ret
+// A byte fragment from a 16-bit write holds the full parent value in the IR
+// (AL = Lower16(AX) = 0x1234), so the byte carry must mask it to 8 bits:
+// otherwise `255 < al` sees 0x1234 and wrongly reports a carry, making the
+// ADC add 1 (0x35 instead of 0x34).
+#[test]
+fn byte_carry_masks_wide_fragment() {
+  let code = [0xB8, 0x34, 0x12, 0x04, 0x00, 0x14, 0x00, 0xC3];
+  let source = decompile_raw(&code);
+
+  assert!(!source.contains("UNIMPL"), "must be exact:\n{source}");
+  assert!(
+    !source.contains("255 < al_2"),
+    "byte carry must not compare the full 16-bit fragment:\n{source}"
+  );
+  assert!(source.contains("& 255"), "byte carry must mask the operand:\n{source}");
+}
+
 // add al,bl; adc al,cl; adc al,dl; ret
 // The middle ADC's carry-out must feed the last ADC as bit 8 (`0xFF < sum`),
 // not the bit-16 form that is always 0 for byte operands. Two distinct 8-bit
