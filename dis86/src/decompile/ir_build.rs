@@ -74,14 +74,30 @@ struct IRBuilder<'a> {
   df_may_be_set: bool,
 
   // Carry-out value (a 0/1 u16 Ref) of the most recent flag-writing
-  // instruction *in the current basic block*, or None when it is unknown.
-  // Cleared at every block boundary and by any flag writer that does not
-  // model its carry (see append_update_flags), and set explicitly by the
-  // producers we understand. ADC/SBB consume it to lower carry-in exactly;
-  // when it is None they stay loud rather than guess. This is only sound
-  // within a block (a carry across a control-flow merge would need a real
-  // CF SSA value); cross-block chains degrade loudly.
+  // instruction in the current basic block, or None when the value has not
+  // been materialized yet. `carry_known` says whether a carry is currently
+  // known at all; when it is set but `last_cf` is None the value lives in the
+  // CF SSA variable and is pulled on first use (see `get_cf`). Producers set
+  // both, and any flag writer that does not model its carry clears them.
   last_cf: Option<Ref>,
+  carry_known: bool,
+
+  // Carry (CF) is threaded across basic blocks as a real SSA value under a
+  // synthetic `Name::Var`, so the phi machinery merges it at control-flow
+  // joins. Only the carry-out *definition* is stored here; whether a given
+  // block's entry carry is provably known is computed by a must-analysis
+  // (see derive_carry_entry_known) and cached in `carry_known_entry`.
+  // `exit_known` records, from the most recent build pass, whether each
+  // block provably leaves a known carry; the two drive the fixpoint.
+  carry_known_entry: HashMap<BlockRef, bool>,
+  exit_known: HashMap<BlockRef, bool>,
+}
+
+/// The SSA variable name under which CF is threaded across blocks. It renders
+/// as a readable C local; it cannot collide with a register (those use
+/// `Name::Reg`).
+fn carry_var() -> Name {
+  Name::Var("carry".to_string())
 }
 
 impl<'a> IRBuilder<'a> {
@@ -103,6 +119,9 @@ impl<'a> IRBuilder<'a> {
 
       df_may_be_set: false,
       last_cf: None,
+      carry_known: false,
+      carry_known_entry: HashMap::new(),
+      exit_known: HashMap::new(),
     };
 
     // Create and seal the entry block
@@ -300,10 +319,16 @@ impl<'a> IRBuilder<'a> {
   }
 
   fn switch_blk(&mut self, bref: BlockRef) {
+    // Record whether the block we are leaving provably has a known carry;
+    // the driver's must-analysis reads this to seed successor entries.
+    self.exit_known.insert(self.cur, self.carry_known);
     self.cur = bref;
-    // A carry does not survive a control-flow merge without a real CF SSA
-    // value: invalidate the tracked carry at every block boundary.
+    // Carry survives the join only when every predecessor defines it: the
+    // analysis proves that (all preds' exit known). Do NOT resolve the CF
+    // SSA value here — get_var would prepend a phi and break the builder's
+    // "new block is empty" invariant. `get_cf` pulls it on first use.
     self.last_cf = None;
+    self.carry_known = self.carry_known_entry.get(&bref).copied().unwrap_or(false);
   }
 
   /// Whether a branch target lies inside the function's decoded
@@ -498,22 +523,50 @@ impl IRBuilder<'_> {
     self.ir.set_var(instr::Reg::FLAGS, self.cur, vref);
   }
 
+  /// The carry currently in effect, or None when it is unknown. When it is
+  /// known only via a cross-block merge (`carry_known` set, value not yet
+  /// materialized) the CF SSA value is fetched now, which may prepend a phi
+  /// into the current block — hence this is deferred to first use rather
+  /// than done at block entry.
+  fn get_cf(&mut self) -> Option<Ref> {
+    if self.last_cf.is_none() && self.carry_known {
+      let cf = self.ir.get_var(carry_var(), self.cur);
+      self.last_cf = Some(cf);
+    }
+    self.last_cf
+  }
+
+  /// Record a known carry-out and publish it as the CF SSA value.
+  fn set_carry_out(&mut self, cf: Ref) {
+    self.last_cf = Some(cf);
+    self.carry_known = true;
+    self.ir.set_var(carry_var(), self.cur, cf);
+  }
+
+  /// The carry is no longer known (a flag writer we do not model ran).
+  fn clear_carry(&mut self) {
+    self.last_cf = None;
+    self.carry_known = false;
+  }
+
   fn append_update_flags(&mut self, vref: Ref) {
     let old_flags = self.get_flags();
     let new_flags = self.append_instr(Type::U16, Opcode::UpdateFlags, vec![old_flags, vref]);
     self.set_flags(new_flags);
     // A flag write we do not model a carry for invalidates the tracked
     // carry; the producers below opt back in via append_update_flags_carry.
-    self.last_cf = None;
+    self.clear_carry();
   }
 
   /// Like `append_update_flags`, but records the carry-out so a following
-  /// ADC/SBB in the same block can consume it (see `last_cf`).
+  /// ADC/SBB can consume it (see `last_cf`).
   fn append_update_flags_carry(&mut self, vref: Ref, cf: Ref) {
     let old_flags = self.get_flags();
     let new_flags = self.append_instr(Type::U16, Opcode::UpdateFlags, vec![old_flags, vref]);
     self.set_flags(new_flags);
-    self.last_cf = Some(cf);
+    // Publish the carry-out as the CF SSA value so a following block can
+    // merge it through a phi (see carry_var).
+    self.set_carry_out(cf);
   }
 
   /// Clobber the opaque FLAGS value with the unknown initial flags, so a
@@ -523,13 +576,13 @@ impl IRBuilder<'_> {
   /// abort, which is not the "rather than aborting" contract (see ast.rs).
   fn clobber_flags(&mut self) {
     self.set_flags(Ref::Init(instr::Reg::FLAGS));
-    self.last_cf = None;
+    self.clear_carry();
   }
 
   /// Like `clobber_flags`, but preserves a known carry-out (RCL/RCR/STC).
   fn clobber_flags_carry(&mut self, cf: Ref) {
     self.set_flags(Ref::Init(instr::Reg::FLAGS));
-    self.last_cf = Some(cf);
+    self.set_carry_out(cf);
   }
 
   fn is_word(r: Ref, ir: &IR) -> bool {
@@ -1151,7 +1204,7 @@ impl IRBuilder<'_> {
       self.ir.set_var(reg, self.cur, Ref::Init(reg));
     }
     // FLAGS is now unknown, so any tracked carry is invalid.
-    self.last_cf = None;
+    self.clear_carry();
   }
 
   fn append_cond_jump(&mut self, ins: &instr::Instr, compare_opcode: Opcode) {
@@ -1245,7 +1298,7 @@ impl IRBuilder<'_> {
       // NEG writes CF (= operand != 0); NOT leaves the flags intact. A
       // following ADC/SBB must not consume a pre-NEG carry.
       if ins.opcode == instr::Opcode::OP_NEG {
-        self.last_cf = None;
+        self.clear_carry();
       }
       return;
     }
@@ -1274,7 +1327,7 @@ impl IRBuilder<'_> {
         let a = self.append_asm_src_operand(&ins.operands[0]);
         let b = self.append_asm_src_operand(&ins.operands[1]);
         let typ = self.deduce_type_binary(a, b);
-        match self.last_cf {
+        match self.get_cf() {
           Some(cf) => {
             let word = Self::operand_is_word(&ins.operands[0]);
             let (a, b) = if word { (a, b) } else { (self.to_byte(a), self.to_byte(b)) };
@@ -1307,7 +1360,7 @@ impl IRBuilder<'_> {
           instr::Operand::Imm(imm) => Some(imm.val as i32),
           _ => None,
         };
-        match (width, count, self.last_cf) {
+        match (width, count, self.get_cf()) {
           (Some(w), Some(raw), Some(cf_in)) if (0..=w as i32).contains(&raw) => {
             let v = self.append_asm_src_operand(&ins.operands[0]);
             if raw == 0 {
@@ -1418,7 +1471,7 @@ impl IRBuilder<'_> {
         let a = self.append_asm_src_operand(&ins.operands[0]);
         let b = self.append_asm_src_operand(&ins.operands[1]);
         let typ = self.deduce_type_binary(a, b);
-        match self.last_cf {
+        match self.get_cf() {
           Some(cf) => {
             let word = Self::operand_is_word(&ins.operands[0]);
             let (a, b) = if word { (a, b) } else { (self.to_byte(a), self.to_byte(b)) };
@@ -1564,7 +1617,7 @@ impl IRBuilder<'_> {
         let typ = self.deduce_type_binary(lhs, rhs);
         let res = self.append_instr(typ, Opcode::IMul, vec![lhs, rhs]);
         self.append_asm_dst_operand(&ins.operands[0], res);
-        self.last_cf = None; // MUL/IMUL write CF/OF; no modeled carry
+        self.clear_carry(); // MUL/IMUL write CF/OF; no modeled carry
       }
       instr::Opcode::OP_IMUL => {
         // IMUL has many forms, let's be conservative for now and hard sanity check the version we need
@@ -1579,7 +1632,7 @@ impl IRBuilder<'_> {
         let (upper, lower) = self.append_upper_lower_split(res);
         self.append_asm_dst_operand(&ins.operands[0], upper);
         self.append_asm_dst_operand(&ins.operands[1], lower);
-        self.last_cf = None; // MUL/IMUL write CF/OF; no modeled carry
+        self.clear_carry(); // MUL/IMUL write CF/OF; no modeled carry
       }
       instr::Opcode::OP_MUL => {
         // Sanity check the form we have
@@ -1593,7 +1646,7 @@ impl IRBuilder<'_> {
         let (upper, lower) = self.append_upper_lower_split(res);
         self.append_asm_dst_operand(&ins.operands[0], upper);
         self.append_asm_dst_operand(&ins.operands[1], lower);
-        self.last_cf = None; // MUL/IMUL write CF/OF; no modeled carry
+        self.clear_carry(); // MUL/IMUL write CF/OF; no modeled carry
      }
       instr::Opcode::OP_INC => {
         let attr = if operand_is_stack_reg(&ins.operands[0]) { Attribute::STACK_PTR } else { Attribute::NONE };
@@ -1604,8 +1657,10 @@ impl IRBuilder<'_> {
         self.append_asm_dst_operand(&ins.operands[0], vref);
         // INC/DEC update ZF/SF/OF/AF but leave CF intact.
         let cf = self.last_cf;
+        let known = self.carry_known;
         self.append_update_flags(vref);
         self.last_cf = cf;
+        self.carry_known = known;
       }
       instr::Opcode::OP_DEC => {
         let attr = if operand_is_stack_reg(&ins.operands[0]) { Attribute::STACK_PTR } else { Attribute::NONE };
@@ -1614,9 +1669,12 @@ impl IRBuilder<'_> {
         let typ = self.deduce_type_binary(vref, one);
         let vref = self.append_instr_with_attrs(typ, attr, Opcode::Sub, vec![vref, one]);
         self.append_asm_dst_operand(&ins.operands[0], vref);
+        // DEC, like INC, leaves CF intact.
         let cf = self.last_cf;
+        let known = self.carry_known;
         self.append_update_flags(vref);
         self.last_cf = cf;
+        self.carry_known = known;
       }
       instr::Opcode::OP_JMP => {
         match &ins.operands[0] {
@@ -1704,12 +1762,12 @@ impl IRBuilder<'_> {
 
       instr::Opcode::OP_CALLF => {
         // A call may clobber flags (unmodeled): the tracked carry is invalid.
-        self.last_cf = None;
+        self.clear_carry();
         self.process_callf(ins);
       }
       instr::Opcode::OP_CALL => {
         let cs_pushed = matches!(special, Some(SpecialState::PushCS));
-        self.last_cf = None;
+        self.clear_carry();
         self.process_calln(ins, cs_pushed);
       }
       instr::Opcode::OP_INT => {
@@ -1768,7 +1826,7 @@ impl IRBuilder<'_> {
         let (upper_out, lower_out) = self.append_upper_lower_split(quotient);
         self.append_asm_dst_operand(&ins.operands[0], upper_out);
         self.append_asm_dst_operand(&ins.operands[1], lower_out);
-        self.last_cf = None; // DIV writes CF/OF; no modeled carry
+        self.clear_carry(); // DIV writes CF/OF; no modeled carry
       }
       instr::Opcode::OP_STOS => {
         let src = self.append_asm_src_operand(&ins.operands[1]);
@@ -1852,7 +1910,7 @@ impl IRBuilder<'_> {
           instr::Opcode::OP_STC => Some(self.ir.const_new(1)),
           instr::Opcode::OP_CLC => Some(self.ir.const_new(0)),
           // CMC complements the tracked carry; an unknown carry stays unknown.
-          _ => match self.last_cf {
+          _ => match self.get_cf() {
             Some(prev) => {
               let one = self.ir.const_new(1);
               Some(self.append_instr(Type::U16, Opcode::Xor, vec![prev, one]))
@@ -1912,6 +1970,54 @@ impl IRBuilder<'_> {
   }
 
   fn build(&mut self) {
+    // CF threading across blocks is a must-analysis mutually recursive with
+    // the build: a producer's carry-out is known only if its own carry-in
+    // was, and a block's entry carry is known only if *every* predecessor's
+    // exit carry is. Iterate the whole build to a fixpoint: each pass records
+    // per-block exit-known, and the next pass seeds block entries from the AND
+    // over predecessor exits. Unknown starts false and only grows true, so
+    // this terminates in at most (#blocks + 1) passes.
+    let cfg = self.cfg;
+    let instrs = self.instrs;
+    let spec = self.spec;
+    let binary = self.binary;
+    let overlay = self.overlay;
+    let pin_all = self.pin_all;
+    let mut entry_known: HashMap<BlockRef, bool> = HashMap::new();
+    let mut passes = 0usize;
+    loop {
+      *self = IRBuilder::new(cfg, instrs, spec, binary, overlay, pin_all);
+      self.carry_known_entry = entry_known.clone();
+      self.build_once();
+      let next = self.derive_carry_entry_known();
+      if next == entry_known {
+        break;
+      }
+      entry_known = next;
+      passes += 1;
+      assert!(passes <= self.ir.iter_blocks().count() + 1, "carry fixpoint did not converge");
+    }
+  }
+
+  /// Seed for the next pass: a block's entry carry is known iff it has a
+  /// predecessor and every predecessor's exit carry was known. The function
+  /// entry block has no predecessor and CF is unknown there.
+  fn derive_carry_entry_known(&self) -> HashMap<BlockRef, bool> {
+    let mut map = HashMap::new();
+    for bref in self.ir.iter_blocks() {
+      let known = if bref == BlockRef(0) {
+        false
+      } else {
+        let preds = &self.ir.block(bref).preds;
+        !preds.is_empty()
+          && preds.iter().all(|p| self.exit_known.get(p).copied().unwrap_or(false))
+      };
+      map.insert(bref, known);
+    }
+    map
+  }
+
+  fn build_once(&mut self) {
     // Step 0: Direction-flag guard. DF is written only by CLD/STD and the
     // flag-restoring POPF/IRET; with none present the direction is provably
     // clear (see the df_may_be_set field).
@@ -1962,6 +2068,8 @@ impl IRBuilder<'_> {
       }
       self.append_asm_instr(ins);
     }
+    // The last block is never switched away from; record its carry exit.
+    self.exit_known.insert(self.cur, self.carry_known);
 
     // Step 4: walk blocks and seal them
     for blkref in self.ir.iter_blocks() {
@@ -2769,15 +2877,34 @@ mod tests {
   }
 
   #[test]
-  fn block_boundary_clears_tracked_carry() {
+  fn block_boundary_seeds_carry_from_entry_knownness() {
     let (_types, cfg, binary, spec) = bit_test_builder(&[0xC3]);
     let instrs: &[instr::Instr] = &[];
     let mut b = test_builder(&cfg, instrs, &spec, &binary);
     b.append_asm_instr(&alu_instr(instr::Opcode::OP_ADD, instr::Reg::AX, instr::Reg::BX));
     assert!(b.last_cf.is_some());
     let next = b.ir.add_block("next");
+    // Without a proven entry carry the new block starts unknown.
     b.switch_blk(next);
-    assert!(b.last_cf.is_none(), "a new block must invalidate the tracked carry");
+    assert!(!b.carry_known, "unknown entry carry must not be inherited");
+    assert!(b.last_cf.is_none());
+
+    // When the analysis proves the entry carry, the block inherits it (the
+    // value itself is resolved lazily from the CF SSA on first use).
+    let next2 = b.ir.add_block("next2");
+    b.carry_known_entry.insert(next2, true);
+    b.switch_blk(next2);
+    assert!(b.carry_known, "a proven entry carry must be inherited");
+  }
+
+  #[test]
+  fn producer_publishes_carry_as_ssa() {
+    let (_types, cfg, binary, spec) = bit_test_builder(&[0xC3]);
+    let instrs: &[instr::Instr] = &[];
+    let mut b = test_builder(&cfg, instrs, &spec, &binary);
+    b.append_asm_instr(&alu_instr(instr::Opcode::OP_ADD, instr::Reg::AX, instr::Reg::BX));
+    let cf = b.last_cf.expect("add must track a carry");
+    assert_eq!(b.ir.get_var(carry_var(), b.cur), cf, "carry must be published as CF SSA");
   }
 
   fn mul_instr() -> instr::Instr {
