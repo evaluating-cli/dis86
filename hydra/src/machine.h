@@ -125,6 +125,21 @@
     while (_n--) { STORE_16(es, _di, _v); _di += 2; } \
   } while(0)
 
+/* REP LODS: a counted load loop returning the final accumulator (`cur`
+ * when CX==0). Reads only; the decompiler models the SI/CX updates. */
+#define REP_LODSB(ds, si, cx, cur) ({ \
+    u16 _n = (cx); \
+    u16 _si = (si); \
+    u8 _r = (u8)(cur); \
+    if (_n) { _si += _n - 1; _r = LOAD_8(ds, _si); } \
+    _r; })
+#define REP_LODSW(ds, si, cx, cur) ({ \
+    u16 _n = (cx); \
+    u16 _si = (si); \
+    u16 _r = (cur); \
+    if (_n) { _si += (_n - 1) * 2; _r = LOAD_16(ds, _si); } \
+    _r; })
+
 #define PTR_8_FROM_32(_u32)  ({ STATIC_ASSERT_U32(_u32); u32 v = (_u32); PTR_8(v>>16, v); })
 #define PTR_16_FROM_32(_u32) ({ STATIC_ASSERT_U32(_u32); u32 v = (_u32); PTR_16(v>>16, v); })
 #define PTR_32_FROM_32(_u32) ({ STATIC_ASSERT_U32(_u32); u32 v = (_u32); PTR_32(v>>16, v); })

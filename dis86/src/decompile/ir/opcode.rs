@@ -89,6 +89,9 @@ pub enum Opcode {
   // CX0*size) are modeled separately as ordinary IR values.
   RepMovs,
   RepStos,
+  // REP LODS: a counted load loop that only reads memory; the value is the
+  // final accumulator, and SI/CX updates are modeled separately.
+  RepLods,
 
   // Port I/O. In* read a port into AL/AX (a value), Out* write a value to a
   // port (a side effect). They render as hydra's INB/INW/OUTB/OUTW macros
@@ -187,6 +190,7 @@ impl Opcode {
       Opcode::Int         => "int",
       Opcode::RepMovs     => "repmovs",
       Opcode::RepStos     => "repstos",
+      Opcode::RepLods     => "replods",
       Opcode::In8         => "in8",
       Opcode::In16        => "in16",
       Opcode::Out8        => "out8",

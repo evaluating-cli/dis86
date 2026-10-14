@@ -686,6 +686,25 @@ impl IRBuilder<'_> {
         self.append_asm_dst_reg(&instr::OperandReg(instr::Reg::DI), di_n);
         self.append_asm_dst_reg(&instr::OperandReg(instr::Reg::CX), zero);
       }
+      instr::Opcode::OP_LODS => {
+        // operands: [AL/AX, DS:SI]. Only reads memory: the result value is
+        // the final accumulator, and SI/CX are updated deterministically.
+        let dst = &ins.operands[0];
+        let src = &ins.operands[1];
+        let size = Self::string_operand_size(src);
+        let typ = if size == 2 { Type::U16 } else { Type::U8 };
+        let ds = self.ir.get_var(seg_of(src, instr::Reg::DS), self.cur);
+        let si = self.ir.get_var(instr::Reg::SI, self.cur);
+        let cur = self.append_asm_src_operand(dst);
+        // The helper reads the last element (or returns `cur` when CX==0).
+        let val = self.append_instr(typ, Opcode::RepLods, vec![ds, si, cx, cur]);
+        self.append_asm_dst_operand(dst, val);
+        let size_c = self.ir.const_new(size);
+        let off = self.append_instr(Type::U16, Opcode::UMul, vec![cx, size_c]);
+        let si_n = self.append_instr(Type::U16, Opcode::Add, vec![si, off]);
+        self.append_asm_dst_reg(&instr::OperandReg(instr::Reg::SI), si_n);
+        self.append_asm_dst_reg(&instr::OperandReg(instr::Reg::CX), zero);
+      }
       _ => unreachable!("lower_rep_string_op called for {:?}", ins.opcode),
     }
   }
@@ -1091,11 +1110,12 @@ impl IRBuilder<'_> {
     // result is data-dependent). Any of them with a possibly-set direction
     // flag stays loud rather than guessing the direction.
     if ins.rep.is_some() {
-      // Only 8/16-bit MOVS/STOS are modeled; a wider (unreachable) form
-      // falls back to the loud marker rather than emitting the wrong-width
-      // macro.
-      let modeled = matches!(ins.opcode, instr::Opcode::OP_MOVS | instr::Opcode::OP_STOS)
-        && matches!(&ins.operands[0],
+      // Only 8/16-bit MOVS/STOS/LODS are modeled; a wider (unreachable)
+      // form falls back to the loud marker rather than emitting the
+      // wrong-width macro. LODS's memory operand is the source.
+      let size_oper = if ins.opcode == instr::Opcode::OP_LODS { &ins.operands[1] } else { &ins.operands[0] };
+      let modeled = matches!(ins.opcode, instr::Opcode::OP_MOVS | instr::Opcode::OP_STOS | instr::Opcode::OP_LODS)
+        && matches!(size_oper,
           instr::Operand::Mem(m) if matches!(m.sz, instr::Size::Size8 | instr::Size::Size16));
       if !modeled || self.df_may_be_set {
         // Flags are conservatively clobbered because e.g. `repe scasb`
@@ -2697,16 +2717,21 @@ mod tests {
   }
 
   #[test]
-  fn rep_lods_stays_loud() {
+  fn rep_lods_is_modeled() {
     let (_types, cfg, binary, spec) = bit_test_builder(&[0xC3]);
     let instrs: &[instr::Instr] = &[];
     let mut b = test_builder(&cfg, instrs, &spec, &binary);
+    let cx = b.ir.const_new(3);
+    b.ir.set_var(instr::Reg::CX, b.cur, cx);
     let ins = rep_string_instr(instr::Opcode::OP_LODS, vec![
       instr::Operand::Reg(instr::OperandReg(instr::Reg::AX)),
       string_mem(instr::Size::Size16, instr::Reg::DS, instr::Reg::SI),
     ]);
     b.append_asm_instr(&ins);
 
-    let _ = only_instr(&b.ir, b.cur, Opcode::Unimpl);
+    let _ = only_instr(&b.ir, b.cur, Opcode::RepLods);
+    let cx_after = b.ir.get_var(instr::Reg::CX, b.cur);
+    assert_eq!(b.ir.const_lookup(cx_after), Some(0), "CX consumed to 0");
+    let _ = assert_rep_advanced(&mut b, instr::Reg::SI, 2);
   }
 }

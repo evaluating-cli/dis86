@@ -92,15 +92,15 @@ fn rep_stosw_emits_macro_and_advances_di() {
   assert!(source.contains("3 * 2"), "word size 2 times the count:\n{source}");
 }
 
-// mov cx,2; rep lodsb; ret
-// LODS/CMPS/SCAS are data-dependent and not modeled yet: stay loud.
+// mov cx,2; rep lodsb; mov dx,si; ret
+// REP LODS is now modeled (see rep_lods.rs); CMPS/SCAS remain loud.
 #[test]
-fn rep_lods_stays_loud() {
-  let code = [0xB9, 0x02, 0x00, 0xF3, 0xAC, 0xC3];
+fn rep_lods_is_modeled() {
+  let code = [0xB9, 0x02, 0x00, 0xF3, 0xAC, 0x89, 0xF2, 0xC3];
   let source = decompile_raw(&code);
 
-  assert!(source.contains("UNIMPL()"), "rep lods must stay loud:\n{source}");
-  assert!(!source.contains("REP_"), "must not emit a bulk macro:\n{source}");
+  assert!(!source.contains("UNIMPL"), "modeled rep lods must not be loud:\n{source}");
+  assert!(source.contains("REP_LODSB(DS, SI, 2, AL)"), "expected the lods helper:\n{source}");
 }
 
 // std; mov cx,4; rep movsb; ret

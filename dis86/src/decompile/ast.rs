@@ -594,6 +594,13 @@ impl<'a> Builder<'a> {
         let exprs: Vec<_> = instr.operands[..4].iter().map(|r| self.ref_to_expr(*r, depth+1)).collect();
         Expr::Abstract(name, exprs)
       }
+      ir::Opcode::RepLods => {
+        // operands: [ds, si, cx, cur]; the value is the final accumulator
+        // (name from the byte/word result type).
+        let name = if instr.typ == Type::U16 || instr.typ == Type::I16 { "REP_LODSW" } else { "REP_LODSB" };
+        let exprs: Vec<_> = instr.operands.iter().map(|r| self.ref_to_expr(*r, depth+1)).collect();
+        Expr::Abstract(name, exprs)
+      }
       ir::Opcode::In8 | ir::Opcode::In16 => {
         // operand: [port]. Reads a port (hardware side effect).
         let name = if instr.opcode == ir::Opcode::In16 { "INW" } else { "INB" };
