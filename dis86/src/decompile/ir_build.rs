@@ -1354,6 +1354,42 @@ impl IRBuilder<'_> {
     else { Type::Unknown }
   }
 
+  /// Lower DIV (`signed == false`, `UDiv`) and IDIV (`signed == true`,
+  /// `IDiv`). Word form divides `DX:AX` by `r/m16` (quotient `AX`,
+  /// remainder `DX`); byte form divides `AX` by `r/m8` (quotient `AL`,
+  /// remainder `AH`). The quotient is exact; the remainder has no IR
+  /// reader, so it is an explicit unknown (fatal only if read). Flags
+  /// are architecturally undefined and clobbered to the loud-but-non-fatal
+  /// unknown marker. Divide-overflow traps (#DE) are not modeled.
+  fn lower_div(&mut self, ins: &instr::Instr, signed: bool) {
+    let upper_in = self.append_asm_src_operand(&ins.operands[0]);
+    let lower_in = self.append_asm_src_operand(&ins.operands[1]);
+    let divisor = self.append_asm_src_operand(&ins.operands[2]);
+    let op = if signed { Opcode::IDiv } else { Opcode::UDiv };
+    if Self::operand_is_word(&ins.operands[2]) {
+      let dividend = self.append_instr(Type::U32, Opcode::Make32, vec![upper_in, lower_in]);
+      let quotient = self.append_instr(Type::U32, op, vec![dividend, divisor]);
+      let (_, lower_out) = self.append_upper_lower_split(quotient);
+      self.append_asm_dst_operand(&ins.operands[1], lower_out);
+    } else {
+      // Byte form: the 16-bit dividend is AH:AL, not a 32-bit Make32.
+      let hi = self.to_byte(upper_in);
+      let lo = self.to_byte(lower_in);
+      let eight = self.ir.const_new(8);
+      let shifted = self.append_instr(Type::U16, Opcode::Shl, vec![hi, eight]);
+      let dividend = self.append_instr(Type::U16, Opcode::Or, vec![shifted, lo]);
+      let divisor = self.to_byte(divisor);
+      let quotient = self.append_instr(Type::U16, op, vec![dividend, divisor]);
+      let (_, lower_out) = self.append_byte_split(quotient);
+      self.append_asm_dst_operand(&ins.operands[1], lower_out);
+    }
+    // Remainder (DX/AH): no URem/IRem IR opcode exists; an explicit
+    // unknown beats the old silent zero (Upper16 of a <64K quotient).
+    let rem = self.append_instr(Type::U16, Opcode::Unimpl, vec![upper_in, lower_in, divisor]);
+    self.append_asm_dst_operand(&ins.operands[0], rem);
+    self.clobber_flags();
+  }
+
   fn append_asm_instr(&mut self, ins: &instr::Instr) {
     //println!("## {}", intel_syntax::format(ins, &[], false).unwrap());
 
@@ -1922,17 +1958,7 @@ impl IRBuilder<'_> {
         let upper = self.append_instr(Type::U16, Opcode::Upper16, vec![vref]);
         self.append_asm_dst_operand(&ins.operands[0], upper);
       }
-      instr::Opcode::OP_DIV => {
-        let upper_in = self.append_asm_src_operand(&ins.operands[0]);
-        let lower_in = self.append_asm_src_operand(&ins.operands[1]);
-        let divisor = self.append_asm_src_operand(&ins.operands[2]);
-        let dividend = self.append_instr(Type::U32, Opcode::Make32, vec![upper_in, lower_in]);
-        let quotient = self.append_instr(Type::U32, Opcode::UDiv, vec![dividend, divisor]);
-        let (upper_out, lower_out) = self.append_upper_lower_split(quotient);
-        self.append_asm_dst_operand(&ins.operands[0], upper_out);
-        self.append_asm_dst_operand(&ins.operands[1], lower_out);
-        self.clear_carry(); // DIV writes CF/OF; no modeled carry
-      }
+      instr::Opcode::OP_DIV => self.lower_div(ins, false),
       instr::Opcode::OP_STOS => {
         let src = self.append_asm_src_operand(&ins.operands[1]);
         self.append_asm_dst_operand(&ins.operands[0], src);
@@ -2082,20 +2108,7 @@ impl IRBuilder<'_> {
         let v = self.append_instr(Type::U8, Opcode::Load8, vec![seg, addr]);
         self.append_asm_dst_operand(&ins.operands[0], v);
       }
-      instr::Opcode::OP_IDIV => {
-        // Signed mirror of DIV: same DX:AX (or AH:AL) dividend shape,
-        // divided with IDiv. x86 raises #DE on signed overflow, which is
-        // not modeled (consistent with DIV).
-        let upper_in = self.append_asm_src_operand(&ins.operands[0]);
-        let lower_in = self.append_asm_src_operand(&ins.operands[1]);
-        let divisor = self.append_asm_src_operand(&ins.operands[2]);
-        let dividend = self.append_instr(Type::U32, Opcode::Make32, vec![upper_in, lower_in]);
-        let quotient = self.append_instr(Type::U32, Opcode::IDiv, vec![dividend, divisor]);
-        let (upper_out, lower_out) = self.append_upper_lower_split(quotient);
-        self.append_asm_dst_operand(&ins.operands[0], upper_out);
-        self.append_asm_dst_operand(&ins.operands[1], lower_out);
-        self.clear_carry(); // DIV writes CF/OF; no modeled carry
-      }
+      instr::Opcode::OP_IDIV => self.lower_div(ins, true),
       instr::Opcode::OP_ENTER => {
         // operands: [BP, IMM16 frame size, IMM8 nesting level]. Level 0
         // (the overwhelmingly common case) is push BP; BP = SP; SP -= frame.
@@ -2132,6 +2145,7 @@ impl IRBuilder<'_> {
         // Overflow and parity have no IR flag readers, so the result is an
         // explicit unknown (fatal only if executed). Flags are preserved
         // (SETcc never touches them), so they are left intact.
+        self.warn(format!("Unimpl opcode {:?} at {} — emitting UNIMPL marker", ins.opcode, ins.addr));
         let vref = self.append_instr(Type::U8, Opcode::Unimpl, vec![]);
         self.append_asm_dst_operand(&ins.operands[0], vref);
       }
@@ -2161,20 +2175,24 @@ impl IRBuilder<'_> {
         self.append_update_flags(v);
       }
       instr::Opcode::OP_AAA | instr::Opcode::OP_AAS => {
-        // BCD adjust of AL/AH: explicit unknown written to both fragments
-        // (any use traps at runtime), flags defined-but-unknown.
+        // BCD adjust of AL/AH: a distinct explicit unknown per fragment
+        // (any use traps at runtime; sharing one SSA value would let
+        // `cmp al,ah` fold), flags defined-but-unknown.
         let a = self.append_asm_src_operand(&ins.operands[0]);
         let b = self.append_asm_src_operand(&ins.operands[1]);
         let typ = self.deduce_type_binary(a, b);
-        let vref = self.append_instr(typ, Opcode::Unimpl, vec![a, b]);
-        self.append_asm_dst_operand(&ins.operands[0], vref);
-        self.append_asm_dst_operand(&ins.operands[1], vref);
-        self.append_update_flags(vref);
+        self.warn(format!("Unimpl opcode {:?} at {} — emitting UNIMPL markers", ins.opcode, ins.addr));
+        let lo = self.append_instr(typ.clone(), Opcode::Unimpl, vec![a, b]);
+        self.append_asm_dst_operand(&ins.operands[0], lo);
+        let hi = self.append_instr(typ, Opcode::Unimpl, vec![a, b]);
+        self.append_asm_dst_operand(&ins.operands[1], hi);
+        self.append_update_flags(lo);
       }
       instr::Opcode::OP_DAA | instr::Opcode::OP_DAS => {
         // BCD adjust of AL: explicit unknown, flags defined-but-unknown.
         let a = self.append_asm_src_operand(&ins.operands[0]);
         let typ = self.deduce_type_unary(a);
+        self.warn(format!("Unimpl opcode {:?} at {} — emitting UNIMPL marker", ins.opcode, ins.addr));
         let vref = self.append_instr(typ, Opcode::Unimpl, vec![a]);
         self.append_asm_dst_operand(&ins.operands[0], vref);
         self.append_update_flags(vref);
@@ -2185,6 +2203,7 @@ impl IRBuilder<'_> {
         // decompile at build time. INTO over-approximates: it traps only
         // on an untracked overflow, but staying loud forces the model gap
         // visible instead of silently succeeding.
+        self.warn(format!("Unimpl opcode {:?} at {} — emitting UNIMPL marker", ins.opcode, ins.addr));
         self.append_instr(Type::Void, Opcode::Unimpl, vec![]);
       }
       _ => {

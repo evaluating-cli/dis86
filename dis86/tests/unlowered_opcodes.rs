@@ -112,6 +112,54 @@ fn idiv_lowers_to_signed_division() {
   );
 }
 
+// Byte idiv divides the 16-bit AX (AH:AL), not a 32-bit Make32, and the
+// unmodeled remainder stays loud instead of a silent zero.
+#[test]
+fn byte_idiv_divides_ax_with_loud_remainder() {
+  let source = decompile_raw(&[0xF6, 0xFB, 0xC3]);
+  assert!(
+    source.contains("((AH << 8) | AL) / (i16)BL"),
+    "byte idiv must emit a signed 16-bit AX (AH:AL) division:\n{source}"
+  );
+  assert!(
+    source.contains("UNIMPL("),
+    "the unmodeled remainder must stay a loud marker:\n{source}"
+  );
+}
+
+// div clobbers flags (architecturally undefined): a branch after div must
+// not fold against a pre-division flag producer.
+#[test]
+fn div_clobbers_flags_for_following_branch() {
+  let code = [
+    0x2B, 0xC0, // sub ax,ax
+    0xF7, 0xF1, // div cx
+    0x74, 0x01, // jz +1
+    0x90,       // nop
+    0xC3,       // ret
+  ];
+  let source = decompile_raw(&code);
+  assert!(
+    !source.contains("AX == AX"),
+    "post-DIV flags must not fold to the pre-DIV `sub ax,ax` result:\n{source}"
+  );
+  assert!(
+    source.contains("UNIMPL_FLAGS"),
+    "post-DIV flags must degrade to the loud UNIMPL_FLAGS marker:\n{source}"
+  );
+}
+
+// aaa produces distinct unknowns per fragment so al/ah never compare equal.
+#[test]
+fn aaa_writes_distinct_unknowns_per_fragment() {
+  let source = decompile_raw(&[0x37, 0xC3]);
+  assert_eq!(
+    source.matches("UNIMPL(AL, AH)").count(),
+    2,
+    "aaa must write a distinct unknown to AL and AH:\n{source}"
+  );
+}
+
 // sets/setns read the sign flag; seto degrades to a loud value marker.
 #[test]
 fn sign_setcc_reads_sign_flag_overflow_stays_loud() {
