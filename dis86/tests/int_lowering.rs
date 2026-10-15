@@ -110,6 +110,29 @@ fn post_int_register_reads_see_live_values() {
     "the post-INT `mov ax,cx` must read the live CX, not the stale 0x1234:\n{source}"
   );
 }
+// mov bx,ax; mov ah,6; int 21h; mov ax,bx; ret (issue #78)
+// BX must capture AX before the AH=6 recompose overwrites it: the guest
+// writes must read `BX = AX` (entry) ahead of `AX = (6 << 8) | ...`, so the
+// post-INT restore returns the saved value, not 0x06xx.
+#[test]
+fn int_materialization_preserves_register_copy_order() {
+  let code = [
+    0x89, 0xC3,       // mov bx,ax
+    0xB4, 0x06,       // mov ah,6
+    0xCD, 0x21,       // int 21h
+    0x89, 0xD8,       // mov ax,bx
+    0xC3,             // ret
+  ];
+  let source = decompile_raw(&code);
+
+  assert!(source.contains("INT(0x21)"), "interrupt must be emitted:\n{source}");
+  let bx = source.find("BX = AX").expect("copy BX = AX(entry) must be emitted:\n{source}");
+  let ax_setup = source.find("6 << 8").expect("AH=6 recompose must be emitted:\n{source}");
+  assert!(
+    bx < ax_setup,
+    "BX must capture AX before the AH=6 overwrite (BX={bx}, AX={ax_setup}):\n{source}"
+  );
+}
 // sub ax,ax; int 21h; jz; nop; ret
 // The flags after INT belong to the handler, so the branch must not fold
 // against the pre-INT `sub`.
