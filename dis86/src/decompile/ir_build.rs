@@ -17,9 +17,11 @@ fn operand_is_stack_reg(operand: &instr::Operand) -> bool {
 }
 
 /// Whether an instruction may leave the direction flag set: STD sets it
-/// explicitly, and POPF/IRET restore it from a popped flags value. (The
-/// latter are not lowered yet — they panic — but including them keeps the
-/// string-op direction guard sound if/when they are.)
+/// explicitly, and POPF/IRET restore it from a popped flags value. POPF is
+/// lowered (opaque flags update) and clears the per-point `df_clear` state;
+/// IRET is terminal, so only its function-scope membership here matters for
+/// the string-op direction guard. (RETF pops CS:IP only — not flags — so it
+/// is correctly absent.)
 fn opcode_may_set_df(op: instr::Opcode) -> bool {
   matches!(op, instr::Opcode::OP_STD | instr::Opcode::OP_POPF | instr::Opcode::OP_IRET)
 }
@@ -64,14 +66,23 @@ struct IRBuilder<'a> {
   overlay: bool,
   pin_all: bool,
 
-  // Whether the decoded function may leave the direction flag set/unknown.
-  // DF is written only by CLD/STD (and by the flag-restoring POPF/IRET,
-  // which are not lowered yet but must be covered when they are). With
-  // none present the direction is provably clear (DF=0, the DOS ABI
-  // entry/exit convention) and string-op pointer updates advance;
-  // otherwise the direction is unknown and those updates degrade to a
-  // loud marker rather than silently running the wrong way.
+  // Whether the decoded function contains an instruction that may leave
+  // the direction flag set/unknown (STD, or the flag-restoring POPF/IRET).
+  // This is the function-scope fact; the point-wise state below decides
+  // each string op.
   df_may_be_set: bool,
+
+  // Whether DF is provably clear (DF=0, the DOS ABI entry/exit convention)
+  // at the current point of the build. CLD sets it, STD clears it, and
+  // POPF (whose popped value is opaque) clears it; any block boundary
+  // resets it to `!df_may_be_set` (unknown when writers exist, since joins
+  // are not tracked; provably clear when no writer exists anywhere).
+  // String-op pointer updates advance only while this holds; otherwise
+  // they degrade to a loud marker rather than silently running the wrong
+  // way. The marker stays fatal (UNIMPL, not UNIMPL_FLAGS) deliberately:
+  // the imprecision is in the SI/DI pointer *values*, not just the flags,
+  // so the non-fatal flags marker would understate it.
+  df_clear: bool,
 
   // Carry-out value (a 0/1 u16 Ref) of the most recent flag-writing
   // instruction in the current basic block, or None when the value has not
@@ -128,6 +139,7 @@ impl<'a> IRBuilder<'a> {
       pin_all,
 
       df_may_be_set: false,
+      df_clear: true,
       last_cf: None,
       carry_known: false,
       carry_known_entry: HashMap::new(),
@@ -341,6 +353,9 @@ impl<'a> IRBuilder<'a> {
     // "new block is empty" invariant. `get_cf` pulls it on first use.
     self.last_cf = None;
     self.carry_known = self.carry_known_entry.get(&bref).copied().unwrap_or(self.entry_known_default);
+    // Joins are not DF-tracked: a new block starts unknown whenever a
+    // DF writer exists anywhere in the function.
+    self.df_clear = !self.df_may_be_set;
   }
 
   /// Whether a branch target lies inside the function's decoded
@@ -668,8 +683,9 @@ impl IRBuilder<'_> {
   }
 
   /// Update flags for a simple ALU binary op, tracking the carry-out where
-  /// known: word ADD and any-width SUB/CMP enable carry chains, the
-  /// logical ops clear CF, and shifts leave it unknown.
+  /// known: word ADD and any-width SUB/CMP enable carry chains, shifts
+  /// with constant counts publish their last-bit-out, the logical ops
+  /// clear CF, and anything else leaves it unknown.
   fn set_flags_for_binary(&mut self, opcode: Opcode, res: Ref, a: Ref, b: Ref, word: bool) {
     match opcode {
       Opcode::Add if word => match self.add_carry_out(res, a) {
@@ -700,13 +716,43 @@ impl IRBuilder<'_> {
         let zero = self.ir.const_new(0);
         self.append_update_flags_carry(res, zero);
       }
-      _ => self.append_update_flags(res), // word carry unknown / shifts
+      Opcode::Shl | Opcode::UShr | Opcode::Shr => {
+        // Shifts publish their carry-out (the last bit shifted out) for
+        // constant counts: SHL carries bit (w-n), SHR/SAR carry bit (n-1)
+        // (sign-independent). Gated to 1..=w: x86 masks the count to 5
+        // bits, so e.g. `shl ax,16` genuinely shifts by 16 and carries
+        // bit 0 (pos = w-n = 0). Variable counts and counts above w keep
+        // the conservative clobber. ROL/ROR carry is not modeled (their
+        // zero-count case preserves CF, which needs a conditional).
+        // A zero count leaves every flag unchanged in HW (including CF),
+        // so it is a full no-op for flags: preserve the tracked carry and
+        // emit no update — mirroring the RCL/RCR zero-count path below.
+        if self.ir.const_lookup(b) == Some(0) {
+          return;
+        }
+        let w: i16 = if word { 16 } else { 8 };
+        let cf = match self.ir.const_lookup(b) {
+          Some(n) if (1..=w).contains(&n) => {
+            let pos = if opcode == Opcode::Shl { w - n } else { n - 1 };
+            let s = self.ir.const_new(pos);
+            let shifted = self.append_instr(Type::U16, Opcode::UShr, vec![a, s]);
+            let one = self.ir.const_new(1);
+            Some(self.append_instr(Type::U16, Opcode::And, vec![shifted, one]))
+          }
+          _ => None,
+        };
+        match cf {
+          Some(cf) => self.append_update_flags_carry(res, cf),
+          None => self.append_update_flags(res),
+        }
+      }
+      _ => self.append_update_flags(res),
     }
   }
 
   /// String-op pointer auto-update (`SI`/`DI` += element size), assuming
-  /// the direction flag is clear (increment). Only called when
-  /// `!df_may_be_set`, so the direction is provably clear (DOS ABI).
+  /// the direction flag is clear (increment). Only called while `df_clear`
+  /// holds, so the direction is provably clear (DOS ABI).
   fn advance_string_ptr(&mut self, reg: instr::Reg, size: i16) {
     let cur = self.ir.get_var(reg, self.cur);
     let step = self.ir.const_new(size);
@@ -715,10 +761,11 @@ impl IRBuilder<'_> {
   }
 
   /// Finish a single-step string op: advance the pointers the op updates
-  /// (with DF=0), or, when the function contains a `std`, degrade to a
-  /// loud marker instead of a possibly-wrong-direction update.
+  /// (with DF=0), or, when the direction is not provably clear at this
+  /// point, degrade to a loud marker instead of a possibly-wrong-direction
+  /// update.
   fn string_op_advance(&mut self, si: Option<&instr::Operand>, di: Option<&instr::Operand>) {
-    if self.df_may_be_set {
+    if !self.df_clear {
       self.append_instr(Type::Void, Opcode::Unimpl, vec![]);
       return;
     }
@@ -1261,7 +1308,12 @@ impl IRBuilder<'_> {
     // ast.rs), WriteVar16 against the Register symbol renders as a real guest
     // write and keeps each setup value live through DCE. Registers still at
     // their initial (unknown) value are skipped: writing them would emit a
-    // no-op `BX = BX`.
+    // no-op `BX = BX`. DF is deliberately left alone: the DOS convention
+    // (see docs/8086_flags.txt: DF=0 on entry, restored on exit) is that
+    // callees and interrupt handlers preserve DF, and CALL callees are
+    // treated the same (process_calln leaves `df_clear` intact) — so the
+    // per-point `df_clear` state survives the call. Clearing here but not
+    // on CALL would be inconsistent; both trust the same ABI premise.
     let mut pending = vec![];
     for reg in [instr::Reg::AX, instr::Reg::BX, instr::Reg::CX, instr::Reg::DX,
                 instr::Reg::SI, instr::Reg::DI, instr::Reg::DS, instr::Reg::ES] {
@@ -1419,7 +1471,7 @@ impl IRBuilder<'_> {
           instr::Opcode::OP_INS | instr::Opcode::OP_OUTS)
         && matches!(size_oper,
           instr::Operand::Mem(m) if matches!(m.sz, instr::Size::Size8 | instr::Size::Size16));
-      if !modeled || self.df_may_be_set {
+      if !modeled || !self.df_clear {
         // Flags are conservatively clobbered because e.g. `repe scasb`
         // defines the flags its caller tests.
         let vref = self.append_instr(Type::U16, Opcode::Unimpl, vec![]);
@@ -1994,7 +2046,7 @@ impl IRBuilder<'_> {
         // ins: operands [ES:DI, DX]. The helper executes the raw instruction
         // (port read -> ES:DI); DI advances by size. A possibly-set direction
         // flag makes the advance direction unknown, so stay loud.
-        if self.df_may_be_set {
+        if !self.df_clear {
           self.append_instr(Type::Void, Opcode::Unimpl, vec![]);
         } else {
           let dst = &ins.operands[0]; // ES:DI
@@ -2012,7 +2064,7 @@ impl IRBuilder<'_> {
         // outs: operands [DX, DS:SI]. The helper executes the raw instruction
         // (DS:SI -> port); SI advances by size. A possibly-set direction flag
         // makes the advance direction unknown, so stay loud.
-        if self.df_may_be_set {
+        if !self.df_clear {
           self.append_instr(Type::Void, Opcode::Unimpl, vec![]);
         } else {
           let src = &ins.operands[1]; // DS:SI
@@ -2027,9 +2079,10 @@ impl IRBuilder<'_> {
         }
       }
       instr::Opcode::OP_STD => {
-        // Sets DF. DF is not modeled as a value, but the whole-function
-        // `df_may_be_set` guard already keeps any REP/string model loud when
-        // a STD is present, so this only needs to be a non-fatal side effect.
+        // Sets DF: string ops after this point (in this block) no longer
+        // have a provably clear direction. Emitted as a non-fatal side
+        // effect; the per-point `df_clear` state drives the models.
+        self.df_clear = false;
         self.append_instr(Type::Void, Opcode::Std, vec![]);
       }
       instr::Opcode::OP_STC | instr::Opcode::OP_CLC | instr::Opcode::OP_CMC => {
@@ -2089,6 +2142,9 @@ impl IRBuilder<'_> {
         self.append_instr(Type::Void, op, vec![port, val]);
       }
       instr::Opcode::OP_CLD => {
+        // Clears DF: string ops after this point (in this block) have a
+        // provably clear direction even when a STD exists elsewhere.
+        self.df_clear = true;
         self.append_instr(Type::Void, Opcode::Cld, vec![]);
       }
       instr::Opcode::OP_CBW => {
@@ -2168,9 +2224,10 @@ impl IRBuilder<'_> {
         self.append_push(flags);
       }
       instr::Opcode::OP_POPF => {
-        // Flags = popped value (may change DF too, which the
-        // whole-function df_may_be_set guard already treats
-        // conservatively). Following branches degrade to UNIMPL_FLAGS.
+        // Flags = popped value, which may change DF too: string ops after
+        // this point (in this block) no longer have a provably clear
+        // direction. Following branches degrade to UNIMPL_FLAGS.
+        self.df_clear = false;
         let v = self.append_pop();
         self.append_update_flags(v);
       }
@@ -2325,10 +2382,14 @@ impl IRBuilder<'_> {
   }
 
   fn build_once(&mut self) {
-    // Step 0: Direction-flag guard. DF is written only by CLD/STD and the
-    // flag-restoring POPF/IRET; with none present the direction is provably
-    // clear (see the df_may_be_set field).
+    // Step 0: Direction-flag guard. DF is written only by STD and the
+    // flag-restoring POPF/IRET (CLD clears it); with none present the
+    // direction is provably clear for the whole function (see df_clear).
+    // When writers exist the entry stays conservative (a string op before
+    // any in-function writer stays loud): entry DF is unknowable locally,
+    // matching the join treatment in switch_blk. Deliberate, not a TODO.
     self.df_may_be_set = self.instrs.iter().any(|i| opcode_may_set_df(i.opcode));
+    self.df_clear = !self.df_may_be_set;
 
     // Step 1: Infer basic-block boundaries
     let mut block_start = HashSet::new();
@@ -3113,6 +3174,47 @@ mod tests {
   }
 
   #[test]
+  fn cld_after_std_restores_exact_string_model() {
+    // Issue #86: DF is tracked per point within a block, so a `cld`
+    // re-establishes the provably-clear direction and the following
+    // string op is modeled exactly even when a STD exists elsewhere.
+    let (_types, cfg, binary, spec) = bit_test_builder(&[0xC3]);
+    let instrs: &[instr::Instr] = &[];
+    let mut b = test_builder(&cfg, instrs, &spec, &binary);
+    b.df_may_be_set = true;
+    b.df_clear = false;
+    b.append_asm_instr(&string_instr(instr::Opcode::OP_CLD, vec![]));
+    let ins = string_instr(instr::Opcode::OP_MOVS, vec![
+      string_mem(instr::Size::Size8, instr::Reg::ES, instr::Reg::DI),
+      string_mem(instr::Size::Size8, instr::Reg::DS, instr::Reg::SI),
+    ]);
+    b.append_asm_instr(&ins);
+    assert_advanced(&mut b, instr::Reg::SI, 1);
+    assert_advanced(&mut b, instr::Reg::DI, 1);
+    assert!(
+      b.ir.iter_instrs(b.cur).all(|r| b.ir.instr(r).unwrap().opcode != Opcode::Unimpl),
+      "no loud marker once CLD re-establishes DF=0"
+    );
+  }
+
+  #[test]
+  fn std_poison_string_ops_until_cld() {
+    // The other half of #86: after a STD with no intervening CLD, the
+    // direction is genuinely unknown and the marker must stay.
+    let (_types, cfg, binary, spec) = bit_test_builder(&[0xC3]);
+    let instrs: &[instr::Instr] = &[];
+    let mut b = test_builder(&cfg, instrs, &spec, &binary);
+    b.append_asm_instr(&string_instr(instr::Opcode::OP_STD, vec![]));
+    assert!(!b.df_clear, "STD must clear the provably-clear direction");
+    let ins = string_instr(instr::Opcode::OP_MOVS, vec![
+      string_mem(instr::Size::Size8, instr::Reg::ES, instr::Reg::DI),
+      string_mem(instr::Size::Size8, instr::Reg::DS, instr::Reg::SI),
+    ]);
+    b.append_asm_instr(&ins);
+    let _ = only_instr(&b.ir, b.cur, Opcode::Unimpl);
+  }
+
+  #[test]
   fn movsb_advances_by_one() {
     let (_types, cfg, binary, spec) = bit_test_builder(&[0xC3]);
     let instrs: &[instr::Instr] = &[];
@@ -3191,6 +3293,7 @@ mod tests {
     let instrs: &[instr::Instr] = &[];
     let mut b = test_builder(&cfg, instrs, &spec, &binary);
     b.df_may_be_set = true;
+    b.df_clear = false;
     let ins = string_instr(instr::Opcode::OP_MOVS, vec![
       string_mem(instr::Size::Size16, instr::Reg::ES, instr::Reg::DI),
       string_mem(instr::Size::Size16, instr::Reg::DS, instr::Reg::SI),
@@ -3269,6 +3372,89 @@ mod tests {
     // a shift leaves the carry unknown.
     b.append_asm_instr(&alu_instr(instr::Opcode::OP_SHL, instr::Reg::AX, instr::Reg::CX));
     assert!(b.last_cf.is_none(), "shift leaves the carry unknown");
+  }
+
+  #[test]
+  fn shift_imm_publishes_carry_out_for_adc() {
+    // Issue #86 (related note): `shl ax,1` carries bit 15, so a following
+    // ADC must lower exactly instead of degrading to UNIMPL_FLAGS.
+    let (_types, cfg, binary, spec) = bit_test_builder(&[0xC3]);
+    let instrs: &[instr::Instr] = &[];
+    let mut b = test_builder(&cfg, instrs, &spec, &binary);
+    b.append_asm_instr(&rotate_instr(instr::Opcode::OP_SHL, instr::Reg::AX, imm_count(1)));
+    let cf = b.last_cf.expect("shl ax,1 must track bit 15 as the carry");
+    let and = b.ir.instr(cf).unwrap();
+    assert_eq!(and.opcode, Opcode::And, "carry-out must be masked to one bit");
+    assert_eq!(b.ir.const_lookup(and.operands[1]), Some(1));
+    let shr = b.ir.instr(and.operands[0]).unwrap();
+    assert_eq!(shr.opcode, Opcode::UShr, "carry-out must shift the source down");
+    assert_eq!(b.ir.const_lookup(shr.operands[1]), Some(15), "shl by 1 carries bit 15");
+    // A following ADC consumes the tracked carry exactly.
+    b.append_asm_instr(&alu_instr(instr::Opcode::OP_ADC, instr::Reg::BX, instr::Reg::CX));
+    assert!(b.last_cf.is_some(), "adc after shl must lower exactly with the shift carry");
+  }
+
+  #[test]
+  fn shift_imm_carry_positions_cover_widths_and_directions() {
+    // SHR/SAR carry bit (n-1); byte SHL carries bit (8-n).
+    let (_types, cfg, binary, spec) = bit_test_builder(&[0xC3]);
+    let instrs: &[instr::Instr] = &[];
+    let mut b = test_builder(&cfg, instrs, &spec, &binary);
+    b.append_asm_instr(&rotate_instr(instr::Opcode::OP_SHR, instr::Reg::AX, imm_count(1)));
+    let cf = b.last_cf.expect("shr ax,1 must track bit 0");
+    let and = b.ir.instr(cf).unwrap();
+    assert_eq!(and.opcode, Opcode::And);
+    let shr = b.ir.instr(and.operands[0]).unwrap();
+    assert_eq!(shr.opcode, Opcode::UShr);
+    assert_eq!(b.ir.const_lookup(shr.operands[1]), Some(0), "shr by 1 carries bit 0");
+    let mut b = test_builder(&cfg, instrs, &spec, &binary);
+    b.append_asm_instr(&rotate_instr(instr::Opcode::OP_SHL, instr::Reg::AL, imm_count(2)));
+    let cf = b.last_cf.expect("shl al,2 must track bit 6");
+    let and = b.ir.instr(cf).unwrap();
+    let shr = b.ir.instr(and.operands[0]).unwrap();
+    assert_eq!(b.ir.const_lookup(shr.operands[1]), Some(6), "byte shl by 2 carries bit 6");
+  }
+
+  #[test]
+  fn shift_overwide_and_variable_counts_stay_loud() {
+    // Counts above w have no single defined bit, and CL counts are runtime
+    // values: both keep the clobber. (Zero counts preserve flags — see the
+    // next test — so they are not in this list.)
+    let cl = instr::Operand::Reg(instr::OperandReg(instr::Reg::CL));
+    for (opcode, count) in [
+      (instr::Opcode::OP_SHL, imm_count(20)),
+      (instr::Opcode::OP_SHL, cl),
+      (instr::Opcode::OP_SHR, imm_count(20)),
+    ] {
+      let (_types, cfg, binary, spec) = bit_test_builder(&[0xC3]);
+      let instrs: &[instr::Instr] = &[];
+      let mut b = test_builder(&cfg, instrs, &spec, &binary);
+      b.append_asm_instr(&rotate_instr(opcode, instr::Reg::AX, count));
+      assert!(b.last_cf.is_none(), "{opcode:?} with this count must leave the carry unknown");
+    }
+  }
+
+  #[test]
+  fn shift_zero_count_preserves_flags_and_carry() {
+    // HW leaves every flag unchanged on a zero-count shift, so a tracked
+    // carry (here from STC) must survive untouched, with no flag update.
+    let (_types, cfg, binary, spec) = bit_test_builder(&[0xC3]);
+    let instrs: &[instr::Instr] = &[];
+    let mut b = test_builder(&cfg, instrs, &spec, &binary);
+    b.append_asm_instr(&string_instr(instr::Opcode::OP_STC, vec![]));
+    let cf_before = b.last_cf.expect("stc must track CF=1");
+    assert_eq!(b.ir.const_lookup(cf_before), Some(1));
+    let flags_before = b.get_flags();
+    let updates_before = b.ir.iter_instrs(b.cur)
+      .filter(|r| b.ir.instr(*r).unwrap().opcode == Opcode::UpdateFlags)
+      .count();
+    b.append_asm_instr(&rotate_instr(instr::Opcode::OP_SHL, instr::Reg::AX, imm_count(0)));
+    assert_eq!(b.last_cf, Some(cf_before), "shl ax,0 must preserve the tracked carry");
+    assert_eq!(b.get_flags(), flags_before, "shl ax,0 must emit no flag update");
+    let updates_after = b.ir.iter_instrs(b.cur)
+      .filter(|r| b.ir.instr(*r).unwrap().opcode == Opcode::UpdateFlags)
+      .count();
+    assert_eq!(updates_after, updates_before, "shl ax,0 must emit no flag update");
   }
 
   #[test]
@@ -3486,6 +3672,7 @@ mod tests {
     let instrs: &[instr::Instr] = &[];
     let mut b = test_builder(&cfg, instrs, &spec, &binary);
     b.df_may_be_set = true;
+    b.df_clear = false;
     let cx = b.ir.const_new(5);
     b.ir.set_var(instr::Reg::CX, b.cur, cx);
     let ins = rep_string_instr(instr::Opcode::OP_MOVS, vec![
