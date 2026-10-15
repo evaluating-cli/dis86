@@ -403,7 +403,9 @@ impl IRBuilder<'_> {
       instr::Reg::DL | instr::Reg::DH => (instr::Reg::DX, instr::Reg::DL, instr::Reg::DH),
       instr::Reg::AX | instr::Reg::BX | instr::Reg::CX | instr::Reg::DX => {
         let cur = self.ir.get_var(reg.0, self.cur);
-        let (upper, lower) = self.append_upper_lower_split(cur);
+        // Byte fragments, not 32-bit halves: Upper16/Lower16 would leave
+        // Upper16 == 0 and Lower16 == full value for a 16-bit parent.
+        let (upper, lower) = self.append_byte_split(cur);
         let (f_lo, f_hi) = match reg.0 {
           instr::Reg::AX => (instr::Reg::AL, instr::Reg::AH),
           instr::Reg::BX => (instr::Reg::BL, instr::Reg::BH),
@@ -654,12 +656,11 @@ impl IRBuilder<'_> {
   }
 
   /// Reduce a byte-register read to its low 8 bits before a width-sensitive
-  /// compare. A byte fragment can hold the full parent-register value: a
-  /// 16-bit write splits AX into AL/AH via `Lower16`, which is not 8-bit
-  /// masked, and `forward_store_to_load` forwards values without regard to
-  /// width. ALU results re-mask on the byte write, but carries and borrows
-  /// compare the raw operand, so mask here. A never-written register (`Init`)
-  /// and an 8-bit immediate (`Const`) are already within 8 bits.
+  /// compare. Byte fragments are 8-bit masked at the split, but
+  /// `forward_store_to_load` forwards values without regard to width, so
+  /// mask here defensively. ALU results re-mask on the byte write, but
+  /// carries and borrows compare the raw operand. A never-written register
+  /// (`Init`) and an 8-bit immediate (`Const`) are already within 8 bits.
   fn to_byte(&mut self, r: Ref) -> Ref {
     if matches!(r, Ref::Init(_) | Ref::Const(_)) { return r; }
     let mask = self.ir.const_new(0xFF);
@@ -1045,7 +1046,7 @@ impl IRBuilder<'_> {
     // BX/SI/DI/BP are callee-saved: untouched.
     for reg in [instr::Reg::AX, instr::Reg::CX, instr::Reg::DX] {
       let cur = self.ir.get_var(reg, self.cur);
-      let (upper, lower) = self.append_upper_lower_split(cur);
+      let (upper, lower) = self.append_byte_split(cur);
       let (lo, hi) = match reg {
         instr::Reg::AX => (instr::Reg::AL, instr::Reg::AH),
         instr::Reg::CX => (instr::Reg::CL, instr::Reg::CH),
@@ -1247,6 +1248,19 @@ impl IRBuilder<'_> {
   fn append_upper_lower_split(&mut self, r: Ref) -> (Ref, Ref) {
     let upper = self.append_instr(Type::U16, Opcode::Upper16, vec![r]);
     let lower = self.append_instr(Type::U16, Opcode::Lower16, vec![r]);
+    (upper, lower)
+  }
+
+  /// Split a 16-bit register value into genuine 8-bit fragments.
+  /// Unlike `append_upper_lower_split` (32 -> two 16-bit halves via
+  /// Upper16/Lower16), this masks to a byte on both sides:
+  /// `AL = v & 0xFF`, `AH = (v >> 8) & 0xFF`.
+  fn append_byte_split(&mut self, r: Ref) -> (Ref, Ref) {
+    let mask = self.ir.const_new(0xFF);
+    let eight = self.ir.const_new(8);
+    let shifted = self.append_instr(Type::U16, Opcode::UShr, vec![r, eight]);
+    let upper = self.append_instr(Type::U16, Opcode::And, vec![shifted, mask]);
+    let lower = self.append_instr(Type::U16, Opcode::And, vec![r, mask]);
     (upper, lower)
   }
 
@@ -2218,13 +2232,15 @@ mod tests {
     let instrs: &[instr::Instr] = &[];
     let mut b = test_builder(&cfg, instrs, &spec, &binary);
     let cur = b.cur;
-    // Full write splits into fragments.
+    // Full write splits into genuine 8-bit fragments.
     let full = b.ir.const_new(0x1234);
     b.append_asm_dst_reg(&instr::OperandReg(instr::Reg::AX), full);
     let al = b.ir.get_var(instr::Reg::AL, cur);
     let ah = b.ir.get_var(instr::Reg::AH, cur);
-    assert_eq!(b.ir.instr(al).unwrap().opcode, Opcode::Lower16);
-    assert_eq!(b.ir.instr(ah).unwrap().opcode, Opcode::Upper16);
+    let al_instr = b.ir.instr(al).expect("AL must be a masked byte fragment");
+    let ah_instr = b.ir.instr(ah).expect("AH must be a masked byte fragment");
+    assert_eq!(al_instr.opcode, Opcode::And, "AL must be And(full, 0xFF)");
+    assert_eq!(ah_instr.opcode, Opcode::And, "AH must be And(UShr(full, 8), 0xFF)");
     // Partial write recomposes instead of bare-storing.
     let lo_new = b.ir.const_new(0x56);
     b.append_asm_dst_reg(&instr::OperandReg(instr::Reg::AL), lo_new);
@@ -2243,6 +2259,75 @@ mod tests {
       ax_instr.operands.iter().any(|r| b.ir.instr(*r).map(|i| i.opcode) == Some(Opcode::Shl)),
       "recomposition must shift the preserved HI"
     );
+  }
+
+  fn eval_const_u16(ir: &crate::decompile::ir::IR, r: Ref) -> Option<u16> {
+    match r {
+      Ref::Const(_) => ir.const_lookup(r).map(|v| v as u16),
+      Ref::Instr(_, _) => {
+        let i = ir.instr(r)?;
+        match i.opcode {
+          Opcode::Ref if i.operands.len() == 1 => eval_const_u16(ir, i.operands[0]),
+          Opcode::And | Opcode::Or | Opcode::Shl | Opcode::UShr | Opcode::Shr
+            if i.operands.len() == 2 =>
+          {
+            let a = eval_const_u16(ir, i.operands[0])? as i32;
+            let b = eval_const_u16(ir, i.operands[1])? as i32;
+            let v = match i.opcode {
+              Opcode::And => a & b,
+              Opcode::Or => a | b,
+              Opcode::Shl => (a << b) & 0xFFFF,
+              Opcode::UShr => ((a as u16 as u32) >> (b as u32)) as i32,
+              Opcode::Shr => ((a as i16 as i32) >> (b as u32)) & 0xFFFF,
+              _ => unreachable!(),
+            };
+            Some((v & 0xFFFF) as u16)
+          }
+          _ => None,
+        }
+      }
+      _ => None,
+    }
+  }
+
+  #[test]
+  fn full_write_then_ah_preserves_low_byte() {
+    // Issue #77 case 1: `mov ax,0x0607; mov ah,0x4A` must give 0x4A07,
+    // not 0x4E07 (high byte of the preserved low fragment leaking into AH).
+    let types = Rc::new(TypeDatabase::new());
+    let cfg = Config { types: types.clone(), structs: vec![], code_segs: vec![], funcs: vec![], indirects: vec![], globals: vec![], text_section: vec![] };
+    let binary = binary::Binary::from_raw(&[0xC3], None);
+    let spec = spec::Spec::from_start_and_end(Some(SegOff { seg: Seg::Normal(0), off: Off(0) }), Some(SegOff { seg: Seg::Normal(0), off: Off(1) }));
+    let instrs: &[instr::Instr] = &[];
+    let mut b = test_builder(&cfg, instrs, &spec, &binary);
+    let cur = b.cur;
+    let full = b.ir.const_new(0x0607);
+    b.append_asm_dst_reg(&instr::OperandReg(instr::Reg::AX), full);
+    let hi_new = b.ir.const_new(0x4A);
+    b.append_asm_dst_reg(&instr::OperandReg(instr::Reg::AH), hi_new);
+    let ax = b.ir.get_var(instr::Reg::AX, cur);
+    let v = eval_const_u16(&b.ir, ax).expect("AX must fold to a constant for constant inputs");
+    assert_eq!(v, 0x4A07, "mov ah must replace the high byte, preserving only the low byte");
+  }
+
+  #[test]
+  fn full_write_then_al_preserves_high_byte() {
+    // Issue #77 case 2: `mov ax,0x1234; mov al,0x56` must give 0x1256,
+    // not 0x0056 (preserved AH lost because Upper16(0x1234) == 0).
+    let types = Rc::new(TypeDatabase::new());
+    let cfg = Config { types: types.clone(), structs: vec![], code_segs: vec![], funcs: vec![], indirects: vec![], globals: vec![], text_section: vec![] };
+    let binary = binary::Binary::from_raw(&[0xC3], None);
+    let spec = spec::Spec::from_start_and_end(Some(SegOff { seg: Seg::Normal(0), off: Off(0) }), Some(SegOff { seg: Seg::Normal(0), off: Off(1) }));
+    let instrs: &[instr::Instr] = &[];
+    let mut b = test_builder(&cfg, instrs, &spec, &binary);
+    let cur = b.cur;
+    let full = b.ir.const_new(0x1234);
+    b.append_asm_dst_reg(&instr::OperandReg(instr::Reg::AX), full);
+    let lo_new = b.ir.const_new(0x56);
+    b.append_asm_dst_reg(&instr::OperandReg(instr::Reg::AL), lo_new);
+    let ax = b.ir.get_var(instr::Reg::AX, cur);
+    let v = eval_const_u16(&b.ir, ax).expect("AX must fold to a constant for constant inputs");
+    assert_eq!(v, 0x1256, "mov al must replace the low byte, preserving the high byte");
   }
 
   #[test]
@@ -2314,6 +2399,7 @@ mod tests {
     // Calls clobber AX/CX/DX: after save_return_value the fragment
     // views must be splits of the post-call value, not stale
     // pre-call versions (call f + mov [bx],al must store the result).
+    // Fragments are genuine 8-bit values (And-masked), not Lower16/Upper16.
     let types = Rc::new(TypeDatabase::new());
     let cfg = Config { types: types.clone(), structs: vec![], code_segs: vec![], funcs: vec![], indirects: vec![], globals: vec![], text_section: vec![] };
     let binary = binary::Binary::from_raw(&[0xC3], None);
@@ -2329,12 +2415,15 @@ mod tests {
     assert_eq!(ax, ret);
     let al = b.ir.get_var(instr::Reg::AL, cur);
     let al_instr = b.ir.instr(al).expect("AL must be refreshed post-call, not stale");
-    assert_eq!(al_instr.opcode, Opcode::Lower16);
-    assert_eq!(al_instr.operands, vec![ret]);
+    assert_eq!(al_instr.opcode, Opcode::And);
+    assert!(al_instr.operands.contains(&ret));
     let ah = b.ir.get_var(instr::Reg::AH, cur);
     let ah_instr = b.ir.instr(ah).expect("AH must be refreshed post-call, not stale");
-    assert_eq!(ah_instr.opcode, Opcode::Upper16);
-    assert_eq!(ah_instr.operands, vec![ret]);
+    assert_eq!(ah_instr.opcode, Opcode::And);
+    // AH goes through UShr(ret, 8) before the mask.
+    let shr = ah_instr.operands.iter().find_map(|r| b.ir.instr(*r)).expect("AH mask input");
+    assert_eq!(shr.opcode, Opcode::UShr);
+    assert!(shr.operands.contains(&ret));
   }
 
   #[test]
@@ -2627,12 +2716,18 @@ mod tests {
     let ands: Vec<Ref> = b.ir.iter_instrs(cur)
       .filter(|r| b.ir.instr(*r).unwrap().opcode == Opcode::And)
       .collect();
-    assert_eq!(ands.len(), 2, "count mask plus complementary-shift mask");
-    let n = *ands.iter().find(|r| {
+    // The full-width AX write also splits into genuine 8-bit fragments
+    // (two Ands with 0xFF); only the rotate masks use 15.
+    let rotate_ands: Vec<Ref> = ands.iter().copied()
+      .filter(|r| b.ir.const_lookup(b.ir.instr(*r).unwrap().operands[1]) == Some(15)
+        || b.ir.const_lookup(b.ir.instr(*r).unwrap().operands[0]) == Some(15))
+      .collect();
+    assert_eq!(rotate_ands.len(), 2, "count mask plus complementary-shift mask");
+    let n = *rotate_ands.iter().find(|r| {
       let i = b.ir.instr(**r).unwrap();
       b.ir.const_lookup(i.operands[0]) == Some(1) && b.ir.const_lookup(i.operands[1]) == Some(15)
     }).expect("count mask And [1, 15] present");
-    let m = *ands.iter().find(|r| **r != n).expect("second And present");
+    let m = *rotate_ands.iter().find(|r| **r != n).expect("second And present");
     let m_instr = b.ir.instr(m).unwrap();
     let sub = b.ir.instr(m_instr.operands[0]).unwrap();
     assert_eq!(sub.opcode, Opcode::Sub);
@@ -2954,11 +3049,10 @@ mod tests {
 
   #[test]
   fn byte_add_carry_masks_wide_fragment() {
-    // After a 16-bit write, a byte fragment holds the full parent value
-    // (append_asm_dst_reg splits AX via Lower16, not 8-bit masked). The byte
-    // ADD carry widens `a + b` and compares against 0xFF, so the operand
-    // must be masked to 8 bits or `0xFF < a + b` is wrong whenever the high
-    // bits are set (`mov ax,0x1234; add al,0` would report a carry).
+    // Byte fragments are 8-bit masked at the split, but the byte ADD carry
+    // still masks defensively via `to_byte`: the carry widens `a + b` and
+    // compares against 0xFF, so an unmasked operand would report a carry
+    // whenever the high bits are set.
     let (_types, cfg, binary, spec) = bit_test_builder(&[0xC3]);
     let instrs: &[instr::Instr] = &[];
     let mut b = test_builder(&cfg, instrs, &spec, &binary);
