@@ -3,7 +3,7 @@
 Hydra hosts on the **stock, unmodified** dosemu2 binary. No rebuild, no patching, no
 fork. Hydra runs as an external process that drives dosemu2 through its built-in
 debugger protocol (dosdebug FIFOs) and maps guest memory via `/proc/<pid>/fd/`. The
-design is in [`OPTION_D_DESIGN.md`](OPTION_D_DESIGN.md).
+design is in [`HOST_DESIGN.md`](HOST_DESIGN.md).
 
 > **Status:** Hydra's stock-dosemu2 host and opt-in overlay path are implemented.
 > PR [#39](https://github.com/evaluating-cli/dis86/pull/39) was merged as
@@ -15,14 +15,15 @@ design is in [`OPTION_D_DESIGN.md`](OPTION_D_DESIGN.md).
 > generated-metadata MZ/FBOV overlay dispatch. It also covered verified lowmem
 > selection, guest-visible IF=0 restoration, persistent register+lowmem
 > snapshots, nested callthrough, guest-owned raw-code scratch, and default-mode
-> overlay rejection. Code lives in `hydra/src/dosemu_host/`; see
-> [`TESTING.md`](TESTING.md) for the test inventory and historical evidence.
+> overlay rejection.
 >
 > Overlay hooks are available with the explicit `overlays=armed` host option.
 > Without that option, the host still fails closed before guest execution.
 
-SST (SingleStepTests hardware captures) is the validation authority for emu86. dosemu2's
-role is Hydra hosting only — not validation.
+dosemu2 (+ its simx86 CPU core and FDPP) is a **trusted third-party component**:
+it is the runtime substrate for Hydra hybrid execution and the oracle used to run
+original binaries in the native-recompile workflow. We neither validate, patch,
+nor fork it; see the development direction in [`../../README.md`](../../README.md).
 
 ## How it works
 
@@ -47,12 +48,6 @@ role is Hydra hosting only — not validation.
 Function-level hooking is the right granularity for the supported decompilation path.
 Instruction-level interception is used only for bounded raw-code/native→guest tracing.
 
-## Reference: retired validator transport
-
-Development patches 0001–0010 are closed historical development. The carrier was the two-patch squashed frozen series (since removed), governed by [`FREEZE_ABI_V1.md`](FREEZE_ABI_V1.md).
-
-Historical patch 0010 implemented deferred acknowledgement for standalone nonterminating host services. Eligible unchanged DOS/BIOS vectors are normalized at the exact saved return `CS:IP`. Application-installed handlers are a different contract: they remain visible and controller-stepped in lockstep.
-
 ## Evidence snapshot
 
 **Current Hydra host:** exact behavioral candidate `3beac798...` passed both normal CI
@@ -62,24 +57,14 @@ dispatches, 45 raw/native→guest runs, 45 returns, 66 redirects, CF preservatio
 preservation, byte-for-byte raw scratch restoration, and a live dosemu2 process at
 completion.
 
-**Pinned-runtime proven (historical validator, retired):** the frozen carrier applied/built/linked; pinned FDPP and comcom32 provisioning; ABI initialization; basic request/step acknowledgement; live `/dosemu_mem` bidirectional aliasing; end barrier and clean shutdown; terminating MZ execution; target-exit and fault publication; an unprefixed `INT 21h/AH=30h` acknowledgement at the post-service target boundary with DOS-returned state; and (historically) the validator corpus mode (`emu86_validator --corpus`) running a small declarative fixture set with per-boundary register and memory-window comparison, proven before the validator binary and fixture corpus were archived.
-
-**Host-only proven (emu86, unit level):** the host-side fixture corpus (REP string-op matrix and seeded register/segment mutation) was deleted when the differential validator was archived. On a separate axis, emu86's instruction behavior is *hardware*-anchored against the SingleStepTests 80286 captures via the SST harness (`docs/emu86/sst.md`); that axis is unrelated to — and does not speak to — twin equivalence with dosemu2 simx86.
-
-**Not integration-tested on the retired differential path:** prefixed service calls; application-installed handlers outside the target MCB; broader BIOS coverage; differential REP semantics (whole-REP-per-step in emu86 vs per-iteration SAME_PC in dosemu2). SST Track 3 R1 validates emu86 REP behavior against hardware, but it does not establish emu86/dosemu2 boundary equivalence; that differential mismatch remains unverified and is simply no longer a validation gate. Also unverified are interrupt shadow and shadow composition; child/helper exclusion; helper/lifecycle transitions; differential register/segment mutation (notably segment-override memory and stack effects); broad state/control redirection; and the representative per-boundary differential corpus.
-
-On a separate axis, emu86's instruction behavior is *hardware*-anchored against the SingleStepTests 80286 captures via the SST harness (`docs/emu86/sst.md`); that axis is unrelated to — and does not speak to — twin equivalence with dosemu2 simx86.
-
-“Implemented,” “host-only tested,” “pinned-runtime tested,” and “exact-head runtime tested” are distinct claims. Correctness smoke tests establish no performance claim.
+“Implemented,” “host-only tested,” and “exact-head runtime tested” are distinct claims.
+Correctness smoke tests establish no performance claim.
 
 ## Document map
 
 | Document | Content |
 | --- | --- |
-| [`OPTION_D_DESIGN.md`](OPTION_D_DESIGN.md) | Current design: external Hydra client via dosdebug + verified `/proc/pid/fd` mmap. |
-| [`FREEZE_ABI_V1.md`](FREEZE_ABI_V1.md) | Reference-only: the retired validator's 88-byte ABI-v1 contract. |
-| [`PHASE1_SPEC.md`](PHASE1_SPEC.md) | Reference-only: normative execution/ABI/ownership/interrupt/shutdown contract. |
-| [`PHASE1_IMPLEMENTATION.md`](PHASE1_IMPLEMENTATION.md) | Reference-only: implementation map for the frozen transport. |
-| [`TESTING.md`](TESTING.md) | Current hosting tests and exact-head evidence + reference-only frozen-transport evidence. |
-| [`REVIEW.md`](REVIEW.md) | Reference-only: design decisions and review cautions. |
-| [`SOURCES.md`](SOURCES.md) | Code and upstream source coordinates. |
+| [`HOST_DESIGN.md`](HOST_DESIGN.md) | Host design: external Hydra client via dosdebug + verified `/proc/pid/fd` mmap. |
+| [`OVERLAY_DESIGN.md`](OVERLAY_DESIGN.md) | Opt-in overlay-hook support (`overlays=armed`), fail-closed by default. |
+| [`TESTING.md`](TESTING.md) | Current hosting tests, build/run commands, and exact-head evidence. |
+| [`HISTORY.md`](HISTORY.md) | One-page history of the retired ABI-v1 differential validator. |

@@ -1,6 +1,8 @@
 # dosemu2 hosting testing
 
-SST (SingleStepTests hardware captures) is the validation authority for emu86; this document covers the **current Hydra-on-dosemu2 hosting tests** (first section) and the reference-only frozen dosemu2 transport evidence (remaining sections, historical).
+This document covers the **Hydra-on-dosemu2 hosting tests** and their exact-head
+evidence. The retired differential validator and its frozen transport are
+summarized in [`HISTORY.md`](HISTORY.md).
 
 ## Current: Hydra-on-dosemu2 hosting (external client)
 
@@ -204,78 +206,13 @@ The CI recipe compiles the `hydra/src/dosemu_host/*.c` implementation/test sourc
 addition to the top-level Hydra sources so a green workflow cannot miss host-driver
 compile errors.
 
-emu86 validation authority remains independent:
-
-```sh
-cargo test --locked --all-targets
-# emu86_sst audit --probe           # hardware-corpus authority where applicable
-```
+emu86/SST are frozen offline tooling with no role in product validation and are
+not built by the default lane (enable with `--features emu86`); see
+[`docs/emu86/sst.md`](../emu86/sst.md).
 
 ---
 
-## Reference-only: frozen transport evidence (historical)
+## Retired validator (historical)
 
-Everything below describes the retired differential validator's pinned-runtime
-transport. Kept for provenance; not a validation gate and not the current
-approach.
-
-## Test levels
-
-Testing claims use these levels; passing a lower level must not be reported as passing a higher one.
-
-1. **Specified:** behavior is required by `PHASE1_SPEC.md`.
-2. **Implemented:** code existed in the dosemu2 carrier (since removed) and/or the dis86 adapter.
-3. **Unit tested:** host-independent tests exercise code without booting dosemu2.
-4. **Pinned-runtime tested:** the patches are applied to dosemu2 commit `604ce0cdd1a71f657e2a2df623d216d5ab289313` and exercised with the pinned runtime stack. The shared-memory contract is ABI version **1**.
-5. **Still-unverified E2E:** the expanded pinned-runtime differential corpus has not yet proved the behavior.
-
-## Host-independent checks (historical transport)
-
-The old frozen-transport checks covered the retired validator's host command, target identity, shared-memory ABI, lifecycle, and comparison plumbing. They are retained as transport provenance, not as evidence for the current external Hydra host.
-
-### Hardware-anchored emu86 coverage (validation authority)
-
-SST is the replacement validation authority for the dosemu2 differential validator:
-emu86 is validated against real 80C286 hardware captures, and the dosemu2 differential
-corpus is no longer a validation gate.
-
-The authoritative hardened full-corpus run recorded elsewhere in this repository
-executed 1,064,157 tests across all 268 V1 forms with 1,050,652 PASS, 0 FAIL,
-0 DECODE_ERR, and 0 PANIC; see `docs/emu86/sst.md` for aggregate, filtering/revocation
-counts, and pinned runner/corpus SHAs. This is the hardware-validation axis, not a
-Hydra-on-dosemu2 hosting result.
-
-The optional SDL frontend remains separate:
-
-```sh
-cargo build --manifest-path dis86/Cargo.toml --features sdl --bin emu86
-```
-
-## Pinned-runtime coverage (retired)
-
-The retired `dosemu2 frozen feature patches` workflow applied the frozen patch series to
-the pinned dosemu2 commit and exercised the validator transport; its carrier has since
-been removed. Focused historical evidence included:
-
-- patch-series apply/compile/link success;
-- ABI-v1 initialization;
-- request/step acknowledgement;
-- bidirectional visibility of the live low-memory backing;
-- end-barrier and shutdown behavior;
-- a small terminating MZ fixture through the retired backend;
-- target-exit and architectural-fault publication;
-- host-service normalization cases; and
-- the archived differential fixture corpus before that validator path was removed.
-
-These results are not substitutes for the current Hydra host's real-dosemu tests above.
-
-## Expanded pinned-runtime differential corpus
-
-**SUPERSEDED:** this differential corpus is no longer a validation gate. SST validates
-emu86 against real hardware captures. The old dosemu2 boundary-alignment work remains
-reference-only, including historical open questions around REP boundary mapping,
-interrupt shadows, application-installed handlers, lifecycle transitions, broad
-register/control-flow mutation, and representative per-boundary memory comparison.
-
-Keep historical runtime evidence conceptually separate from the current external Hydra
-host so an old validator pass is never reported as a current hosting pass.
+The frozen ABI-v1 differential validator (emu86 vs dosemu2) and its pinned-runtime
+transport were retired; [`HISTORY.md`](HISTORY.md) keeps the one-page record.

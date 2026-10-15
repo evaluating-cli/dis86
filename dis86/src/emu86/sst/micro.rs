@@ -1,4 +1,4 @@
-//! Hermetic micro-corpus lane (plan.md phase P4).
+//! Hermetic micro-corpus lane.
 //!
 //! Runs the checked-in real-data corpus at `data/sst/micro/` (resolved relative
 //! to `CARGO_MANIFEST_DIR`, never the process cwd) through the REAL runner and

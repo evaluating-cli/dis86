@@ -1,7 +1,7 @@
 //! SST 80286 capability audit: classified expectations for every upstream
 //! `v1_real_mode` form, derived from emu86's step.rs dispatch arms (the
 //! authoritative IMPLEMENTED-opcode list) and instr_fmt.rs INSTR_TBL (decode
-//! knowledge). See plan.md phase P2.
+//! knowledge).
 //!
 //! `cap` is authoritative for what emu86 can actually *execute*: a form is
 //! `Implemented` only if `step()` has a dispatch arm that does not panic for

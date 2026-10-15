@@ -41,7 +41,6 @@ pub mod emu;
 pub use emu::run;
 pub use emu::{Emulator, LoadConfig};
 pub use cpu::{InitialStatePolicy, normalize_initial_state};
-pub mod validator;
 
 // Tests
 #[cfg(test)] mod alu_test;

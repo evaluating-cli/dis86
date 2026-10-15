@@ -20,7 +20,7 @@ Dis86 has been built for doing reverse-engineering work such as analyzing and re
 | `confgen/` | Python generators that produce `.bsl` configuration. |
 | `hydra/` | Hybrid runtime (C, Meson) linking native decompiled code with remaining x86-16 machine code. Emulator-independent core; see [`hydra/README.md`](hydra/README.md). |
 | `docs/` | 8086/DOS reference notes and the dosemu2 migration corpus (`docs/dosemu2/`). |
-| `scripts/` | SST corpus-fetch and runtime-probe tooling. |
+| `scripts/` | SST corpus-fetch tooling. |
 
 ## Goals and Non-goals
 

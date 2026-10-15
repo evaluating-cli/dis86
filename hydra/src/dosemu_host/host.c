@@ -792,7 +792,7 @@ void hydra_user_init(hydra_conf_t *conf,
             host_load_user_library(ctx, lib_path);
     }
 
-    /* OPTION E opt-in: dynamic overlay breakpoint arming. Absent or any
+    /* Overlay opt-in: dynamic overlay breakpoint arming. Absent or any
      * value other than "armed" keeps #34's fail-closed rejection. */
     {
         char ov[16];

@@ -1,4 +1,4 @@
-# OPTION E DESIGN — Opt-in overlay-hook support (external dosdebug host)
+# Overlay-hook design — opt-in support (external dosdebug host)
 
 Status: implementation and test reference for the shipped Phase 7 overlay support.
 Overlay hooks stay **fail-closed by default** and require the explicit
