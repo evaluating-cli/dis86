@@ -19,8 +19,9 @@ fn operand_is_stack_reg(operand: &instr::Operand) -> bool {
 /// Whether an instruction may leave the direction flag set: STD sets it
 /// explicitly, and POPF/IRET restore it from a popped flags value. POPF is
 /// lowered (opaque flags update) and clears the per-point `df_clear` state;
-/// IRET/RETF are terminal, so only their function-scope membership here
-/// matters for the string-op direction guard.
+/// IRET is terminal, so only its function-scope membership here matters for
+/// the string-op direction guard. (RETF pops CS:IP only — not flags — so it
+/// is correctly absent.)
 fn opcode_may_set_df(op: instr::Opcode) -> bool {
   matches!(op, instr::Opcode::OP_STD | instr::Opcode::OP_POPF | instr::Opcode::OP_IRET)
 }
@@ -720,10 +721,15 @@ impl IRBuilder<'_> {
         // constant counts: SHL carries bit (w-n), SHR/SAR carry bit (n-1)
         // (sign-independent). Gated to 1..=w: x86 masks the count to 5
         // bits, so e.g. `shl ax,16` genuinely shifts by 16 and carries
-        // bit 0 (pos = w-n = 0). Variable counts, zero counts (real HW
-        // preserves the flags), and counts above w keep the conservative
-        // clobber. ROL/ROR carry is not modeled (their zero-count case
-        // preserves CF, which needs a conditional).
+        // bit 0 (pos = w-n = 0). Variable counts and counts above w keep
+        // the conservative clobber. ROL/ROR carry is not modeled (their
+        // zero-count case preserves CF, which needs a conditional).
+        // A zero count leaves every flag unchanged in HW (including CF),
+        // so it is a full no-op for flags: preserve the tracked carry and
+        // emit no update — mirroring the RCL/RCR zero-count path below.
+        if self.ir.const_lookup(b) == Some(0) {
+          return;
+        }
         let w: i16 = if word { 16 } else { 8 };
         let cf = match self.ir.const_lookup(b) {
           Some(n) if (1..=w).contains(&n) => {
@@ -1302,8 +1308,12 @@ impl IRBuilder<'_> {
     // ast.rs), WriteVar16 against the Register symbol renders as a real guest
     // write and keeps each setup value live through DCE. Registers still at
     // their initial (unknown) value are skipped: writing them would emit a
-    // no-op `BX = BX`. DF is deliberately left alone: DOS interrupt handlers
-    // preserve it, so the per-point `df_clear` state survives the call.
+    // no-op `BX = BX`. DF is deliberately left alone: the DOS convention
+    // (see docs/8086_flags.txt: DF=0 on entry, restored on exit) is that
+    // callees and interrupt handlers preserve DF, and CALL callees are
+    // treated the same (process_calln leaves `df_clear` intact) — so the
+    // per-point `df_clear` state survives the call. Clearing here but not
+    // on CALL would be inconsistent; both trust the same ABI premise.
     let mut pending = vec![];
     for reg in [instr::Reg::AX, instr::Reg::BX, instr::Reg::CX, instr::Reg::DX,
                 instr::Reg::SI, instr::Reg::DI, instr::Reg::DS, instr::Reg::ES] {
@@ -2375,6 +2385,9 @@ impl IRBuilder<'_> {
     // Step 0: Direction-flag guard. DF is written only by STD and the
     // flag-restoring POPF/IRET (CLD clears it); with none present the
     // direction is provably clear for the whole function (see df_clear).
+    // When writers exist the entry stays conservative (a string op before
+    // any in-function writer stays loud): entry DF is unknowable locally,
+    // matching the join treatment in switch_blk. Deliberate, not a TODO.
     self.df_may_be_set = self.instrs.iter().any(|i| opcode_may_set_df(i.opcode));
     self.df_clear = !self.df_may_be_set;
 
@@ -3403,15 +3416,15 @@ mod tests {
   }
 
   #[test]
-  fn shift_zero_overwide_and_variable_counts_stay_loud() {
-    // Zero counts preserve flags in HW, counts above w have no single
-    // defined bit, and CL counts are runtime values: all keep the clobber.
+  fn shift_overwide_and_variable_counts_stay_loud() {
+    // Counts above w have no single defined bit, and CL counts are runtime
+    // values: both keep the clobber. (Zero counts preserve flags — see the
+    // next test — so they are not in this list.)
     let cl = instr::Operand::Reg(instr::OperandReg(instr::Reg::CL));
     for (opcode, count) in [
-      (instr::Opcode::OP_SHL, imm_count(0)),
       (instr::Opcode::OP_SHL, imm_count(20)),
-      (instr::Opcode::OP_SHR, imm_count(0)),
       (instr::Opcode::OP_SHL, cl),
+      (instr::Opcode::OP_SHR, imm_count(20)),
     ] {
       let (_types, cfg, binary, spec) = bit_test_builder(&[0xC3]);
       let instrs: &[instr::Instr] = &[];
@@ -3419,6 +3432,29 @@ mod tests {
       b.append_asm_instr(&rotate_instr(opcode, instr::Reg::AX, count));
       assert!(b.last_cf.is_none(), "{opcode:?} with this count must leave the carry unknown");
     }
+  }
+
+  #[test]
+  fn shift_zero_count_preserves_flags_and_carry() {
+    // HW leaves every flag unchanged on a zero-count shift, so a tracked
+    // carry (here from STC) must survive untouched, with no flag update.
+    let (_types, cfg, binary, spec) = bit_test_builder(&[0xC3]);
+    let instrs: &[instr::Instr] = &[];
+    let mut b = test_builder(&cfg, instrs, &spec, &binary);
+    b.append_asm_instr(&string_instr(instr::Opcode::OP_STC, vec![]));
+    let cf_before = b.last_cf.expect("stc must track CF=1");
+    assert_eq!(b.ir.const_lookup(cf_before), Some(1));
+    let flags_before = b.get_flags();
+    let updates_before = b.ir.iter_instrs(b.cur)
+      .filter(|r| b.ir.instr(*r).unwrap().opcode == Opcode::UpdateFlags)
+      .count();
+    b.append_asm_instr(&rotate_instr(instr::Opcode::OP_SHL, instr::Reg::AX, imm_count(0)));
+    assert_eq!(b.last_cf, Some(cf_before), "shl ax,0 must preserve the tracked carry");
+    assert_eq!(b.get_flags(), flags_before, "shl ax,0 must emit no flag update");
+    let updates_after = b.ir.iter_instrs(b.cur)
+      .filter(|r| b.ir.instr(*r).unwrap().opcode == Opcode::UpdateFlags)
+      .count();
+    assert_eq!(updates_after, updates_before, "shl ax,0 must emit no flag update");
   }
 
   #[test]
