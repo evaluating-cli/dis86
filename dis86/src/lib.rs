@@ -19,7 +19,9 @@ pub mod asm;
 pub mod analyze;
 pub mod decompile;
 
-// Emulator
+// Emulator: frozen offline tooling (no development; not part of product
+// validation). See the development direction in README.md.
+#[cfg(feature = "emu86")]
 pub mod emu86;
 
 // Main application glue

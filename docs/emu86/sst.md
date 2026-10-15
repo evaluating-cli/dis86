@@ -1,5 +1,11 @@
 # SST 80286 hardware validation — current status
 
+> **Frozen offline tooling.** Per the development direction in
+> [`../../README.md`](../../README.md), emu86 and the SST harness are no longer
+> developed and play no role in product validation: they are retained as
+> offline reference tooling only. They are not built by the default lane — every
+> cargo command below needs `--features emu86`.
+
 This document is the current, review-hardened status of the SingleStepTests (SST)
 80286 validation work for `emu86`. The detailed chronological divergence audit
 from the original investigation is preserved verbatim in
@@ -154,14 +160,14 @@ From the repository root, fetch the pinned corpus:
 Audit policy/decode coverage:
 
 ```sh
-cargo run --locked --manifest-path dis86/Cargo.toml --bin emu86_sst -- audit --probe
+cargo run --locked --features emu86 --manifest-path dis86/Cargo.toml --bin emu86_sst -- audit --probe
 ```
 
 Run all 268 forms with the hardened defaults (count-sensitive flags and
 undeclared write checking enabled):
 
 ```sh
-cargo run --locked --release --manifest-path dis86/Cargo.toml --bin emu86_sst -- run \
+cargo run --locked --release --features emu86 --manifest-path dis86/Cargo.toml --bin emu86_sst -- run \
   --stride 1 \
   --revocations dis86/data/sst/full/revocation_list.txt \
   $(awk '!/^#/ && NF >= 2 { print "dis86/data/sst/full/" $1 ".MOO" }' \
@@ -175,8 +181,11 @@ on process exit status alone.
 
 `dis86/data/sst/micro/` contains checked-in tests extracted from the same pinned
 hardware corpus. The cargo-test lane executes them through the real SST runner
-without network access. It is regression evidence for the harness and selected
-CPU semantics, not a substitute for the full 268-form corpus.
+without network access. The lane is gated behind the non-default `emu86`
+feature (`cargo test --features emu86`), so it no longer runs in the default
+CI lane; it remains regression evidence for the harness and selected CPU
+semantics when run offline. It is not a substitute for the full 268-form
+corpus.
 
 The historical investigation and all detailed divergence accounting remain
 available in `sst-historical.md`.

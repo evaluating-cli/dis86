@@ -33,9 +33,9 @@ From the repository root:
 ```sh
 ./scripts/sst_fetch.sh dis86/data/sst/full
 
-cargo run --locked --manifest-path dis86/Cargo.toml --bin emu86_sst -- audit --probe
+cargo run --locked --features emu86 --manifest-path dis86/Cargo.toml --bin emu86_sst -- audit --probe
 
-cargo run --locked --release --manifest-path dis86/Cargo.toml --bin emu86_sst -- run \
+cargo run --locked --release --features emu86 --manifest-path dis86/Cargo.toml --bin emu86_sst -- run \
   --stride 1 \
   --revocations dis86/data/sst/full/revocation_list.txt \
   $(awk '!/^#/ && NF >= 2 { print "dis86/data/sst/full/" $1 ".MOO" }' \
