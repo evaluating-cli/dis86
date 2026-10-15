@@ -1188,6 +1188,72 @@ impl IRBuilder<'_> {
     }
   }
 
+  /// Parent full register whose storage a byte fragment aliases (`AL`/`AH`
+  /// read `AX` storage; see the `AL`/`AH` macros in hydra's machine.h).
+  /// Full registers and non-fragmented registers map to themselves.
+  fn init_storage_parent(reg: instr::Reg) -> instr::Reg {
+    match reg {
+      instr::Reg::AL | instr::Reg::AH => instr::Reg::AX,
+      instr::Reg::BL | instr::Reg::BH => instr::Reg::BX,
+      instr::Reg::CL | instr::Reg::CH => instr::Reg::CX,
+      instr::Reg::DL | instr::Reg::DH => instr::Reg::DX,
+      _ => reg,
+    }
+  }
+
+  /// Whether the SSA value `r` (transitively) reads the live entry value
+  /// of `target`: `Ref::Init(target)` renders as the mutable C variable for
+  /// the register, so a materialized write carrying `r` must be emitted
+  /// before any write that overwrites `target`. The walk covers indirect
+  /// reads too (e.g. a recompose `Or` holding `And(Init(AX), 0xFF)`), not
+  /// just a direct `Init` alias from `mov reg,reg`. Byte fragments alias
+  /// their parent's storage (`Init(AL)` reads `AX`), so they count as
+  /// reads of the parent full register.
+  fn ref_reads_init(ir: &IR, r: Ref, target: instr::Reg) -> bool {
+    let mut stack = vec![r];
+    let mut seen: HashSet<Ref> = HashSet::new();
+    while let Some(cur) = stack.pop() {
+      if !seen.insert(cur) { continue; }
+      match cur {
+        Ref::Init(reg) => {
+          if Self::init_storage_parent(reg) == target { return true; }
+        }
+        Ref::Instr(_, _) => {
+          let Some(instr) = ir.instr(cur) else { continue; };
+          stack.extend(instr.operands.iter().copied());
+        }
+        Ref::Const(_) | Ref::Symbol(_) | Ref::Func(_) | Ref::Block(_) => (),
+      }
+    }
+    false
+  }
+
+  /// Order batched guest writes so copies observe program-order values.
+  /// Emitting `WriteVar16` in a fixed register order is wrong when a
+  /// register was copied while its source still held the entry value
+  /// (`mov bx,ax` records `BX = Init(AX)`, a live read): writing the
+  /// source first lets the copy observe the new value. A dest whose value
+  /// reads `Init(X)` is emitted before `X`'s write (stable topological
+  /// order over the fixed register order). A dependency cycle (not
+  /// expected from `mov` copies, which collapse to the same entry ref)
+  /// falls back to fixed order for its members rather than looping.
+  fn order_guest_writes(ir: &IR, pending: &[(instr::Reg, Ref)]) -> Vec<(instr::Reg, Ref)> {
+    let mut remaining: Vec<(instr::Reg, Ref)> = pending.to_vec();
+    let mut ordered: Vec<(instr::Reg, Ref)> = Vec::with_capacity(remaining.len());
+    while !remaining.is_empty() {
+      // Eligible: no *other* remaining write reads this candidate's register.
+      let pos = remaining.iter().position(|(reg, _)| {
+        !remaining.iter().any(|(other_reg, vref)| {
+          *other_reg != *reg && Self::ref_reads_init(ir, *vref, *reg)
+        })
+      });
+      // Cycle fallback: keep fixed order for the rest.
+      let idx = pos.unwrap_or(0);
+      ordered.push(remaining.remove(idx));
+    }
+    ordered
+  }
+
   fn process_int(&mut self, ins: &instr::Instr) {
     // An INT handler may read any general-purpose register, so first make the
     // live register values explicit as pinned guest writes. Unlike appending
@@ -1196,10 +1262,16 @@ impl IRBuilder<'_> {
     // write and keeps each setup value live through DCE. Registers still at
     // their initial (unknown) value are skipped: writing them would emit a
     // no-op `BX = BX`.
+    let mut pending = vec![];
     for reg in [instr::Reg::AX, instr::Reg::BX, instr::Reg::CX, instr::Reg::DX,
                 instr::Reg::SI, instr::Reg::DI, instr::Reg::DS, instr::Reg::ES] {
       let vref = self.ir.get_var(reg, self.cur);
       if vref == Ref::Init(reg) { continue; }
+      pending.push((reg, vref));
+    }
+    // Copies must observe program-order values (issue #78): a batched write
+    // whose value reads another pending register's entry value goes first.
+    for (reg, vref) in Self::order_guest_writes(&self.ir, &pending) {
       let sym = self.ir.symbols.find_ref_by_name(sym::Table::Register, reg.info().name).unwrap();
       self.append_instr_with_attrs(Type::U16, Attribute::PIN, Opcode::WriteVar16, vec![Ref::Symbol(sym), vref]);
     }
@@ -2481,6 +2553,51 @@ mod tests {
     for (name, r) in &writes {
       assert_ne!(b.ir.instr(*r).unwrap().opcode, Opcode::Nop, "{name} guest write must survive DCE");
     }
+  }
+
+  #[test]
+  fn int_materializes_copies_before_source_overwrite() {
+    // Issue #78: `mov bx,ax` records BX as Init(AX), a live read of the
+    // mutable guest variable. A later `mov ah,6` overwrites AX, so the
+    // batched INT writes must emit BX first: `BX = AX(entry)` before
+    // `AX = recompose`, never the reverse.
+    let types = Rc::new(TypeDatabase::new());
+    let cfg = Config { types: types.clone(), structs: vec![], code_segs: vec![], funcs: vec![], indirects: vec![], globals: vec![], text_section: vec![] };
+    let binary = binary::Binary::from_raw(&[0xC3], None);
+    let spec = spec::Spec::from_start_and_end(Some(SegOff { seg: Seg::Normal(0), off: Off(0) }), Some(SegOff { seg: Seg::Normal(0), off: Off(1) }));
+    let instrs: &[instr::Instr] = &[];
+    let mut b = test_builder(&cfg, instrs, &spec, &binary);
+    let cur = b.cur;
+    // mov bx,ax while AX still holds the entry value.
+    let ax_entry = b.ir.get_var(instr::Reg::AX, cur);
+    assert_eq!(ax_entry, Ref::Init(instr::Reg::AX));
+    b.append_asm_dst_reg(&instr::OperandReg(instr::Reg::BX), ax_entry);
+    // mov ah,6 recomposes AX.
+    let six = b.ir.const_new(6);
+    b.append_asm_dst_reg(&instr::OperandReg(instr::Reg::AH), six);
+    b.append_asm_instr(&int_instr(0x21));
+    // Block order of the guest writes: BX must precede AX.
+    let order: Vec<String> = b.ir.iter_instrs(cur).filter_map(|r| {
+      let i = b.ir.instr(r)?;
+      if i.opcode != Opcode::WriteVar16 { return None; }
+      if let Ref::Symbol(s) = i.operands[0] {
+        Some(s.name(&b.ir.symbols).to_string())
+      } else { None }
+    }).collect();
+    let bx_pos = order.iter().position(|n| n == "BX").expect("BX must be materialized");
+    let ax_pos = order.iter().position(|n| n == "AX").expect("AX must be materialized");
+    assert!(bx_pos < ax_pos, "copy BX = AX(entry) must precede the AX overwrite: {order:?}");
+    // And the BX write must carry the entry value, not the recomposed AX.
+    let bx_write = b.ir.iter_instrs(cur).find(|r| {
+      let i = b.ir.instr(*r).unwrap();
+      i.opcode == Opcode::WriteVar16
+        && matches!(i.operands[0], Ref::Symbol(s) if s.name(&b.ir.symbols) == "BX")
+    }).unwrap();
+    assert_eq!(
+      b.ir.instr(bx_write).unwrap().operands[1],
+      Ref::Init(instr::Reg::AX),
+      "BX must capture the entry AX"
+    );
   }
 
   fn jmp_instr(opcode: instr::Opcode, addr_off: u16, n_bytes: u16, rel: u16) -> instr::Instr {
