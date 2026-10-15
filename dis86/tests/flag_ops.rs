@@ -116,3 +116,29 @@ fn std_keeps_rep_movsb_loud() {
   assert!(source.contains("STD()"), "STD must appear:\n{source}");
   assert!(source.contains("UNIMPL("), "STD+rep must stay loud:\n{source}");
 }
+
+// std; cld; rep movsb; ret (issue #86)
+// The CLD re-establishes DF=0 at that point, so the REP form models
+// exactly despite the earlier STD.
+#[test]
+fn std_then_cld_lets_rep_movsb_model() {
+  let code = [0xFD, 0xFC, 0xF3, 0xA4, 0xC3];
+  let source = decompile_raw(&code);
+
+  assert!(source.contains("STD()"), "STD must appear:\n{source}");
+  assert!(source.contains("CLD()"), "CLD must appear:\n{source}");
+  assert!(source.contains("REP_MOVSB"), "CLD must restore the exact REP model:\n{source}");
+  assert!(!source.contains("UNIMPL"), "no loud marker once CLD re-establishes DF=0:\n{source}");
+}
+
+// mov ax,0x8000; shl ax,1; adc bx,cx; mov ax,bx; ret (issue #86 note)
+// The shift publishes bit 15 as the carry, so the ADC lowers exactly
+// instead of degrading to UNIMPL_FLAGS.
+#[test]
+fn shl_imm_carry_flows_into_adc_exactly() {
+  let code = [0xB8, 0x00, 0x80, 0xD1, 0xE0, 0x13, 0xD9, 0x89, 0xD8, 0xC3];
+  let source = decompile_raw(&code);
+
+  assert!(!source.contains("UNIMPL"), "shift-carry ADC must lower exactly:\n{source}");
+  assert!(source.contains(">> 15"), "the carry must come from bit 15:\n{source}");
+}

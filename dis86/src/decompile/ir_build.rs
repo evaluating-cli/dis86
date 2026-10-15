@@ -17,9 +17,10 @@ fn operand_is_stack_reg(operand: &instr::Operand) -> bool {
 }
 
 /// Whether an instruction may leave the direction flag set: STD sets it
-/// explicitly, and POPF/IRET restore it from a popped flags value. (The
-/// latter are not lowered yet — they panic — but including them keeps the
-/// string-op direction guard sound if/when they are.)
+/// explicitly, and POPF/IRET restore it from a popped flags value. POPF is
+/// lowered (opaque flags update) and clears the per-point `df_clear` state;
+/// IRET/RETF are terminal, so only their function-scope membership here
+/// matters for the string-op direction guard.
 fn opcode_may_set_df(op: instr::Opcode) -> bool {
   matches!(op, instr::Opcode::OP_STD | instr::Opcode::OP_POPF | instr::Opcode::OP_IRET)
 }
@@ -717,9 +718,10 @@ impl IRBuilder<'_> {
       Opcode::Shl | Opcode::UShr | Opcode::Shr => {
         // Shifts publish their carry-out (the last bit shifted out) for
         // constant counts: SHL carries bit (w-n), SHR/SAR carry bit (n-1)
-        // (sign-independent). Gated to 1..=w; variable counts, zero counts
-        // (real HW preserves the flags), and over-wide counts (whose
-        // hardware masking is ambiguous to model) keep the conservative
+        // (sign-independent). Gated to 1..=w: x86 masks the count to 5
+        // bits, so e.g. `shl ax,16` genuinely shifts by 16 and carries
+        // bit 0 (pos = w-n = 0). Variable counts, zero counts (real HW
+        // preserves the flags), and counts above w keep the conservative
         // clobber. ROL/ROR carry is not modeled (their zero-count case
         // preserves CF, which needs a conditional).
         let w: i16 = if word { 16 } else { 8 };
@@ -1300,7 +1302,8 @@ impl IRBuilder<'_> {
     // ast.rs), WriteVar16 against the Register symbol renders as a real guest
     // write and keeps each setup value live through DCE. Registers still at
     // their initial (unknown) value are skipped: writing them would emit a
-    // no-op `BX = BX`.
+    // no-op `BX = BX`. DF is deliberately left alone: DOS interrupt handlers
+    // preserve it, so the per-point `df_clear` state survives the call.
     let mut pending = vec![];
     for reg in [instr::Reg::AX, instr::Reg::BX, instr::Reg::CX, instr::Reg::DX,
                 instr::Reg::SI, instr::Reg::DI, instr::Reg::DS, instr::Reg::ES] {
@@ -3401,12 +3404,14 @@ mod tests {
 
   #[test]
   fn shift_zero_overwide_and_variable_counts_stay_loud() {
-    // Zero counts preserve flags in HW, over-wide counts have ambiguous
-    // masking, and CL counts are runtime values: all keep the clobber.
+    // Zero counts preserve flags in HW, counts above w have no single
+    // defined bit, and CL counts are runtime values: all keep the clobber.
+    let cl = instr::Operand::Reg(instr::OperandReg(instr::Reg::CL));
     for (opcode, count) in [
       (instr::Opcode::OP_SHL, imm_count(0)),
       (instr::Opcode::OP_SHL, imm_count(20)),
       (instr::Opcode::OP_SHR, imm_count(0)),
+      (instr::Opcode::OP_SHL, cl),
     ] {
       let (_types, cfg, binary, spec) = bit_test_builder(&[0xC3]);
       let instrs: &[instr::Instr] = &[];
