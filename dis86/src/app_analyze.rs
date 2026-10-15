@@ -13,5 +13,5 @@ pub fn run(cfg: &Config, exe_path: &str) -> i32 {
 
   //a.analyze_code_segments_and_report();
 
-  1
+  0
 }

@@ -302,15 +302,19 @@ fn disassemble_data(binary: &Binary, start: SegOff, end: SegOff, _cfg: Option<&C
   println!("");
 }
 
+fn print_usage(prog: &str) {
+  eprintln!("usage: {} [CMD]", prog);
+  eprintln!("");
+  eprintln!("Commands:");
+  for c in COMMANDS {
+    eprintln!("  {:<10} {}", c.name, c.desc);
+  }
+}
+
 fn main() {
   let args: Vec<String> = std::env::args().collect();
   if args.len() < 2 {
-    eprintln!("usage: {} [CMD]", args[0]);
-    eprintln!("");
-    eprintln!("Commands:");
-    for c in COMMANDS {
-      eprintln!("  {:<10} {}", c.name, c.desc);
-    }
+    print_usage(&args[0]);
     std::process::exit(1);
   }
 
@@ -322,5 +326,8 @@ fn main() {
     }
   }
 
-  panic!("Unknown command: {}", cmd);
+  eprintln!("Error: unknown command '{}'.", cmd);
+  eprintln!("");
+  print_usage(&args[0]);
+  std::process::exit(1);
 }
