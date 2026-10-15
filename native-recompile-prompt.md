@@ -73,11 +73,13 @@ but exits nonzero if any function failed — read its stderr carefully and fix
 each failure class at its root (config, opcode coverage, IR→AST gap) rather
 than by deleting functions from scope.
 
-### Known decompiler limitations (audit for these; report, don't hide)
+### Known decompiler traps and their diagnostics (audit for these; report, don't hide)
 
-This fork's `dis86` has known gaps that surface on real DOS binaries. Detect
-them early and account for them explicitly (a workaround or a named exclusion
-with justification — never a silent scope cut):
+This fork's `dis86` has known traps that surface on real DOS binaries. Detect
+them early and account for them explicitly: where a bullet names a fixed
+issue, follow its guidance (do not "work around" a non-issue); where it names
+a live limitation, pick a workaround or a named exclusion with justification —
+never a silent scope cut:
 
 - **`INT` register setup is preserved — do not work around dropped setup.**
   `process_int` pins the live guest registers as writes ahead of the
