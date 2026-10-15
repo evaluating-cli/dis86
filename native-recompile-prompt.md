@@ -47,7 +47,7 @@ blocker(s), what was tried, partial artifacts, and why no workaround exists
 
 | Path | What it is |
 | --- | --- |
-| `dis86/` | Decompiler (Rust): decode → analysis → SSA IR → opt → control flow → AST → C codegen. Also `emu86` (8086/286 reference emulator) and the `mzfile` companion binary. Build: `cd dis86 && cargo build` (or `just build-dis86`; binaries land in `build/bin/`). |
+| `dis86/` | Decompiler (Rust): decode → analysis → SSA IR → opt → control flow → AST → C codegen. Also the `mzfile` companion binary. Build: `cd dis86 && cargo build` (or `just build-dis86`; both binaries land in `build/bin/`). |
 | `bsl/` | Barebones Specification Language (config/annotation tables). |
 | `confgen/generate.py` + `confgen/hydra/{annotations.py,gen/}` | Generate `.bsl` config / appdata headers from an annotation source: `PYTHONPATH=confgen python3 confgen/generate.py SRC --dis86-conf\|--appdata-hdr\|--appdata-src`. `SRC` must be an **importable Python source file** (give it a `.py` extension — `confgen/hydra/gen/load.py` loads it via `importlib` and will not accept an arbitrary extension such as `.src`). |
 | `hydra/` | Hybrid runtime (C, Meson). **You may use Hydra headers/macros as a runtime library** in the final native binary. Current host = external dosdebug client in `hydra/src/dosemu_host/` (see `docs/dosemu2/README.md`). Build: `just build-hydra`. |
@@ -79,26 +79,35 @@ This fork's `dis86` has known gaps that surface on real DOS binaries. Detect
 them early and account for them explicitly (a workaround or a named exclusion
 with justification — never a silent scope cut):
 
-- **`INT` register setup is dropped.** `int N` is modeled with no register
-  inputs, so `mov ah,<fn>` / `mov bx,<handle>` immediately before an `INT` is
-  dead-code-eliminated; the emitted `INT(...)` dispatches with stale registers.
-  This breaks essentially every DOS program at runtime until it is fixed in
-  `dis86` (issue #66).
+- **`INT` register setup is preserved — do not work around dropped setup.**
+  `process_int` pins the live guest registers as writes ahead of the
+  `INT(...)` dispatch, so `mov ah,<fn>` / `mov bx,<handle>` immediately
+  before an `INT` survives DCE (issue #66, fixed). If registers look stale
+  at an `INT` in emitted code, that is a new bug: report it with the
+  disassembly + IR, don't build shims around assumed-dropped setup.
 - **Branches to a target outside a function's declared `[start, end)` are
-  dropped with no diagnostic** (cross-function tail jumps, shared epilogues,
-  tail-call optimization). Symptom: a function ends without a `return`/`goto`,
-  or a body simply stops mid-flow. Mitigation: split ranges so every branch
-  target lands inside a range, or route the tail through an in-range copy
-  (issue #67).
-- **Embedded data inside a suggested range aborts the linear decoder.**
-  `--analyze` ranges are reachability-based, but decode is linear, so a runtime
-  banner/string/table inside a range fails with `Unsupported or invalid
-  instruction`. Audit each suggested range and split out non-code bytes; declare
-  them in `text_section`. The `--analyze` "Gaps" report is not currently wired
-  into the CLI output (issue #65).
-- **`sbb`/`adc`/`rcl`/`rcr`/`rol`/`ror` and `REP`-prefixed string ops lower to
-  `UNIMPL`, which aborts at runtime.** CRC/checksum/block-copy/codec paths use
-  these heavily (issue #69).
+  dropped — but each dropped edge now warns.** The build prints a `WARN`
+  naming the branch and its out-of-range target (issue #67, diagnostic
+  added; the drop itself is by design). Treat every such warning as a
+  range-split task: split ranges so every branch target lands inside a
+  range, or route the tail through an in-range copy. Symptom if you ignore
+  the warning: a function ends without a `return`/`goto`, or a body simply
+  stops mid-flow.
+- **Embedded data inside a suggested range aborts the linear decoder —
+  and `--analyze` now flags the bad ranges for you.** `--analyze` ranges
+  are reachability-based but decode is linear, so a runtime banner/string/
+  table inside a range fails with `Unsupported or invalid instruction`.
+  Each offending suggestion carries a `# UNDECODABLE GAP` diagnostic naming
+  the exact failing address (issue #65): shorten the range at the named
+  address and declare the data bytes in `text_section` (issue #65, fixed).
+- **`adc`/`sbb`/`rcl`/`rcr`/`rol`/`ror` and `REP`-prefixed string ops are
+  exact when their state is known — a loud marker means genuinely unknown
+  state, not a missing opcode.** `ADC`/`SBB` chain on a known incoming
+  carry, `RCL`/`RCR` lower exactly with a known carry-in, `ROL`/`ROR` are
+  value-exact (flags clobbered), and `REP MOVS`/`STOS`/`LODS` model exactly
+  (issue #69, fixed). If one of these still emits `UNIMPL`/`UNIMPL_FLAGS`,
+  investigate the state at that point (unknown carry? possibly-set DF?) —
+  don't blanket-exclude the opcode class from scope.
 - **`--analyze` insists on at least one seeded function.** With an empty config
   it has nothing to scan from; seed your best guess at the entry first.
 
@@ -146,8 +155,10 @@ build/recompile-<TARGET_NAME>/
 ## 7. Phases 1–3 — config → whole-binary decompile → native recompile
 
 End-to-end loop: seed a minimal `.bsl` naming the entry → `--analyze` and read
-the suggested `F( ... )` lines → **audit every suggested range** (split out
-embedded data and out-of-range branch targets; see §3) → write `annotations.py`
+the suggested `F( ... )` lines **including their diagnostics** (`# UNDECODABLE
+GAP`, `# RET KIND UNKNOWN`, `# MIXED RETURN KINDS` pinpoint exactly which
+ranges need auditing; see §3) → **audit every flagged range** (split out
+embedded data and out-of-range branch targets) → write `annotations.py`
 → `confgen/generate.py … --dis86-conf` → whole-segment
 `--codeseg-name … --codegen-hydra`. Repeat until the batch exits 0.
 
