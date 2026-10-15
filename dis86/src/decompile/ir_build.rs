@@ -1188,12 +1188,27 @@ impl IRBuilder<'_> {
     }
   }
 
+  /// Parent full register whose storage a byte fragment aliases (`AL`/`AH`
+  /// read `AX` storage; see the `AL`/`AH` macros in hydra's machine.h).
+  /// Full registers and non-fragmented registers map to themselves.
+  fn init_storage_parent(reg: instr::Reg) -> instr::Reg {
+    match reg {
+      instr::Reg::AL | instr::Reg::AH => instr::Reg::AX,
+      instr::Reg::BL | instr::Reg::BH => instr::Reg::BX,
+      instr::Reg::CL | instr::Reg::CH => instr::Reg::CX,
+      instr::Reg::DL | instr::Reg::DH => instr::Reg::DX,
+      _ => reg,
+    }
+  }
+
   /// Whether the SSA value `r` (transitively) reads the live entry value
   /// of `target`: `Ref::Init(target)` renders as the mutable C variable for
   /// the register, so a materialized write carrying `r` must be emitted
   /// before any write that overwrites `target`. The walk covers indirect
   /// reads too (e.g. a recompose `Or` holding `And(Init(AX), 0xFF)`), not
-  /// just a direct `Init` alias from `mov reg,reg`.
+  /// just a direct `Init` alias from `mov reg,reg`. Byte fragments alias
+  /// their parent's storage (`Init(AL)` reads `AX`), so they count as
+  /// reads of the parent full register.
   fn ref_reads_init(ir: &IR, r: Ref, target: instr::Reg) -> bool {
     let mut stack = vec![r];
     let mut seen: HashSet<Ref> = HashSet::new();
@@ -1201,7 +1216,7 @@ impl IRBuilder<'_> {
       if !seen.insert(cur) { continue; }
       match cur {
         Ref::Init(reg) => {
-          if reg == target { return true; }
+          if Self::init_storage_parent(reg) == target { return true; }
         }
         Ref::Instr(_, _) => {
           let Some(instr) = ir.instr(cur) else { continue; };
