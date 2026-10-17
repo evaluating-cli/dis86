@@ -38,19 +38,19 @@ $ cargo test --locked --all-targets
      [1m[94m= [0m[1mnote[0m: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
 
 [1m[33mwarning[0m: `dis86` (lib test) generated 1 warning (run `cargo fix --lib -p dis86 --tests` to apply 1 suggestion)
-[1m[92m    Finished[0m `test` profile [unoptimized + debuginfo] target(s) in 4.17s
+[1m[92m    Finished[0m `test` profile [unoptimized + debuginfo] target(s) in 4.13s
 [1m[92m     Running[0m unittests src/lib.rs (/tmp/main/dis86/target/debug/deps/dis86-41e0c43f83193edf)
 
 running 172 tests
 test analyze::analyze::tests::ignored_branches_emit_no_suggestion_line ... ok
 test analyze::analyze::tests::ret_kind_flags_observed_kinds_are_authoritative ... ok
 test analyze::analyze::tests::ret_kind_flags_unknown_defers_to_configured_mode ... ok
+test analyze::analyze::tests::suggestion_flags_mixed_return_kinds ... ok
 test analyze::analyze::tests::suggestion_flags_undecodable_gap ... ok
 test analyze::analyze::tests::suggestion_gives_interrupt_specific_guidance ... ok
 test analyze::analyze::tests::suggestion_mixed_needs_a_classified_kind ... ok
 test analyze::analyze::tests::suggestion_omits_diagnostic_for_known_kinds ... ok
 test analyze::analyze::tests::suggestion_preserves_configured_mode_with_kept_note ... ok
-test analyze::analyze::tests::suggestion_flags_mixed_return_kinds ... ok
 test analyze::analyze::tests::suggestion_renders_diagnostic_before_entry_with_bare_name ... ok
 test analyze::code_segment::tests::plain_mz_yields_single_load_base_segment ... ok
 test analyze::code_segment::tests::wrapped_seginfo_segment_is_rejected_upfront ... ok
@@ -60,37 +60,37 @@ test analyze::func_details::tests::analysis_respects_annotated_end_bound ... ok
 test analyze::func_details::tests::first_undecodable_addr_flags_jumped_over_data ... ok
 test analyze::func_details::tests::first_undecodable_addr_is_total_on_bad_ranges ... ok
 test analyze::func_details::tests::iret_terminates_function_as_interrupt ... ok
-test analyze::func_details::tests::inferred_end_spans_gap_that_linear_decode_rejects ... ok
+test analyze::func_details::tests::mixed_return_kinds_record_ignored_not_winning ... ok
 test analyze::func_details::tests::noreturn_function_reports_unknown_return_kind ... ok
 test analyze::func_details::tests::repeated_winning_kind_records_nothing ... ok
-test analyze::func_details::tests::mixed_return_kinds_record_ignored_not_winning ... ok
+test analyze::func_details::tests::ret_retf_mix_records_ignored_far ... ok
+test analyze::func_details::tests::inferred_end_spans_gap_that_linear_decode_rejects ... ok
 test analyze::func_details::tests::ret_yields_near_return_kind ... ok
 test analyze::func_details::tests::retf_yields_far_return_kind ... ok
 test analyze::instr_details::tests::iret_yields_interrupt_return ... ok
 test analyze::instr_details::tests::memory_indirect_call_counts_as_indirect ... ok
-test analyze::func_details::tests::ret_retf_mix_records_ignored_far ... ok
+test analyze::instr_details::tests::register_indirect_call_counts_as_indirect ... ok
 test analyze::instr_details::tests::relative_call_is_direct ... ok
 test app::tests::relocatable_seg_list_parses_hex_with_optional_prefix ... ok
-test app::tests::relocatable_seg_list_rejects_empty_and_bad_tokens ... ok
 test asm::decode::tests::lock_prefix_is_scoped_to_validated_string_ops ... ok
-test analyze::instr_details::tests::register_indirect_call_counts_as_indirect ... ok
 test asm::instr_fmt::tests::test ... ok
 test binfmt::mz::decode::tests::decodes_synthetic_mz_fbov_stub_and_overlay_payload ... ok
+test app::tests::relocatable_seg_list_rejects_empty_and_bad_tokens ... ok
 test bsl::wrap::tests::test_1 ... ok
 test bsl::wrap::tests::test_2 ... ok
 test bsl::wrap::tests::test_3 ... ok
-test bsl::wrap::tests::test_4 ... ok
 test bsl::wrap::tests::test_5 ... ok
+test bsl::wrap::tests::test_4 ... ok
 test decompile::ast::tests::body_name_walk_finds_nested_uses ... ok
-test decompile::ast::tests::fragment_parents_map_correctly ... ok
-test decompile::ast::tests::ground_frame_accepts_single_local ... ok
 test config::tests::ret_kind_unknown_marker_is_ignored_by_config_parsing ... ok
-test decompile::ast::tests::ground_frame_rejects_local_below_return_address_slot ... ok
+test decompile::ast::tests::ground_frame_accepts_single_local ... ok
+test decompile::ast::tests::fragment_parents_map_correctly ... ok
 test decompile::ast::tests::ground_frame_no_locals_means_no_frame ... ok
+test decompile::ast::tests::ground_frame_rejects_local_below_return_address_slot ... ok
 test decompile::ast::tests::ground_frame_rejects_shallow_frame ... ok
-test decompile::ast::tests::ground_frame_widens_to_eliminated_push_save_locals ... ok
-test decompile::ast::tests::negative_offsets_are_rejected ... ok
 test decompile::ast::tests::ground_frame_rejects_unrepresentable_extents ... ok
+test decompile::ast::tests::negative_offsets_are_rejected ... ok
+test decompile::ast::tests::ground_frame_widens_to_eliminated_push_save_locals ... ok
 test decompile::ast::tests::overflowing_ranges_are_rejected ... ok
 test decompile::ast::tests::valid_ranges_pass_through ... ok
 test decompile::ast::tests::widen_frame_leaves_superset_unchanged ... ok
@@ -98,25 +98,25 @@ test decompile::ast::tests::widen_frame_survives_i16_min_extent ... ok
 test decompile::ast::tests::widen_frame_widens_both_directions ... ok
 test decompile::control_flow::tests::normalize_if_arms_handles_an_empty_arm ... ok
 test decompile::control_flow::tests::infer_if_captures_two_disjoint_arms_to_common_join ... ok
-test decompile::ir::methods::tests::block_exits_empty_block_has_no_exits ... ok
 test decompile::control_flow::tests::sequentially_reaching_rejects_cycles ... ok
-test decompile::ir::methods::tests::block_exits_return_has_no_exits ... ok
 test asm::decode::tests::test ... ok
+test decompile::ir::methods::tests::block_exits_empty_block_has_no_exits ... ok
+test decompile::ir::methods::tests::block_exits_return_has_no_exits ... ok
 test decompile::ir::methods::tests::block_exits_tolerates_dce_erased_tail ... ok
 test decompile::ir::methods::tests::block_last_instr_empty_block_yields_none ... ok
-test decompile::ir::methods::tests::get_var_terminates_on_unreachable_self_loop ... ok
 test decompile::ir::methods::tests::get_var_preserves_normal_loop_phi ... ok
+test decompile::ir::methods::tests::get_var_terminates_on_unreachable_self_loop ... ok
 test decompile::ir::methods::tests::get_var_terminates_on_unreachable_single_predecessor_cycle ... ok
 test decompile::ir_build::tests::block_boundary_seeds_carry_from_entry_knownness ... ok
 test decompile::ir_build::tests::alu_carry_tracking_sets_uses_preserves_and_clears ... ok
-test decompile::ir_build::tests::branch_to_next_at_end_links_both_arms_silently ... ok
 test decompile::ir_build::tests::byte_adc_tracks_bit8_carry ... ok
+test decompile::ir_build::tests::branch_to_next_at_end_links_both_arms_silently ... ok
 test decompile::ir_build::tests::build_marks_df_may_be_set_from_decoded_instructions ... ok
 test decompile::ir_build::tests::byte_add_carry_masks_wide_fragment ... ok
 test decompile::ir_build::tests::byte_add_tracks_carry_via_widened_sum ... ok
 test decompile::ir_build::tests::calls_refresh_partial_register_views ... ok
-test decompile::ir_build::tests::carry_writers_without_a_modeled_carry_invalidate_it ... ok
 test decompile::ir_build::tests::cld_after_std_restores_exact_string_model ... ok
+test decompile::ir_build::tests::carry_writers_without_a_modeled_carry_invalidate_it ... ok
 test decompile::ir_build::tests::cmps_advances_si_and_di ... ok
 test decompile::ir_build::tests::first_fragment_write_has_no_undeclared_phi ... ok
 test decompile::ir_build::tests::full_write_then_ah_preserves_low_byte ... ok
@@ -143,75 +143,75 @@ test decompile::ir_build::tests::rep_with_possible_std_degrades_loud ... ok
 test decompile::ir_build::tests::rol_imm_lowers_to_masked_shifts_or ... ok
 test decompile::ir_build::tests::ror_cl_count_uses_byte_width_reg_count ... ok
 test decompile::ir_build::tests::scas_advances_only_di ... ok
-test decompile::ir_build::tests::shift_imm_carry_positions_cover_widths_and_directions ... ok
 test decompile::ir_build::tests::shift_imm_publishes_carry_out_for_adc ... ok
-test decompile::ir_build::tests::shift_zero_count_preserves_flags_and_carry ... ok
+test decompile::ir_build::tests::shift_imm_carry_positions_cover_widths_and_directions ... ok
 test decompile::ir_build::tests::shift_overwide_and_variable_counts_stay_loud ... ok
+test decompile::ir_build::tests::shift_zero_count_preserves_flags_and_carry ... ok
 test decompile::ir_build::tests::std_poison_string_ops_until_cld ... ok
 test decompile::ir_build::tests::stos_advances_only_di ... ok
-test decompile::ir_build::tests::string_op_with_std_degrades_loud_without_guessing_direction ... ok
 test decompile::ir_build::tests::target_in_range_accepts_start_and_rejects_end_and_other_seg ... ok
+test decompile::ir_build::tests::string_op_with_std_degrades_loud_without_guessing_direction ... ok
 test decompile::ir_build::tests::undefined_sibling_register_seeds_initial_value ... ok
 test decompile::ir_build::tests::trailing_conditional_branch_fallthrough_still_gets_a_block ... ok
-test decompile::opt::tests::chained_comparison_inverts_eq_zero_and_preserves_neq_zero ... ok
 test decompile::ir_build::tests::warnings_are_not_duplicated_across_analysis_passes ... ok
 test decompile::opt::tests::chained_comparison_requires_zero_on_both_rhs_operands ... ok
-test decompile::opt::tests::chained_comparison_skips_non_comparison_inner_opcode ... ok
+test decompile::opt::tests::chained_comparison_inverts_eq_zero_and_preserves_neq_zero ... ok
 test decompile::opt::tests::chained_comparison_skips_malformed_inner_arity ... ok
+test decompile::opt::tests::chained_comparison_skips_non_comparison_inner_opcode ... ok
 test decompile::opt::tests::chained_signed_byte_comparison_preserves_width_for_constant_folding ... ok
 test decompile::opt::tests::constant_folding_leaves_shifts_and_multiplication_for_separate_width_rules ... ok
 test decompile::opt::tests::constant_folding_folds_word_arithmetic_and_bitwise_ops ... ok
+test decompile::opt::tests::constant_folding_folds_signed_and_unsigned_comparisons ... ok
 test decompile::opt::tests::constant_folding_leaves_signed_comparisons_with_unknown_width_unfolded ... ok
 test decompile::opt::tests::constant_folding_requires_exact_binary_arity ... ok
-test decompile::opt::tests::constant_folding_folds_signed_and_unsigned_comparisons ... ok
 test decompile::opt::tests::constant_folding_skips_width_sensitive_arithmetic ... ok
-test decompile::opt::tests::deadblock_drops_var_mappings_into_removed_block ... ok
 test decompile::opt::tests::deadblock_dangling_ref_survives_full_optimize ... ok
+test decompile::opt::tests::deadblock_drops_var_mappings_into_removed_block ... ok
 test decompile::opt::tests::deadblock_elimination_repairs_dangling_data_refs ... ok
 test decompile::opt::tests::deadblock_erases_transitive_pure_consumers ... ok
-test decompile::opt::tests::deadblock_keep_path_restores_exit_repair ... ok
-test decompile::opt::tests::deadblock_keeps_block_with_branch_consumer ... ok
 test decompile::opt::tests::deadblock_keeps_block_with_side_effecting_consumer ... ok
+test decompile::opt::tests::deadblock_keeps_block_with_branch_consumer ... ok
 test decompile::opt::tests::deadblock_keeps_block_with_writearr_consumer ... ok
+test decompile::opt::tests::deadblock_keep_path_restores_exit_repair ... ok
 test decompile::opt::tests::deadblock_keeps_block_with_transitive_side_effecting_consumer ... ok
 test decompile::opt::tests::deadblock_removes_self_referencing_block ... ok
-test decompile::opt::tests::deadblock_skips_exit_without_recorded_edge ... ok
 test decompile::opt::tests::deadblock_repairs_duplicate_edges_together ... ok
+test decompile::opt::tests::deadblock_skips_exit_without_recorded_edge ... ok
 test decompile::opt::tests::deadblock_skips_short_phi_operands ... ok
 test decompile::opt::tests::exit_repair_restore_roundtrips_interleaved_duplicates ... ok
-test decompile::opt::tests::logical_producers_leave_always_or_never_taken_tests_marked ... ok
 test decompile::opt::tests::logical_relational_keeps_byte_producer_width ... ok
+test decompile::opt::tests::logical_producers_leave_always_or_never_taken_tests_marked ... ok
 test decompile::opt::tests::logical_producers_simplify_relational_tests_against_zero ... ok
 test decompile::opt::tests::mul_and_div_are_not_zf_exact_producers ... ok
-test decompile::opt::tests::shifts_are_not_zf_exact_producers ... ok
 test decompile::opt::tests::sign_cond_on_initial_flags_is_not_folded ... ok
+test decompile::opt::tests::shifts_are_not_zf_exact_producers ... ok
 test decompile::opt::tests::unimpl_marker_survives_dead_code_elimination ... ok
+test decompile::opt::tests::zf_exact_producers_simplify_equality_tests_against_zero ... ok
 test decompile::opt::tests::simplify_branch_conditions_preserves_compare_operand_width ... ok
 test region::tests::test ... ok
-test decompile::opt::tests::zf_exact_producers_simplify_equality_tests_against_zero ... ok
 test types::tests::guest_pointer_annotations_have_guest_widths ... ok
+test types::tests::recursive_arrays_preserve_c_dimension_order_and_size ... ok
 test types::tests::guest_pointer_parsing_matches_python_parser ... ok
 test util::parse::tests::test ... ok
-test types::tests::recursive_arrays_preserve_c_dimension_order_and_size ... ok
-test util::range_set::tests::gaps_within_basic ... ok
-test util::range_set::tests::gaps_within_empty_query ... ok
 test util::range_set::tests::empty_range_ignored ... ok
-test util::range_set::tests::gaps_within_no_ranges ... ok
-test util::range_set::tests::gaps_within_query_inside_range ... ok
+test util::range_set::tests::gaps_within_empty_query ... ok
+test util::range_set::tests::gaps_within_basic ... ok
 test util::range_set::tests::gaps_within_fully_covered ... ok
+test util::range_set::tests::gaps_within_query_inside_range ... ok
+test util::range_set::tests::gaps_within_no_ranges ... ok
+test util::range_set::tests::insert_non_overlapping_after ... ok
 test util::range_set::tests::gaps_within_ranges_outside_query_ignored ... ok
 test util::range_set::tests::insert_into_empty ... ok
 test util::range_set::tests::insert_non_overlapping_before ... ok
-test util::range_set::tests::insert_non_overlapping_after ... ok
 test util::range_set::tests::insert_non_overlapping_middle ... ok
 test util::range_set::tests::insert_subset ... ok
 test util::range_set::tests::merge_adjacent ... ok
-test util::range_set::tests::merge_adjacent_both_sides ... ok
 test util::range_set::tests::insert_superset ... ok
+test util::range_set::tests::merge_adjacent_both_sides ... ok
 test util::range_set::tests::merge_multiple ... ok
 test util::range_set::tests::merge_overlapping ... ok
-test util::range_set::tests::span_multiple ... ok
 test util::range_set::tests::span_empty ... ok
+test util::range_set::tests::span_multiple ... ok
 test util::range_set::tests::span_single ... ok
 test decompile::ir::methods::tests::get_var_handles_deep_single_predecessor_chain ... ok
 
@@ -238,46 +238,46 @@ test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 [1m[92m     Running[0m tests/ast_byte_variables.rs (/tmp/main/dis86/target/debug/deps/ast_byte_variables-818cc1476a32d016)
 
 running 23 tests
-test byte_global_store_emits_symbol_assignment ... ok
 test annotated_member_layout_failure_returns_contextual_error ... ok
 test annotated_far_pointer_splits_segment_and_offset_for_memory_access ... ok
+test byte_global_store_emits_symbol_assignment ... ok
 test annotated_near_es_pointer_reads_and_writes_use_segmented_memory ... ok
+test entry_bp_read_snapshots_callers_bp_before_frame_enter ... ok
 test guest_pointer_expressions_emit_segmented_loads_and_stores ... ok
 test byte_stack_symbol_reads_and_writes_emit_ptr8_mapping ... ok
-test entry_bp_read_snapshots_callers_bp_before_frame_enter ... ok
 test far_pointer_offset_with_unrelated_segment_keeps_raw_memory_path ... ok
 test hydra_case_labels_and_array_indices_never_relocate ... ok
-test hydra_entry_fragments_get_declared_and_initialized ... ok
 test hydra_decimal_consts_relocate_only_when_nonnegative ... ok
-test hydra_make32_half_with_u16_cast_is_not_double_cast ... ok
 test hydra_memory_offsets_and_frame_mappings_never_relocate ... ok
-test hydra_relocatable_hex_consts_emit_code_start_seg_offset ... ok
+test hydra_entry_fragments_get_declared_and_initialized ... ok
 test hydra_make32_halves_cast_to_u16 ... ok
-test near_es_pointer_with_unrelated_segment_keeps_raw_memory_path ... ok
+test hydra_make32_half_with_u16_cast_is_not_double_cast ... ok
+test hydra_relocatable_hex_consts_emit_code_start_seg_offset ... ok
 test nested_array_annotation_generates_c_dimension_order ... ok
+test near_es_pointer_with_unrelated_segment_keeps_raw_memory_path ... ok
 test pointer_annotation_on_struct_member_reaches_indirect_accesses ... ok
 test redefined_bp_read_needs_no_snapshot ... ok
 test standard_flavor_ignores_relocation_table_entirely ... ok
 test reducible_diamond_generates_if_else_code ... ok
-test symbol_named_like_register_is_not_a_fragment ... ok
 test reducible_if_with_empty_then_arm_generates_one_arm_if ... ok
+test symbol_named_like_register_is_not_a_fragment ... ok
 
 test result: ok. 23 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
 
 [1m[92m     Running[0m tests/carry_ops.rs (/tmp/main/dis86/target/debug/deps/carry_ops-2b1ef5a571977b14)
 
 running 13 tests
-test add_adc_chain_is_exact ... ok
 test byte_carry_masks_wide_fragment ... ok
+test add_adc_chain_is_exact ... ok
 test byte_adc_is_exact ... ok
 test byte_adc_carry_chain_is_exact ... ok
 test byte_sbb_is_exact ... ok
-test cross_block_adc_is_exact ... ok
 test cross_block_clobbering_arm_stays_loud ... ok
+test cross_block_adc_is_exact ... ok
 test divergent_carry_merge_is_exact ... ok
+test non_flag_instruction_preserves_carry ... ok
 test neg_invalidates_tracked_carry ... ok
 test known_carry_survives_merge ... ok
-test non_flag_instruction_preserves_carry ... ok
 test stc_then_adc_uses_known_carry ... ok
 test sub_sbb_chain_is_exact ... ok
 
@@ -302,8 +302,8 @@ test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 running 7 tests
 test ins_outs_decode_without_modrm ... ok
 test insw_models_di_advance ... ok
-test outsb_models_si_advance ... ok
 test insb_models_di_advance ... ok
+test outsb_models_si_advance ... ok
 test rep_insb_models_cx_and_di ... ok
 test std_keeps_ins_outs_loud ... ok
 test rep_outsw_models_cx_and_si ... ok
@@ -335,8 +335,8 @@ test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
 [1m[92m     Running[0m tests/rcl_rcr.rs (/tmp/main/dis86/target/debug/deps/rcl_rcr-7b7a92c55462eabe)
 
 running 8 tests
-test rcl_count_uses_w_plus_one ... ok
 test clc_rcr_by_one_is_exact ... ok
+test rcl_count_uses_w_plus_one ... ok
 test rcl_uses_the_producer_carry ... ok
 test rcl_variable_count_is_loud ... ok
 test rcl_without_known_carry_is_loud ... ok
@@ -373,8 +373,8 @@ test rep_blocks_store_to_load_forwarding ... ok
 test rep_movsb_emits_macro_and_advances_pointers ... ok
 test rep_lods_is_modeled ... ok
 test modeled_rep_preserves_flags ... ok
-test std_makes_rep_stay_loud ... ok
 test store_to_load_forwarding_still_works_without_clobber ... ok
+test std_makes_rep_stay_loud ... ok
 test rep_stosw_emits_macro_and_advances_di ... ok
 
 test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
@@ -407,8 +407,8 @@ test idiv_lowers_to_signed_division ... ok
 test byte_idiv_divides_ax_with_loud_remainder ... ok
 test div_clobbers_flags_for_following_branch ... ok
 test lahf_preserves_flags_hlt_stays_loud ... ok
-test sign_setcc_reads_sign_flag_overflow_stays_loud ... ok
 test xlat_lowers_to_indexed_byte_load ... ok
+test sign_setcc_reads_sign_flag_overflow_stays_loud ... ok
 test unlowered_opcodes_do_not_panic ... ok
 
 test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s

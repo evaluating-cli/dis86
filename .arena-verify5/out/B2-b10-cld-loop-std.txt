@@ -1,0 +1,38 @@
+$ dis86 --config b10-cld-loop-std.bsl --binary-raw b10-cld-loop-std.bin --name test --emit-code b10-cld-loop-std.c --codegen-hydra 
+relocatable segments: []
+exit=0
+OUTPUT FILE: present (449 bytes)
+----- b10-cld-loop-std.c -----
+HYDRA_FUNC(H_test)
+{
+  u16 SP0 = SP;
+
+  FRAME_ENTER(0);
+
+  u16 cx_2, cx_3;
+
+  CLD();
+  cx_2 = CX;
+  while (1) {
+  addr_0001:;
+    *PTR_8(ES, DI) = *PTR_8(DS, SI);
+    UNIMPL() /* UNIMPL op */;
+    cx_3 = cx_2 - 1;
+    if (cx_3 == 0) {
+      goto addr_0004;
+    }
+    cx_2 = cx_3;
+    goto addr_0001;
+  }
+addr_0004:;
+  STD();
+  *PTR_8(ES, DI) = *PTR_8(DS, SI);
+  UNIMPL() /* UNIMPL op */;
+  DX = DX;
+  AX = AX;
+  FRAME_LEAVE();
+  RETURN_NEAR();
+
+}
+
+

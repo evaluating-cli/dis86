@@ -1,7 +1,7 @@
 $ dis86 --config a2-mixed-panic.bsl --binary-raw a2-mixed-panic.bin --name indirect --emit-code a2-mixed-panic.indirect.c --codegen-hydra
 relocatable segments: []
 
-thread 'main' (3369) panicked at src/decompile/ir_build.rs:289:12:
+thread 'main' (3433) panicked at src/decompile/ir_build.rs:289:12:
 Unsupported branch instruction: 'jmp    bx' | Reg(OperandReg(BX))
 note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
 Error: Panicked while decompiling indirect; continuing with the rest.
