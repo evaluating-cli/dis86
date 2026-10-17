@@ -5,8 +5,13 @@ edition = "2021"
 
 [features]
 default = []
-# The interactive emu86 frontend is optional.  The decompiler, its unit tests,
-# and the dosemu2 validator do not need a host display or SDL development files.
+# emu86 (the interpreter, its DOS layer, and the SST harness) is frozen offline
+# tooling: it is not built or tested by the default lane. Enable it explicitly
+# (`--features emu86`) when running the hardware-corpus tools offline; see the
+# development direction in README.md.
+emu86 = []
+# The interactive emu86 frontend is optional.  The decompiler and its unit
+# tests do not need a host display or SDL development files.
 sdl = ["dep:sdl2"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
@@ -25,4 +30,9 @@ cc = "1.0.87"
 [[bin]]
 name = "emu86"
 path = "src/bin/emu86.rs"
-required-features = ["sdl"]
+required-features = ["sdl", "emu86"]
+
+[[bin]]
+name = "emu86_sst"
+path = "src/bin/emu86_sst.rs"
+required-features = ["emu86"]
