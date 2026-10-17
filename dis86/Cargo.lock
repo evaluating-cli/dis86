@@ -221,7 +221,6 @@ version = "0.1.0"
 dependencies = [
  "cc",
  "itertools",
- "libc",
  "moo-rs",
  "pico-args",
  "sdl2",
