@@ -1,0 +1,27 @@
+$ dis86 --config b7-two-paths-join.bsl --binary-raw b7-two-paths-join.bin --name test --emit-code b7-two-paths-join.c --codegen-hydra 
+relocatable segments: []
+exit=0
+OUTPUT FILE: present (267 bytes)
+----- b7-two-paths-join.c -----
+HYDRA_FUNC(H_test)
+{
+  u16 SP0 = SP;
+
+  FRAME_ENTER(0);
+
+
+  if (UNIMPL_FLAGS(FLAGS) /* UNIMPL flags */) {
+    CLD();
+  } else {
+    STD();
+  }
+  *PTR_8(ES, DI) = *PTR_8(DS, SI);
+  UNIMPL() /* UNIMPL op */;
+  DX = DX;
+  AX = AX;
+  FRAME_LEAVE();
+  RETURN_NEAR();
+
+}
+
+

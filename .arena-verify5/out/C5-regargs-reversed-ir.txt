@@ -1,0 +1,20 @@
+$ dis86 ... --name test --emit-ir-final c5-regargs-reversed.ir
+WARN: Far call to f with unknown args, inferred 0 arg(s)... possibly erroneously
+exit=0
+----- c5-regargs-reversed.ir -----
+
+b0: () entry
+1   |   t0       = u16      shl        #6                   #8                  
+1   |   ax.2     = u16      or         t0                   AL                  
+0   |              u16      writevar16 BX                   AX                   [pin]
+0   |              u16      writevar16 AX                   ax.2                 [pin]
+1   |   t3       = u32      callargs   f                   
+1   |   dx.2     = u16      upper16    t3                  
+0   |   sp.2     = void     pin        SP                  
+0   |   bp.2     = void     pin        BP                  
+0   |   si.2     = void     pin        SI                  
+0   |   di.2     = void     pin        DI                  
+0   |   ss.2     = void     pin        SS                  
+0   |   ds.2     = void     pin        DS                  
+0   |              void     retn       AX                   dx.2                
+

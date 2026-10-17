@@ -1,0 +1,10 @@
+$ dis86 --config a2-mixed-panic.bsl --binary-raw a2-mixed-panic.bin --codeseg-name CODE --emit-code a2-mixed-panic.c --codegen-hydra
+relocatable segments: []
+
+thread 'main' (3367) panicked at src/decompile/ir_build.rs:289:12:
+Unsupported branch instruction: 'jmp    bx' | Reg(OperandReg(BX))
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+Error: Panicked while decompiling indirect; continuing with the rest.
+Error: Failed to decompile 1 function(s).
+exit=1
+OUTPUT FILE: MISSING — every function discarded, including the good one

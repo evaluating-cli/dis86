@@ -1,0 +1,22 @@
+$ dis86 ... --name test --emit-ir-final b6-std-blk-cld-movsb.ir
+exit=0
+----- b6-std-blk-cld-movsb.ir -----
+
+b0: () entry
+0   |              void     std       
+0   |              void     jmp        b2                  
+
+b2: (b0) addr_0004
+0   |              void     cld       
+1   |   t3       = u8       load8      DS                   SI                   [may_escape]
+0   |              void     store8     ES                   DI                   t3                   [may_escape]
+1   |   si.3     = u16      add        SI                   #1                  
+1   |   di.3     = u16      add        DI                   #1                  
+0   |   sp.3     = void     pin        SP                  
+0   |   bp.3     = void     pin        BP                  
+0   |   si.4     = void     pin        si.3                
+0   |   di.4     = void     pin        di.3                
+0   |   ss.3     = void     pin        SS                  
+0   |   ds.3     = void     pin        DS                  
+0   |              void     retn       AX                   DX                  
+
