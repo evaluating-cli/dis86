@@ -1,0 +1,23 @@
+$ dis86 --config .bsl --binary-raw .bin --name test --emit-code p-cmpsb-di.c --codegen-hydra
+relocatable segments: []
+exit=0
+OUTPUT FILE: present (214 bytes)
+----- p-cmpsb-di.c -----
+HYDRA_FUNC(H_test)
+{
+  u16 SP0 = SP;
+
+  FRAME_ENTER(0);
+
+  u16 tmp_0, ax_2;
+
+  tmp_0 = (CX - REPE_CMPSB(DS, SI, ES, DI, CX)) * 1;
+  ax_2 = DI + tmp_0;
+  DX = DX;
+  AX = ax_2;
+  FRAME_LEAVE();
+  RETURN_NEAR();
+
+}
+
+

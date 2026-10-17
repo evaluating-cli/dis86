@@ -1,0 +1,25 @@
+$ dis86 --config .bsl --binary-raw .bin --name test --emit-code t78d.c --codegen-hydra
+relocatable segments: []
+WARN: Far call to f with unknown args, inferred 0 arg(s)... possibly erroneously
+exit=0
+OUTPUT FILE: present (197 bytes)
+----- t78d.c -----
+HYDRA_FUNC(H_test)
+{
+  u16 SP0 = SP;
+
+  FRAME_ENTER(0);
+
+  u32 tmp_0;
+
+  AX = (6 << 8) | AL;
+  BX = AX;
+  tmp_0 = f(m);
+  DX = (u16)(tmp_0 >> 16);
+  AX = AX;
+  FRAME_LEAVE();
+  RETURN_NEAR();
+
+}
+
+

@@ -1,0 +1,21 @@
+$ dis86 --config .bsl --binary-raw .bin --name test --emit-code t85-aaa.c --codegen-hydra
+relocatable segments: []
+Unimpl opcode OP_AAA at 0000:0000 — emitting UNIMPL markers
+exit=0
+OUTPUT FILE: present (203 bytes)
+----- t85-aaa.c -----
+HYDRA_FUNC(H_test)
+{
+  u16 SP0 = SP;
+
+  FRAME_ENTER(0);
+
+
+  DX = DX;
+  AX = ((UNIMPL(AL, AH) /* UNIMPL op */ & 255) << 8) | (UNIMPL(AL, AH) /* UNIMPL op */ & 255);
+  FRAME_LEAVE();
+  RETURN_NEAR();
+
+}
+
+

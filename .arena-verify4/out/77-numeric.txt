@@ -1,0 +1,4 @@
+numeric expectations (issue #77):
+  77a want 0x4A07  (was 0x4E07 on bae36b0)
+  77b want 0x1256  (was 0x0056)
+  77c want 0x12    (was 0x00)

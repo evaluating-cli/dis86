@@ -1,0 +1,15 @@
+$ dis86 ... --name test --emit-ir-final p-lodsb-si.ir
+exit=0
+----- p-lodsb-si.ir -----
+
+b0: () entry
+1   |   t0       = u16      umul       CX                   #1                  
+2   |   ax.3     = u16      add        SI                   t0                  
+0   |   sp.2     = void     pin        SP                  
+0   |   bp.2     = void     pin        BP                  
+0   |   si.3     = void     pin        ax.3                
+0   |   di.2     = void     pin        DI                  
+0   |   ss.2     = void     pin        SS                  
+0   |   ds.2     = void     pin        DS                  
+0   |              void     retn       ax.3                 DX                  
+

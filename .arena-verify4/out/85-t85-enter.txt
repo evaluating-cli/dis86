@@ -1,0 +1,22 @@
+$ dis86 --config .bsl --binary-raw .bin --name test --emit-code t85-enter.c --codegen-hydra
+relocatable segments: []
+exit=0
+OUTPUT FILE: present (149 bytes)
+----- t85-enter.c -----
+HYDRA_FUNC(H_test)
+{
+  u16 SP0 = SP;
+
+  FRAME_ENTER(0);
+
+  u16 bp_2;
+
+  bp_2 = SP0 - 2;
+  DX = DX;
+  AX = AX;
+  FRAME_LEAVE();
+  RETURN_NEAR();
+
+}
+
+

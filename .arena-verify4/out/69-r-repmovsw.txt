@@ -1,0 +1,23 @@
+$ dis86 --config .bsl --binary-raw .bin --name test --emit-code r-repmovsw.c --codegen-hydra
+relocatable segments: []
+exit=0
+OUTPUT FILE: present (183 bytes)
+----- r-repmovsw.c -----
+HYDRA_FUNC(H_test)
+{
+  u16 SP0 = SP;
+
+  FRAME_ENTER(0);
+
+  u16 tmp_0;
+
+  REP_MOVSW(DS, SI, ES, DI, CX);
+  tmp_0 = CX * 2;
+  DX = DX;
+  AX = AX;
+  FRAME_LEAVE();
+  RETURN_NEAR();
+
+}
+
+

@@ -1,0 +1,22 @@
+$ dis86 --config .bsl --binary-raw .bin --name test --emit-code d1-cld-movsb.c --codegen-hydra
+relocatable segments: []
+exit=0
+OUTPUT FILE: present (163 bytes)
+----- d1-cld-movsb.c -----
+HYDRA_FUNC(H_test)
+{
+  u16 SP0 = SP;
+
+  FRAME_ENTER(0);
+
+
+  CLD();
+  *PTR_8(ES, DI) = *PTR_8(DS, SI);
+  DX = DX;
+  AX = AX;
+  FRAME_LEAVE();
+  RETURN_NEAR();
+
+}
+
+

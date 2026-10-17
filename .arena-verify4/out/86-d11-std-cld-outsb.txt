@@ -1,0 +1,23 @@
+$ dis86 --config .bsl --binary-raw .bin --name test --emit-code d11-std-cld-outsb.c --codegen-hydra
+relocatable segments: []
+exit=0
+OUTPUT FILE: present (158 bytes)
+----- d11-std-cld-outsb.c -----
+HYDRA_FUNC(H_test)
+{
+  u16 SP0 = SP;
+
+  FRAME_ENTER(0);
+
+
+  STD();
+  CLD();
+  OUTSB(DS, SI, DX);
+  DX = DX;
+  AX = AX;
+  FRAME_LEAVE();
+  RETURN_NEAR();
+
+}
+
+

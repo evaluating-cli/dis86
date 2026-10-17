@@ -1,0 +1,75 @@
+=== Opcode::Unimpl sites in ir_build.rs (main) ===
+769:      self.append_instr(Type::Void, Opcode::Unimpl, vec![]);
+1440:    let rem = self.append_instr(Type::U16, Opcode::Unimpl, vec![upper_in, lower_in, divisor]);
+1477:        let vref = self.append_instr(Type::U16, Opcode::Unimpl, vec![]);
+1537:            let vref = self.append_instr(typ, Opcode::Unimpl, vec![a, b]);
+1595:            let vref = self.append_instr(typ, Opcode::Unimpl, vec![a, b]);
+1634:          let vref = self.append_instr(typ, Opcode::Unimpl, vec![a, b]);
+1692:            let vref = self.append_instr(typ, Opcode::Unimpl, vec![a, b]);
+2050:          self.append_instr(Type::Void, Opcode::Unimpl, vec![]);
+2068:          self.append_instr(Type::Void, Opcode::Unimpl, vec![]);
+2178:          self.append_instr(Type::Void, Opcode::Unimpl, vec![]);
+2205:        let vref = self.append_instr(Type::U8, Opcode::Unimpl, vec![]);
+2242:        let lo = self.append_instr(typ.clone(), Opcode::Unimpl, vec![a, b]);
+2244:        let hi = self.append_instr(typ, Opcode::Unimpl, vec![a, b]);
+2253:        let vref = self.append_instr(typ, Opcode::Unimpl, vec![a]);
+2264:        self.append_instr(Type::Void, Opcode::Unimpl, vec![]);
+2272:        self.append_instr(Type::Void, Opcode::Unimpl, vec![]);
+3127:    let unimpl = only_instr(&b.ir, cur, Opcode::Unimpl);
+3195:      b.ir.iter_instrs(b.cur).all(|r| b.ir.instr(r).unwrap().opcode != Opcode::Unimpl),
+3214:    let _ = only_instr(&b.ir, b.cur, Opcode::Unimpl);
+3304:    let _ = only_instr(&b.ir, b.cur, Opcode::Unimpl);
+3600:    for op in [Opcode::Load8, Opcode::Store8, Opcode::Add, Opcode::RetNear, Opcode::Unimpl,
+3684:    let _ = only_instr(&b.ir, b.cur, Opcode::Unimpl);
+
+=== panic! sites in ir_build.rs (main) ===
+211:      || panic!("Failed to find text section region ({}) for: '{}' at '{}'", addr, instr_str(ins), ins.addr));
+215:      panic!("Expected text segment region to be an array of known length ({}) for: '{}'", region.name, instr_str(ins));
+220:      panic!("Expected text segment region to be an array with basetype u16, got ({}) for: '{}'", region.name, instr_str(ins));
+225:      panic!("Expected text segment region with a length that is consistent with the region size, got ({}) for: '{}'", region.name, instr_str(ins));
+289:      _ => panic!("Unsupported branch instruction: '{}' | {:?}", instr_str(ins), ins.operands[oper_num]),
+499:      _ => panic!("32-bit stores not supported"),
+514:    //   _ => panic!("32-bit immediates not supported"),
+520:    panic!("unimpl");
+524:    panic!("unimpl");
+541:      instr::Operand::Imm(_)   => panic!("Should never have a destination imm"),
+542:      instr::Operand::Rel(_)   => panic!("Should never have a destination rel"),
+543:      instr::Operand::Far(_)   => panic!("Should never have a destination far"),
+959:      _ => panic!("Unsupported function return type: {}", ret),
+1087:      _ => panic!("Unsupported function return type: {}", ret_type),
+1161:        panic!("Found function but it's call mode doesn't match! Expected {:?}, Got {:?}", mode, func.mode);
+1355:    let instr::Operand::Rel(rel) = &ins.operands[0] else { panic!("Expected relative offset operand for JMP") };
+1711:        let instr::Operand::Rel(rel) = &ins.operands[1] else { panic!("Expected relative offset operand for LOOPcc") };
+1877:              panic!("Indirect jump form not currently supported for '{}'", instr_str(ins));
+1880:              panic!("Shouldn't fail.. should be checked by jump_indirect_targets already");
+1889:          _ => panic!("Unsupported JMP operand for '{}'", instr_str(ins)),
+1894:        let instr::Operand::Rel(rel) = &ins.operands[1] else { panic!("Expected relative offset operand for JCXZ") };
+1907:        let instr::Operand::Rel(rel) = &ins.operands[0] else { panic!("Expected relative offset operand for JS") };
+1921:        let instr::Operand::Rel(rel) = &ins.operands[0] else { panic!("Expected relative offset operand for JNS") };
+1971:          panic!("Expected LEA to have a mem operand");
+2128:          other => panic!("Unsupported IN destination: {:?}", other),
+2140:          other => panic!("Unsupported OUT source: {:?}", other),
+2455:  if elt_addr < slice_addr { panic!("elt not in slice!"); }
+2458:  if (off % std::mem::size_of::<T>()) != 0 { panic!("offset is not a multiple of element size"); }
+2461:  if n >= slice.len() { panic!("index is out of range"); }
+2952:      panic!("JMP must carry a relative target");
+
+=== df_may_be_set sites (main) ===
+73:  df_may_be_set: bool,
+78:  // resets it to `!df_may_be_set` (unknown when writers exist, since joins
+141:      df_may_be_set: false,
+358:    self.df_clear = !self.df_may_be_set;
+2391:    self.df_may_be_set = self.instrs.iter().any(|i| opcode_may_set_df(i.opcode));
+2392:    self.df_clear = !self.df_may_be_set;
+3184:    b.df_may_be_set = true;
+3295:    b.df_may_be_set = true;
+3308:  fn build_marks_df_may_be_set_from_decoded_instructions() {
+3318:    assert!(b.df_may_be_set, "build must detect STD in the decoded function");
+3674:    b.df_may_be_set = true;
+
+=== opcode_may_set_df (main) ===
+fn opcode_may_set_df(op: instr::Opcode) -> bool {
+  matches!(op, instr::Opcode::OP_STD | instr::Opcode::OP_POPF | instr::Opcode::OP_IRET)
+}
+
+=== UNIMPL macro (hydra support) ===

@@ -1,0 +1,19 @@
+$ dis86 ... --name test --emit-ir-final d7-std-cld-repmovsb.ir
+exit=0
+----- d7-std-cld-repmovsb.ir -----
+
+b0: () entry
+0   |              void     std       
+0   |              void     cld       
+0   |   t2       = void     repmovs    DS                   SI                   ES                   DI                   CX                   #1                  
+2   |   t3       = u16      umul       CX                   #1                  
+1   |   si.2     = u16      add        SI                   t3                  
+1   |   di.2     = u16      add        DI                   t3                  
+0   |   sp.2     = void     pin        SP                  
+0   |   bp.2     = void     pin        BP                  
+0   |   si.3     = void     pin        si.2                
+0   |   di.3     = void     pin        di.2                
+0   |   ss.2     = void     pin        SS                  
+0   |   ds.2     = void     pin        DS                  
+0   |              void     retn       AX                   DX                  
+

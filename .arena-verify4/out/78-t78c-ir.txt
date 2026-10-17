@@ -1,0 +1,18 @@
+$ dis86 ... --name test --emit-ir-final t78c.ir
+exit=0
+----- t78c.ir -----
+
+b0: () entry
+1   |   t0       = u16      shl        #1                   #8                  
+1   |   cx.2     = u16      or         t0                   CL                  
+0   |              u16      writevar16 SI                   CX                   [pin]
+0   |              u16      writevar16 CX                   cx.2                 [pin]
+0   |   t3       = void     int        #0x21               
+0   |   sp.2     = void     pin        SP                  
+0   |   bp.2     = void     pin        BP                  
+0   |   si.4     = void     pin        SI                  
+0   |   di.3     = void     pin        DI                  
+0   |   ss.2     = void     pin        SS                  
+0   |   ds.3     = void     pin        DS                  
+0   |              void     retn       AX                   DX                  
+

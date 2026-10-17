@@ -1,0 +1,5 @@
+main sha: 91cae79dc5d3e9314efa6a4a0c5b133872dc8933
+main subj: hydra: native_host vtable skeleton, dosemu2-free (#98) (#99)
+dis86:    af8cf39eaa4adbd7  (/tmp/main/build/bin/dis86)
+rustc 1.99.1 (58cf8f9c3 2026-10-13)
+cargo 1.99.1 (5f94df478 2026-08-27)

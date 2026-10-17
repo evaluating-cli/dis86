@@ -1,0 +1,17 @@
+$ dis86 ... --name test --emit-ir-final t77b.ir
+exit=0
+----- t77b.ir -----
+
+b0: () entry
+1   |   t0       = u16      ushr       #0x1234              #8                  
+1   |   ah.2     = u16      and        t0                   #0xff               
+1   |   t1       = u16      shl        ah.2                 #8                  
+1   |   ax.3     = u16      or         t1                   #0x56               
+0   |   sp.2     = void     pin        SP                  
+0   |   bp.2     = void     pin        BP                  
+0   |   si.2     = void     pin        SI                  
+0   |   di.2     = void     pin        DI                  
+0   |   ss.2     = void     pin        SS                  
+0   |   ds.2     = void     pin        DS                  
+0   |              void     retn       ax.3                 DX                  
+

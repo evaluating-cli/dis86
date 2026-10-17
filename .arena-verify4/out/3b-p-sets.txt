@@ -1,0 +1,20 @@
+$ dis86 --config .bsl --binary-raw .bin --name test --emit-code p-sets.c --codegen-hydra
+relocatable segments: []
+exit=0
+OUTPUT FILE: present (175 bytes)
+----- p-sets.c -----
+HYDRA_FUNC(H_test)
+{
+  u16 SP0 = SP;
+
+  FRAME_ENTER(0);
+
+
+  DX = DX;
+  AX = (AH << 8) | (UNIMPL_FLAGS(FLAGS) /* UNIMPL flags */ & 255);
+  FRAME_LEAVE();
+  RETURN_NEAR();
+
+}
+
+
