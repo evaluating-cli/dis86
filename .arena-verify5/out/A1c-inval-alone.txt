@@ -1,7 +1,0 @@
-$ dis86 --config a1-mixed.bsl --binary-raw a1-mixed.bin --name inval --emit-code a1-mixed.inval.c --codegen-hydra
-relocatable segments: []
-Error: Failed to decode instruction: Unsupported or invalid instruction at 0000:0004
-Error: Failed to decompile inval; continuing with the rest.
-Error: Failed to decompile 1 function(s).
-exit=1
-OUTPUT FILE: MISSING
