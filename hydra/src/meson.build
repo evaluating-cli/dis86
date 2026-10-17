@@ -18,3 +18,4 @@ libhydra = shared_library(
 )
 
 subdir('dosemu_host')
+subdir('native_host')

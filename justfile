@@ -18,7 +18,9 @@ build-dis86:
 
 # Run the host-independent checks used by CI. Syntax-check both the Hydra core
 # and the external dosemu2 host/tests so a green workflow covers the code added
-# by the hosting PR without requiring a dosemu2 runtime.
+# by the hosting PR without requiring a dosemu2 runtime. The native host unit
+# test is the first linked-and-run Hydra test in this lane: it links the core
+# with -rdynamic so the dlsym(RTLD_DEFAULT) seam resolves against the binary.
 check:
   #!/bin/bash
   set -euo pipefail
@@ -31,6 +33,15 @@ check:
   cc -std=c11 -D_GNU_SOURCE -Dtypeof=__typeof__ \
     -Ihydra/src -Ihydra/include -Ihydra/src/dosemu_host \
     -fsyntax-only hydra/src/dosemu_host/*.c
+  cc -std=c11 -D_GNU_SOURCE -Dtypeof=__typeof__ \
+    -Ihydra/src -Ihydra/include -Ihydra/src/native_host \
+    -fsyntax-only hydra/src/native_host/*.c
+  mkdir -p build
+  cc -std=c11 -D_GNU_SOURCE -Dtypeof=__typeof__ \
+    -Ihydra/src -Ihydra/include -Ihydra/src/native_host \
+    hydra/src/*.c hydra/src/native_host/*.c \
+    -rdynamic -pthread -ldl -o build/test_native_host
+  ./build/test_native_host
 
 # Build the hydra component only
 build-hydra:
