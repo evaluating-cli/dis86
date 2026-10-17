@@ -1,0 +1,21 @@
+$ dis86 --config c7-frag-regargs.bsl --binary-raw c7-frag-regargs.bin --name test --emit-code c7-frag-regargs.c --codegen-hydra 
+relocatable segments: []
+WARN: Far call to f with unknown args, inferred 0 arg(s)... possibly erroneously
+exit=0
+OUTPUT FILE: present (138 bytes)
+----- c7-frag-regargs.c -----
+HYDRA_FUNC(H_test)
+{
+  u16 SP0 = SP;
+
+  FRAME_ENTER(0);
+
+  u32 tmp_0;
+
+  AX = 0x1234;
+  CX = (CH << 8) | (AL & 255);
+  tmp_0 = f(m);
+
+}
+
+

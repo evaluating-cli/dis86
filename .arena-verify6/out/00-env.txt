@@ -1,0 +1,4 @@
+main sha: f5b563c4b1427adda983751a0e4fbd2969241542
+main subj: parity: standing golden/native outbox fixture (#96) (#100)
+rustc 1.99.1 (58cf8f9c3 2026-10-13)
+cargo 1.99.1 (5f94df478 2026-08-27)

@@ -1,0 +1,13 @@
+$ dis86 ... --name test --emit-ir-final c7-frag-regargs.ir
+WARN: Far call to f with unknown args, inferred 0 arg(s)... possibly erroneously
+exit=0
+----- c7-frag-regargs.ir -----
+
+b0: () entry
+1   |   cl.3     = u16      and        AL                   #0xff               
+1   |   t0       = u16      shl        CH                   #8                  
+1   |   cx.2     = u16      or         t0                   cl.3                
+0   |              u16      writevar16 AX                   #0x1234              [pin]
+0   |              u16      writevar16 CX                   cx.2                 [pin]
+0   |   t3       = u32      callargs   f                   
+

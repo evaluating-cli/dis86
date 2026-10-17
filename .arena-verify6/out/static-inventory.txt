@@ -1,0 +1,97 @@
+=== append_regargs and its callers ===
+1148:  fn append_regargs(&mut self, regargs: &Option<Vec<instr::Reg>>) {
+1163:      self.append_regargs(&func.regargs);
+1287:  fn order_guest_writes(ir: &IR, pending: &[(instr::Reg, Ref)]) -> Vec<(instr::Reg, Ref)> {
+1326:    for (reg, vref) in Self::order_guest_writes(&self.ir, &pending) {
+
+=== return_vals / RetNear / Gen::ret (return-path order) ===
+  fn return_vals(&mut self) -> Vec<Ref> {
+    let ax = self.ir.get_var(instr::Reg::AX, self.cur);
+    let dx = self.ir.get_var(instr::Reg::DX, self.cur);
+    let ax_dx = vec![ax, dx];
+
+    let Some(func) = self.spec.func else {
+      // Assume worst case: DX:AX return
+      return ax_dx;
+    };
+
+    let Some(ret) = &func.ret else {
+      // Assume worst case: DX:AX return
+      return ax_dx;
+    };
+
+    // Use type based return information
+    match ret {
+      Type::Void => vec![], // no return value
+      Type::U8 | Type::I8 | Type::U16 | Type::I16 => vec![ax],
+      Type::U32 | Type::I32  => vec![ax, dx],
+      _ => panic!("Unsupported function return type: {}", ret),
+    }
+  }
+
+=== df_clear assignments ===
+358:    self.df_clear = !self.df_may_be_set;
+2085:        self.df_clear = false;
+2147:        self.df_clear = true;
+2230:        self.df_clear = false;
+2392:    self.df_clear = !self.df_may_be_set;
+3185:    b.df_clear = false;
+3296:    b.df_clear = false;
+3675:    b.df_clear = false;
+
+=== switch_blk ===
+  fn switch_blk(&mut self, bref: BlockRef) {
+    // Record whether the block we are leaving provably has a known carry;
+    // the driver's must-analysis reads this to seed successor entries.
+    self.exit_known.insert(self.cur, self.carry_known);
+    self.cur = bref;
+    // Carry survives the join only when every predecessor defines it: the
+    // analysis proves that (all preds' exit known). Do NOT resolve the CF
+    // SSA value here — get_var would prepend a phi and break the builder's
+    // "new block is empty" invariant. `get_cf` pulls it on first use.
+    self.last_cf = None;
+    self.carry_known = self.carry_known_entry.get(&bref).copied().unwrap_or(self.entry_known_default);
+    // Joins are not DF-tracked: a new block starts unknown whenever a
+    // DF writer exists anywhere in the function.
+    self.df_clear = !self.df_may_be_set;
+  }
+
+=== app.rs failure handling ===
+  let mut failures = 0;
+  for spec in specs {
+    let name = spec.name.clone();
+    // Contain panics per function: ControlFlow inference and AST building
+    // still panic on degenerate input (goto cycles, unimplemented opcodes,
+    // unsupported types). Without this, one such function unwinds past the
+    // loop and aborts the whole batch. Truncate any partial output the
+    // panicking spec appended before counting it as failed.
+    let code_len = all_code.len();
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+      decompile_spec(&args, &cfg, &binary, spec, &mut all_code, &relocatable_segs)
+    }));
+    match outcome {
+      Ok(0) => {}
+      Ok(_) => {
+        // Best-effort batch decompile: one malformed function must not abort
+        // the rest of the codeseg (the specific error was already reported by
+        // decompile_spec above). Count it and continue.
+        eprintln!("Error: Failed to decompile {}; continuing with the rest.", name);
+        failures += 1;
+      }
+      Err(_) => {
+        all_code.truncate(code_len);
+        eprintln!("Error: Panicked while decompiling {}; continuing with the rest.", name);
+        failures += 1;
+      }
+    }
+  }
+  if failures != 0 {
+    eprintln!("Error: Failed to decompile {} function(s).", failures);
+    return 1;
+  }
+
+  if let Some(path) = args.emit_code.as_ref() {
+    write_to_path(path, &all_code);
+  }
+
+  0
