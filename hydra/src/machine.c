@@ -143,34 +143,41 @@ void hydra_impl_raw_code_reset(void)
    * address whose simx86 translation may still be cached. */
 }
 
+/* NOP/CLD/STD/CLI/STI touch no operands and no memory, so they are applied
+ * straight to the mirrored flag register instead of round-tripping through
+ * hydra_impl_raw_code. This keeps them usable on hosts with no guest CPU to
+ * execute raw snippets (the standalone native host), and the dosemu2 host
+ * still propagates the flags back to the CPU via machine_to_regs. */
 void hydra_impl_nop(void)
 {
-  u8 code[] = {0x90, 0xcb};
-  hydra_impl_raw_code(code, ARRAY_SIZE(code));
 }
 
 void hydra_impl_cld(void)
 {
-  u8 machine_code[] = {0xfc, 0xcb};
-  hydra_impl_raw_code(machine_code, ARRAY_SIZE(machine_code));
+  hydra_exec_ctx_t *exec = execution_context_get(NULL);
+  hydra_machine_t *m = &exec->machine;
+  FLAGS_DF_OFF();
 }
 
 void hydra_impl_std(void)
 {
-  u8 machine_code[] = {0xfd, 0xcb};
-  hydra_impl_raw_code(machine_code, ARRAY_SIZE(machine_code));
+  hydra_exec_ctx_t *exec = execution_context_get(NULL);
+  hydra_machine_t *m = &exec->machine;
+  FLAGS_DF_ON();
 }
 
 void hydra_impl_cli(void)
 {
-  u8 machine_code[] = {0xfa, 0xcb};
-  hydra_impl_raw_code(machine_code, ARRAY_SIZE(machine_code));
+  hydra_exec_ctx_t *exec = execution_context_get(NULL);
+  hydra_machine_t *m = &exec->machine;
+  FLAGS_IF_OFF();
 }
 
 void hydra_impl_sti(void)
 {
-  u8 machine_code[] = {0xfb, 0xcb};
-  hydra_impl_raw_code(machine_code, ARRAY_SIZE(machine_code));
+  hydra_exec_ctx_t *exec = execution_context_get(NULL);
+  hydra_machine_t *m = &exec->machine;
+  FLAGS_IF_ON();
 }
 
 u8 hydra_impl_inb(u16 port)

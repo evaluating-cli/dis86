@@ -52,8 +52,8 @@
 #define FLAGS_SF_ON() do { FLAGS |= 1<<7; } while(0)
 #define FLAGS_TF_ON() do { FLAGS |= 1<<8; } while(0)
 #define FLAGS_IF_ON() do { FLAGS |= 1<<9; } while(0)
-#define FLAGS_DF_ON() do { FLAGS |= 1<<10); } while(0)
-#define FLAGS_OF_ON() do { FLAGS |= 1<<11); } while(0)
+#define FLAGS_DF_ON() do { FLAGS |= 1<<10; } while(0)
+#define FLAGS_OF_ON() do { FLAGS |= 1<<11; } while(0)
 
 #define FLAGS_CF_OFF() do { FLAGS &= ~(1<<0); } while(0)
 #define FLAGS_PF_OFF() do { FLAGS &= ~(1<<2); } while(0)
