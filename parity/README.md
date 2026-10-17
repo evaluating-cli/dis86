@@ -72,12 +72,13 @@ only needed when poking/capturing pre-boot state.
 ## Native-host enablement note
 
 `hydra_impl_nop/cld/std/cli/sti` used to execute one-instruction raw snippets
-on the emulated CPU, which requires a guest-reserved raw-code region. The
-standalone native host has no CPU to execute snippets, so these five
-operand-free flag ops are now applied directly to the mirrored flag register.
-The dosemu2 host still propagates the result to the CPU via
-`machine_to_regs`. Port I/O and interrupt helpers remain raw-code/host-seam
-operations and the fixture deliberately avoids them.
+on the emulated CPU, which requires a guest-reserved raw-code region. That path
+is retained whenever the host provides a region (stock dosemu2, so dispatch
+accounting is unchanged). The standalone native host reserves none and has no
+CPU to execute snippets, so these five operand-free flag ops fall back to
+setting the mirrored flag register directly (propagated to the CPU via
+`machine_to_regs` on hosts that have one). Port I/O and interrupt helpers
+remain raw-code/host-seam operations and the fixture deliberately avoids them.
 
 ## Known dis86 lowering gaps (fixture avoids; follow-ups to file)
 

@@ -143,17 +143,32 @@ void hydra_impl_raw_code_reset(void)
    * address whose simx86 translation may still be cached. */
 }
 
-/* NOP/CLD/STD/CLI/STI touch no operands and no memory, so they are applied
- * straight to the mirrored flag register instead of round-tripping through
- * hydra_impl_raw_code. This keeps them usable on hosts with no guest CPU to
- * execute raw snippets (the standalone native host), and the dosemu2 host
- * still propagates the flags back to the CPU via machine_to_regs. */
+/* NOP/CLD/STD/CLI/STI touch no operands and no memory. Hosts that can execute
+ * raw snippets (dosemu2 reserves a guest raw-code region) keep the historical
+ * path, so the emulated CPU state and dispatch accounting are unchanged.
+ * Hosts with no guest CPU to run snippets (the standalone native host) have no
+ * raw-code region; there these five ops are applied straight to the mirrored
+ * flag register, which the host propagates to its own state. */
+static bool hydra_raw_code_available(void)
+{
+  return HYDRA_CONF->raw_code_size >= MAX_RAW_CODE;
+}
+
 void hydra_impl_nop(void)
 {
+  if (hydra_raw_code_available()) {
+    u8 code[] = {0x90, 0xcb};
+    hydra_impl_raw_code(code, ARRAY_SIZE(code));
+  }
 }
 
 void hydra_impl_cld(void)
 {
+  if (hydra_raw_code_available()) {
+    u8 machine_code[] = {0xfc, 0xcb};
+    hydra_impl_raw_code(machine_code, ARRAY_SIZE(machine_code));
+    return;
+  }
   hydra_exec_ctx_t *exec = execution_context_get(NULL);
   hydra_machine_t *m = &exec->machine;
   FLAGS_DF_OFF();
@@ -161,6 +176,11 @@ void hydra_impl_cld(void)
 
 void hydra_impl_std(void)
 {
+  if (hydra_raw_code_available()) {
+    u8 machine_code[] = {0xfd, 0xcb};
+    hydra_impl_raw_code(machine_code, ARRAY_SIZE(machine_code));
+    return;
+  }
   hydra_exec_ctx_t *exec = execution_context_get(NULL);
   hydra_machine_t *m = &exec->machine;
   FLAGS_DF_ON();
@@ -168,6 +188,11 @@ void hydra_impl_std(void)
 
 void hydra_impl_cli(void)
 {
+  if (hydra_raw_code_available()) {
+    u8 machine_code[] = {0xfa, 0xcb};
+    hydra_impl_raw_code(machine_code, ARRAY_SIZE(machine_code));
+    return;
+  }
   hydra_exec_ctx_t *exec = execution_context_get(NULL);
   hydra_machine_t *m = &exec->machine;
   FLAGS_IF_OFF();
@@ -175,6 +200,11 @@ void hydra_impl_cli(void)
 
 void hydra_impl_sti(void)
 {
+  if (hydra_raw_code_available()) {
+    u8 machine_code[] = {0xfb, 0xcb};
+    hydra_impl_raw_code(machine_code, ARRAY_SIZE(machine_code));
+    return;
+  }
   hydra_exec_ctx_t *exec = execution_context_get(NULL);
   hydra_machine_t *m = &exec->machine;
   FLAGS_IF_ON();
