@@ -397,3 +397,31 @@ raw("c4-ret-dxax-ctl", bytes([0x89, 0xC2, 0xC3]), fn="test")
     "  text_section {}\n"
     "}\n")
 print("c3/c4: return-path DX:AX ordering (ret u32)")
+
+# --- B (part 2): does a block boundary lose a CLD that happened earlier? ---
+# In every case below the function also contains an STD somewhere, so
+# `df_may_be_set` is true; the question is whether `df_clear` survives the
+# block switch (switch_blk sets df_clear = !df_may_be_set).
+DF_BLOCK_CASES2 = {
+    # CLD in block 0, movsb in block 1, STD still later in block 1.
+    "b9-cld-blk0-movsb-blk1-std": ([0xFC, 0xEB, 0x01, 0x90, 0xA4, 0xFD, 0xC3],
+        "cld; jmp 0004; nop; movsb; std; ret"),
+    # Realistic mixed-direction function: a forward movsb loop plus a later
+    # backward (std) copy.
+    "b10-cld-loop-std": ([0xFC, 0xA4, 0xE2, 0xFD, 0xFD, 0xA4, 0xC3],
+        "cld; movsb; loop 0001; std; movsb; ret"),
+    # Control for b10: same forward loop, no STD anywhere.
+    "b11-cld-loop-no-std": ([0xFC, 0xA4, 0xE2, 0xFD, 0xC3],
+        "cld; movsb; loop 0001; ret"),
+    # STD then CLD, then a movsb loop whose body starts a new block.
+    "b12-std-cld-loop": ([0xFD, 0xFC, 0xA4, 0xE2, 0xFD, 0xC3],
+        "std; cld; movsb; loop 0002; ret"),
+    # Control for b12: cld then the loop, no STD.
+    "b13-cld-loop-only": ([0xFC, 0xA4, 0xE2, 0xFD, 0xC3],
+        "cld; movsb; loop 0001; ret"),
+}
+(D / "r5-df-cases2.txt").write_text(
+    "".join(f"{n}: {d}\n" for n, (_, d) in DF_BLOCK_CASES2.items()))
+for name, (data, _d) in DF_BLOCK_CASES2.items():
+    raw(name, bytes(data))
+print("b9..b13: block-boundary DF probes")

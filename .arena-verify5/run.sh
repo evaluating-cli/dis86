@@ -100,6 +100,11 @@ for case in $(listcases "$R/r5-df-cases.txt"); do
   ir "B-$case-ir" "$case"
 done
 
+for case in $(listcases "$R/r5-df-cases2.txt"); do
+  emit "B2-$case" "$case"
+  ir "B2-$case-ir" "$case"
+done
+
 # ------------------------------------------------------------------- C ------
 emit "C1-call-regargs"      t78d
 ir   "C1-call-regargs-ir"   t78d
