@@ -1,0 +1,92 @@
+# Parity fixture (#96)
+
+A standing, end-to-end parity lane: one DOS image (`fixture.asm`) runs twice —
+byte-identically — through two independent stacks:
+
+| lane   | engine | reader |
+|--------|--------|--------|
+| golden | stock dosemu2, free-run `-E fixture.exe`, `mapmshm` lowmem | `golden_capture.c` reads live guest memory |
+| native | dis86 `--codegen-hydra` output on hydra + standalone `native_host` (no dosemu2) | `native_runner.c` reads the host's memory image |
+
+Both lanes compare the same 80-byte snapshot: a 16-byte outbox header plus 64
+reserved lane bytes. The header is written **last**, so its presence proves a
+complete world; both readers scan for it instead of hardcoding a guest
+address, so load-segment skew cannot leak into the diff.
+
+## Contract
+
+`fixture.asm` zero-fills its outbox, computes lanes 0..29, writes the checksum
+(lane 30 = sum of lanes 0..29 mod 256), then publishes magic `PHYPAR16`,
+version 2 and the lane reserve count. `outbox.h` is the shared contract and
+known-answer table; `build.sh` asserts the `.asm` layout constants match its
+defines. Expected lanes:
+
+```
+c0 c1 00 01 10 00 02 81 81 80 0b 2c 78 02 8c 02
+34 34 12 34 20 01 78 12 34 34 7a 11 80 88 a9 00
+```
+
+The fixture covers: ADC/SBB carry-in seeds, word carry, SHL/RCL/RCR/ROL/ROR,
+REP MOVSB/STOSW/CMPSB under a `cld`-ed DF, byte/word aliasing, word MUL, XCHG,
+push/pop and one near call to a real second function. It issues no INTs and
+reads no DOS-seeded state. The tail returns to a raw `jmp $` outside both
+annotated functions; the native runner pre-releases the fixture's park
+sentinel and seeds the near-return landing so it stops on a hook miss instead
+of executing those bytes.
+
+`annotations.py` declares **two** functions, both `ret="u16"` and
+`flags="NEAR"`:
+
+* `F_parity_main` `[0x0000, 0x0185)`
+* `F_parity_leaf` `[0x0185, 0x0189)` (near-call target)
+
+Hydra hook lookup matches exact entry addresses and the call site lowers
+through the generated callstub (`F_parity_leaf(m)`), so the leaf must be its
+own registered hook. `NEAR` is required because bsl emission defaults to
+`far`; a mismatch trips `ir_build.rs`'s call-mode assertion.
+
+## Running
+
+```sh
+bash parity/build.sh     # Gate 1 (hooks, no UNIMPL) + native Gate 2
+bash parity/run_golden.sh # golden Gate 2 (needs dosemu2+fdpp) + compare
+```
+
+`build.sh` needs `nasm` and `cc`; it builds dis86 with cargo if needed. Golden
+needs a stock dosemu2 with `mapmshm` and fdpp. The native compile links the
+emitted code plus confgen appdata against `hydra/src/*.c` and
+`hydra/src/native_host`, with no meson and no dosemu2.
+
+`run_golden.sh` boots a private, headless session, waits up to
+`PARITY_TIMEOUT` (default 90 s) for the outbox, verifies it against the
+known-answer table, compares it with `native.lanes`, and then proves the
+comparison is live by flipping one byte in a copy and requiring `cmp` to fail.
+
+### Do not use `-H1` for the golden lane
+
+dosemu2's `-H1` locks the guest before the bootsector until a dosdebug client
+attaches. A free-running capture lane never attaches, so with `-H1` the guest
+never boots and the outbox never appears. The earlier `-H1` + attach recipe is
+only needed when poking/capturing pre-boot state.
+
+## Native-host enablement note
+
+`hydra_impl_nop/cld/std/cli/sti` used to execute one-instruction raw snippets
+on the emulated CPU, which requires a guest-reserved raw-code region. That path
+is retained whenever the host provides a region (stock dosemu2, so dispatch
+accounting is unchanged). The standalone native host reserves none and has no
+CPU to execute snippets, so these five operand-free flag ops fall back to
+setting the mirrored flag register directly (propagated to the CPU via
+`machine_to_regs` on hosts that have one). Port I/O and interrupt helpers
+remain raw-code/host-seam operations and the fixture deliberately avoids them.
+
+## Known dis86 lowering gaps (fixture avoids; follow-ups to file)
+
+* Byte `MUL`: unmodeled — decompile assert/panic near `ir_build.rs:1832`.
+* `DIV`/`IDIV`: lower only "loud" on the remainder half-register.
+* `SAR` with a folded unsigned byte constant widens to `i16` and loses the
+  sign-extension (`(i16)0xF0 >> 1` emits `0x78`, hardware gives `0xF8`).
+
+When any of these is fixed, add the corresponding lane to `fixture.asm`,
+update the expected table in `outbox.h`, and both lanes prove the change
+end-to-end.

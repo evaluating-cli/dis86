@@ -8,6 +8,8 @@ on:
       - 'hydra/src/dosemu_host/**'
       - 'hydra/src/meson.build'
       - 'hydra/src/native_host/**'
+      - 'hydra/src/*.c'
+      - 'hydra/src/*.h'
       - 'hydra/meson.build'
       - 'confgen/**'
       - '.github/workflows/dosemu-host-runtime.yml'

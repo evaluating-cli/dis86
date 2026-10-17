@@ -244,13 +244,18 @@ static void native_update_registers(hydra_machine_ctx_t *ctx,
 /* so the native host must own empty-metadata copies of both (same     */
 /* rationale as the dosemu host: hosts that load a metadata .so later   */
 /* can inject richer tables through the *_metadata_set functions).     */
+/* Both are weak: a linked-in real table (e.g. confgen-generated       */
+/* appdata in a native runner) must override the empty defaults        */
+/* instead of colliding with them at link time.                        */
 
+__attribute__((weak))
 const hydra_function_metadata_t *hydra_user_functions(void)
 {
   static const hydra_function_metadata_t md = {0, NULL};
   return &md;
 }
 
+__attribute__((weak))
 const hydra_callstack_metadata_t *hydra_user_callstack(void)
 {
   static const hydra_callstack_metadata_t md = {0, NULL};

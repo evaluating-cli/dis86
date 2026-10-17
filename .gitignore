@@ -7,3 +7,4 @@ build/
 # Local benchmark/session artifacts: never committed, never added.
 /FCD.EXE
 /codex-session-*.md
+__pycache__/

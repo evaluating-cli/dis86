@@ -1,0 +1,98 @@
+name: parity fixture
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'parity/**'
+      - 'hydra/src/**'
+      - 'confgen/**'
+      - 'dis86/**'
+      - '.github/workflows/parity-fixture.yml'
+  pull_request:
+    paths:
+      - 'parity/**'
+      - 'hydra/src/**'
+      - 'confgen/**'
+      - 'dis86/**'
+      - '.github/workflows/parity-fixture.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  parity:
+    name: Golden and native outbox parity
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: dis86
+
+      - name: Install fixture toolchain
+        run: |
+          set -euo pipefail
+          sudo apt-get update -q
+          sudo apt-get install -y nasm
+
+      - name: Gate 1 + native lane (dosemu2-free)
+        run: bash parity/build.sh
+
+      - name: Install stock dosemu2 runtime
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y software-properties-common
+
+          added=0
+          for attempt in 1 2 3; do
+            if sudo add-apt-repository -y ppa:dosemu2/ppa; then
+              added=1
+              break
+            fi
+            echo "dosemu2 PPA setup attempt $attempt failed" >&2
+            sleep $((attempt * 5))
+          done
+          if [ "$added" -ne 1 ]; then
+            echo "dosemu2 PPA setup failed after retries" >&2
+            exit 1
+          fi
+
+          sudo apt-get update -q
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y dosemu2 fdpp
+
+          echo "### Runtime package identity" >> "$GITHUB_STEP_SUMMARY"
+          echo '```text' >> "$GITHUB_STEP_SUMMARY"
+          apt-cache policy dosemu2 fdpp | tee -a "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          command -v dosemu
+          dosemu --version || true
+
+      - name: Golden lane + byte comparison
+        run: bash parity/run_golden.sh
+
+      - name: Export parity evidence
+        if: always()
+        run: |
+          set -euo pipefail
+          echo "### Parity fixture (#96)" >> "$GITHUB_STEP_SUMMARY"
+          echo '```text' >> "$GITHUB_STEP_SUMMARY"
+          if [ -f build/parity/native.lanes ] && [ -f build/parity/golden.lanes ]; then
+            cmp build/parity/native.lanes build/parity/golden.lanes &&
+              echo "native == golden (80-byte outbox snapshot)" ||
+              echo "native != golden"
+            od -An -tx1 -v build/parity/golden.lanes
+          else
+            echo "lane snapshots missing"
+          fi
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Show dosemu log on failure
+        if: failure()
+        run: |
+          tail -200 build/parity/golden-dosemu.log 2>/dev/null || true
