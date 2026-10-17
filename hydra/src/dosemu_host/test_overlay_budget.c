@@ -1,4 +1,4 @@
-/* Host-independent regressions for Option E metadata/breakpoint accounting. */
+/* Host-independent regressions for overlay metadata/breakpoint accounting. */
 #include <stdio.h>
 
 #include "hydra_machine.h"

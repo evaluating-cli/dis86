@@ -1,5 +1,5 @@
 //! SST 80286 harness: execute hardware-captured SingleStepTests MOO test cases
-//! against emu86 and bucket the results (see plan.md, phase P1).
+//! against emu86 and bucket the results.
 
 pub mod runner;
 pub mod policy;

@@ -337,4 +337,4 @@ anonymous, but accessible via `/proc/<pid>/fd/`.
 
 The retired two-patch carrier was the reference implementation of the boundary hook and
 low-memory-backing query; it has been removed and was never applied by the current host.
-The ABI-v1 contract it implemented is described in `FREEZE_ABI_V1.md` (reference-only).
+The ABI-v1 contract it implemented is recorded in [`HISTORY.md`](HISTORY.md).

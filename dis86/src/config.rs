@@ -527,7 +527,7 @@ mod tests {
   use super::*;
 
   // Removes the temp config on drop, so a failing assertion cannot leak
-  // the file into TMPDIR (house pattern, cf. DosemuProcess's Drop).
+  // the file into TMPDIR (house pattern).
   struct TempConfig(std::path::PathBuf);
 
   // Disambiguates temp files beyond the pid: unit tests in one binary share

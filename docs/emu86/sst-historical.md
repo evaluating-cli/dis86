@@ -4,7 +4,7 @@
 80286 **v1.1.0** real-mode hardware corpus (Harris 80C286 captures, repo commit
 `37c73caf53dcd22d3dd369ff09305d13d117a4fe`) against **emu86**. It is *evidence*,
 not a fix list: no emu86 behavior changes are proposed anywhere in this document.
-This is the P3 "first classification wave" of the plan in `.opencode/plan.md`.
+This is the first classification wave of the original SST investigation.
 
 **Date of run:** 2026-08-15 (UTC), first full V1 run.
 **Hardware anchor:** SingleStepTests/80286 @ 37c73caf, suite v1.1.0 (`v1_real_mode`).
@@ -833,7 +833,8 @@ LES/LDS, ENTER/LEAVE). These have **no** hardware evidence in this ledger.
   shift AF/OF + SST-D-004-undefined IMUL bits masked 2026-08-16 — per-form
   `flags_umask`, Track 2, 152,384 harness-caveat FAILs → PASS.)
 - Forward work: Track 3 (REP-vs-dosemu2 reconciliation) and Track 4 (Hydra
-  Option C/D) remain, per `.opencode/plan.md`.
+  Option C/D) remained in the original investigation; both are out of scope for
+  the frozen tooling.
 
 ## Hermetic micro-corpus (checked-in)
 
