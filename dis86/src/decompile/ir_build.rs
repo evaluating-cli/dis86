@@ -1147,8 +1147,19 @@ impl IRBuilder<'_> {
 
   fn append_regargs(&mut self, regargs: &Option<Vec<instr::Reg>>) {
     let Some(regargs) = regargs else { return };
+    // Same hazard as `process_int` (issues #78/#101): each pinned write is a
+    // guest register assignment in the emitted C, so a copy recorded as
+    // `Ref::Init(src)` would observe the value its source gets *after* the
+    // copy if the source were written first. Order the batch the way
+    // `process_int` does, and skip registers still holding their entry value
+    // (a pinned `AX = AX` is a no-op write).
+    let mut pending = vec![];
     for reg in regargs {
       let vref = self.ir.get_var(reg, self.cur);
+      if vref == Ref::Init(*reg) { continue; }
+      pending.push((*reg, vref));
+    }
+    for (reg, vref) in Self::order_guest_writes(&self.ir, &pending) {
       let sym = self.ir.symbols.find_ref_by_name(sym::Table::Register, reg.info().name).unwrap();
       self.append_instr_with_attrs(Type::U16, Attribute::PIN, Opcode::WriteVar16, vec![Ref::Symbol(sym), vref]);
     }
