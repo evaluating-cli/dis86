@@ -17,11 +17,10 @@ fn operand_is_stack_reg(operand: &instr::Operand) -> bool {
 }
 
 /// Whether an instruction may leave the direction flag set: STD sets it
-/// explicitly, and POPF/IRET restore it from a popped flags value. POPF is
-/// lowered (opaque flags update) and clears the per-point `df_clear` state;
-/// IRET is terminal, so only its function-scope membership here matters for
-/// the string-op direction guard. (RETF pops CS:IP only — not flags — so it
-/// is correctly absent.)
+/// explicitly, and POPF/IRET restore it from a popped flags value. Both are
+/// lowered to an opaque flags update and clear the per-point `df_clear`
+/// state, so a later string op's direction is unknown. (RETF pops CS:IP only
+/// — not flags — so it is correctly absent.)
 fn opcode_may_set_df(op: instr::Opcode) -> bool {
   matches!(op, instr::Opcode::OP_STD | instr::Opcode::OP_POPF | instr::Opcode::OP_IRET)
 }
@@ -66,18 +65,12 @@ struct IRBuilder<'a> {
   overlay: bool,
   pin_all: bool,
 
-  // Whether the decoded function contains an instruction that may leave
-  // the direction flag set/unknown (STD, or the flag-restoring POPF/IRET).
-  // This is the function-scope fact; the point-wise state below decides
-  // each string op.
-  df_may_be_set: bool,
-
   // Whether DF is provably clear (DF=0, the DOS ABI entry/exit convention)
   // at the current point of the build. CLD sets it, STD clears it, and
   // POPF (whose popped value is opaque) clears it. Block entry state comes
-  // from the must-analysis in `build` (see `df_clear_entry`), not from the
-  // function-scope fact: an annotated function entry assumes DF=0, and a
-  // join is clear only when every predecessor leaves it clear.
+  // from the must-analysis in `build` (see `df_clear_entry`): an annotated
+  // function entry assumes DF=0, and a join is clear only when every
+  // predecessor leaves it clear.
   // String-op pointer updates advance only while this holds; otherwise
   // they degrade to a loud marker rather than silently running the wrong
   // way. The marker stays fatal (UNIMPL, not UNIMPL_FLAGS) deliberately:
@@ -149,7 +142,6 @@ impl<'a> IRBuilder<'a> {
       overlay,
       pin_all,
 
-      df_may_be_set: false,
       df_clear: true,
       df_clear_entry: HashMap::new(),
       df_exit_clear: HashMap::new(),
@@ -2328,8 +2320,13 @@ impl IRBuilder<'_> {
     // passes — all entries unknown, then all known/clear. A block whose exit
     // flips with the assumption merely forwards its entry (identity);
     // otherwise its exit is constant. The analysis then runs over these
-    // summaries alone, and the IR is rebuilt at most once more with the
-    // converged seed.
+    // summaries alone, and the IR is built once more with the converged seed.
+    //
+    // DF converges first: its transfer never depends on carry, so it needs no
+    // carry seed. Carry converges second with the DF map, so its probes model
+    // the same string-op direction guards the retained build will use — the
+    // loud rep path clobbers flags, so a probe that assumed DF clear would
+    // disagree with the final IR.
     let cfg = self.cfg;
     let instrs = self.instrs;
     let spec = self.spec;
@@ -2350,20 +2347,30 @@ impl IRBuilder<'_> {
       instr::Opcode::OP_INS | instr::Opcode::OP_OUTS));
     let has_df_writer = instrs.iter().any(|i| opcode_may_set_df(i.opcode));
 
-    // The retained build. Unless the analysis proves more, only the entry is
-    // DF-clear; with no writer anywhere DF stays clear everywhere.
+    // Converge DF entry clearness first (see above). Only a DF writer can
+    // make a later block's entry unclear, and only a string op consumes it,
+    // so the analysis is skipped when either is absent (then DF stays clear).
+    let df_entry = if has_df_consumer && has_df_writer {
+      Some(analyze_df(cfg, instrs, spec, binary, overlay, pin_all))
+    } else {
+      None
+    };
+
+    // The retained build. Without a DF writer DF stays clear everywhere;
+    // otherwise only the entry is clear unless the analysis proves more.
     let mut retained = IRBuilder::new(cfg, instrs, spec, binary, overlay, pin_all);
-    retained.df_entry_default = !has_df_writer;
+    match &df_entry {
+      Some(entry) => {
+        retained.df_clear_entry = entry.clone();
+        retained.df_entry_default = false;
+      }
+      None => retained.df_entry_default = !has_df_writer,
+    }
     if has_carry_consumer {
-      retained.carry_known_entry = analyze_carry(cfg, instrs, spec, binary, overlay, pin_all);
+      retained.carry_known_entry =
+        analyze_carry(cfg, instrs, spec, binary, overlay, pin_all, df_entry.as_ref());
     }
     retained.build_once();
-
-    // Only a DF writer can make a later block's entry unclear, so the
-    // analysis is skipped when the whole function is provably clear.
-    if has_df_consumer && has_df_writer {
-      retained = refine_df(retained, cfg, instrs, spec, binary, overlay, pin_all);
-    }
 
     retained.emit_warnings();
     *self = retained;
@@ -2381,7 +2388,6 @@ impl IRBuilder<'_> {
     // flag-restoring POPF/IRET (CLD clears it). An annotated function entry
     // assumes DF=0 (the DOS ABI convention, docs/8086_flags.txt); later block
     // entries are seeded by the must-analysis in `build`.
-    self.df_may_be_set = self.instrs.iter().any(|i| opcode_may_set_df(i.opcode));
     self.df_clear = true;
 
     // Step 1: Infer basic-block boundaries
@@ -2442,8 +2448,21 @@ impl IRBuilder<'_> {
   }
 }
 
+/// Seed a probe builder with the converged DF map so its string-op direction
+/// guards match the retained build. With no map (no DF writer, or no consumer)
+/// DF is provably clear everywhere.
+fn seed_df<'a>(builder: &mut IRBuilder<'a>, df_entry: Option<&HashMap<BlockRef, bool>>) {
+  if let Some(entry) = df_entry {
+    builder.df_clear_entry = entry.clone();
+    builder.df_entry_default = false;
+  }
+}
+
 /// Converge the per-block carry entry-knownness (the CF must-analysis; see
 /// `IRBuilder::build`). Least fixpoint: unknown starts false and only grows.
+/// `df_entry` is the converged DF map (see `analyze_df`); the probes seed it so
+/// a DF-unclear `rep` in the summary clobbers flags exactly as it will in the
+/// retained build.
 fn analyze_carry<'a>(
   cfg: &'a Config,
   instrs: &'a [instr::Instr],
@@ -2451,10 +2470,12 @@ fn analyze_carry<'a>(
   binary: &'a binary::Binary,
   overlay: bool,
   pin_all: bool,
+  df_entry: Option<&HashMap<BlockRef, bool>>,
 ) -> HashMap<BlockRef, bool> {
   // Pass 1: assume no block entry carries a known value (the conservative
   // default), keeping the IR only for its per-block summaries.
   let mut probe = IRBuilder::new(cfg, instrs, spec, binary, overlay, pin_all);
+  seed_df(&mut probe, df_entry);
   probe.build_once();
   let exit_unknown = probe.exit_known.clone();
   let blocks: Vec<BlockRef> = probe.ir.iter_blocks().collect();
@@ -2467,6 +2488,7 @@ fn analyze_carry<'a>(
   // an identity transfer from a constant one.
   let mut probe2 = IRBuilder::new(cfg, instrs, spec, binary, overlay, pin_all);
   probe2.entry_known_default = true;
+  seed_df(&mut probe2, df_entry);
   probe2.build_once();
   let exit_known = probe2.exit_known.clone();
 
@@ -2505,36 +2527,37 @@ fn analyze_carry<'a>(
   in_known
 }
 
-/// Run the DF must-analysis on top of the retained (carry-converged) build.
-/// Returns the retained builder, or a rebuilt one whose `df_clear_entry`
-/// proves every block entry that is clear on all paths (see
-/// `IRBuilder::build`).
-fn refine_df<'a>(
-  retained: IRBuilder<'a>,
+/// Converge the per-block DF entry clearness (the DF must-analysis; see
+/// `IRBuilder::build`). Returns the map consumed by both the retained build
+/// and `analyze_carry`'s probes, so all three agree on each string op's
+/// direction guard.
+fn analyze_df<'a>(
   cfg: &'a Config,
   instrs: &'a [instr::Instr],
   spec: &'a spec::Spec<'a>,
   binary: &'a binary::Binary,
   overlay: bool,
   pin_all: bool,
-) -> IRBuilder<'a> {
-  // Pass A is `retained`: the entry is clear (contract), every other block
-  // starts not-clear.
-  let carry_entry = retained.carry_known_entry.clone();
-  let exit_a = retained.df_exit_clear.clone();
-  let blocks: Vec<BlockRef> = retained.ir.iter_blocks().collect();
+) -> HashMap<BlockRef, bool> {
+  // Pass A: the entry is clear (contract), every other block starts
+  // not-clear. Its summaries and predecessor lists drive the fixpoint.
+  let mut probe_a = IRBuilder::new(cfg, instrs, spec, binary, overlay, pin_all);
+  probe_a.df_entry_default = false;
+  probe_a.build_once();
+  let exit_a = probe_a.df_exit_clear.clone();
+  let blocks: Vec<BlockRef> = probe_a.ir.iter_blocks().collect();
   let preds: HashMap<BlockRef, Vec<BlockRef>> = blocks
     .iter()
-    .map(|b| (*b, retained.ir.block(*b).preds.clone()))
+    .map(|b| (*b, probe_a.ir.block(*b).preds.clone()))
     .collect();
 
   // Pass B: assume every block entry is clear, to tell an identity transfer
-  // (exit follows the entry) from a constant one.
-  let mut probe = IRBuilder::new(cfg, instrs, spec, binary, overlay, pin_all);
-  probe.carry_known_entry = carry_entry.clone();
-  probe.df_entry_default = true;
-  probe.build_once();
-  let exit_b = probe.df_exit_clear.clone();
+  // (exit follows the entry) from a constant one. DF transfer is independent
+  // of carry, so this probe needs no carry seed.
+  let mut probe_b = IRBuilder::new(cfg, instrs, spec, binary, overlay, pin_all);
+  probe_b.df_entry_default = true;
+  probe_b.build_once();
+  let exit_b = probe_b.df_exit_clear.clone();
 
   // Must-analysis over the per-block summaries (greatest fixpoint): a block
   // entry is clear only if every predecessor's exit is, but an identity
@@ -2548,7 +2571,7 @@ fn refine_df<'a>(
   loop {
     let mut changed = false;
     for b in &blocks {
-      let known = if *b == BlockRef(0) {
+      let clear = if *b == BlockRef(0) {
         true // an annotated function entry assumes DF=0
       } else {
         let ps = &preds[b];
@@ -2561,8 +2584,8 @@ fn refine_df<'a>(
           }
         })
       };
-      if entry_clear[b] != known {
-        entry_clear.insert(*b, known);
+      if entry_clear[b] != clear {
+        entry_clear.insert(*b, clear);
         changed = true;
       }
     }
@@ -2570,19 +2593,7 @@ fn refine_df<'a>(
       break;
     }
   }
-
-  // Nothing beyond the entry is provably clear: pass A is already the build.
-  if !blocks.iter().any(|b| *b != BlockRef(0) && entry_clear[b]) {
-    return retained;
-  }
-
-  // Otherwise rebuild once with the converged seed.
-  let mut rebuilt = IRBuilder::new(cfg, instrs, spec, binary, overlay, pin_all);
-  rebuilt.carry_known_entry = carry_entry;
-  rebuilt.df_clear_entry = entry_clear;
-  rebuilt.df_entry_default = false;
-  rebuilt.build_once();
-  rebuilt
+  entry_clear
 }
 
 /// Returns the offset of `elt` into `slice`.
@@ -3318,7 +3329,6 @@ mod tests {
     let (_types, cfg, binary, spec) = bit_test_builder(&[0xC3]);
     let instrs: &[instr::Instr] = &[];
     let mut b = test_builder(&cfg, instrs, &spec, &binary);
-    b.df_may_be_set = true;
     b.df_clear = false;
     b.append_asm_instr(&string_instr(instr::Opcode::OP_CLD, vec![]));
     let ins = string_instr(instr::Opcode::OP_MOVS, vec![
@@ -3429,7 +3439,6 @@ mod tests {
     let (_types, cfg, binary, spec) = bit_test_builder(&[0xC3]);
     let instrs: &[instr::Instr] = &[];
     let mut b = test_builder(&cfg, instrs, &spec, &binary);
-    b.df_may_be_set = true;
     b.df_clear = false;
     let ins = string_instr(instr::Opcode::OP_MOVS, vec![
       string_mem(instr::Size::Size16, instr::Reg::ES, instr::Reg::DI),
@@ -3442,9 +3451,10 @@ mod tests {
   }
 
   #[test]
-  fn build_marks_df_may_be_set_from_decoded_instructions() {
-    // `std; ret` decoded: build() must set the guard so string ops in
-    // this function degrade loud. Without std, the guard stays clear.
+  fn build_detects_df_writer_from_decoded_instructions() {
+    // `std; ret` decoded: build() must treat the standard as a DF writer, so
+    // later block entries fall back to not-clear (which keeps their string ops
+    // loud). Without std there is no writer and the fallback stays clear.
     let (_types, cfg, binary, spec) = bit_test_builder(&[0xFD, 0xC3]);
     let mut ins = string_instr(instr::Opcode::OP_STD, vec![]);
     ins.n_bytes = 1;
@@ -3452,7 +3462,7 @@ mod tests {
     let instrs = [ins, ret];
     let mut b = test_builder(&cfg, &instrs, &spec, &binary);
     b.build();
-    assert!(b.df_may_be_set, "build must detect STD in the decoded function");
+    assert!(!b.df_entry_default, "build must detect the DF writer (STD)");
   }
 
   #[test]
@@ -3679,7 +3689,6 @@ mod tests {
     let instrs: &[instr::Instr] = &[];
     let mut b = test_builder(&cfg, instrs, &spec, &binary);
     // A DF writer exists, so the probe/default fallback is not-clear.
-    b.df_may_be_set = true;
     b.df_entry_default = false;
     b.df_clear = true;
     let next = b.ir.add_block("next");
@@ -3828,7 +3837,6 @@ mod tests {
     let (_types, cfg, binary, spec) = bit_test_builder(&[0xC3]);
     let instrs: &[instr::Instr] = &[];
     let mut b = test_builder(&cfg, instrs, &spec, &binary);
-    b.df_may_be_set = true;
     b.df_clear = false;
     let cx = b.ir.const_new(5);
     b.ir.set_var(instr::Reg::CX, b.cur, cx);

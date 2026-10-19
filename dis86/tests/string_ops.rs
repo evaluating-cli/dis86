@@ -248,3 +248,29 @@ fn step_before_popf_is_modeled() {
   assert!(!source.contains("UNIMPL"), "the pre-popf step must be modeled:\n{source}");
   assert!(source.contains("SI + 1"), "SI must advance before the popf:\n{source}");
 }
+
+// stc; std; jz +2; jmp $; rep movsb; jz $; adc ax,bx; ret
+// `stc` leaves a known carry and `std` an unclear DF; the `rep` block is the
+// only path to the `adc`. Because DF is unclear there, the retained build
+// lowers the rep through the loud path, which clobbers flags. The carry
+// must-analysis is seeded with the DF map so it reaches the same conclusion:
+// without the seed it would model the rep, forward the `stc` carry into the
+// `adc`, and disagree with the IR it summarizes. Pin the conservative result.
+#[test]
+fn df_unclear_rep_clears_carry_for_a_later_adc() {
+  let code = [0xF9, 0xFD, 0x74, 0x02, 0xEB, 0x00, 0xF3, 0xA4, 0x74, 0x00, 0x11, 0xD8, 0xC3];
+  let source = decompile_raw(&code);
+
+  assert!(
+    source.contains("UNIMPL() /* UNIMPL op */"),
+    "the loud rep must be flagged:\n{source}"
+  );
+  assert!(
+    has_value_unimpl(&source),
+    "the adc after the flag-clobbering rep must degrade loud:\n{source}"
+  );
+  assert!(
+    !source.contains("(AX + BX) + 1"),
+    "the adc must not reuse the pre-rep carry:\n{source}"
+  );
+}

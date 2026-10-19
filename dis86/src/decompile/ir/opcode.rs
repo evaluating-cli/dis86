@@ -120,8 +120,9 @@ pub enum Opcode {
   // Direction/interrupt flag control. These change DF/IF only — never the
   // arithmetic flags (CF/ZF/SF/OF/PF) — so they render as hydra's
   // CLD/STD/CLI/STI macros and are side effects, without touching the opaque
-  // FLAGS value the rest of the IR models. DF is tracked separately by the
-  // whole-function `df_may_be_set` guard, so CLD/STD need no value here.
+  // FLAGS value the rest of the IR models. DF is tracked separately: CLD/STD
+  // set the per-point clear state and the driver's must-analysis propagates
+  // it across blocks, so CLD/STD need no value here.
   Cld,
   Std,
   Cli,
