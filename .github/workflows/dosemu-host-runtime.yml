@@ -20,9 +20,13 @@ permissions:
 
 jobs:
   runtime:
-    name: Stock dosemu2 host integration
+    name: Stock dosemu2 host integration (${{ matrix.flavor }})
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        flavor: [mz-ovl, exe, com, cap, ovl]
 
     steps:
       - uses: actions/checkout@v4
@@ -142,14 +146,14 @@ jobs:
           echo "tested commit: $(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
           echo "test_host: PASS" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Run Phase 7 acceptance matrix
+      - name: Run Phase 7 acceptance matrix (${{ matrix.flavor }})
         run: |
           set -euo pipefail
           export DOSDEBUG_STREAM_LOG=/tmp/opencode/dosdebug_driver_stream.log
           rm -f "$DOSDEBUG_STREAM_LOG"
-          TESTPROG_FLAVOR=both timeout 600 \
+          TESTPROG_FLAVOR=${{ matrix.flavor }} timeout 600 \
             bash hydra/src/dosemu_host/run_driver_test.sh
-          echo "Phase 7 matrix: exe x1 / MZ-FBOV generated-metadata overlay x1 / com x2 / capture x1 / restore x2 / COM overlay page-in and paged/unpaged restore PASS" \
+          echo "Phase 7 flavour ${{ matrix.flavor }}: PASS" \
             >> "$GITHUB_STEP_SUMMARY"
 
       - name: Show dosemu log on failure
