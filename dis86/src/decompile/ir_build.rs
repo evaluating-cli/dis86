@@ -1,6 +1,7 @@
 use crate::decompile::sym;
 use crate::decompile::ir::*;
 use crate::asm::instr;
+use crate::asm::branch;
 use crate::binary;
 use crate::segoff::{Seg, Off, SegOff};
 use crate::config::{self, Config};
@@ -10,6 +11,27 @@ use crate::asm::intel_syntax::instr_str;
 use std::collections::{HashSet, HashMap};
 
 const DEBUG: bool = false;
+
+/// The destination of a branch instruction, as the IR builder needs it.
+enum BranchTargets {
+  /// Explicit targets plus, for branches that fall through, the implicit
+  /// fallthrough address. The two are kept separate (rather than
+  /// "fallthrough is last") so callers cannot range-check the wrong
+  /// subset.
+  Targets { targets: Vec<SegOff>, fallthrough: Option<SegOff> },
+  /// A transfer with no statically known target: the block ends there.
+  Unresolved(branch::UnresolvedTransfer),
+}
+
+/// How a transfer that is not a relative branch is modeled.
+enum Transfer {
+  /// A far jump inside the function's own code segment: CS does not
+  /// change, so it is a plain jump to `target` (which may sit outside
+  /// the function's range).
+  SameSegment { target: SegOff },
+  /// A transfer the IR cannot express: the block ends here.
+  Unmodelled,
+}
 
 fn operand_is_stack_reg(operand: &instr::Operand) -> bool {
   let instr::Operand::Reg(instr::OperandReg(reg)) = operand else { return false };
@@ -198,6 +220,16 @@ impl<'a> IRBuilder<'a> {
     *self.addrmap.get(&effective).unwrap()
   }
 
+  /// Whether the memory operand has the shape of the config-described
+  /// jump table: `jmp WORD PTR cs:[bx+off]`.
+  fn is_jump_table_form(&self, m: &instr::OperandMem) -> bool {
+    m.sz == instr::Size::Size16 &&
+    m.sreg == instr::Reg::CS &&
+    m.reg1.is_some() &&
+    m.reg2.is_none() &&
+    m.off.is_some()
+  }
+
   fn jump_indirect_targets(&self, ins: &instr::Instr, m: &instr::OperandMem) -> Option<Vec<SegOff>> {
     // Matching jumps of the form: "jmp WORD PTR cs:[bx+0x6d7]"
     if m.sz != instr::Size::Size16 { return None; }
@@ -212,9 +244,14 @@ impl<'a> IRBuilder<'a> {
       off: Off(off),
     };
 
-    // Try to find a matching text segment region in config
-    let region = self.cfg.text_region_lookup(addr, ins.addr).unwrap_or_else(
-      || panic!("Failed to find text section region ({}) for: '{}' at '{}'", addr, instr_str(ins), ins.addr));
+    // Try to find a matching text segment region in config. A jump of
+    // this shape whose table the config does not describe has no known
+    // target: it stays loud instead of aborting the decompile of the
+    // whole function (issue #112). The malformed-config panics below
+    // stay: those describe a broken config, not an unsupported input.
+    let Some(region) = self.cfg.text_region_lookup(addr, ins.addr) else {
+      return None;
+    };
 
     // Unpack the array type
     let Type::Array(basetype, ArraySize::Known(len)) = &region.typ else {
@@ -248,56 +285,47 @@ impl<'a> IRBuilder<'a> {
   /// that fall through, the implicit fallthrough address. The two are
   /// returned separately (rather than "fallthrough is last") so callers
   /// cannot range-check the wrong subset.
-  fn jump_targets(&self, ins: &instr::Instr) -> Option<(Vec<SegOff>, Option<SegOff>)> {
-    // Special handling for some indirect jumps
+  ///
+  /// A branch whose target is not a relative offset (a far jump, or an
+  /// indirect jump with no resolvable jump table) has no address to
+  /// return, so it is reported as `Unresolved` instead of panicking:
+  /// aborting the build here lost the whole function (issue #112).
+  fn jump_targets(&self, ins: &instr::Instr) -> Option<BranchTargets> {
+    // Special handling for some indirect jumps: a `jmp cs:[bx+off]` whose
+    // target table the config describes resolves to a set of targets.
     if ins.opcode == instr::Opcode::OP_JMP {
-      if let instr::Operand::Mem(m) = &ins.operands[0] {
+      if let Some(instr::Operand::Mem(m)) = ins.operands.get(0) {
         if let Some(targets) = self.jump_indirect_targets(ins, m) {
-          return Some((targets, None));
+          return Some(BranchTargets::Targets { targets, fallthrough: None });
         }
-        // If none.. we want to fall through so we hit the panic below
+        // Otherwise the target is only known at run time: unresolved.
       }
     }
 
-    // Filter for branch instructions
-    let (oper_num, fallthrough) = match &ins.opcode {
-      instr::Opcode::OP_JA   => (0, true),
-      instr::Opcode::OP_JAE  => (0, true),
-      instr::Opcode::OP_JB   => (0, true),
-      instr::Opcode::OP_JBE  => (0, true),
-      instr::Opcode::OP_JCXZ => (1, true),
-      instr::Opcode::OP_JE   => (0, true),
-      instr::Opcode::OP_JG   => (0, true),
-      instr::Opcode::OP_JGE  => (0, true),
-      instr::Opcode::OP_JL   => (0, true),
-      instr::Opcode::OP_JLE  => (0, true),
-      instr::Opcode::OP_JMP  => (0, false),
-      instr::Opcode::OP_JMPF => (0, false),
-      instr::Opcode::OP_JNE  => (0, true),
-      instr::Opcode::OP_JNO  => (0, true),
-      instr::Opcode::OP_JNP  => (0, true),
-      instr::Opcode::OP_JNS  => (0, true),
-      instr::Opcode::OP_JO   => (0, true),
-      instr::Opcode::OP_JP   => (0, true),
-      instr::Opcode::OP_JS   => (0, true),
-      instr::Opcode::OP_LOOP => (1, true),
-      instr::Opcode::OP_LOOPE => (1, true),
-      instr::Opcode::OP_LOOPNE => (1, true),
-      _ => return None,
+    match branch::branch_target(ins)? {
+      branch::BranchTarget::Relative { target, fallthrough } =>
+        Some(BranchTargets::Targets { targets: vec![target], fallthrough }),
+      branch::BranchTarget::Unresolved(kind) =>
+        Some(BranchTargets::Unresolved(kind)),
+    }
+  }
+
+  /// Classify a transfer whose target is not a relative offset.
+  ///
+  /// A far jump loads CS with an explicit segment value. It is a jump
+  /// within the function's own code segment only when that segment is
+  /// the one the function lives in. In an overlay the segment value
+  /// belongs to the original program's address space, which this
+  /// segment model does not represent, so every far jump there is
+  /// unmodelled.
+  fn transfer_model(&self, kind: branch::UnresolvedTransfer) -> Transfer {
+    let branch::UnresolvedTransfer::FarDirect { seg, off } = kind else {
+      return Transfer::Unmodelled;
     };
-
-    let mut targets = vec![];
-
-    match &ins.operands[oper_num] {
-      instr::Operand::Rel(rel) => {
-        targets.push(ins.rel_addr(rel));
-      }
-      _ => panic!("Unsupported branch instruction: '{}' | {:?}", instr_str(ins), ins.operands[oper_num]),
-    };
-
-    let fallthrough = fallthrough.then(|| ins.end_addr());
-
-    Some((targets, fallthrough))
+    if self.overlay { return Transfer::Unmodelled; }
+    let Seg::Normal(cur_seg) = self.spec.start.seg else { return Transfer::Unmodelled; };
+    if seg != cur_seg { return Transfer::Unmodelled; }
+    Transfer::SameSegment { target: SegOff { seg: self.spec.start.seg, off: Off(off) } }
   }
 
   fn append_instr(&mut self, typ: Type, opcode: Opcode, operands: Vec<Ref>) -> Ref {
@@ -319,6 +347,21 @@ impl<'a> IRBuilder<'a> {
   fn append_jmp(&mut self, next: BlockRef) {
     self.ir.block_mut(next).preds.push(self.cur);
     self.append_instr(Type::Void, Opcode::Jmp, vec![Ref::Block(next)]);
+  }
+
+  /// Lower a transfer the IR cannot model: a loud marker plus the end of
+  /// the block, with no fallthrough edge.
+  ///
+  /// The block ends with a jump to an empty block, the established idiom
+  /// for "control leaves the function here" (see
+  /// `ir::methods::block_exits`): an empty block has no exits, so the code
+  /// after the transfer becomes an unreachable block and is dropped,
+  /// instead of being modelled as a fallthrough that never happens.
+  fn append_unmodelled_transfer(&mut self, ins: &instr::Instr, msg: &str) {
+    self.warn(msg.to_string());
+    self.append_instr(Type::Void, Opcode::Unimpl, vec![]);
+    let trap = self.new_block(&format!("transfer_out_{:04x}", ins.addr.off.0));
+    self.append_jmp(trap);
   }
 
   fn append_jne(&mut self, cond: Ref, true_blk: BlockRef, false_blk: BlockRef) {
@@ -1927,23 +1970,75 @@ impl IRBuilder<'_> {
         self.carry_known = known;
       }
       instr::Opcode::OP_JMP => {
-        match &ins.operands[0] {
-          instr::Operand::Mem(m) => {
-            // Special handling for some indirect jumps
-            let Some(targets) = self.jump_indirect_targets(ins, m) else {
-              panic!("Indirect jump form not currently supported for '{}'", instr_str(ins));
-            };
-            let Some(reg) = m.reg1 else {
-              panic!("Shouldn't fail.. should be checked by jump_indirect_targets already");
-            };
-            let reg_ref = self.ir.get_var(reg, self.cur);
-            self.append_jmptbl(reg_ref, targets);
+        match ins.operands.get(0) {
+          Some(instr::Operand::Mem(m)) => {
+            // Special handling for some indirect jumps: a `jmp cs:[bx+off]`
+            // whose target table the config describes lowers to a jump
+            // table. Any other indirect jump has no statically known
+            // target, so it ends the block loudly instead of aborting
+            // the whole decompile (issue #112).
+            if let Some(targets) = self.jump_indirect_targets(ins, m) {
+              let Some(reg) = m.reg1 else {
+                panic!("Shouldn't fail.. should be checked by jump_indirect_targets already");
+              };
+              let reg_ref = self.ir.get_var(reg, self.cur);
+              self.append_jmptbl(reg_ref, targets);
+            } else {
+              // A jump of the config-described jump-table shape whose
+              // table the config does not have is a missing annotation,
+              // not a runtime-only target: say so, so the operator can
+              // add the region.
+              let msg = if self.is_jump_table_form(m) {
+                format!("Unmodelled indirect jump '{}' at {} — the config has no jump table for it; emitting UNIMPL marker",
+                  instr_str(ins), ins.addr)
+              } else {
+                format!("Unmodelled indirect jump '{}' at {} — target is only known at run time; emitting UNIMPL marker",
+                  instr_str(ins), ins.addr)
+              };
+              self.append_unmodelled_transfer(ins, &msg);
+            }
           }
-          instr::Operand::Rel(rel) => {
+          Some(instr::Operand::Rel(rel)) => {
             let blkref = self.get_block(ins.rel_addr(rel));
             self.append_jmp(blkref);
           }
-          _ => panic!("Unsupported JMP operand for '{}'", instr_str(ins)),
+          // `jmp <reg>` (e.g. `jmp ax`): the target is a register value,
+          // known only at run time.
+          _ => {
+            self.append_unmodelled_transfer(ins, &format!(
+              "Unmodelled indirect jump '{}' at {} — target is only known at run time; emitting UNIMPL marker",
+              instr_str(ins), ins.addr));
+          }
+        }
+      }
+
+      instr::Opcode::OP_JMPF => {
+        // A far jump transfers control to another segment (or to a target
+        // read from memory), which the IR cannot express: hydra has no
+        // far-jump primitive and the IR has no cross-segment control
+        // flow. A far jump inside the function's own code segment does
+        // not change CS, so it lowers to a plain jump; every other far
+        // jump ends the block loudly (issue #112).
+        let kind = branch::unresolved_transfer(ins);
+        match self.transfer_model(kind) {
+          Transfer::SameSegment { target } => {
+            let blkref = self.get_block(target);
+            self.append_jmp(blkref);
+          }
+          Transfer::Unmodelled => {
+            let msg = match kind {
+              branch::UnresolvedTransfer::FarDirect { seg, off } => format!(
+                "Unmodelled far jump '{}' at {} — target {:04x}:{:04x} is not in the function's code segment; emitting UNIMPL marker",
+                instr_str(ins), ins.addr, seg, off),
+              branch::UnresolvedTransfer::FarIndirect => format!(
+                "Unmodelled far jump '{}' at {} — target is read from memory at run time; emitting UNIMPL marker",
+                instr_str(ins), ins.addr),
+              branch::UnresolvedTransfer::NearIndirect => format!(
+                "Unmodelled jump '{}' at {} — target is only known at run time; emitting UNIMPL marker",
+                instr_str(ins), ins.addr),
+            };
+            self.append_unmodelled_transfer(ins, &msg);
+          }
         }
       }
 
@@ -2422,22 +2517,40 @@ impl IRBuilder<'_> {
         block_start.insert(ins.addr);
         last_was_jump = false;
       }
-      let Some((explicit, fallthrough)) = self.jump_targets(ins) else { continue };
-      // Every target — including an implicit fallthrough — needs a block:
-      // conditional lowerings resolve ins.end_addr() via get_block, which
-      // panics on a missing entry when the branch is the last decoded
-      // instruction. Only explicit targets are range-checked below.
-      for tgt in explicit.iter().chain(fallthrough.iter()) {
-        block_start.insert(*tgt);
-      }
-      // Explicit branch targets must lie inside the function's [start,
-      // end): anything outside decodes to zero instructions, becomes an
-      // empty block, and is silently dropped from the output. Warn loudly
-      // instead of hiding the lost edge; the drop semantics are unchanged.
-      for tgt in &explicit {
-        if self.out_of_range_edge(*tgt, fallthrough) {
-          self.warn(format!("WARN: {}: branch at {} targets {} outside function range [{}, {}); the edge is dropped from the output",
-            self.spec.name, ins.addr, tgt, self.spec.start, self.spec.end));
+      let Some(branch_targets) = self.jump_targets(ins) else { continue };
+      match branch_targets {
+        BranchTargets::Targets { targets: explicit, fallthrough } => {
+          // Every target — including an implicit fallthrough — needs a block:
+          // conditional lowerings resolve ins.end_addr() via get_block, which
+          // panics on a missing entry when the branch is the last decoded
+          // instruction. Only explicit targets are range-checked below.
+          for tgt in explicit.iter().chain(fallthrough.iter()) {
+            block_start.insert(*tgt);
+          }
+          // Explicit branch targets must lie inside the function's [start,
+          // end): anything outside decodes to zero instructions, becomes an
+          // empty block, and is silently dropped from the output. Warn loudly
+          // instead of hiding the lost edge; the drop semantics are unchanged.
+          for tgt in &explicit {
+            if self.out_of_range_edge(*tgt, fallthrough) {
+              self.warn(format!("WARN: {}: branch at {} targets {} outside function range [{}, {}); the edge is dropped from the output",
+                self.spec.name, ins.addr, tgt, self.spec.start, self.spec.end));
+            }
+          }
+        }
+        BranchTargets::Unresolved(kind) => {
+          // A transfer with no statically known target: no block is created
+          // for it. The lowering ends the block at the transfer (loudly), so
+          // the code after it becomes a separate, unreachable block.
+          if let Transfer::SameSegment { target } = self.transfer_model(kind) {
+            // A far jump inside the function's own segment is a plain jump
+            // to that address: it needs a block like any other target.
+            block_start.insert(target);
+            if self.out_of_range_edge(target, None) {
+              self.warn(format!("WARN: {}: branch at {} targets {} outside function range [{}, {}); the edge is dropped from the output",
+                self.spec.name, ins.addr, target, self.spec.start, self.spec.end));
+            }
+          }
         }
       }
       last_was_jump = true;
@@ -3941,5 +4054,101 @@ mod tests {
     let cx_after = b.ir.get_var(instr::Reg::CX, b.cur);
     assert_eq!(b.ir.const_lookup(cx_after), Some(0), "CX consumed to 0");
     let _ = assert_rep_advanced(&mut b, instr::Reg::SI, 2);
+  }
+
+  /// Decode `code` into instructions for a builder over the same range.
+  fn decode_all(binary: &binary::Binary, spec: &spec::Spec) -> Vec<instr::Instr> {
+    use crate::asm::decode::Decoder;
+    let mut decoder = Decoder::new(binary.region_iter(spec.start, spec.end));
+    let mut instrs = vec![];
+    while let Some((ins, _raw)) = decoder.try_next().expect("decode") {
+      instrs.push(ins);
+    }
+    instrs
+  }
+
+  #[test]
+  fn same_segment_far_jump_lowers_to_a_jump() {
+    // `jmp far 0000:0009` does not change CS, so it is a plain jump to
+    // that address: the IR must carry a Jmp to the target block, with no
+    // imprecision marker (issue #112).
+    let code: &[u8] = &[0xEA, 0x09, 0x00, 0x00, 0x00, 0xB8, 0x01, 0x00, 0xC3, 0xB8, 0x02, 0x00, 0xC3];
+    let (_types, cfg, binary, spec) = bit_test_builder(code);
+    let instrs = decode_all(&binary, &spec);
+    assert_eq!(instrs[0].opcode, instr::Opcode::OP_JMPF);
+
+    let ir = build_from_instrs(&instrs, &cfg, &spec, &binary, false, false);
+    let entry = ir.iter_blocks().next().expect("entry block");
+    let last = ir.block_last(entry);
+    assert_eq!(ir.instr(last).unwrap().opcode, Opcode::Jmp, "a same-segment far jump is a plain jump");
+    let target = ir.instr(last).unwrap().operands[0].unwrap_block();
+    assert_eq!(ir.block(target).name, "addr_0009", "the jump must target the far offset");
+    assert!(ir.iter_instrs(entry).all(|r| ir.instr(r).unwrap().opcode != Opcode::Unimpl),
+      "a modellable transfer must not be marked imprecise");
+  }
+
+  #[test]
+  fn cross_segment_far_jump_ends_the_block_without_a_fallthrough() {
+    // A far jump into another segment cannot be expressed in the IR: the
+    // block ends with a loud marker and a jump to an empty block (the
+    // "control leaves the function" idiom), so the code after it is not
+    // reachable through a fallthrough edge (issue #112).
+    let code: &[u8] = &[0xEA, 0x00, 0x01, 0x34, 0x12, 0xB8, 0x01, 0x00, 0xC3];
+    let (_types, cfg, binary, spec) = bit_test_builder(code);
+    let instrs = decode_all(&binary, &spec);
+    assert_eq!(instrs[0].opcode, instr::Opcode::OP_JMPF);
+
+    let ir = build_from_instrs(&instrs, &cfg, &spec, &binary, false, false);
+    let entry = ir.iter_blocks().next().expect("entry block");
+    let _ = only_instr(&ir, entry, Opcode::Unimpl);
+    let last = ir.block_last(entry);
+    assert_eq!(ir.instr(last).unwrap().opcode, Opcode::Jmp, "the block must end with a jump");
+    let trap = ir.instr(last).unwrap().operands[0].unwrap_block();
+    assert_eq!(ir.block_instr_count(trap), 0, "the transfer target must be an empty block");
+    assert!(ir.block_exits(trap).is_empty(), "an empty block has no exits: control leaves the function");
+
+    // The code after the transfer is a separate block with no
+    // predecessor: it is unreachable, not a fallthrough.
+    let after = ir.iter_blocks().find(|b| ir.block(*b).name == "addr_0005").expect("the fallthrough block");
+    assert!(ir.block(after).preds.is_empty(), "the transfer must not create a fallthrough edge");
+  }
+
+  #[test]
+  fn jump_targets_never_panics_on_a_non_relative_operand() {
+    // Every branch in the table must survive an operand that is not a
+    // relative offset: the old code panicked on anything but `Rel`,
+    // which lost the whole function (issue #112).
+    use crate::asm::branch;
+    let (_types, cfg, binary, spec) = bit_test_builder(&[0xC3]);
+    let b = test_builder(&cfg, &[], &spec, &binary);
+    let opcodes = [
+      instr::Opcode::OP_JA, instr::Opcode::OP_JAE, instr::Opcode::OP_JB, instr::Opcode::OP_JBE,
+      instr::Opcode::OP_JCXZ, instr::Opcode::OP_JE, instr::Opcode::OP_JG, instr::Opcode::OP_JGE,
+      instr::Opcode::OP_JL, instr::Opcode::OP_JLE, instr::Opcode::OP_JMP, instr::Opcode::OP_JMPF,
+      instr::Opcode::OP_JNE, instr::Opcode::OP_JNO, instr::Opcode::OP_JNP, instr::Opcode::OP_JNS,
+      instr::Opcode::OP_JO, instr::Opcode::OP_JP, instr::Opcode::OP_JS,
+      instr::Opcode::OP_LOOP, instr::Opcode::OP_LOOPE, instr::Opcode::OP_LOOPNE,
+    ];
+    for op in opcodes {
+      let mut operands = ArrayVec::new();
+      operands.push(instr::Operand::Reg(instr::OperandReg(instr::Reg::AX)));
+      // LOOPcc/JCXZ carry a hidden CX operand, so their relative target
+      // is operand 1.
+      if branch::branch_shape(op).map(|s| s.oper_num) == Some(1) {
+        operands.push(instr::Operand::Reg(instr::OperandReg(instr::Reg::AX)));
+      }
+      let ins = instr::Instr {
+        rep: None,
+        opcode: op,
+        operands,
+        addr: SegOff { seg: Seg::Normal(0), off: Off(0) },
+        n_bytes: 2,
+        intel_hidden_operand_bitmask: 0,
+      };
+      let targets = b.jump_targets(&ins);
+      assert!(targets.is_some(), "{op:?} must be recognized as a branch");
+      assert!(matches!(targets, Some(BranchTargets::Unresolved(_))),
+        "{op:?} with a non-relative operand must be unresolved, not a target");
+    }
   }
 }

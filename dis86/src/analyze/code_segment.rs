@@ -24,6 +24,15 @@ impl CodeSegment {
     let end_off: u16 = (self.primary.skip_off + self.primary.size).try_into().unwrap();
     SegOff { seg: self.primary.seg, off: Off(end_off) }
   }
+
+  /// Whether `addr` lies inside this segment's bytes. A branch target
+  /// outside it has no code to continue at: decoding there would read
+  /// past the segment's data (or from another segment entirely).
+  pub fn contains(&self, addr: SegOff) -> bool {
+    addr.seg == self.primary.seg &&
+    addr.off.0 >= self.start().off.0 &&
+    addr.off.0 < self.end().off.0
+  }
 }
 
 #[derive(Debug)]
