@@ -1390,6 +1390,24 @@ impl IRBuilder<'_> {
     self.append_jne(cond, true_blk, false_blk);
   }
 
+  /// `Jcc` for a flag reader with no negated IR opcode: compose
+  /// `Eq(reader(flags), 0)` the way JNS does. The reader renders as the
+  /// non-fatal UNIMPL_FLAGS when its flags input is imprecise (see ast.rs),
+  /// so the negated forms inherit that marker class instead of aborting.
+  fn append_cond_jump_negated(&mut self, ins: &instr::Instr, compare_opcode: Opcode) {
+    let instr::Operand::Rel(rel) = &ins.operands[0] else { panic!("Expected relative offset operand for JMP") };
+
+    let false_blk = self.get_block(ins.end_addr());
+    let true_blk = self.get_block(ins.rel_addr(rel));
+
+    let flags = self.get_flags();
+    let reader = self.append_instr(Type::U16, compare_opcode, vec![flags]);
+    let z = self.ir.const_new(0);
+    let cond = self.append_instr(Type::U16, Opcode::Eq, vec![reader, z]);
+
+    self.append_jne(cond, true_blk, false_blk);
+  }
+
   fn append_cond_set(&mut self, ins: &instr::Instr, compare_opcode: Opcode) {
     let flags = self.get_flags();
     let cond = self.append_instr(Type::U8, compare_opcode, vec![flags]);
@@ -1969,6 +1987,11 @@ impl IRBuilder<'_> {
 
         self.append_jne(cond, true_blk, false_blk);
       }
+
+      instr::Opcode::OP_JO  => self.append_cond_jump(ins, Opcode::OverflowFlags),
+      instr::Opcode::OP_JNO => self.append_cond_jump_negated(ins, Opcode::OverflowFlags),
+      instr::Opcode::OP_JP  => self.append_cond_jump(ins, Opcode::ParityFlags),
+      instr::Opcode::OP_JNP => self.append_cond_jump_negated(ins, Opcode::ParityFlags),
 
       instr::Opcode::OP_JE  => self.append_cond_jump(ins, Opcode::EqFlags),
       instr::Opcode::OP_JNE => self.append_cond_jump(ins, Opcode::NeqFlags),
@@ -3008,6 +3031,54 @@ mod tests {
     assert!(!b.out_of_range_edge(at(0x20), Some(at(0x20))), "branch-to-next at end is silent");
     assert!(!b.out_of_range_edge(at(0x15), Some(at(0x15))), "branch-to-next mid-range is silent");
     assert!(b.out_of_range_edge(SegOff { seg: Seg::Normal(1), off: Off(0x12) }, None), "far target warns");
+  }
+
+  #[test]
+  fn of_pf_jumps_lower_to_non_fatal_flag_readers() {
+    // #108: JO/JNO/JP/JNP must read OF/PF through the non-fatal reader
+    // opcodes instead of falling to the fatal Unimpl fallback. The direct
+    // forms use the reader as the branch condition; the negated forms compose
+    // Eq(reader, 0), matching JNS and the SET* forms.
+    let (_types, cfg, binary, spec) = test_spec(0x0000, 0x0004, &[0xC3]);
+    for (opcode, expected_reader, negated) in [
+      (instr::Opcode::OP_JO, Opcode::OverflowFlags, false),
+      (instr::Opcode::OP_JNO, Opcode::OverflowFlags, true),
+      (instr::Opcode::OP_JP, Opcode::ParityFlags, false),
+      (instr::Opcode::OP_JNP, Opcode::ParityFlags, true),
+    ] {
+      let instrs = [jmp_instr(opcode, 0x0000, 2, 1)];
+      let mut b = test_builder(&cfg, &instrs, &spec, &binary);
+      b.build();
+
+      let mut jne_ref = None;
+      for blk in b.ir.iter_blocks() {
+        for r in b.ir.iter_instrs(blk) {
+          assert_ne!(b.ir.instr(r).unwrap().opcode, Opcode::Unimpl, "{opcode:?} must not emit a fatal Unimpl marker");
+          if b.ir.instr(r).unwrap().opcode == Opcode::Jne {
+            jne_ref = Some(r);
+          }
+        }
+      }
+      let jne = b.ir.instr(jne_ref.expect("jump must lower to a Jne")).unwrap();
+      let cond_ref = jne.operands[0];
+      let reader_ref = if negated {
+        let cond = b.ir.instr(cond_ref).unwrap();
+        assert_eq!(cond.opcode, Opcode::Eq, "{opcode:?} negated form must compose Eq(reader, 0)");
+        cond.operands[0]
+      } else {
+        cond_ref
+      };
+      let reader = b.ir.instr(reader_ref).unwrap();
+      assert_eq!(reader.opcode, expected_reader, "{opcode:?} must read its flag non-fatally");
+
+      // The true block is the jump target (offset 3); the false block is the
+      // fallthrough (offset 2). A true/false swap would keep the condition
+      // shape but invert the control flow, so pin the wiring too.
+      let true_blk = jne.operands[1].unwrap_block();
+      let false_blk = jne.operands[2].unwrap_block();
+      assert_eq!(b.ir.block(true_blk).name, "addr_0003", "{opcode:?} true edge must be the jump target");
+      assert_eq!(b.ir.block(false_blk).name, "addr_0002", "{opcode:?} false edge must be the fallthrough");
+    }
   }
 
   #[test]
