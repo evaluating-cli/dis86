@@ -160,20 +160,8 @@ fn aaa_writes_distinct_unknowns_per_fragment() {
   );
 }
 
-// sets/setns read the sign flag; seto degrades to a loud value marker.
-#[test]
-fn sign_setcc_reads_sign_flag_overflow_stays_loud() {
-  let sets = decompile_raw(&[0x0F, 0x98, 0xC0, 0xC3]);
-  assert!(
-    sets.contains("UNIMPL_FLAGS"),
-    "sets must read the (possibly unknown) sign flag loudly:\n{sets}"
-  );
-  let seto = decompile_raw(&[0x0F, 0x90, 0xC0, 0xC3]);
-  assert!(
-    seto.contains("UNIMPL()"),
-    "seto (untracked overflow) must stay a loud value marker:\n{seto}"
-  );
-}
+// The SETcc marker contract lives in tests/setcc_flag_readers.rs (issue
+// #103): every SETcc reads a possibly-unknown flag non-fatally.
 
 // lahf stores the opaque flags to AH; hlt is a fatal-only-if-executed marker.
 #[test]
