@@ -1388,6 +1388,18 @@ impl IRBuilder<'_> {
     self.append_asm_dst_operand(&ins.operands[0], cond);
   }
 
+  /// `SETcc` for a flag reader with no negated IR opcode: compose
+  /// `Eq(reader(flags), 0)` the way JNS does. The reader renders as the
+  /// non-fatal UNIMPL_FLAGS when its flags input is imprecise (see ast.rs),
+  /// so the negated forms inherit that marker class instead of aborting.
+  fn append_cond_set_negated(&mut self, ins: &instr::Instr, compare_opcode: Opcode) {
+    let flags = self.get_flags();
+    let reader = self.append_instr(Type::U16, compare_opcode, vec![flags]);
+    let z = self.ir.const_new(0);
+    let cond = self.append_instr(Type::U8, Opcode::Eq, vec![reader, z]);
+    self.append_asm_dst_operand(&ins.operands[0], cond);
+  }
+
   fn append_upper_lower_split(&mut self, r: Ref) -> (Ref, Ref) {
     let upper = self.append_instr(Type::U16, Opcode::Upper16, vec![r]);
     let lower = self.append_instr(Type::U16, Opcode::Lower16, vec![r]);
@@ -2205,25 +2217,12 @@ impl IRBuilder<'_> {
           self.ir.set_var(instr::Reg::SP, self.cur, sp);
         }
       }
-      instr::Opcode::OP_SETS => self.append_cond_set(ins, Opcode::SignFlags),
-      instr::Opcode::OP_SETNS => {
-        // No negated-Flags IR opcode exists; compose Eq(SignFlags, 0) the
-        // way JNS does.
-        let flags = self.get_flags();
-        let sign = self.append_instr(Type::U16, Opcode::SignFlags, vec![flags]);
-        let z = self.ir.const_new(0);
-        let cond = self.append_instr(Type::U8, Opcode::Eq, vec![sign, z]);
-        self.append_asm_dst_operand(&ins.operands[0], cond);
-      }
-      instr::Opcode::OP_SETO | instr::Opcode::OP_SETNO |
-      instr::Opcode::OP_SETP | instr::Opcode::OP_SETNP => {
-        // Overflow and parity have no IR flag readers, so the result is an
-        // explicit unknown (fatal only if executed). Flags are preserved
-        // (SETcc never touches them), so they are left intact.
-        self.warn(format!("Unimpl opcode {:?} at {} — emitting UNIMPL marker", ins.opcode, ins.addr));
-        let vref = self.append_instr(Type::U8, Opcode::Unimpl, vec![]);
-        self.append_asm_dst_operand(&ins.operands[0], vref);
-      }
+      instr::Opcode::OP_SETS  => self.append_cond_set(ins, Opcode::SignFlags),
+      instr::Opcode::OP_SETO  => self.append_cond_set(ins, Opcode::OverflowFlags),
+      instr::Opcode::OP_SETP  => self.append_cond_set(ins, Opcode::ParityFlags),
+      instr::Opcode::OP_SETNS => self.append_cond_set_negated(ins, Opcode::SignFlags),
+      instr::Opcode::OP_SETNO => self.append_cond_set_negated(ins, Opcode::OverflowFlags),
+      instr::Opcode::OP_SETNP => self.append_cond_set_negated(ins, Opcode::ParityFlags),
       instr::Opcode::OP_LAHF => {
         // AH = low flags byte. Flags are one opaque value, so this stores
         // it to AH; SAHF round-trips it back exactly, and any branch on

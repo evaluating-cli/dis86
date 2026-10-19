@@ -58,6 +58,13 @@ pub enum Opcode {
   ULtFlags,    // Maps to: JB  / JNAE / JC
   ULeqFlags,   // Maps to: JBE / JNA
   SignFlags,   // Maps to: JS and inverted for JNS,
+  // OF/PF readers. No ALU producer models these bits yet, so a consumer
+  // always renders as the non-fatal UNIMPL_FLAGS (see ast.rs) rather than
+  // the fatal UNIMPL. SETO/SETNO and SETP/SETNP lower through them; the
+  // negated forms compose `Eq(reader, 0)` because no negated reader exists
+  // (matching SETNS). JO/JNO/JP/JNP are not lowered yet.
+  OverflowFlags, // Maps to: SETO, inverted for SETNO
+  ParityFlags,   // Maps to: SETP / JPE, inverted for SETNP / JPO
 
   Eq,          // Operator: == (any sign)
   Neq,         // Operator: != (any sign)
@@ -196,7 +203,9 @@ impl Opcode {
       Opcode::UGeqFlags   => "ugeqf",
       Opcode::ULtFlags    => "ultf",
       Opcode::ULeqFlags   => "uleqf",
-      Opcode::SignFlags   => "signf",
+      Opcode::SignFlags     => "signf",
+      Opcode::OverflowFlags => "ovf",
+      Opcode::ParityFlags   => "parf",
       Opcode::Eq          => "eq",
       Opcode::Neq         => "neq",
       Opcode::Gt          => "gt",

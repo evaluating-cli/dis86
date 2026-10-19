@@ -733,10 +733,12 @@ impl<'a> Builder<'a> {
       }
       ir::Opcode::EqFlags | ir::Opcode::NeqFlags | ir::Opcode::GtFlags | ir::Opcode::GeqFlags |
       ir::Opcode::LtFlags | ir::Opcode::LeqFlags | ir::Opcode::UGtFlags | ir::Opcode::UGeqFlags |
-      ir::Opcode::ULtFlags | ir::Opcode::ULeqFlags | ir::Opcode::SignFlags => {
+      ir::Opcode::ULtFlags | ir::Opcode::ULeqFlags | ir::Opcode::SignFlags |
+      ir::Opcode::OverflowFlags | ir::Opcode::ParityFlags => {
         // A flag test that survived `simplify_branch_conds` (e.g. its flag
-        // producer is unknown or relational-over-non-logical). Conditions
-        // built from these stay explicit in the C output via UNIMPL_FLAGS.
+        // producer is unknown or relational-over-non-logical), or an OF/PF
+        // reader with no producer model yet. Conditions built from these
+        // stay explicit in the C output via UNIMPL_FLAGS.
         let exprs: Vec<_> = instr.operands.iter().map(|r| self.ref_to_expr(*r, depth+1)).collect();
         Expr::Abstract("UNIMPL_FLAGS", exprs)
       }
