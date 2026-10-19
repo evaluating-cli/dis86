@@ -19,6 +19,7 @@
 
 #include "hydra_backend.h"
 #include "hydra_machine.h"
+#include "internal.h"
 
 static int t_failures;
 
@@ -274,5 +275,92 @@ int hydra_backend_selftest(void)
 
   free(ctx);
   be->shutdown(st);
+  return t_failures;
+}
+
+/********************************************************************/
+/* Wiring: hydra_impl_int -> raw-code guard -> dlsym hook -> dispatch ->
+ * backend. These run against a live machine rather than against the
+ * dispatch table directly, so a broken seam cannot pass. */
+
+static hydra_machine_t *g_probe_m;
+
+static void probe_impl_unhandled(void)
+{
+  g_probe_m->registers->ax = 0x0000;
+  hydra_impl_int(0x22);
+}
+
+static void probe_impl_exit(void)
+{
+  g_probe_m->registers->ax = 0x4c00;      /* INT 21h AH=4Ch, exit code 0 */
+  hydra_impl_int(0x21);
+}
+
+int hydra_backend_linktest(hydra_machine_t *m)
+{
+  t_failures = 0;
+
+  TCHECK(hydra_user_int_hook != NULL,
+         "wiring: hydra_user_int hook resolved by dlsym");
+  if (!hydra_user_int_hook)
+    return t_failures;
+
+  /* hydra_impl_int finds the machine through the active execution context,
+   * which is NULL outside a running hook. Install one aliasing this machine
+   * so the primitive can be exercised directly. */
+  hydra_exec_ctx_t exec;
+  memset(&exec, 0, sizeof(exec));
+  exec.machine = *m;
+  execution_context_set(&exec);
+
+  hydra_native_backend_select("terminal");
+  void *st = NULL;
+  const hydra_backend_t *be = hydra_native_backend_active(&st);
+  TCHECK(be != NULL && strcmp(be->name, "terminal") == 0,
+         "wiring: terminal backend selected through the registry");
+  if (!be)
+    return t_failures;
+
+  uint8_t rows = 0, cols = 0;
+  const uint8_t *buf = be->text_buffer(st, &rows, &cols);
+  TCHECK(buf != NULL && cols > 0, "wiring: backend exposes a shadow buffer");
+  if (!buf)
+    return t_failures;
+
+  /* Registers are read from the execution context's copy of the machine. */
+  exec.machine.registers->ax = 0x0e41;     /* INT 10h AH=0Eh, AL='A' */
+  hydra_impl_int(0x10);
+  TCHECK(buf[0] == 'A',
+         "wiring: INT 10h AH=0Eh via hydra_impl_int reaches the backend");
+
+  exec.machine.registers->ax = 0x0200;     /* INT 21h AH=02h */
+  exec.machine.registers->dx = 0x0042;     /* DL='B' */
+  hydra_impl_int(0x21);
+  TCHECK(buf[1] == 'B',
+         "wiring: INT 21h AH=02h via hydra_impl_int reaches the backend");
+
+  /* A string read out of guest memory proves the host ctx is threaded
+   * through, not just the registers. */
+  exec.machine.registers->ax = 0x0900;     /* INT 21h AH=09h */
+  exec.machine.registers->ds = 0x0200;
+  exec.machine.registers->dx = 0x0000;
+  {
+    native_host_ctx_t *ctx = (native_host_ctx_t *)exec.machine.hardware->ctx;
+    memcpy(ctx->mem + (0x0200u * 16u), "CD$", 3);
+  }
+  hydra_impl_int(0x21);
+  TCHECK(buf[2] == 'C' && buf[3] == 'D',
+         "wiring: INT 21h AH=09h reads guest memory through the host ctx");
+
+  /* Both classes of failure still abort when reached through the primitive. */
+  g_probe_m = &exec.machine;
+  TCHECK(probe_aborts(probe_impl_unhandled),
+         "wiring: unhandled vector via hydra_impl_int aborts");
+  TCHECK(probe_aborts(probe_impl_exit),
+         "wiring: guest termination aborts with a diagnostic (no exit path yet)");
+
+  /* Leave the execution context as we found it. */
+  execution_context_set(NULL);
   return t_failures;
 }

@@ -33,6 +33,27 @@ struct hydra_mode {
 extern hydra_mode_t HYDRA_MODE[1];
 
 /********************************************************************/
+/* Optional host interrupt handler (dlsym user hook, resolved in
+ * api_impl.c). Only consulted by hosts that have no guest CPU able to
+ * execute a raw `int` instruction — i.e. the standalone native host,
+ * which reserves no raw-code region. Hosts that run raw code (dosemu2)
+ * never reach it, and hosts that provide no symbol leave it NULL.
+ *
+ * Return convention:
+ *   0   the interrupt was serviced
+ *   1   the guest requested termination (exit code in AL)
+ *   <0  not handled by this host
+ */
+
+extern int (*hydra_user_int_hook)(hydra_machine_t *m, u8 num);
+
+/* Note the deliberate name difference: the dlsym symbol is "hydra_user_int",
+ * which a host defines as a *function*. The pointer that core code calls
+ * through cannot carry that name, or it would collide with the host's
+ * definition at link time (see hydra_user_step_hook, which is static in
+ * api_impl.c and therefore has no external symbol). */
+
+/********************************************************************/
 /* conf.c */
 
 extern hydra_conf_t HYDRA_CONF[1];
