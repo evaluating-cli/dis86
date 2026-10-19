@@ -211,6 +211,9 @@ DF controls string instruction direction:
   DF=1 (STD): SI and DI decrement (reverse scan)
 DF does not get set by arithmetic. Set explicitly with CLD or STD.
 DOS convention: DF=0 on entry to any DOS function; restore it on exit.
+The decompiler applies the same contract to every annotated function entry:
+DF starts clear, only in-function writers (STD, POPF, IRET) can invalidate it,
+and a join stays clear only when every predecessor leaves it clear.
 
 
 Practical Example: REPNE SCASB to find a byte
