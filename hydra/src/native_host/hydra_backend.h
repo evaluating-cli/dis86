@@ -83,7 +83,22 @@ int native_int_dispatch(native_host_ctx_t *ctx,
                         const hydra_backend_t *be,
                         void *be_state);
 
-/* Self-test entry point, called from test_native_host.c so the whole native
+/* Select the active backend by name (NULL or "" = the default, terminal).
+ * Fails loud on an unknown name. Implemented in backend_host.c. */
+void hydra_native_backend_select(const char *name);
+
+/* The active backend and its state, selecting the default if none has been
+ * chosen. Useful to a host that wants to drive the backend directly (e.g. to
+ * call present()), and to tests inspecting the shadow buffer. */
+const hydra_backend_t *hydra_native_backend_active(void **state_out);
+
+/* Self-test entry points, called from test_native_host.c so the whole native
  * host keeps a single main() (all native-host sources link into one binary).
- * Returns the number of failures. */
+ * Each returns the number of failures.
+ *
+ * hydra_backend_selftest() covers the HAL and dispatch in isolation;
+ * hydra_backend_linktest() covers the wiring from a live machine, i.e. that
+ * hydra_impl_int reaches a backend through the dlsym hook.
+ */
 int hydra_backend_selftest(void);
+int hydra_backend_linktest(hydra_machine_t *m);

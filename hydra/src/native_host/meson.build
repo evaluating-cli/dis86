@@ -5,7 +5,7 @@
 
 libhydra_native = shared_library(
   'hydra_native',
-  files('native_host.c', 'backend_terminal.c', 'int_dispatch.c'),
+  files('native_host.c', 'backend_terminal.c', 'int_dispatch.c', 'backend_host.c'),
   link_with : libhydra,
 )
 

@@ -5,6 +5,7 @@ char *HYDRA_CMDLINE_CONF;
 hydra_mode_t HYDRA_MODE[1];
 
 static void (*hydra_user_step_hook)(hydra_machine_t *m) = NULL;
+int (*hydra_user_int_hook)(hydra_machine_t *m, u8 num) = NULL;
 
 HYDRA_MACHINE_INIT_FUNC(hydra_machine_init)
 {
@@ -29,6 +30,10 @@ HYDRA_MACHINE_INIT_FUNC(hydra_machine_init)
 
   // Set up user_step_hook (okay if not found)
   *(void**)&hydra_user_step_hook = dlsym(RTLD_DEFAULT, "hydra_user_step_hook");
+
+  // Set up user_int (okay if not found: hosts that execute raw code, and
+  // native hosts with no device layer, simply leave it NULL)
+  *(void**)&hydra_user_int_hook = dlsym(RTLD_DEFAULT, "hydra_user_int");
 
   // Set up the datasection baseptr
   u16 seg = HYDRA_CONF->code_load_offset + HYDRA_CONF->data_section_seg;

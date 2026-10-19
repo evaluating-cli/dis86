@@ -247,8 +247,28 @@ void hydra_impl_outb(u16 port, u8 val)
 
 void hydra_impl_int(u8 num)
 {
-  u8 machine_code[] = {0xcd, num, 0xcb};
-  hydra_impl_raw_code(machine_code, ARRAY_SIZE(machine_code));
+  if (hydra_raw_code_available()) {
+    u8 machine_code[] = {0xcd, num, 0xcb};
+    hydra_impl_raw_code(machine_code, ARRAY_SIZE(machine_code));
+    return;
+  }
+
+  /* No guest CPU can execute the `int` here: this host reserved no raw-code
+   * region. Hand the interrupt to the host's device layer instead (dlsym
+   * hook, see internal.h). Guarded the same way as nop/cld/std/cli/sti, so
+   * hosts that do execute raw code take the unchanged path above. */
+  hydra_exec_ctx_t *exec = execution_context_get(NULL);
+  hydra_machine_t *m = &exec->machine;
+
+  int rc = hydra_user_int_hook ? hydra_user_int_hook(m, num) : -1;
+  if (rc == 0)
+    return;
+  if (rc > 0)
+    FAIL("native host: guest requested termination (INT 21h AH=4Ch, exit code %d) "
+         "but the native host has no exit path wired yet",
+         (int)(m->registers->ax & 0xff));
+  FAIL("native host: INT %02xh was not serviced: no host handler is installed and "
+       "no raw-code region is reserved", (unsigned)num);
 }
 
 u16 hydra_impl_inw(u16 port)
