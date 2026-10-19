@@ -77,6 +77,13 @@ int main(void)
   CHECK(HYDRA_CONF->raw_code_offset == 0 && HYDRA_CONF->raw_code_size == 0,
         "raw-code reservation never guessed");
 
+  /* The backend is chosen during init, not lazily on the first dispatch, so
+   * a hook thread can never race with first-use initialization. */
+  void *backend_state = NULL;
+  const hydra_backend_t *backend = hydra_native_backend_active(&backend_state);
+  CHECK(backend != NULL && backend_state != NULL,
+        "backend selected during init (no lazy first-use init)");
+
   /* mem roundtrips: byte, word at an ODD address (both lanes visible), and
    * hostaddr aliasing back onto the same array. */
   hw->mem_write8(hw->ctx, 0x1234, 0xab);

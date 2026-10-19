@@ -6,10 +6,14 @@
  * in this lane (see the investigation notes: `just check` compiles these
  * sources with a bare `cc`, so any backend must build without new deps).
  *
- * This is a skeleton: nothing calls into it yet. The wiring step (routing
- * `hydra_impl_int` and the port primitives here when
- * `hydra_raw_code_available()` is false) is deliberately separate, so this
- * addition cannot affect the dosemu host.
+ * INT dispatch is wired end to end: `hydra_impl_int` routes here through the
+ * optional `hydra_user_int` hook (dlsym, see internal.h) whenever
+ * `hydra_raw_code_available()` is false, i.e. on a host with no guest CPU to
+ * execute the `int` opcode itself. Hosts that do execute raw code (dosemu2)
+ * never reach this layer, so they are unaffected.
+ *
+ * Port I/O is still deliberately separate: routing `inb`/`outb`/`insb`/`rep_*`
+ * here needs a port -> device map that this vtable does not express.
  */
 #pragma once
 
@@ -84,12 +88,18 @@ int native_int_dispatch(native_host_ctx_t *ctx,
                         void *be_state);
 
 /* Select the active backend by name (NULL or "" = the default, terminal).
- * Fails loud on an unknown name. Implemented in backend_host.c. */
+ * Fails loud on an unknown name. Implemented in backend_host.c.
+ *
+ * hydra_user_init() calls this once, before any guest code can run. Calling it
+ * again from a running host is allowed (the old backend is shut down first),
+ * but only from the thread that owns execution: it mutates process state and
+ * does not synchronize with a concurrent dispatch. */
 void hydra_native_backend_select(const char *name);
 
-/* The active backend and its state, selecting the default if none has been
- * chosen. Useful to a host that wants to drive the backend directly (e.g. to
- * call present()), and to tests inspecting the shadow buffer. */
+/* The active backend and its state, as selected above. Non-mutating: it fails
+ * loud if no backend has been selected, rather than initializing one from a
+ * hook thread. Useful to a host that wants to drive the backend directly (e.g.
+ * to call present()), and to tests inspecting the shadow buffer. */
 const hydra_backend_t *hydra_native_backend_active(void **state_out);
 
 /* Self-test entry points, called from test_native_host.c so the whole native

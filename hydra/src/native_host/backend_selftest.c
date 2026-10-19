@@ -281,7 +281,14 @@ int hydra_backend_selftest(void)
 /********************************************************************/
 /* Wiring: hydra_impl_int -> raw-code guard -> dlsym hook -> dispatch ->
  * backend. These run against a live machine rather than against the
- * dispatch table directly, so a broken seam cannot pass. */
+ * dispatch table directly, so a broken seam cannot pass.
+ *
+ * Coverage note: every test here takes the !hydra_raw_code_available() arm,
+ * because the native host never reserves a raw-code region. The other arm -
+ * reserved region, i.e. a guest CPU - cannot be reached from this process:
+ * hydra_impl_raw_code() hands the snippet to the guest via hydra_impl_call_far()
+ * and blocks. That arm is covered end to end by the dosemu CI lane
+ * (dosemu_host/test_driver.c: INT(0x28), raw_code_runs == raw_code_returns). */
 
 static hydra_machine_t *g_probe_m;
 
@@ -297,14 +304,51 @@ static void probe_impl_exit(void)
   hydra_impl_int(0x21);
 }
 
+/* Finding 5: with no execution context installed, a primitive used to
+ * dereference NULL and die with SIGSEGV. It must fail loud (SIGABRT with a
+ * diagnostic) instead; probe_aborts() rejects any other signal. The clear is
+ * local to the forked child, so the parent keeps its context. */
+static void probe_impl_no_context(void)
+{
+  execution_context_set(NULL);
+  hydra_impl_int(0x10);
+}
+
+/* nop needs no machine, so unlike the primitives above it must stay a silent
+ * no-op with no context installed; only the guard's fail-loud path is new. */
+static void probe_impl_nop_no_context(void)
+{
+  execution_context_set(NULL);
+  hydra_impl_nop();
+}
+
+/* Fork into a probe that must return normally. */
+static int probe_exits_zero(void (*probe)(void))
+{
+  fflush(stdout);
+  pid_t pid = fork();
+  if (pid < 0)
+    return 0;
+  if (pid == 0) {
+    probe();
+    fflush(stdout);
+    _exit(0);
+  }
+  int status = 0;
+  if (waitpid(pid, &status, 0) != pid)
+    return 0;
+  return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+}
+
 int hydra_backend_linktest(hydra_machine_t *m)
 {
   t_failures = 0;
+  int context_installed = 0;
 
   TCHECK(hydra_user_int_hook != NULL,
          "wiring: hydra_user_int hook resolved by dlsym");
   if (!hydra_user_int_hook)
-    return t_failures;
+    goto done;
 
   /* hydra_impl_int finds the machine through the active execution context,
    * which is NULL outside a running hook. Install one aliasing this machine
@@ -313,6 +357,7 @@ int hydra_backend_linktest(hydra_machine_t *m)
   memset(&exec, 0, sizeof(exec));
   exec.machine = *m;
   execution_context_set(&exec);
+  context_installed = 1;
 
   hydra_native_backend_select("terminal");
   void *st = NULL;
@@ -320,13 +365,13 @@ int hydra_backend_linktest(hydra_machine_t *m)
   TCHECK(be != NULL && strcmp(be->name, "terminal") == 0,
          "wiring: terminal backend selected through the registry");
   if (!be)
-    return t_failures;
+    goto done;
 
   uint8_t rows = 0, cols = 0;
   const uint8_t *buf = be->text_buffer(st, &rows, &cols);
   TCHECK(buf != NULL && cols > 0, "wiring: backend exposes a shadow buffer");
   if (!buf)
-    return t_failures;
+    goto done;
 
   /* Registers are read from the execution context's copy of the machine. */
   exec.machine.registers->ax = 0x0e41;     /* INT 10h AH=0Eh, AL='A' */
@@ -359,8 +404,14 @@ int hydra_backend_linktest(hydra_machine_t *m)
          "wiring: unhandled vector via hydra_impl_int aborts");
   TCHECK(probe_aborts(probe_impl_exit),
          "wiring: guest termination aborts with a diagnostic (no exit path yet)");
+  TCHECK(probe_aborts(probe_impl_no_context),
+         "wiring: primitive with no execution context aborts, not SIGSEGV");
+  TCHECK(probe_exits_zero(probe_impl_nop_no_context),
+         "wiring: nop with no execution context stays a no-op");
 
-  /* Leave the execution context as we found it. */
-  execution_context_set(NULL);
+done:
+  /* Leave the execution context as we found it, including on an early exit. */
+  if (context_installed)
+    execution_context_set(NULL);
   return t_failures;
 }

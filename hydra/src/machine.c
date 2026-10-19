@@ -264,9 +264,9 @@ void hydra_impl_int(u8 num)
   if (rc == 0)
     return;
   if (rc > 0)
-    FAIL("native host: guest requested termination (INT 21h AH=4Ch, exit code %d) "
-         "but the native host has no exit path wired yet",
-         (int)(m->registers->ax & 0xff));
+    FAIL("native host: the handler for INT %02xh requested guest termination "
+         "(exit code %u) but the native host has no exit path wired yet",
+         (unsigned)num, (unsigned)(m->registers->ax & 0xff));
   FAIL("native host: INT %02xh was not serviced: no host handler is installed and "
        "no raw-code region is reserved", (unsigned)num);
 }

@@ -89,7 +89,11 @@ EOF
 cc -std=c11 -O2 -D_GNU_SOURCE -Dtypeof=__typeof__ \
     -I"$ROOT/hydra/src" -I"$ROOT/hydra/include" \
     -I"$ROOT/hydra/src/native_host" -I"$OUT" \
-    "$ROOT"/hydra/src/*.c "$ROOT"/hydra/src/native_host/native_host.c \
+    "$ROOT"/hydra/src/*.c \
+    "$ROOT"/hydra/src/native_host/native_host.c \
+    "$ROOT"/hydra/src/native_host/backend_terminal.c \
+    "$ROOT"/hydra/src/native_host/int_dispatch.c \
+    "$ROOT"/hydra/src/native_host/backend_host.c \
     "$OUT/parity_appdata.c" "$OUT/fixture_code.c" "$ROOT/parity/native_runner.c" \
     -rdynamic -pthread -ldl -o "$OUT/native_runner"
 
