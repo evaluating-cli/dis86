@@ -1402,7 +1402,7 @@ impl IRBuilder<'_> {
   /// so the negated forms inherit that marker class instead of aborting.
   fn append_cond_set_negated(&mut self, ins: &instr::Instr, compare_opcode: Opcode) {
     let flags = self.get_flags();
-    let reader = self.append_instr(Type::U16, compare_opcode, vec![flags]);
+    let reader = self.append_instr(Type::U8, compare_opcode, vec![flags]);
     let z = self.ir.const_new(0);
     let cond = self.append_instr(Type::U8, Opcode::Eq, vec![reader, z]);
     self.append_asm_dst_operand(&ins.operands[0], cond);
