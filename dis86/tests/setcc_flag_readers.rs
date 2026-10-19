@@ -144,8 +144,8 @@ fn setcc_after_a_flag_producer_stays_non_fatal() {
   ] {
     let source = decompile_raw(code);
     assert!(
-      source.contains("NEAR") || source.contains("return"),
-      "{name} must decompile to a function:\n{source}"
+      source.contains("UNIMPL_FLAGS"),
+      "{name} must keep the non-fatal flag-reader marker:\n{source}"
     );
     assert!(
       !source.contains("UNIMPL("),
@@ -155,20 +155,28 @@ fn setcc_after_a_flag_producer_stays_non_fatal() {
 }
 
 // The reader feeds the same destination path as the other SETcc forms,
-// including a memory destination (`seto byte [bx]`).
+// including a memory destination. Cover direct and negated OF/PF forms
+// (`seto/setno/setp/setnp byte [bx]`), not just the direct `seto`.
 #[test]
 fn setcc_to_memory_is_non_fatal() {
-  let source = decompile_raw(&[0x0F, 0x90, 0x07, 0xC3]);
-  assert!(
-    source.contains("PTR_8(DS, BX)"),
-    "seto byte [bx] must store through the guest pointer:\n{source}"
-  );
-  assert!(
-    source.contains("UNIMPL_FLAGS"),
-    "seto byte [bx] must use the non-fatal flag marker:\n{source}"
-  );
-  assert!(
-    !source.contains("UNIMPL("),
-    "seto byte [bx] must not abort:\n{source}"
-  );
+  for (code, name) in [
+    (&[0x0F, 0x90, 0x07, 0xC3][..], "seto byte [bx]"),
+    (&[0x0F, 0x91, 0x07, 0xC3][..], "setno byte [bx]"),
+    (&[0x0F, 0x9A, 0x07, 0xC3][..], "setp byte [bx]"),
+    (&[0x0F, 0x9B, 0x07, 0xC3][..], "setnp byte [bx]"),
+  ] {
+    let source = decompile_raw(code);
+    assert!(
+      source.contains("PTR_8(DS, BX)"),
+      "{name} must store through the guest pointer:\n{source}"
+    );
+    assert!(
+      source.contains("UNIMPL_FLAGS"),
+      "{name} must use the non-fatal flag marker:\n{source}"
+    );
+    assert!(
+      !source.contains("UNIMPL("),
+      "{name} must not abort:\n{source}"
+    );
+  }
 }
