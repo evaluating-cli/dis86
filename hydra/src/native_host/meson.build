@@ -5,11 +5,13 @@
 
 libhydra_native = shared_library(
   'hydra_native',
-  files('native_host.c'),
+  files('native_host.c', 'backend_terminal.c', 'int_dispatch.c'),
   link_with : libhydra,
 )
 
+## The HAL/INT-dispatch self-test is test-only, so it stays out of the shared
+## library and is compiled straight into the test binary.
 test_native_host = executable(
-  'test_native_host', 'test_native_host.c',
+  'test_native_host', ['test_native_host.c', 'backend_selftest.c'],
   link_with : [libhydra, libhydra_native],
 )

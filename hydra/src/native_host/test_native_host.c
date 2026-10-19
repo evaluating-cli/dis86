@@ -14,6 +14,7 @@
 #include "hydra_machine.h"
 #include "internal.h"
 #include "native_host.h"
+#include "hydra_backend.h"
 
 static int g_failures;
 #define CHECK(cond, label) do {                                      \
@@ -152,6 +153,12 @@ int main(void)
    * so api_impl's cache stays NULL and the call is a safe no-op. */
   hydra_machine_step_hook(&m);
   CHECK(1, "step_hook no-op with absent user hook");
+
+  /* Device HAL, terminal backend and INT dispatch skeleton (issue #95).
+   * Separate entry point so the native host keeps a single main(); returns
+   * its failure count to be folded into the run's total. */
+  printf("\n--- device HAL / terminal backend / INT dispatch (issue #95) ---\n");
+  g_failures += hydra_backend_selftest();
 
   if (g_failures) {
     printf("FAIL: %d failures\n", g_failures);
