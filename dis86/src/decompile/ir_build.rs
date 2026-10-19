@@ -3070,6 +3070,14 @@ mod tests {
       };
       let reader = b.ir.instr(reader_ref).unwrap();
       assert_eq!(reader.opcode, expected_reader, "{opcode:?} must read its flag non-fatally");
+
+      // The true block is the jump target (offset 3); the false block is the
+      // fallthrough (offset 2). A true/false swap would keep the condition
+      // shape but invert the control flow, so pin the wiring too.
+      let true_blk = jne.operands[1].unwrap_block();
+      let false_blk = jne.operands[2].unwrap_block();
+      assert_eq!(b.ir.block(true_blk).name, "addr_0003", "{opcode:?} true edge must be the jump target");
+      assert_eq!(b.ir.block(false_blk).name, "addr_0002", "{opcode:?} false edge must be the fallthrough");
     }
   }
 

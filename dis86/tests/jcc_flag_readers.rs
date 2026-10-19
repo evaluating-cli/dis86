@@ -116,3 +116,23 @@ fn jcc_after_a_flag_producer_stays_non_fatal() {
     );
   }
 }
+
+// `jo +1; ret; mov ax,1; ret` — the block at offset 3 is reachable only by
+// taking the jump. Before the lowering arm existed, the generic fallback gave
+// the JO no `Jne`, so its taken edge was never registered, the target block
+// had zero predecessors, and `deadblock_elimination` deleted it: `AX = 1`
+// vanished from the output entirely rather than merely being marked loud.
+// Both arms must now survive.
+#[test]
+fn of_jump_taken_arm_is_not_dead_block_eliminated() {
+  let code = [0x70, 0x01, 0xC3, 0xB8, 0x01, 0x00, 0xC3];
+  let source = decompile_raw(&code);
+  assert!(
+    source.contains("addr_0003"),
+    "the jump-target block must not be dead-block-eliminated:\n{source}"
+  );
+  assert!(
+    source.contains("MAKE_32(DX, 1)"),
+    "the taken arm's `mov ax,1` must survive:\n{source}"
+  );
+}
