@@ -1,11 +1,12 @@
 /* Self-tests for the device HAL, terminal backend and INT dispatch skeleton
  * (issue #95). Invoked from test_native_host.c so the native host keeps a
- * single main() (every native_host/*.c links into one test binary).
+ * single main() (every native-host source links into one test binary).
  *
  * Covers: backend lookup, text-mode accept / graphics-mode reject (the
- * fail-closed contract), teletype into the shadow buffer, tick scaling, the
- * implemented INT functions, and — via fork — that both classes of
- * unimplemented service abort rather than silently returning.
+ * fail-closed contract), 40-column geometry, teletype into the shadow buffer,
+ * tick scaling, the implemented INT functions (including INT 16h peek /
+ * consume), and — via fork — that both classes of unimplemented service abort
+ * rather than silently returning.
  */
 
 #include <signal.h>
@@ -31,6 +32,38 @@ static int t_failures;
 static native_host_ctx_t *g_probe_ctx;
 static const hydra_backend_t *g_probe_be;
 static void *g_probe_st;
+
+/* Deterministic input backend for the INT 16h tests: poll peeks, read
+ * consumes, so the key-present path does not depend on a tty. */
+typedef struct {
+  uint16_t key;
+  int pending;
+} fake_input_t;
+
+static int fake_poll_key(void *state, uint16_t *key)
+{
+  fake_input_t *in = (fake_input_t *)state;
+  if (!in->pending)
+    return 0;
+  *key = in->key;
+  return 1;
+}
+
+static int fake_read_key(void *state, uint16_t *key)
+{
+  fake_input_t *in = (fake_input_t *)state;
+  if (!in->pending)
+    return 0;
+  *key = in->key;
+  in->pending = 0;
+  return 1;
+}
+
+static const hydra_backend_t FAKE_INPUT_BACKEND = {
+  .name     = "test-input",
+  .poll_key = fake_poll_key,
+  .read_key = fake_read_key,
+};
 
 static void probe_unhandled_vector(void)
 {
@@ -92,10 +125,21 @@ int hydra_backend_selftest(void)
     return t_failures;
 
   /* --- video modes: text yes, graphics no ------------------------------- */
+  uint8_t rows = 0, cols = 0;
   TCHECK(be->set_video_mode(st, 0x03) == 0, "video mode 03h (text) accepted");
   TCHECK(be->set_video_mode(st, 0x07) == 0, "video mode 07h (mono text) accepted");
   TCHECK(be->set_video_mode(st, 0x13) < 0, "video mode 13h (VGA graphics) refused");
   TCHECK(be->set_video_mode(st, 0x03) == 0, "back to text mode after a refusal");
+
+  /* 40-column text modes must report (and wrap at) 40 columns. */
+  TCHECK(be->set_video_mode(st, 0x00) == 0, "video mode 00h (40-column text) accepted");
+  be->text_buffer(st, &rows, &cols);
+  TCHECK(rows == BACKEND_TEXT_ROWS && cols == 40,
+         "video mode 00h reports 40x25 geometry");
+  TCHECK(be->set_video_mode(st, 0x01) == 0, "video mode 01h (40-column text) accepted");
+  be->text_buffer(st, &rows, &cols);
+  TCHECK(cols == 40, "video mode 01h reports 40-column geometry");
+  TCHECK(be->set_video_mode(st, 0x03) == 0, "back to 80-column text mode");
 
   /* --- teletype into the shadow buffer ---------------------------------- */
   be->teletype(st, 'H', 0x07);
@@ -103,7 +147,6 @@ int hydra_backend_selftest(void)
   be->teletype(st, '\n', 0x07);
   be->teletype(st, '!', 0x07);
 
-  uint8_t rows = 0, cols = 0;
   const uint8_t *buf = be->text_buffer(st, &rows, &cols);
   TCHECK(buf != NULL && rows == BACKEND_TEXT_ROWS && cols == BACKEND_TEXT_COLS,
          "shadow buffer reports 80x25 geometry");
@@ -169,13 +212,44 @@ int hydra_backend_selftest(void)
     TCHECK(got >= t0, "INT 1Ah AH=00h returns a tick count consistent with the backend");
   }
 
-  /* INT 16h AH=01h: non-blocking key status (no key under a batch run). */
+  /* INT 16h: AH=01h peeks, AH=00h consumes. Use the deterministic fake input
+   * backend so the key-present path is covered without a tty. */
   {
+    fake_input_t in = { 0 };
     hydra_machine_registers_t regs = { 0 };
+
+    regs.ax = 0x0100;
+    TCHECK(native_int_dispatch(ctx, &regs, 0x16, &FAKE_INPUT_BACKEND, &in) == 0,
+           "INT 16h AH=01h handled");
+    TCHECK((regs.flags & (1u << 6)) != 0,
+           "INT 16h AH=01h sets ZF when no key is pending");
+
+    in.key = 0x1e61;                /* 'a': scan 1Eh, ASCII 61h */
+    in.pending = 1;
     regs.ax = 0x0100;
     regs.flags = 0x0000;
-    TCHECK(native_int_dispatch(ctx, &regs, 0x16, be, st) == 0, "INT 16h AH=01h handled");
-    TCHECK((regs.flags & (1u << 6)) != 0, "INT 16h AH=01h sets ZF when no key is pending");
+    TCHECK(native_int_dispatch(ctx, &regs, 0x16, &FAKE_INPUT_BACKEND, &in) == 0,
+           "INT 16h AH=01h handled with a key pending");
+    TCHECK(regs.ax == 0x1e61 && (regs.flags & (1u << 6)) == 0,
+           "INT 16h AH=01h returns the key word and clears ZF");
+
+    regs.ax = 0x0100;
+    regs.flags = 0x0000;
+    native_int_dispatch(ctx, &regs, 0x16, &FAKE_INPUT_BACKEND, &in);
+    TCHECK(regs.ax == 0x1e61 && in.pending,
+           "INT 16h AH=01h peeks the same key twice");
+
+    regs.ax = 0x0000;
+    TCHECK(native_int_dispatch(ctx, &regs, 0x16, &FAKE_INPUT_BACKEND, &in) == 0,
+           "INT 16h AH=00h handled");
+    TCHECK(regs.ax == 0x1e61 && !in.pending,
+           "INT 16h AH=00h returns and consumes the key");
+
+    regs.ax = 0x0100;
+    regs.flags = 0x0000;
+    native_int_dispatch(ctx, &regs, 0x16, &FAKE_INPUT_BACKEND, &in);
+    TCHECK((regs.flags & (1u << 6)) != 0,
+           "INT 16h AH=01h sets ZF after the key is consumed");
   }
 
   /* INT 21h AH=4Ch: exit request. */

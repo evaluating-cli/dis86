@@ -11,7 +11,7 @@
  *
  * Skeletons are provided for the minimum surface a text-mode, keyboard-driven
  * Tier-1 target needs: video mode set + teletype, DOS print char / print
- * string / exit, timer ticks, and non-blocking key status.
+ * string / exit, timer ticks, and key status / blocking key read.
  */
 
 #include <stdio.h>
@@ -112,6 +112,20 @@ static int d_exit(native_host_ctx_t *ctx, hydra_machine_registers_t *regs,
 /********************************************************************/
 /* INT 16h - keyboard services                                       */
 
+/* AH=00h: wait for a keystroke, remove it and return it in AX. */
+static int k_read_key(native_host_ctx_t *ctx, hydra_machine_registers_t *regs,
+                      const hydra_backend_t *be, void *st)
+{
+  (void)ctx;
+  uint16_t key = 0;
+  if (!be || !be->read_key)
+    FAIL("native host: no backend supplies read_key");
+  if (!be->read_key(st, &key))
+    FAIL("native host: INT 16h AH=00h keyboard input ended without a key");
+  regs->ax = key;
+  return 0;
+}
+
 /* AH=01h: check for a keystroke without removing it. ZF clear with the key
  * in AX when one is pending, ZF set otherwise. Non-blocking by contract. */
 static int k_check_key(native_host_ctx_t *ctx, hydra_machine_registers_t *regs,
@@ -119,7 +133,9 @@ static int k_check_key(native_host_ctx_t *ctx, hydra_machine_registers_t *regs,
 {
   (void)ctx;
   uint16_t key = 0;
-  if (be && be->poll_key && be->poll_key(st, &key)) {
+  if (!be || !be->poll_key)
+    FAIL("native host: no backend supplies poll_key");
+  if (be->poll_key(st, &key)) {
     regs->ax = key;
     regs->flags = (uint16_t)(regs->flags & ~FLAG_ZF);
   } else {
@@ -159,6 +175,7 @@ static const hydra_int_ah_fn video_ah[VIDEO_AH_N] = {
 };
 
 static const hydra_int_ah_fn kbd_ah[KBD_AH_N] = {
+  [0x00] = k_read_key,
   [0x01] = k_check_key,
 };
 

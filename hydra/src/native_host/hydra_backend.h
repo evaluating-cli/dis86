@@ -40,9 +40,13 @@ struct hydra_backend {
   void (*putchar_text)(void *state, uint8_t row, uint8_t col, uint8_t ch, uint8_t attr);
   void (*present)(void *state);
 
-  /* Input. Returns 1 when a key was available (and stores it in *key),
-   * 0 otherwise. Never blocks. */
+  /* Input. Key words use the BIOS encoding: high byte = scan code, low byte =
+   * ASCII (0 for extended keys). `poll_key` peeks at the next key and returns
+   * 1 without consuming it, or 0 when none is pending; it never blocks.
+   * `read_key` consumes and returns the next key, blocking until one arrives
+   * (or input ends, in which case it returns 0). */
   int  (*poll_key)(void *state, uint16_t *key);
+  int  (*read_key)(void *state, uint16_t *key);
 
   /* Timer: the BIOS tick count at the 18.2 Hz nominal rate. */
   uint32_t (*ticks)(void *state);
@@ -80,6 +84,6 @@ int native_int_dispatch(native_host_ctx_t *ctx,
                         void *be_state);
 
 /* Self-test entry point, called from test_native_host.c so the whole native
- * host keeps a single main() (all of native_host/*.c link into one binary).
+ * host keeps a single main() (all native-host sources link into one binary).
  * Returns the number of failures. */
 int hydra_backend_selftest(void);
