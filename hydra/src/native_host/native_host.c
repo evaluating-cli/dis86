@@ -19,6 +19,7 @@
 
 #include "internal.h"
 #include "native_host.h"
+#include "hydra_backend.h"
 
 extern char *HYDRA_CMDLINE_CONF;
 
@@ -298,4 +299,10 @@ void hydra_user_init(hydra_conf_t *conf,
   hw->state_save = native_state_save;
   hw->state_restore = native_state_restore;
   hw->update_registers = native_update_registers;
+
+  /* Select the device backend here, once, before any guest code can run.
+   * Interrupt dispatch then only reads the registry instead of initializing
+   * it from a hook thread (see active_backend() in backend_host.c). No
+   * backend-selection knob exists yet, so this always picks the default. */
+  hydra_native_backend_select(NULL);
 }

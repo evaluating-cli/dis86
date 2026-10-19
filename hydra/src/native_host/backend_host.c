@@ -41,12 +41,14 @@ void hydra_native_backend_select(const char *name)
   g_backend = be;
 }
 
-/* Lazily selects the default backend so a host that never calls
- * hydra_native_backend_select() still gets one. */
+/* The backend is chosen exactly once, in hydra_user_init(), before any guest
+ * code can run. Nothing here mutates state: a dispatch from a hook thread can
+ * no longer race with a first-use initialization. */
 static const hydra_backend_t *active_backend(void)
 {
   if (!g_backend)
-    hydra_native_backend_select(NULL);
+    FAIL("native host: interrupt dispatched before hydra_user_init() selected "
+         "a backend");
   return g_backend;
 }
 

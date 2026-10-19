@@ -45,6 +45,18 @@ overlay_entry_t *overlay_tracking_find_or_alloc(addr_t stub)
 hydra_exec_ctx_t *execution_context_get(u16 *opt_exec_id)
 {
   hydra_exec_ctx_t *exec = thread_active;
+
+  /* Every primitive that needs the machine (INT dispatch, the flag ops, the
+   * port ops) reaches it through this accessor, and callers dereference the
+   * result unconditionally. Outside a running hook there is no context at
+   * all: returning NULL turned that wiring mistake into a SIGSEGV whose
+   * backtrace is indistinguishable from a guest fault, so fail loud instead.
+   * nop never calls this, so its no-op path (no raw-code region) is
+   * unaffected. */
+  if (!exec)
+    FAIL("Hydra host primitive called with no active execution context "
+         "(outside a running hook)");
+
   if (opt_exec_id) *opt_exec_id = exec - &executions[0];
   return exec;
 }
