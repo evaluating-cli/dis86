@@ -210,6 +210,75 @@ emu86/SST are frozen offline tooling with no role in product validation and are
 not built by the default lane (enable with `--features emu86`); see
 [`docs/emu86/sst.md`](../emu86/sst.md).
 
+## CI job profile and cost
+
+Measured on PR #116: job `Stock dosemu2 host integration` in
+`dosemu-host-runtime.yml`, on `ubuntu-24.04`. Total **6m39s**.
+
+| Step | Time |
+|---|---|
+| Run Phase 7 acceptance matrix | **5m38s** (85%) |
+| Install stock dosemu2 runtime | 31s |
+| Run host state/transport test | 24s |
+| Build Hydra host tests | 3s |
+| everything else | ~3s |
+
+Phase 7 dominates. With `TESTPROG_FLAVOR=both`, `run_driver_test.sh` boots
+dosemu2 **12 times, serially** (~28s each): mz-ovl 1, exe 1, com 2, cap 3,
+ovl 5.
+
+The per-launch `sleep` calls are *not* the cost — they total only ~25–40s across
+the whole job. The dominant cost is booting the guest under full CPU emulation
+(`$_cpu_vm = "emulated"`, `$_cpuemu = (1)`, set both in `run_driver_test.sh` and
+in the workflow's generated dosemu config).
+
+The repository is public, so `ubuntu-24.04` provides 4 vCPU / 16 GB.
+
+### Reducing Phase 7 wall-clock
+
+**Split the flavours into a matrix** (~5m38s → ~3m). `run_driver_test.sh`
+already accepts `TESTPROG_FLAVOR=com|exe|cap|ovl|mz-ovl|both`, so no script
+changes are needed:
+
+```yaml
+strategy:
+  fail-fast: false
+  matrix:
+    flavor: [mz-ovl, exe, com, cap, ovl]
+# ...then: TESTPROG_FLAVOR=${{ matrix.flavor }} bash hydra/src/dosemu_host/run_driver_test.sh
+```
+
+Each flavour gets its own VM, so there are **no shared-state races** — the real
+advantage over parallelising inside the script, where all flavours share
+`/tmp/opencode` and `$XDG_RUNTIME_DIR` and each would need its own working
+directory. The critical path becomes `ovl` (5 boots, ~140s) plus ~35s setup.
+Intra-flavour ordering is preserved: `com` still runs twice inside its job, and
+`cap`/`ovl` keep capture-before-restore.
+
+Trade-off: roughly 5× the runner-minutes. Free for a public repository, but more
+resource overall.
+
+**Do not touch `$_cpuemu = (1)`.** It is the single largest per-boot cost, but it
+is *assumed* to be required for deterministic breakpoint and state inspection.
+This has not been tested — treat changing it as a correctness risk, not a
+performance knob.
+
+**Do not drop the repeated runs.** The `.com` flavour running twice, and `cap`'s
+two restores, are deliberate idempotency and determinism checks.
+
+### Test baselines
+
+The native-host unit test (`build/test_native_host`) counts assertions. Quote the
+commit you measured — the count moves as tests are added.
+
+| Commit | PASS | Note |
+|---|---|---|
+| `e9339ba` | 60 | before the function-hook wiring |
+| `fe70157` | 71 | +11 wiring tests |
+| `6a1a850` | 72 | +1 (guest termination: two assertions replace one) |
+
+A run is green when it exits 0 with 0 failures.
+
 ---
 
 ## Retired validator (historical)

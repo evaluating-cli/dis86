@@ -97,3 +97,46 @@ just build
 
 `just test` builds the local runtime and runs its Meson tests. A running
 dosemu2 instance is required to execute a hybrid DOS program through the host.
+
+## Cross-host constraints
+
+These apply to every host (native, dosemu2) and are easy to violate by accident.
+
+- **`hydra_user_*` hooks are `dlsym` symbols that hosts define as functions.** A
+  pointer in core code must not share the hook's name — that is a link-time
+  collision. `hydra_user_step_hook` escapes this only by being `static` in
+  `api_impl.c`, which is unavailable when another translation unit must see it.
+  Name the pointer differently (e.g. `hydra_user_int_hook`); keep the `dlsym`
+  string clean.
+- **The defining translation unit must not include the header that declares the
+  pointer**, or the two collide.
+- **`machine.c` and `exec.c` are shared with the dosemu2 host.** Native-host
+  behaviour belongs behind the `hydra_raw_code_available()` guard so dosemu2
+  keeps its unchanged path. Never make the core link a backend.
+- **Read registers live from the core** (`m->registers`), not the host's mirror.
+  The mirror is synced by `update_registers` and can lag executing code.
+- **`struct hydra_machine` embeds `hardware[1]` and `registers[1]`** — arrays,
+  not pointers. Copying one copies by value, and the copy's `registers` points
+  into the copy's own storage.
+- **`hydra_impl_*` primitives reach the machine via
+  `execution_context_get(NULL)` → `thread_active`,** which is NULL outside a
+  running hook. Tests must install a context with `execution_context_set()`. The
+  accessor fails loud on NULL, so a missing context is a clean `SIGABRT` — not a
+  `SIGSEGV` to be mistaken for a guest fault.
+- **Hooks run on their own pthreads** (`run_begin` spawns one per hook). Never
+  lazily initialise shared state in a dispatch path — that is a data race. Do it
+  in `hydra_user_init()` (once, single-threaded) and let dispatch only *read*.
+
+### Three consumers, two mechanisms — add files in all of them
+
+`just check` globs `native_host/*.c`, but `hydra/meson.build` and
+`parity/build.sh` use **explicit file lists**. A file missing from the latter two
+passes `just check` and then fails to link — or, worse, is silently not linked
+and stays latent until something references it. When adding a source file, update:
+
+1. `hydra/meson.build` (`libhydra_native` / test target sources)
+2. `parity/build.sh`
+3. nothing — `just check` picks it up by glob
+
+The meson build uses `-Wall -Werror -Wextra` plus `-Wno-*` disables. CI does not
+enforce these; `hydra/just build` does.
