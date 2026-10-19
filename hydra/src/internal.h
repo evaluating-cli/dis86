@@ -41,7 +41,8 @@ extern hydra_mode_t HYDRA_MODE[1];
  *
  * Return convention:
  *   0   the interrupt was serviced
- *   1   the guest requested termination (exit code in AL)
+ *   1   the guest requested termination (exit code in AL); hydra_impl_int
+ *       ends the process with that code rather than returning
  *   <0  not handled by this host
  */
 

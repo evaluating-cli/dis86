@@ -298,9 +298,14 @@ static void probe_impl_unhandled(void)
   hydra_impl_int(0x22);
 }
 
+/* Exit code for probe_impl_exit, so one probe can check that AL is what the
+ * process actually exits with. */
+static int g_probe_exit_code;
+
 static void probe_impl_exit(void)
 {
-  g_probe_m->registers->ax = 0x4c00;      /* INT 21h AH=4Ch, exit code 0 */
+  /* AH=4Ch (terminate), AL = exit code */
+  g_probe_m->registers->ax = 0x4c00u | (uint8_t)g_probe_exit_code;
   hydra_impl_int(0x21);
 }
 
@@ -322,8 +327,10 @@ static void probe_impl_nop_no_context(void)
   hydra_impl_nop();
 }
 
-/* Fork into a probe that must return normally. */
-static int probe_exits_zero(void (*probe)(void))
+/* Fork into a probe that must exit normally with a specific status. Covers
+ * the no-op path (0) and guest termination, where INT 21h AH=4Ch ends the
+ * process with the exit code from AL. */
+static int probe_exits_with(void (*probe)(void), int expected)
 {
   fflush(stdout);
   pid_t pid = fork();
@@ -337,7 +344,7 @@ static int probe_exits_zero(void (*probe)(void))
   int status = 0;
   if (waitpid(pid, &status, 0) != pid)
     return 0;
-  return WIFEXITED(status) && WEXITSTATUS(status) == 0;
+  return WIFEXITED(status) && WEXITSTATUS(status) == expected;
 }
 
 int hydra_backend_linktest(hydra_machine_t *m)
@@ -402,11 +409,18 @@ int hydra_backend_linktest(hydra_machine_t *m)
   g_probe_m = &exec.machine;
   TCHECK(probe_aborts(probe_impl_unhandled),
          "wiring: unhandled vector via hydra_impl_int aborts");
-  TCHECK(probe_aborts(probe_impl_exit),
-         "wiring: guest termination aborts with a diagnostic (no exit path yet)");
+  /* INT 21h AH=4Ch ends the process with the exit code from AL. Check a
+   * distinctive non-zero value as well as zero, so a hardcoded status could
+   * not pass by accident. */
+  g_probe_exit_code = 0x42;
+  TCHECK(probe_exits_with(probe_impl_exit, 0x42),
+         "wiring: INT 21h AH=4Ch exits with the code from AL");
+  g_probe_exit_code = 0x00;
+  TCHECK(probe_exits_with(probe_impl_exit, 0x00),
+         "wiring: INT 21h AH=4Ch exits 0 when AL is 0");
   TCHECK(probe_aborts(probe_impl_no_context),
          "wiring: primitive with no execution context aborts, not SIGSEGV");
-  TCHECK(probe_exits_zero(probe_impl_nop_no_context),
+  TCHECK(probe_exits_with(probe_impl_nop_no_context, 0),
          "wiring: nop with no execution context stays a no-op");
 
 done:

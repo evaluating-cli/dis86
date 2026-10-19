@@ -14,6 +14,8 @@
 /* Deliberately not internal.h: this translation unit defines the function
  * named hydra_user_int, so it must not see any declaration of a pointer by
  * that name (see the note in internal.h). */
+#include <stdlib.h>
+
 #include "header.h"
 #include "hydra_machine.h"
 
@@ -22,6 +24,21 @@
 
 static const hydra_backend_t *g_backend = NULL;
 static void *g_backend_state = NULL;
+
+/* Guest termination ends the process from inside a hook (see hydra_impl_int),
+ * so normal shutdown never reaches the host's own teardown. Restore terminal
+ * state here instead: the terminal backend puts stdin into non-blocking mode
+ * and would otherwise leave the user's shell that way. Aborts do not run
+ * atexit handlers, but those are crash paths anyway. */
+static void backend_atexit(void)
+{
+  if (!g_backend)
+    return;
+  if (g_backend->shutdown)
+    g_backend->shutdown(g_backend_state);
+  g_backend = NULL;
+  g_backend_state = NULL;
+}
 
 void hydra_native_backend_select(const char *name)
 {
@@ -37,6 +54,12 @@ void hydra_native_backend_select(const char *name)
     FAIL("native host: no backend named '%s'", name ? name : "(null)");
   if (be->init(&g_backend_state, "") != 0)
     FAIL("native host: backend '%s' failed to initialize", be->name);
+
+  static int atexit_registered = 0;
+  if (!atexit_registered) {
+    atexit(backend_atexit);
+    atexit_registered = 1;
+  }
 
   g_backend = be;
 }

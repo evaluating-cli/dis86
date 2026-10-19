@@ -1,3 +1,5 @@
+#include <stdlib.h>
+
 #include "internal.h"
 
 void hydra_impl_unknown(const char *func, int line)
@@ -264,9 +266,13 @@ void hydra_impl_int(u8 num)
   if (rc == 0)
     return;
   if (rc > 0)
-    FAIL("native host: the handler for INT %02xh requested guest termination "
-         "(exit code %u) but the native host has no exit path wired yet",
-         (unsigned)num, (unsigned)(m->registers->ax & 0xff));
+    /* Guest termination: INT 21h AH=4Ch carries the exit code in AL. End the
+     * process here instead of returning, because the decompiled hook would
+     * otherwise run whatever follows the INT — code the guest never meant to
+     * reach, since INT 21h AH=4Ch does not return. Same shape as the
+     * capture mode's exit() in hydra_exec_run_special_modes(); the backend's
+     * atexit handler restores terminal state on the way out. */
+    exit((int)(m->registers->ax & 0xff));
   FAIL("native host: INT %02xh was not serviced: no host handler is installed and "
        "no raw-code region is reserved", (unsigned)num);
 }
