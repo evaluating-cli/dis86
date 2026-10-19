@@ -160,8 +160,9 @@ fn aaa_writes_distinct_unknowns_per_fragment() {
   );
 }
 
-// The SETcc marker contract lives in tests/setcc_flag_readers.rs (issue
-// #103): every SETcc reads a possibly-unknown flag non-fatally.
+// The SETcc (issue #103) and OF/PF Jcc (issue #108) marker contracts live in
+// tests/setcc_flag_readers.rs and tests/jcc_flag_readers.rs: they read a
+// possibly-unknown flag non-fatally.
 
 // lahf stores the opaque flags to AH; hlt is a fatal-only-if-executed marker.
 #[test]
