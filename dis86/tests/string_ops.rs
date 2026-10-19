@@ -168,6 +168,23 @@ fn clear_loop_body_is_modeled_across_the_back_edge() {
   );
 }
 
+// movsb; loop $-3; std; ret
+// The back-edge targets the ENTRY block: `switch_blk` must not erase the
+// contract-provided entry seed (issue #102's caveat). The trailing `std` is
+// required to exercise the path — with no DF writer the entry is trivially
+// clear and an erasing reset would be invisible.
+#[test]
+fn back_edge_to_the_entry_block_stays_clear() {
+  let code = [0xA4, 0xE2, 0xFD, 0xFD, 0xC3];
+  let source = decompile_raw(&code);
+
+  assert!(!source.contains("UNIMPL"), "the entry-seeded loop must be modeled:\n{source}");
+  assert!(
+    source.contains("si_2 + 1") && source.contains("di_2 + 1"),
+    "both pointers must advance in the loop:\n{source}"
+  );
+}
+
 // cld; movsb; loop $-3; std; movsb; ret
 // Forward loop first, backward copy later: the loop is clear; only the step
 // after the in-function std stays loud.

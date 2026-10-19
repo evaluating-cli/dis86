@@ -2319,8 +2319,10 @@ impl IRBuilder<'_> {
     // each analysis extracts every block's transfer from two extreme probe
     // passes — all entries unknown, then all known/clear. A block whose exit
     // flips with the assumption merely forwards its entry (identity);
-    // otherwise its exit is constant. The analysis then runs over these
-    // summaries alone, and the IR is built once more with the converged seed.
+    // otherwise its exit is constant. The analyses then run over these
+    // summaries alone. With both CF and DF active the IR is therefore built
+    // five times at most — two DF probes, two carry probes, and the retained
+    // build — each probe set skipped when its consumer/writer pair is absent.
     //
     // DF converges first: its transfer never depends on carry, so it needs no
     // carry seed. Carry converges second with the DF map, so its probes model
