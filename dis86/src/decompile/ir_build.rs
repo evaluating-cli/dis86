@@ -74,15 +74,26 @@ struct IRBuilder<'a> {
 
   // Whether DF is provably clear (DF=0, the DOS ABI entry/exit convention)
   // at the current point of the build. CLD sets it, STD clears it, and
-  // POPF (whose popped value is opaque) clears it; any block boundary
-  // resets it to `!df_may_be_set` (unknown when writers exist, since joins
-  // are not tracked; provably clear when no writer exists anywhere).
+  // POPF (whose popped value is opaque) clears it. Block entry state comes
+  // from the must-analysis in `build` (see `df_clear_entry`), not from the
+  // function-scope fact: an annotated function entry assumes DF=0, and a
+  // join is clear only when every predecessor leaves it clear.
   // String-op pointer updates advance only while this holds; otherwise
   // they degrade to a loud marker rather than silently running the wrong
   // way. The marker stays fatal (UNIMPL, not UNIMPL_FLAGS) deliberately:
   // the imprecision is in the SI/DI pointer *values*, not just the flags,
   // so the non-fatal flags marker would understate it.
   df_clear: bool,
+
+  // DF entry clearness per block, converged by the must-analysis in `build`
+  // and cached for the retained build. `df_exit_clear` records, from the most
+  // recent pass, whether each block provably leaves DF clear; the two drive
+  // the analysis. `df_entry_default` is the fallback for blocks absent from
+  // `df_clear_entry` (false in the analysis probes, true when no DF writer
+  // exists anywhere).
+  df_clear_entry: HashMap<BlockRef, bool>,
+  df_exit_clear: HashMap<BlockRef, bool>,
+  df_entry_default: bool,
 
   // Carry-out value (a 0/1 u16 Ref) of the most recent flag-writing
   // instruction in the current basic block, or None when the value has not
@@ -140,6 +151,9 @@ impl<'a> IRBuilder<'a> {
 
       df_may_be_set: false,
       df_clear: true,
+      df_clear_entry: HashMap::new(),
+      df_exit_clear: HashMap::new(),
+      df_entry_default: true,
       last_cf: None,
       carry_known: false,
       carry_known_entry: HashMap::new(),
@@ -343,9 +357,10 @@ impl<'a> IRBuilder<'a> {
   }
 
   fn switch_blk(&mut self, bref: BlockRef) {
-    // Record whether the block we are leaving provably has a known carry;
-    // the driver's must-analysis reads this to seed successor entries.
+    // Record whether the block we are leaving provably has a known carry and
+    // a clear DF; the driver's must-analyses read these to seed successors.
     self.exit_known.insert(self.cur, self.carry_known);
+    self.df_exit_clear.insert(self.cur, self.df_clear);
     self.cur = bref;
     // Carry survives the join only when every predecessor defines it: the
     // analysis proves that (all preds' exit known). Do NOT resolve the CF
@@ -353,9 +368,10 @@ impl<'a> IRBuilder<'a> {
     // "new block is empty" invariant. `get_cf` pulls it on first use.
     self.last_cf = None;
     self.carry_known = self.carry_known_entry.get(&bref).copied().unwrap_or(self.entry_known_default);
-    // Joins are not DF-tracked: a new block starts unknown whenever a
-    // DF writer exists anywhere in the function.
-    self.df_clear = !self.df_may_be_set;
+    // DF survives the join only when every predecessor leaves it clear (the
+    // `build` must-analysis proves that). A block absent from the converged
+    // map uses the probe/default fallback.
+    self.df_clear = self.df_clear_entry.get(&bref).copied().unwrap_or(self.df_entry_default);
   }
 
   /// Whether a branch target lies inside the function's decoded
@@ -2273,6 +2289,13 @@ impl IRBuilder<'_> {
         self.append_asm_dst_operand(&ins.operands[0], vref);
         self.append_update_flags(vref);
       }
+      instr::Opcode::OP_IRET => {
+        // IRET restores CS:IP and FLAGS, so DF becomes unknown for any code
+        // that follows it in the block; the return itself is not modeled.
+        self.df_clear = false;
+        self.warn(format!("Unimpl opcode {:?} at {} — emitting UNIMPL marker", ins.opcode, ins.addr));
+        self.append_instr(Type::Void, Opcode::Unimpl, vec![]);
+      }
       instr::Opcode::OP_HLT | instr::Opcode::OP_INTO | instr::Opcode::OP_INVAL => {
         // Halt / overflow-trap / internal-invalid: no continuation model.
         // A fatal marker (only if executed) beats aborting the whole
@@ -2294,20 +2317,19 @@ impl IRBuilder<'_> {
   }
 
   fn build(&mut self) {
-    // CF threading across blocks is a must-analysis: a producer's carry-out
-    // is known only if its own carry-in was, and a block's entry carry is
-    // known only if *every* predecessor's exit carry is. The result feeds the
-    // IR (a known carry lowers an ADC/SBB exactly, an unknown one stays loud),
-    // so the IR must be built with the converged entry-knownness.
+    // CF and DF threading across blocks are both must-analyses: a producer's
+    // carry-out is known only if its own carry-in was, and a block's entry DF
+    // is clear only if *every* predecessor leaves it clear (the annotated
+    // function entry assumes DF=0). Both results feed the IR, so it must be
+    // built with the converged entry state.
     //
     // Rebuilding the whole IR once per CFG hop would be O(blocks^2). Instead,
-    // extract each block's carry transfer from two extreme passes — every
-    // entry unknown, then every entry known. A block whose exit flips with the
-    // assumption merely forwards its entry (identity); otherwise its exit is
-    // constant. The must-analysis then runs over these summaries alone, and
-    // the IR is rebuilt at most once more with the converged seed. The
-    // unknown-to-true monotonicity of the per-block transfer guarantees these
-    // two samples pin it exactly.
+    // each analysis extracts every block's transfer from two extreme probe
+    // passes — all entries unknown, then all known/clear. A block whose exit
+    // flips with the assumption merely forwards its entry (identity);
+    // otherwise its exit is constant. The analysis then runs over these
+    // summaries alone, and the IR is rebuilt at most once more with the
+    // converged seed.
     let cfg = self.cfg;
     let instrs = self.instrs;
     let spec = self.spec;
@@ -2315,82 +2337,36 @@ impl IRBuilder<'_> {
     let overlay = self.overlay;
     let pin_all = self.pin_all;
 
-    // Fast path: entry-knownness only reaches the IR through get_cf, which
-    // only ADC/SBB/RCL/RCR/CMC call. Without any of those the carry analysis
-    // cannot change the output, so build once (as before the feature).
+    // Entry-knownness only reaches the IR through get_cf (ADC/SBB/RCL/RCR/
+    // CMC) and DF clearness only through the string-op direction guards.
+    // Without a consumer the respective analysis cannot change the output.
     let has_carry_consumer = instrs.iter().any(|i| matches!(i.opcode,
       instr::Opcode::OP_ADC | instr::Opcode::OP_SBB |
       instr::Opcode::OP_RCL | instr::Opcode::OP_RCR |
       instr::Opcode::OP_CMC));
-    if !has_carry_consumer {
-      *self = IRBuilder::new(cfg, instrs, spec, binary, overlay, pin_all);
-      self.build_once();
-      self.emit_warnings();
-      return;
+    let has_df_consumer = instrs.iter().any(|i| matches!(i.opcode,
+      instr::Opcode::OP_MOVS | instr::Opcode::OP_STOS | instr::Opcode::OP_LODS |
+      instr::Opcode::OP_CMPS | instr::Opcode::OP_SCAS |
+      instr::Opcode::OP_INS | instr::Opcode::OP_OUTS));
+    let has_df_writer = instrs.iter().any(|i| opcode_may_set_df(i.opcode));
+
+    // The retained build. Unless the analysis proves more, only the entry is
+    // DF-clear; with no writer anywhere DF stays clear everywhere.
+    let mut retained = IRBuilder::new(cfg, instrs, spec, binary, overlay, pin_all);
+    retained.df_entry_default = !has_df_writer;
+    if has_carry_consumer {
+      retained.carry_known_entry = analyze_carry(cfg, instrs, spec, binary, overlay, pin_all);
+    }
+    retained.build_once();
+
+    // Only a DF writer can make a later block's entry unclear, so the
+    // analysis is skipped when the whole function is provably clear.
+    if has_df_consumer && has_df_writer {
+      retained = refine_df(retained, cfg, instrs, spec, binary, overlay, pin_all);
     }
 
-    // Pass 1: assume no block entry carries a known value (the conservative
-    // default). Its IR is kept when the analysis converges to all-unknown.
-    *self = IRBuilder::new(cfg, instrs, spec, binary, overlay, pin_all);
-    self.build_once();
-    let exit_unknown = self.exit_known.clone();
-    let blocks: Vec<BlockRef> = self.ir.iter_blocks().collect();
-    let preds: HashMap<BlockRef, Vec<BlockRef>> = blocks
-      .iter()
-      .map(|b| (*b, self.ir.block(*b).preds.clone()))
-      .collect();
-
-    // Pass 2: assume every block entry carries a known value, to distinguish
-    // an identity transfer from a constant one.
-    let mut probe = IRBuilder::new(cfg, instrs, spec, binary, overlay, pin_all);
-    probe.entry_known_default = true;
-    probe.build_once();
-    let exit_known = probe.exit_known.clone();
-
-    // Must-analysis over the per-block summaries (no IR rebuilds). Constant
-    // transfers drop out immediately; identity transfers forward the
-    // predecessor's entry knownness. Unknown starts false and only grows, so
-    // the fixpoint terminates.
-    let mut in_known: HashMap<BlockRef, bool> = blocks.iter().map(|b| (*b, false)).collect();
-    loop {
-      let mut changed = false;
-      for b in &blocks {
-        // The function entry block has no CF predecessor; its carry-in is
-        // always unknown.
-        let known = if *b == BlockRef(0) {
-          false
-        } else {
-          let ps = &preds[b];
-          !ps.is_empty() && ps.iter().all(|p| {
-            let base = exit_unknown.get(p).copied().unwrap_or(false);
-            if Some(&base) == exit_known.get(p) {
-              base // constant transfer
-            } else {
-              in_known.get(p).copied().unwrap_or(false) // identity transfer
-            }
-          })
-        };
-        if in_known[b] != known {
-          in_known.insert(*b, known);
-          changed = true;
-        }
-      }
-      if !changed {
-        break;
-      }
-    }
-
-    // Nothing inherits a known carry: pass 1 is already the correct build.
-    if !in_known.values().any(|&k| k) {
-      self.emit_warnings();
-      return;
-    }
-
-    // Otherwise rebuild once with the converged seed.
-    *self = IRBuilder::new(cfg, instrs, spec, binary, overlay, pin_all);
-    self.carry_known_entry = in_known;
-    self.build_once();
-    self.emit_warnings();
+    retained.emit_warnings();
+    *self = retained;
   }
 
   /// Emit the retained build pass's buffered diagnostics (see `warn`).
@@ -2401,14 +2377,12 @@ impl IRBuilder<'_> {
   }
 
   fn build_once(&mut self) {
-    // Step 0: Direction-flag guard. DF is written only by STD and the
-    // flag-restoring POPF/IRET (CLD clears it); with none present the
-    // direction is provably clear for the whole function (see df_clear).
-    // When writers exist the entry stays conservative (a string op before
-    // any in-function writer stays loud): entry DF is unknowable locally,
-    // matching the join treatment in switch_blk. Deliberate, not a TODO.
+    // Step 0: Direction-flag facts. DF is written only by STD and the
+    // flag-restoring POPF/IRET (CLD clears it). An annotated function entry
+    // assumes DF=0 (the DOS ABI convention, docs/8086_flags.txt); later block
+    // entries are seeded by the must-analysis in `build`.
     self.df_may_be_set = self.instrs.iter().any(|i| opcode_may_set_df(i.opcode));
-    self.df_clear = !self.df_may_be_set;
+    self.df_clear = true;
 
     // Step 1: Infer basic-block boundaries
     let mut block_start = HashSet::new();
@@ -2455,8 +2429,9 @@ impl IRBuilder<'_> {
       }
       self.append_asm_instr(ins);
     }
-    // The last block is never switched away from; record its carry exit.
+    // The last block is never switched away from; record its carry/DF exit.
     self.exit_known.insert(self.cur, self.carry_known);
+    self.df_exit_clear.insert(self.cur, self.df_clear);
 
     // Step 4: walk blocks and seal them
     for blkref in self.ir.iter_blocks() {
@@ -2465,6 +2440,149 @@ impl IRBuilder<'_> {
       }
     }
   }
+}
+
+/// Converge the per-block carry entry-knownness (the CF must-analysis; see
+/// `IRBuilder::build`). Least fixpoint: unknown starts false and only grows.
+fn analyze_carry<'a>(
+  cfg: &'a Config,
+  instrs: &'a [instr::Instr],
+  spec: &'a spec::Spec<'a>,
+  binary: &'a binary::Binary,
+  overlay: bool,
+  pin_all: bool,
+) -> HashMap<BlockRef, bool> {
+  // Pass 1: assume no block entry carries a known value (the conservative
+  // default), keeping the IR only for its per-block summaries.
+  let mut probe = IRBuilder::new(cfg, instrs, spec, binary, overlay, pin_all);
+  probe.build_once();
+  let exit_unknown = probe.exit_known.clone();
+  let blocks: Vec<BlockRef> = probe.ir.iter_blocks().collect();
+  let preds: HashMap<BlockRef, Vec<BlockRef>> = blocks
+    .iter()
+    .map(|b| (*b, probe.ir.block(*b).preds.clone()))
+    .collect();
+
+  // Pass 2: assume every block entry carries a known value, to distinguish
+  // an identity transfer from a constant one.
+  let mut probe2 = IRBuilder::new(cfg, instrs, spec, binary, overlay, pin_all);
+  probe2.entry_known_default = true;
+  probe2.build_once();
+  let exit_known = probe2.exit_known.clone();
+
+  // Must-analysis over the per-block summaries (no IR rebuilds). Constant
+  // transfers drop out immediately; identity transfers forward the
+  // predecessor's entry knownness. Unknown starts false and only grows, so
+  // the fixpoint terminates.
+  let mut in_known: HashMap<BlockRef, bool> = blocks.iter().map(|b| (*b, false)).collect();
+  loop {
+    let mut changed = false;
+    for b in &blocks {
+      // The function entry block has no CF predecessor; its carry-in is
+      // always unknown.
+      let known = if *b == BlockRef(0) {
+        false
+      } else {
+        let ps = &preds[b];
+        !ps.is_empty() && ps.iter().all(|p| {
+          let base = exit_unknown.get(p).copied().unwrap_or(false);
+          if Some(&base) == exit_known.get(p) {
+            base // constant transfer
+          } else {
+            in_known.get(p).copied().unwrap_or(false) // identity transfer
+          }
+        })
+      };
+      if in_known[b] != known {
+        in_known.insert(*b, known);
+        changed = true;
+      }
+    }
+    if !changed {
+      break;
+    }
+  }
+  in_known
+}
+
+/// Run the DF must-analysis on top of the retained (carry-converged) build.
+/// Returns the retained builder, or a rebuilt one whose `df_clear_entry`
+/// proves every block entry that is clear on all paths (see
+/// `IRBuilder::build`).
+fn refine_df<'a>(
+  retained: IRBuilder<'a>,
+  cfg: &'a Config,
+  instrs: &'a [instr::Instr],
+  spec: &'a spec::Spec<'a>,
+  binary: &'a binary::Binary,
+  overlay: bool,
+  pin_all: bool,
+) -> IRBuilder<'a> {
+  // Pass A is `retained`: the entry is clear (contract), every other block
+  // starts not-clear.
+  let carry_entry = retained.carry_known_entry.clone();
+  let exit_a = retained.df_exit_clear.clone();
+  let blocks: Vec<BlockRef> = retained.ir.iter_blocks().collect();
+  let preds: HashMap<BlockRef, Vec<BlockRef>> = blocks
+    .iter()
+    .map(|b| (*b, retained.ir.block(*b).preds.clone()))
+    .collect();
+
+  // Pass B: assume every block entry is clear, to tell an identity transfer
+  // (exit follows the entry) from a constant one.
+  let mut probe = IRBuilder::new(cfg, instrs, spec, binary, overlay, pin_all);
+  probe.carry_known_entry = carry_entry.clone();
+  probe.df_entry_default = true;
+  probe.build_once();
+  let exit_b = probe.df_exit_clear.clone();
+
+  // Must-analysis over the per-block summaries (greatest fixpoint): a block
+  // entry is clear only if every predecessor's exit is, but an identity
+  // transfer forwards the block's own entry, so a loop back-edge that
+  // preserves DF is still clear. Start from clear and shrink; a least
+  // fixpoint (as for carry) would lose that loop-carried case.
+  let mut entry_clear: HashMap<BlockRef, bool> = blocks
+    .iter()
+    .map(|b| (*b, *b != BlockRef(0) && !preds[b].is_empty()))
+    .collect();
+  loop {
+    let mut changed = false;
+    for b in &blocks {
+      let known = if *b == BlockRef(0) {
+        true // an annotated function entry assumes DF=0
+      } else {
+        let ps = &preds[b];
+        !ps.is_empty() && ps.iter().all(|p| {
+          let base = exit_a.get(p).copied().unwrap_or(false);
+          if exit_b.get(p).copied().unwrap_or(false) == base {
+            base // constant transfer
+          } else {
+            entry_clear.get(p).copied().unwrap_or(false) // identity transfer
+          }
+        })
+      };
+      if entry_clear[b] != known {
+        entry_clear.insert(*b, known);
+        changed = true;
+      }
+    }
+    if !changed {
+      break;
+    }
+  }
+
+  // Nothing beyond the entry is provably clear: pass A is already the build.
+  if !blocks.iter().any(|b| *b != BlockRef(0) && entry_clear[b]) {
+    return retained;
+  }
+
+  // Otherwise rebuild once with the converged seed.
+  let mut rebuilt = IRBuilder::new(cfg, instrs, spec, binary, overlay, pin_all);
+  rebuilt.carry_known_entry = carry_entry;
+  rebuilt.df_clear_entry = entry_clear;
+  rebuilt.df_entry_default = false;
+  rebuilt.build_once();
+  rebuilt
 }
 
 /// Returns the offset of `elt` into `slice`.
@@ -3553,6 +3671,26 @@ mod tests {
     b.carry_known_entry.insert(next2, true);
     b.switch_blk(next2);
     assert!(b.carry_known, "a proven entry carry must be inherited");
+  }
+
+  #[test]
+  fn block_boundary_seeds_df_from_entry_clearness() {
+    let (_types, cfg, binary, spec) = bit_test_builder(&[0xC3]);
+    let instrs: &[instr::Instr] = &[];
+    let mut b = test_builder(&cfg, instrs, &spec, &binary);
+    // A DF writer exists, so the probe/default fallback is not-clear.
+    b.df_may_be_set = true;
+    b.df_entry_default = false;
+    b.df_clear = true;
+    let next = b.ir.add_block("next");
+    b.switch_blk(next);
+    assert!(!b.df_clear, "unknown entry DF must not be inherited");
+
+    // When the analysis proves the entry clear, the block inherits it.
+    let next2 = b.ir.add_block("next2");
+    b.df_clear_entry.insert(next2, true);
+    b.switch_blk(next2);
+    assert!(b.df_clear, "a proven-clear entry DF must be inherited");
   }
 
   #[test]
