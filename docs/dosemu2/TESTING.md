@@ -212,59 +212,58 @@ not built by the default lane (enable with `--features emu86`); see
 
 ## CI job profile and cost
 
-Measured on PR #116: job `Stock dosemu2 host integration` in
-`dosemu-host-runtime.yml`, on `ubuntu-24.04`. Total **6m39s**.
+The `dosemu-host-runtime.yml` lane runs the stock-dosemu2 acceptance matrix as
+**one job per flavour** (`fail-fast: false`, `flavor: [mz-ovl, exe, com, cap,
+ovl]`), so the wall-clock is the slowest flavour, not the sum of all twelve
+boots.
 
-| Step | Time |
-|---|---|
-| Run Phase 7 acceptance matrix | **5m38s** (85%) |
-| Install stock dosemu2 runtime | 31s |
-| Run host state/transport test | 24s |
-| Build Hydra host tests | 3s |
-| everything else | ~3s |
+Measured on `main` at `2a1176b` (run 39379043523, `ubuntu-24.04`):
 
-Phase 7 dominates. With `TESTPROG_FLAVOR=both`, `run_driver_test.sh` boots
-dosemu2 **12 times, serially** (~28s each): mz-ovl 1, exe 1, com 2, cap 3,
-ovl 5.
+| Flavour | Phase 7 | Job total | Guest boots |
+|---|---|---|---|
+| mz-ovl | 9s | 1m27s | 1 |
+| ovl | 43s | 1m54s | 5 |
+| exe | 51s | 1m54s | 1 |
+| cap | 1m47s | 3m03s | 3 |
+| **com** | **2m07s** | **3m23s** | 2 |
+
+The **critical path is `com`**, not `ovl`: `ovl` boots the guest five times and
+still finishes Phase 7 in 43s, while `com` runs twice and takes 2m07s. The
+per-boot cost varies about 7× across flavours and does not track the boot
+count, because the flavours do different work per boot (`exe`/`com` drive the
+function-hook driver, `ovl` does overlay page-in/restore round-trips). These
+numbers therefore do not isolate the cost of the emulated boot itself.
+
+Each job pays a fixed overhead of about **1m15s** before Phase 7 starts
+(checkout, installing the stock dosemu2 runtime, building Hydra, the host
+state/transport test). Across the matrix, `run_driver_test.sh` boots dosemu2 12
+times in total: mz-ovl 1, exe 1, com 2, cap 3, ovl 5.
 
 The per-launch `sleep` calls are *not* the cost — they total only ~25–40s across
-the whole job. The dominant cost is booting the guest under full CPU emulation
-(`$_cpu_vm = "emulated"`, `$_cpuemu = (1)`, set both in `run_driver_test.sh` and
-in the workflow's generated dosemu config).
+the whole matrix.
 
 The repository is public, so `ubuntu-24.04` provides 4 vCPU / 16 GB.
 
-### Reducing Phase 7 wall-clock
+### Cost of the per-flavour split
 
-**Split the flavours into a matrix** (~5m38s → ~3m). `run_driver_test.sh`
-already accepts `TESTPROG_FLAVOR=com|exe|cap|ovl|mz-ovl|both`, so no script
-changes are needed:
-
-```yaml
-strategy:
-  fail-fast: false
-  matrix:
-    flavor: [mz-ovl, exe, com, cap, ovl]
-# ...then: TESTPROG_FLAVOR=${{ matrix.flavor }} bash hydra/src/dosemu_host/run_driver_test.sh
-```
+The split replaced a single serial job (~6m40s, one VM) with five parallel
+jobs — the slowest ~3m23s, at roughly 5× the runner-minutes. Free for a public
+repository, but more resource overall.
 
 Each flavour gets its own VM, so there are **no shared-state races** — the real
 advantage over parallelising inside the script, where all flavours share
 `/tmp/opencode` and `$XDG_RUNTIME_DIR` and each would need its own working
-directory. The critical path becomes `ovl` (5 boots, ~140s) plus ~35s setup.
-Intra-flavour ordering is preserved: `com` still runs twice inside its job, and
-`cap`/`ovl` keep capture-before-restore.
-
-Trade-off: roughly 5× the runner-minutes. Free for a public repository, but more
-resource overall.
-
-**Do not touch `$_cpuemu = (1)`.** It is the single largest per-boot cost, but it
-is *assumed* to be required for deterministic breakpoint and state inspection.
-This has not been tested — treat changing it as a correctness risk, not a
-performance knob.
+directory. Intra-flavour ordering is preserved: `com` still runs twice inside
+its job, and `cap`/`ovl` keep capture-before-restore.
 
 **Do not drop the repeated runs.** The `.com` flavour running twice, and `cap`'s
 two restores, are deliberate idempotency and determinism checks.
+
+**Do not touch `$_cpuemu = (1)`.** It is *assumed* to be required for
+deterministic breakpoint and state inspection. The measurements above do not
+isolate it — the per-flavour cost tracks the driver's work, not the boot — so
+it is not a performance knob the numbers argue for. It has not been tested:
+treat changing it as a correctness risk, not a performance knob.
 
 ### Test baselines
 
