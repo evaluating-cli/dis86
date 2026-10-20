@@ -335,7 +335,7 @@ static void probe_impl_serviced(void)
 }
 
 /* The child must survive the interrupt and report what the primitive
- * returned. Both halves matter: the byte proves the code, and the sentinel
+ * returned. Both halves matter: the value proves the code, and the sentinel
  * exit status proves the hook did not end the process — the core reports a
  * termination now, it does not act on it. */
 static int probe_int_reports(void (*probe)(void), int expected)

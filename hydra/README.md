@@ -76,6 +76,12 @@ Two things an embedder has to design around:
 - **The guest's exit code is the driver's to use.** A port that wants the DOS
   convention exits with it; a harness that reports a verdict (the parity
   lane) prints it and keeps its own exit status.
+- **The machine is spent after a termination.** A guest that terminates
+  inside a function reached through a callstub leaves the caller's execution
+  context waiting for a return that never comes, so the machine cannot be
+  reused: a second guest needs a second machine. Running more than one guest
+  in a process (issue #95 Tier 2) needs an explicit teardown for the
+  contexts a terminating guest leaves behind.
 
 Only `AH=4Ch` terminates. `INT 20h` and `INT 21h AH=00h` still fail loud, as
 do COM programs that end by far-returning to their PSP. `INT 20h` in

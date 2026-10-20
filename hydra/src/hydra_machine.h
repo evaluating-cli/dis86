@@ -62,8 +62,20 @@ struct hydra_machine_audio {
  *   HYDRA_EXEC_TERMINATED  the guest finished: it asked to terminate (INT 21h
  *                          AH=4Ch), so the hook returned without running the
  *                          guest's post-INT code. The exit code is available
- *                          from hydra_machine_exit_code(). The host must not
- *                          run the guest again. */
+ *                          from hydra_machine_exit_code().
+ *
+ *                          The machine is spent: the host must not run the
+ *                          guest again, and cannot reuse the machine for
+ *                          another one. A guest that terminated inside a
+ *                          function reached through a callstub leaves the
+ *                          caller's execution context waiting for a return
+ *                          that never comes (the callstub waits on a
+ *                          condition only the resume path signals), so the
+ *                          context stays live and eligible for a later
+ *                          resume. Running more than one guest in a process
+ *                          is issue #95 Tier 2's job, and it needs an
+ *                          explicit teardown for the contexts a terminating
+ *                          guest leaves behind. */
 #define HYDRA_EXEC_RESUME      0
 #define HYDRA_EXEC_REDIRECT    1
 #define HYDRA_EXEC_RESTORE     2
