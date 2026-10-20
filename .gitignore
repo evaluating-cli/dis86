@@ -7,5 +7,6 @@ build/
 # Local benchmark/session artifacts: never committed, never added.
 /FCD.EXE
 /native-recompile-prompt.md
+*.swp
 /codex-session-*.md
 __pycache__/
