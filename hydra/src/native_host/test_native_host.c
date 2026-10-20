@@ -53,6 +53,54 @@ static void probe_mem_oob_write16(hydra_machine_hardware_t *hw)
   hw->mem_write16(hw->ctx, NATIVE_HOST_MEM_SIZE - 1, 0x1234);
 }
 
+/* The PIT control register is write-only on real hardware; reading it must
+ * still fail loud rather than returning a stale or invented byte. */
+static void probe_pit_control_read(hydra_machine_hardware_t *hw)
+{
+  hw->io_in8(hw->ctx, 0x43);
+}
+
+/* Deterministic input backend for the port tests: the terminal backend
+ * cannot have a key injected without a tty, and the key-present path is the
+ * one worth covering. */
+typedef struct {
+  uint16_t key;
+  int pending;
+} fake_port_input_t;
+
+static int fake_port_poll_key(void *state, uint16_t *key)
+{
+  fake_port_input_t *in = (fake_port_input_t *)state;
+  if (!in->pending)
+    return 0;
+  *key = in->key;
+  return 1;
+}
+
+static int fake_port_read_key(void *state, uint16_t *key)
+{
+  fake_port_input_t *in = (fake_port_input_t *)state;
+  if (!in->pending)
+    return 0;
+  *key = in->key;
+  in->pending = 0;
+  return 1;
+}
+
+static const hydra_backend_t FAKE_PORT_BACKEND = {
+  .name     = "fake-port-input",
+  .poll_key = fake_port_poll_key,
+  .read_key = fake_port_read_key,
+};
+
+/* A PIT read is two 8-bit cycles: low byte, then high byte. */
+static uint16_t pit_read16(hydra_machine_hardware_t *hw)
+{
+  uint8_t lo = hw->io_in8(hw->ctx, 0x40);
+  uint8_t hi = hw->io_in8(hw->ctx, 0x40);
+  return (uint16_t)(lo | ((uint16_t)hi << 8));
+}
+
 int main(void)
 {
   hydra_machine_t m = {0};
@@ -120,11 +168,61 @@ int main(void)
     {probe_io_in16, "io_in16 fail loud (abort)"},
     {probe_io_out8, "io_out8 fail loud (abort)"},
     {probe_io_out16, "io_out16 fail loud (abort)"},
+    {probe_pit_control_read, "routed but read-only port still fails loud (0x43)"},
     {probe_mem_oob_read8, "mem_read8 out of bounds fail loud (abort)"},
     {probe_mem_oob_write16, "mem_write16 out of bounds fail loud (abort)"},
   };
   for (size_t i = 0; i < sizeof(probes) / sizeof(probes[0]); i++)
     CHECK(probe_aborts(probes[i].probe, hw), probes[i].label);
+
+  /* --- port -> device routing (issue #95) --------------------------------
+   * The two devices routed so far are the keyboard and the PIT: between them
+   * they cover #95's Tier 1 "keyboard-only, direct port polling" criterion.
+   * Everything unmapped still aborts, which the probes above verify. */
+
+  /* Keyboard with nothing pending. The data port must not block: read_key()
+   * waits for a key, so a guest that polls 0x60 without checking 0x64 first
+   * would hang instead of seeing an empty buffer. */
+  CHECK(hw->io_in8(hw->ctx, 0x64) == 0x00,
+        "port routing: keyboard status 0x64 clear with no key pending");
+  CHECK(hw->io_in8(hw->ctx, 0x60) == 0x00,
+        "port routing: keyboard data 0x60 returns 0 instead of blocking");
+
+  /* Keyboard with a key waiting. 0x64 reports it, 0x60 carries the scan
+   * code (high byte of the BIOS key word), and the read consumes it. */
+  {
+    fake_port_input_t fi = { 0 };
+    fi.key = 0x1e61;                       /* 'a': scan 1Eh, ASCII 61h */
+    fi.pending = 1;
+    hydra_native_backend_install_probe(&FAKE_PORT_BACKEND, &fi);
+
+    CHECK(hw->io_in8(hw->ctx, 0x64) == 0x01,
+          "port routing: keyboard status 0x64 set when a key is pending");
+    CHECK(hw->io_in8(hw->ctx, 0x60) == 0x1e,
+          "port routing: keyboard data 0x60 returns the scan code");
+    CHECK(hw->io_in8(hw->ctx, 0x64) == 0x00,
+          "port routing: reading 0x60 consumes the key");
+
+    hydra_native_backend_select(NULL);     /* restore the default backend */
+  }
+
+  /* PIT. A written reload must bound the count, and the count must actually
+   * move: those two together are what a guest timing loop depends on. */
+  hw->io_out8(hw->ctx, 0x43, 0x36);        /* ch0, lo/hi, mode 3, binary */
+  hw->io_out8(hw->ctx, 0x40, 0x00);        /* reload low byte  */
+  hw->io_out8(hw->ctx, 0x40, 0x08);        /* reload high byte -> 0x0800 */
+
+  uint16_t c1 = pit_read16(hw);
+  /* With a reload of 0x0800 the count can only land in 1..0x0800: it is
+   * reload minus the ticks elapsed since, and 0x0800 fits in 16 bits so it
+   * never truncates to 0. A counter that ignored the reload would run on the
+   * 0x10000 default period, whose count truncates to 0 at tick 0 — so the
+   * != 0 half is what actually pins the reload down. */
+  CHECK(c1 != 0 && c1 <= 0x0800,
+        "port routing: PIT honours a written reload (count within 0x0800)");
+  usleep(20000);
+  uint16_t c2 = pit_read16(hw);
+  CHECK(c1 != c2, "port routing: PIT counter advances over time");
 
   /* Snapshot roundtrip: save the labeled state, smash memory + registers,
    * restore, and require the world back byte-exact. */
