@@ -10,7 +10,7 @@ Dis86 has been built for doing reverse-engineering work such as analyzing and re
 
 **The product is the decompiler**: translating 16-bit real-mode DOS binaries into
 semantically-correct C, usable standalone and through [Hydra](hydra/README.md)
-for the native-recompile workflow ([`native-recompile-prompt.md`](native-recompile-prompt.md)).
+for the native-recompile workflow.
 Everything else in the repository supports that.
 
 | Component | Role |
@@ -141,7 +141,7 @@ Emit C code:
 
 Other modes: `--analyze` (config-driven analysis), `--start-addr`/`--end-addr` (address-range slices), `--codeseg-name` (decompile a whole configured code segment), `--codegen-hydra` (Hydra-flavored codegen), and `--codegen-hydra --relocatable-seg HEX[,HEX...]` (emit listed absolute link-time segment values as `(CODE_START_SEG + seg)` for relocated Hydra execution). Run `dis86 --help` for the full list. The `mzfile` companion binary inspects and extracts MZ executables via subcommands (`mzfile info <program.exe>`, plus `extract`, `map`, and `dis`).
 
-An end-to-end, from-zero walkthrough that drives `dis86` and `hydra` from MZ forensics to a working native binary — including the stock-dosemu2 oracle — is in [`native-recompile-prompt.md`](native-recompile-prompt.md).
+The end-to-end, from-zero walkthrough — MZ forensics to a working native binary, including the stock-dosemu2 oracle — is the operator's local recompile prompt, kept out of this tree; the in-repo end-to-end lane is [`parity/`](parity/README.md).
 
 ## Caveats & Limitations
 
