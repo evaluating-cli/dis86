@@ -16,6 +16,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 #include "internal.h"
 #include "native_host.h"
@@ -109,33 +110,342 @@ static void native_mem_write16(hydra_machine_ctx_t *ctx, uint32_t addr, uint16_t
 }
 
 /********************************************************************/
-/* io: fail loud on every port. Device routing is a later epic deliverable
- * (thin HAL first); until then no port has defined behavior. */
+/* io: port -> device routing (issue #95).
+ *
+ * Deliberately not part of the backend vtable: an entry there would push
+ * port-number knowledge into every backend, including ones with no concept
+ * of a port. The native host owns a small table instead. Each device either
+ * reuses a backend method (the keyboard reads through poll_key/read_key) or
+ * owns its own state (the PIT keeps a start timestamp).
+ *
+ * Unmapped ports still fail loud. That is the point of doing it this way:
+ * routing keyboard and timer traffic must not become a path where an unknown
+ * device quietly returns a plausible-looking value.
+ *
+ * Device state is process-wide, like raw_code_slot above: the host is a
+ * singleton and there is no second guest to keep separate.
+ */
+
+typedef struct {
+  const char *name;
+  uint16_t    base;    /* first port */
+  uint16_t    count;   /* consecutive ports covered */
+  uint8_t   (*read8)(void *dev, const hydra_backend_t *be, void *be_st,
+                     uint16_t port);
+  void      (*write8)(void *dev, const hydra_backend_t *be, void *be_st,
+                      uint16_t port, uint8_t val);
+  void       *dev;     /* device-owned state */
+} port_device_t;
+
+/* --- keyboard (8042): 0x60 data, 0x64 status ---------------------- */
+
+typedef struct {
+  int warned_empty;    /* one-shot diagnostic, see kbd_read_data */
+} kbd_dev_t;
+
+static kbd_dev_t g_kbd;
+
+/* Only bit 0 (output buffer full) is modelled, because that is what a
+ * polling game tests. Bit 1 (input buffer full) stays clear so a game that
+ * waits for the controller to be ready is never stuck. */
+static uint8_t kbd_read_status(void *dev, const hydra_backend_t *be,
+                               void *be_st, uint16_t port)
+{
+  (void)dev;
+  (void)port;
+  uint16_t key = 0;
+  if (!be->poll_key)
+    return 0;
+  return be->poll_key(be_st, &key) ? 0x01u : 0x00u;
+}
+
+static uint8_t kbd_read_data(void *dev, const hydra_backend_t *be,
+                             void *be_st, uint16_t port)
+{
+  (void)port;
+  kbd_dev_t *k = (kbd_dev_t *)dev;
+  uint16_t key = 0;
+
+  /* Non-blocking on purpose. read_key() blocks until a key arrives, and a
+   * game that reads 0x60 without checking 0x64 first would hang forever.
+   * Report the empty read once rather than failing silently. */
+  if (!be->poll_key || !be->poll_key(be_st, &key)) {
+    if (!k->warned_empty) {
+      k->warned_empty = 1;
+      fprintf(stderr,
+              "native host: port 0x60 read with no key pending; returning 0 "
+              "(a guest that polls the data port without checking 0x64 will "
+              "see no keys)\n");
+    }
+    return 0;
+  }
+  if (be->read_key)
+    be->read_key(be_st, &key);
+  /* Port 0x60 carries the scan code; the backend's key word is BIOS
+   * encoded (high byte = scan, low byte = ASCII). */
+  return (uint8_t)(key >> 8);
+}
+
+static void kbd_write(void *dev, const hydra_backend_t *be, void *be_st,
+                      uint16_t port, uint8_t val)
+{
+  (void)dev;
+  (void)be;
+  (void)be_st;
+  (void)port;
+  (void)val;
+  /* Controller commands are absorbed: the backend model has no 8042 to
+   * configure, and failing here would stop every guest that sets the
+   * keyboard up at boot. */
+}
+
+/* --- PIT (8253/8254): 0x40-0x42 counters, 0x43 control ------------
+ *
+ * Deliberately partial model, and the gaps are listed here because a guest
+ * that depends on one of them has to fail visibly rather than mysteriously:
+ *
+ *   - Only the counting behaviour is modelled. Modes 0 and 3 are not
+ *     distinguished: the count decrements by one per tick, where a real
+ *     channel in mode 3 decrements by two per input clock. A guest that
+ *     measures elapsed time from a mode-3 counter therefore sees roughly
+ *     half the rate it expects.
+ *   - The channel-3 read-back command and the BCD bit are accepted and
+ *     ignored (see pit_write_control). The count reported is always binary
+ *     and always read through the channel's programmed access mode. Failing
+ *     on them would kill guests that probe for an 8254 at boot.
+ *   - Device state (this struct and the keyboard's) is not part of
+ *     state_save/state_restore, which covers guest memory and registers
+ *     only. A restored snapshot leaves the PIT counting from the process
+ *     start, not from whatever the guest's timer had reached when it was
+ *     saved.
+ */
+
+#define PIT_HZ 1193182ull
+
+typedef struct {
+  struct timespec start;
+  uint16_t reload[3];
+  uint8_t  read_hi[3];   /* lo/hi sequencing of a read (RW=11 only) */
+  uint8_t  write_hi[3];  /* lo/hi sequencing of a reload write (RW=11 only) */
+  uint8_t  rw[3];        /* access mode: 1 = LSB only, 2 = MSB only,
+                          * 3 = low then high. Never 0: RW=00 in a control
+                          * word is the counter-latch command, not a mode,
+                          * so it must not overwrite what was programmed. */
+  uint16_t latch[3];     /* count frozen by the RW=00 latch command */
+  uint8_t  latched[3];   /* 1 = reads return latch[] until it is drained */
+} pit_dev_t;
+
+static pit_dev_t g_pit;
+
+static uint64_t pit_elapsed_ticks(const pit_dev_t *p)
+{
+  struct timespec now;
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  uint64_t ns = (uint64_t)(now.tv_sec - p->start.tv_sec) * 1000000000ull
+              + (uint64_t)(now.tv_nsec - p->start.tv_nsec);
+
+  /* ns * PIT_HZ would overflow, so scale seconds and remainder apart. */
+  uint64_t sec = ns / 1000000000ull;
+  uint64_t rem = ns % 1000000000ull;
+  return (sec % 4000000000ull) * PIT_HZ + rem * PIT_HZ / 1000000000ull;
+}
+
+static uint16_t pit_count(const pit_dev_t *p, int ch)
+{
+  uint32_t period = p->reload[ch] ? p->reload[ch] : 0x10000u;
+  return (uint16_t)(period - (uint16_t)(pit_elapsed_ticks(p) % period));
+}
+
+static uint8_t pit_read(void *dev, const hydra_backend_t *be, void *be_st,
+                        uint16_t port)
+{
+  (void)be;
+  (void)be_st;
+  pit_dev_t *p = (pit_dev_t *)dev;
+  int ch = (int)(port - 0x40);
+
+  /* A pending latch is what reads return; otherwise the count is live. */
+  uint16_t c = p->latched[ch] ? p->latch[ch] : pit_count(p, ch);
+
+  /* The access mode decides which byte a read returns - a real 8253 does
+   * not alternate unless RW=11 says to. Anything other than 1/2/3 is a
+   * broken invariant (the latch command never writes one), so fail loud
+   * rather than quietly falling into a mode nobody programmed. */
+  uint8_t byte;
+  switch (p->rw[ch]) {
+    case 1:                                  /* RW=01: LSB only, every read */
+      byte = (uint8_t)(c & 0xffu);
+      break;
+    case 2:                                  /* RW=10: MSB only, every read */
+      byte = (uint8_t)(c >> 8);
+      break;
+    case 3:                                  /* RW=11: low, then high */
+      byte = p->read_hi[ch] ? (uint8_t)(c >> 8) : (uint8_t)(c & 0xffu);
+      p->read_hi[ch] ^= 1u;
+      break;
+    default:
+      FAIL("native host: PIT channel %d has no access mode programmed "
+           "(rw=%d)", ch, (int)p->rw[ch]);
+      break;
+  }
+
+  /* The latch is consumed by the reads that return it: one byte for a
+   * single-byte access mode, two for lo/hi (read_hi has just wrapped back
+   * to 0, meaning the high byte was the one returned). */
+  if (p->latched[ch] && (p->rw[ch] != 3 || p->read_hi[ch] == 0))
+    p->latched[ch] = 0;
+
+  return byte;
+}
+
+static void pit_write_control(void *dev, const hydra_backend_t *be,
+                              void *be_st, uint16_t port, uint8_t val)
+{
+  (void)be;
+  (void)be_st;
+  (void)port;
+  pit_dev_t *p = (pit_dev_t *)dev;
+  uint8_t ch = (uint8_t)((val >> 6) & 3u);
+
+  if (ch == 3) {
+    /* Read-back command: not modelled, and neither is the BCD bit below.
+     * Both are accepted silently rather than failed, because a guest that
+     * probes for an 8254 must not be killed by one; the count this device
+     * reports is always binary and always read through the access mode. */
+    return;
+  }
+
+  uint8_t rw = (uint8_t)((val >> 4) & 3u);
+  if (rw == 0) {
+    /* RW=00 is the counter-latch command, NOT an access mode: it freezes a
+     * snapshot of the live count so a latch-then-read pair cannot tear
+     * across a low-byte carry, and it leaves the programmed mode alone. */
+    p->latch[ch] = pit_count(p, ch);
+    p->latched[ch] = 1;
+    p->read_hi[ch] = 0;
+    return;
+  }
+
+  p->rw[ch] = rw;
+  p->read_hi[ch] = 0;
+  p->write_hi[ch] = 0;
+  p->latched[ch] = 0;              /* programming a counter clears its latch */
+}
+
+static void pit_write_counter(void *dev, const hydra_backend_t *be,
+                              void *be_st, uint16_t port, uint8_t val)
+{
+  (void)be;
+  (void)be_st;
+  pit_dev_t *p = (pit_dev_t *)dev;
+  int ch = (int)(port - 0x40);
+
+  /* The access mode is whatever the last control word programmed: rw[] is
+   * initialised to lo/hi, and a latch command does not touch it, so there is
+   * no "unprogrammed" fallback for a stray latch to have corrupted. */
+  if (p->rw[ch] == 1) {                     /* RW=01: LSB only */
+    p->reload[ch] = val;
+    clock_gettime(CLOCK_MONOTONIC, &p->start);
+    return;
+  }
+  if (p->rw[ch] == 2) {                     /* RW=10: MSB only */
+    p->reload[ch] = (uint16_t)((uint16_t)val << 8);
+    clock_gettime(CLOCK_MONOTONIC, &p->start);
+    return;
+  }
+  if (p->rw[ch] != 3)
+    FAIL("native host: PIT channel %d has no access mode programmed (rw=%d)",
+         ch, (int)p->rw[ch]);
+
+  if (p->write_hi[ch] == 0) {               /* RW=11: low, then high */
+    p->reload[ch] = (uint16_t)((p->reload[ch] & 0xff00u) | val);
+    p->write_hi[ch] = 1;
+  } else {
+    p->reload[ch] = (uint16_t)((p->reload[ch] & 0x00ffu)
+                               | ((uint16_t)val << 8));
+    p->write_hi[ch] = 0;
+    clock_gettime(CLOCK_MONOTONIC, &p->start);
+  }
+}
+
+/* --- the map ------------------------------------------------------ */
+
+static const port_device_t PORT_TABLE[] = {
+  /* counters first: 0x43 is inside 0x40..0x42 only if count is 4, and the
+   * control register must not answer a read, so it is a separate entry. */
+  { "pit-counter-0..2", 0x40, 3, pit_read,          pit_write_counter, &g_pit },
+  { "pit-control",      0x43, 1, NULL,              pit_write_control, &g_pit },
+  { "keyboard-data",    0x60, 1, kbd_read_data,     kbd_write,         &g_kbd },
+  { "keyboard-status",  0x64, 1, kbd_read_status,   kbd_write,         &g_kbd },
+};
+
+static const port_device_t *port_lookup(uint16_t port)
+{
+  for (size_t i = 0; i < sizeof(PORT_TABLE) / sizeof(PORT_TABLE[0]); i++) {
+    const port_device_t *d = &PORT_TABLE[i];
+    if (port >= d->base && port < d->base + d->count)
+      return d;
+  }
+  return NULL;
+}
+
+static void port_devices_init(void)
+{
+  memset(&g_kbd, 0, sizeof(g_kbd));
+  memset(&g_pit, 0, sizeof(g_pit));
+  /* A zero reload means "full period" to a real 8253, which pit_count()
+   * already maps to 0x10000, so leaving it zero is the correct default. */
+  clock_gettime(CLOCK_MONOTONIC, &g_pit.start);
+  /* No control word has been written yet. A real 8253 is undefined until
+   * one arrives; lo/hi is what nearly every guest programs, and it must be
+   * set explicitly because the zero bytes above would otherwise read as
+   * "this channel's access mode is the latch command". */
+  for (int i = 0; i < 3; i++)
+    g_pit.rw[i] = 3;
+}
 
 static uint8_t native_io_in8(hydra_machine_ctx_t *ctx, uint16_t port)
 {
   (void)ctx;
-  FAIL("native host: io_in8 has no device routing yet (port=0x%04x)", port);
-}
+  const port_device_t *d = port_lookup(port);
+  if (!d)
+    FAIL("native host: io_in8 has no device routing yet (port=0x%04x)", port);
+  if (!d->read8)
+    FAIL("native host: port 0x%04x (%s) is write-only", port, d->name);
 
-static uint16_t native_io_in16(hydra_machine_ctx_t *ctx, uint16_t port)
-{
-  (void)ctx;
-  FAIL("native host: io_in16 has no device routing yet (port=0x%04x)", port);
+  void *be_st = NULL;
+  const hydra_backend_t *be = hydra_native_backend_active(&be_st);
+  return d->read8(d->dev, be, be_st, port);
 }
 
 static void native_io_out8(hydra_machine_ctx_t *ctx, uint16_t port, uint8_t val)
 {
   (void)ctx;
-  (void)val;
-  FAIL("native host: io_out8 has no device routing yet (port=0x%04x)", port);
+  const port_device_t *d = port_lookup(port);
+  if (!d)
+    FAIL("native host: io_out8 has no device routing yet (port=0x%04x)", port);
+  if (!d->write8)
+    FAIL("native host: port 0x%04x (%s) is read-only", port, d->name);
+
+  void *be_st = NULL;
+  const hydra_backend_t *be = hydra_native_backend_active(&be_st);
+  d->write8(d->dev, be, be_st, port, val);
+}
+
+/* A 16-bit access to an 8-bit device is two bus cycles on real hardware, so
+ * route it that way rather than inventing a word-level protocol. An unmapped
+ * half still fails loud, which keeps io_in16/io_out16 honest. */
+static uint16_t native_io_in16(hydra_machine_ctx_t *ctx, uint16_t port)
+{
+  uint8_t lo = native_io_in8(ctx, port);
+  uint8_t hi = native_io_in8(ctx, (uint16_t)(port + 1));
+  return (uint16_t)(lo | ((uint16_t)hi << 8));
 }
 
 static void native_io_out16(hydra_machine_ctx_t *ctx, uint16_t port, uint16_t val)
 {
-  (void)ctx;
-  (void)val;
-  FAIL("native host: io_out16 has no device routing yet (port=0x%04x)", port);
+  native_io_out8(ctx, port, (uint8_t)(val & 0xffu));
+  native_io_out8(ctx, (uint16_t)(port + 1), (uint8_t)(val >> 8));
 }
 
 /********************************************************************/
@@ -305,4 +615,8 @@ void hydra_user_init(hydra_conf_t *conf,
    * it from a hook thread (see active_backend() in backend_host.c). No
    * backend-selection knob exists yet, so this always picks the default. */
   hydra_native_backend_select(NULL);
+
+  /* Port devices have to be reset here too, or the PIT's start timestamp
+   * would be whatever the previous run left behind. */
+  port_devices_init();
 }

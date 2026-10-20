@@ -88,6 +88,15 @@ void hydra_native_backend_install_probe(const hydra_backend_t *be, void *state)
   if (!be)
     FAIL("native host: install_probe called with no backend");
 
+  /* Shut the outgoing backend down, the way select() does. Without this,
+   * installing a probe over the terminal backend leaves stdin in
+   * non-blocking mode; the next select() then builds a second terminal
+   * backend whose init saves those already-broken flags as the user's
+   * original ones, so the atexit handler "restores" a non-blocking shell
+   * instead of the one it found. */
+  if (g_backend && g_backend->shutdown)
+    g_backend->shutdown(g_backend_state);
+
   backend_register_atexit();
   g_backend = be;
   g_backend_state = state;
