@@ -1,4 +1,5 @@
 use crate::asm::instr::{Instr, Opcode, Operand};
+use crate::asm::branch;
 use crate::asm::intel_syntax::instr_str;
 use crate::segoff::{SegOff, Seg, Off};
 use crate::binary::Binary;
@@ -24,7 +25,15 @@ impl fmt::Display for ReturnKind {
 pub enum Next {
   Fallthrough(SegOff),     // ordinary instruction fallthrough
   Return(ReturnKind),      // return instr (block terminator)
-  Jump(Vec<SegOff>),       // jump targets (block terminator)
+  // Jump targets (block terminator) plus the implicit fallthrough of a
+  // conditional branch. The two are kept apart: a fallthrough is not a
+  // branch target, and it must not be reported as one.
+  Jump { targets: Vec<SegOff>, fallthrough: Option<SegOff> },
+  // Control leaves the function: the block ends here and the analysis
+  // does not follow the transfer. A far jump into another segment, or a
+  // jump whose target is only known at run time, has no address in the
+  // analyzed segment to continue at.
+  Transfer,
 }
 
 pub enum Call {
@@ -72,54 +81,61 @@ pub struct InstrDetails {
   pub call: Option<Call>,
 }
 
-// FIXME: UNIFY BACK WITH ir_build::jump_targets
-fn jump_targets(ins: &Instr) -> Result<Option<Vec<SegOff>>, String> {
-  // Filter for branch instructions
-  let (oper_num, fallthrough) = match &ins.opcode {
-    Opcode::OP_JA   => (0, true),
-    Opcode::OP_JAE  => (0, true),
-    Opcode::OP_JB   => (0, true),
-    Opcode::OP_JBE  => (0, true),
-    Opcode::OP_JCXZ => (1, true),
-    Opcode::OP_JE   => (0, true),
-    Opcode::OP_JG   => (0, true),
-    Opcode::OP_JGE  => (0, true),
-    Opcode::OP_JL   => (0, true),
-    Opcode::OP_JLE  => (0, true),
-    Opcode::OP_JMP  => (0, false),
-    Opcode::OP_JMPF => (0, false),
-    Opcode::OP_JNE  => (0, true),
-    Opcode::OP_JNO  => (0, true),
-    Opcode::OP_JNP  => (0, true),
-    Opcode::OP_JNS  => (0, true),
-    Opcode::OP_JO   => (0, true),
-    Opcode::OP_JP   => (0, true),
-    Opcode::OP_JS   => (0, true),
-    Opcode::OP_LOOP => (1, true),
-    _ => return Ok(None),
-  };
-
-  let mut targets = vec![];
-
-  match &ins.operands[oper_num] {
-    Operand::Rel(rel) => {
-      targets.push(ins.rel_addr(rel));
-    }
-    _ => {
-      return Err(format!("Unsupported branch instruction: '{}' | {:?}", instr_str(ins), ins.operands[oper_num]));
-    }
-  };
-
-  if fallthrough {
-    targets.push(ins.end_addr());
+/// What happens after `ins` when it is a branch.
+///
+/// The branch classification is shared with the decompiler (see
+/// `asm::branch`), so the two cannot drift apart: this module used to
+/// keep its own copy of the table, which lost `LOOPE`/`LOOPNE` (so
+/// `--analyze` did not treat `loopne` as a branch) and reported every far
+/// jump as a hard error, losing the whole function's analysis.
+fn jump_targets(ins: &Instr, analyzed_seg: Seg) -> Option<Next> {
+  match branch::branch_target(ins)? {
+    branch::BranchTarget::Relative { target, fallthrough } =>
+      Some(Next::Jump { targets: vec![target], fallthrough }),
+    branch::BranchTarget::Unresolved(kind) => Some(unresolved_next(ins, kind, analyzed_seg)),
   }
-
-  Ok(Some(targets))
 }
 
-pub fn instr_details(ins: &Instr, binary: &Binary) -> Result<InstrDetails, String> {
-  if let Some(tgts) = jump_targets(ins)? {
-    return Ok(InstrDetails { next: Next::Jump(tgts), call: None });
+/// The continuation of a branch that is not a relative one.
+///
+/// A far jump into the analyzed segment is a jump to that address: CS
+/// does not change, so the address is in the same segment the analysis
+/// walks. Every other transfer (a far jump into another segment, or a
+/// jump whose target is only known at run time) leaves the analyzed
+/// segment, so the block ends there: following it would decode bytes
+/// from the wrong address space.
+fn unresolved_next(ins: &Instr, kind: branch::UnresolvedTransfer, analyzed_seg: Seg) -> Next {
+  // The diagnostics go to stderr: `--analyze` writes the annotation
+  // report to stdout, and that report is a fragment to be pasted into a
+  // config source.
+  let branch::UnresolvedTransfer::FarDirect { seg: far_seg, off } = kind else {
+    eprintln!("WARN: {}: jump target is only known at run time; the analysis stops the block here",
+      instr_str(ins));
+    return Next::Transfer;
+  };
+  // Only a normal (non-overlay) segment can be compared: in an overlay
+  // the segment value in the code belongs to the original program's
+  // address space, which the analysis does not model.
+  let Seg::Normal(cur_seg) = analyzed_seg else {
+    eprintln!("WARN: {}: far jump leaves the analyzed segment; the analysis stops the block here",
+      instr_str(ins));
+    return Next::Transfer;
+  };
+  if far_seg != cur_seg {
+    eprintln!("WARN: {}: far jump to {:04x}:{:04x} leaves the analyzed segment; the analysis stops the block here",
+      instr_str(ins), far_seg, off);
+    return Next::Transfer;
+  }
+  Next::Jump { targets: vec![SegOff { seg: analyzed_seg, off: Off(off) }], fallthrough: None }
+}
+
+/// The details of `ins` as seen by an analysis walking `analyzed_seg`.
+/// The segment is the one the analysis walks, not the one the
+/// instruction was decoded from: what a far jump's encoded segment is
+/// compared against is the analyzed segment.
+pub fn instr_details(ins: &Instr, binary: &Binary, analyzed_seg: Seg) -> Result<InstrDetails, String> {
+  if let Some(next) = jump_targets(ins, analyzed_seg) {
+    return Ok(InstrDetails { next, call: None });
   }
 
   let mut call = None;
@@ -257,12 +273,21 @@ mod tests {
   use crate::segoff::{Seg, Off};
 
   fn details_for(bytes: &[u8]) -> InstrDetails {
+    details_for_seg(bytes, Seg::Normal(0))
+  }
+
+  /// The details of the first instruction of `bytes`, as seen by an
+  /// analysis walking segment `seg`. The instruction itself is decoded
+  /// from a normal segment: what the far-jump classification compares is
+  /// the segment the analysis walks, not the one the bytes live in.
+  fn details_for_seg(bytes: &[u8], seg: Seg) -> InstrDetails {
     let binary = Binary::from_raw(bytes, None);
-    let start = SegOff { seg: Seg::Normal(0), off: Off(0) };
-    let end = SegOff { seg: Seg::Normal(0), off: Off(bytes.len() as u16) };
+    let decode_seg = Seg::Normal(0);
+    let start = SegOff { seg: decode_seg, off: Off(0) };
+    let end = SegOff { seg: decode_seg, off: Off(bytes.len() as u16) };
     let mut decoder = Decoder::new(binary.region_iter(start, end));
     let (instr, _raw) = decoder.try_next().unwrap().unwrap();
-    instr_details(&instr, &binary).unwrap()
+    instr_details(&instr, &binary, seg).unwrap()
   }
 
   #[test]
@@ -293,5 +318,71 @@ mod tests {
     // fallthrough: decoding must not continue past it.
     let d = details_for(&[0xCF]);
     assert!(matches!(d.next, Next::Return(ReturnKind::Interrupt)));
+  }
+
+  #[test]
+  fn loopcc_variants_are_branches() {
+    // The analyzer kept its own copy of the branch table, which lost
+    // `LOOPE`/`LOOPNE`: they were not branches at all, and the analysis
+    // panicked on them ("UNIMPL Opcode for loopne") instead of following
+    // the branch (issue #112).
+    for opcode_bytes in [[0xE0, 0xFE], [0xE1, 0xFE], [0xE2, 0xFE], [0xE3, 0xFE]] {
+      let d = details_for(&[opcode_bytes[0], opcode_bytes[1], 0xC3]);
+      let Next::Jump { targets, fallthrough } = d.next else {
+        panic!("loopcc must be a branch");
+      };
+      assert_eq!(targets.len(), 1, "loopcc has one target");
+      assert!(fallthrough.is_some(), "loopcc has a fallthrough");
+    }
+  }
+
+  #[test]
+  fn same_segment_far_jump_is_followed() {
+    // `jmp far 0000:0005` (EA 05 00 00 00) does not change CS, so the
+    // analysis continues at that address.
+    let d = details_for(&[0xEA, 0x05, 0x00, 0x00, 0x00]);
+    let Next::Jump { targets, fallthrough } = d.next else {
+      panic!("a same-segment far jump must be a jump");
+    };
+    assert_eq!(targets, vec![SegOff { seg: Seg::Normal(0), off: Off(5) }]);
+    assert_eq!(fallthrough, None, "a far jump does not fall through");
+  }
+
+  #[test]
+  fn a_conditional_branch_keeps_its_fallthrough_apart() {
+    // `jz +1` (74 01): the target and the fallthrough are both
+    // destinations, but the fallthrough is not a branch target.
+    let d = details_for(&[0x74, 0x01, 0xC3]);
+    let Next::Jump { targets, fallthrough } = d.next else {
+      panic!("a conditional branch must be a jump");
+    };
+    assert_eq!(targets, vec![SegOff { seg: Seg::Normal(0), off: Off(3) }]);
+    assert_eq!(fallthrough, Some(SegOff { seg: Seg::Normal(0), off: Off(2) }));
+  }
+
+  #[test]
+  fn cross_segment_far_jump_ends_the_block() {
+    // `jmp far 1234:0100` (EA 00 01 34 12) leaves the analyzed
+    // segment: the analysis stops the block there instead of decoding
+    // in another segment's address space.
+    let d = details_for(&[0xEA, 0x00, 0x01, 0x34, 0x12]);
+    assert!(matches!(d.next, Next::Transfer));
+  }
+
+  #[test]
+  fn far_jump_in_an_overlay_ends_the_block() {
+    // In an overlay the segment value in the code belongs to the
+    // original program's address space, so the analysis cannot resolve
+    // the target and stops the block.
+    let d = details_for_seg(&[0xEA, 0x05, 0x00, 0x00, 0x00], Seg::Overlay(0));
+    assert!(matches!(d.next, Next::Transfer));
+  }
+
+  #[test]
+  fn indirect_far_jump_ends_the_block() {
+    // `jmp far [0x1234]` (FF 2E 34 12): the target is read from memory
+    // at run time, so there is no address to continue at.
+    let d = details_for(&[0xFF, 0x2E, 0x34, 0x12]);
+    assert!(matches!(d.next, Next::Transfer));
   }
 }
