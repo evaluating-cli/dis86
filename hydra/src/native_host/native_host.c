@@ -199,16 +199,40 @@ static void kbd_write(void *dev, const hydra_backend_t *be, void *be_st,
    * keyboard up at boot. */
 }
 
-/* --- PIT (8253/8254): 0x40-0x42 counters, 0x43 control ------------ */
+/* --- PIT (8253/8254): 0x40-0x42 counters, 0x43 control ------------
+ *
+ * Deliberately partial model, and the gaps are listed here because a guest
+ * that depends on one of them has to fail visibly rather than mysteriously:
+ *
+ *   - Only the counting behaviour is modelled. Modes 0 and 3 are not
+ *     distinguished: the count decrements by one per tick, where a real
+ *     channel in mode 3 decrements by two per input clock. A guest that
+ *     measures elapsed time from a mode-3 counter therefore sees roughly
+ *     half the rate it expects.
+ *   - The channel-3 read-back command and the BCD bit are accepted and
+ *     ignored (see pit_write_control). The count reported is always binary
+ *     and always read through the channel's programmed access mode. Failing
+ *     on them would kill guests that probe for an 8254 at boot.
+ *   - Device state (this struct and the keyboard's) is not part of
+ *     state_save/state_restore, which covers guest memory and registers
+ *     only. A restored snapshot leaves the PIT counting from the process
+ *     start, not from whatever the guest's timer had reached when it was
+ *     saved.
+ */
 
 #define PIT_HZ 1193182ull
 
 typedef struct {
   struct timespec start;
   uint16_t reload[3];
-  uint8_t  read_hi[3];   /* next byte to return: 0 = low, 1 = high */
-  uint8_t  write_hi[3];  /* low/high sequencing of a reload write */
-  uint8_t  mode[3];      /* access mode from the control word */
+  uint8_t  read_hi[3];   /* lo/hi sequencing of a read (RW=11 only) */
+  uint8_t  write_hi[3];  /* lo/hi sequencing of a reload write (RW=11 only) */
+  uint8_t  rw[3];        /* access mode: 1 = LSB only, 2 = MSB only,
+                          * 3 = low then high. Never 0: RW=00 in a control
+                          * word is the counter-latch command, not a mode,
+                          * so it must not overwrite what was programmed. */
+  uint16_t latch[3];     /* count frozen by the RW=00 latch command */
+  uint8_t  latched[3];   /* 1 = reads return latch[] until it is drained */
 } pit_dev_t;
 
 static pit_dev_t g_pit;
@@ -239,9 +263,38 @@ static uint8_t pit_read(void *dev, const hydra_backend_t *be, void *be_st,
   (void)be_st;
   pit_dev_t *p = (pit_dev_t *)dev;
   int ch = (int)(port - 0x40);
-  uint16_t c = pit_count(p, ch);
-  uint8_t byte = p->read_hi[ch] ? (uint8_t)(c >> 8) : (uint8_t)(c & 0xffu);
-  p->read_hi[ch] ^= 1u;
+
+  /* A pending latch is what reads return; otherwise the count is live. */
+  uint16_t c = p->latched[ch] ? p->latch[ch] : pit_count(p, ch);
+
+  /* The access mode decides which byte a read returns - a real 8253 does
+   * not alternate unless RW=11 says to. Anything other than 1/2/3 is a
+   * broken invariant (the latch command never writes one), so fail loud
+   * rather than quietly falling into a mode nobody programmed. */
+  uint8_t byte;
+  switch (p->rw[ch]) {
+    case 1:                                  /* RW=01: LSB only, every read */
+      byte = (uint8_t)(c & 0xffu);
+      break;
+    case 2:                                  /* RW=10: MSB only, every read */
+      byte = (uint8_t)(c >> 8);
+      break;
+    case 3:                                  /* RW=11: low, then high */
+      byte = p->read_hi[ch] ? (uint8_t)(c >> 8) : (uint8_t)(c & 0xffu);
+      p->read_hi[ch] ^= 1u;
+      break;
+    default:
+      FAIL("native host: PIT channel %d has no access mode programmed "
+           "(rw=%d)", ch, (int)p->rw[ch]);
+      break;
+  }
+
+  /* The latch is consumed by the reads that return it: one byte for a
+   * single-byte access mode, two for lo/hi (read_hi has just wrapped back
+   * to 0, meaning the high byte was the one returned). */
+  if (p->latched[ch] && (p->rw[ch] != 3 || p->read_hi[ch] == 0))
+    p->latched[ch] = 0;
+
   return byte;
 }
 
@@ -254,11 +307,29 @@ static void pit_write_control(void *dev, const hydra_backend_t *be,
   pit_dev_t *p = (pit_dev_t *)dev;
   uint8_t ch = (uint8_t)((val >> 6) & 3u);
 
-  if (ch == 3)                     /* read-back command: not modelled */
+  if (ch == 3) {
+    /* Read-back command: not modelled, and neither is the BCD bit below.
+     * Both are accepted silently rather than failed, because a guest that
+     * probes for an 8254 must not be killed by one; the count this device
+     * reports is always binary and always read through the access mode. */
     return;
-  p->mode[ch] = (uint8_t)((val >> 4) & 3u);
+  }
+
+  uint8_t rw = (uint8_t)((val >> 4) & 3u);
+  if (rw == 0) {
+    /* RW=00 is the counter-latch command, NOT an access mode: it freezes a
+     * snapshot of the live count so a latch-then-read pair cannot tear
+     * across a low-byte carry, and it leaves the programmed mode alone. */
+    p->latch[ch] = pit_count(p, ch);
+    p->latched[ch] = 1;
+    p->read_hi[ch] = 0;
+    return;
+  }
+
+  p->rw[ch] = rw;
   p->read_hi[ch] = 0;
-  p->write_hi[ch] = 0;             /* mode 0 = counter latch, also resets */
+  p->write_hi[ch] = 0;
+  p->latched[ch] = 0;              /* programming a counter clears its latch */
 }
 
 static void pit_write_counter(void *dev, const hydra_backend_t *be,
@@ -268,15 +339,25 @@ static void pit_write_counter(void *dev, const hydra_backend_t *be,
   (void)be_st;
   pit_dev_t *p = (pit_dev_t *)dev;
   int ch = (int)(port - 0x40);
-  uint8_t mode = p->mode[ch] ? p->mode[ch] : 3u;
 
-  if (mode == 1) {                          /* low byte only */
+  /* The access mode is whatever the last control word programmed: rw[] is
+   * initialised to lo/hi, and a latch command does not touch it, so there is
+   * no "unprogrammed" fallback for a stray latch to have corrupted. */
+  if (p->rw[ch] == 1) {                     /* RW=01: LSB only */
     p->reload[ch] = val;
     clock_gettime(CLOCK_MONOTONIC, &p->start);
-  } else if (mode == 2) {                   /* high byte only */
-    p->reload[ch] = (uint16_t)(val << 8);
+    return;
+  }
+  if (p->rw[ch] == 2) {                     /* RW=10: MSB only */
+    p->reload[ch] = (uint16_t)((uint16_t)val << 8);
     clock_gettime(CLOCK_MONOTONIC, &p->start);
-  } else if (p->write_hi[ch] == 0) {        /* low, then high */
+    return;
+  }
+  if (p->rw[ch] != 3)
+    FAIL("native host: PIT channel %d has no access mode programmed (rw=%d)",
+         ch, (int)p->rw[ch]);
+
+  if (p->write_hi[ch] == 0) {               /* RW=11: low, then high */
     p->reload[ch] = (uint16_t)((p->reload[ch] & 0xff00u) | val);
     p->write_hi[ch] = 1;
   } else {
@@ -315,6 +396,12 @@ static void port_devices_init(void)
   /* A zero reload means "full period" to a real 8253, which pit_count()
    * already maps to 0x10000, so leaving it zero is the correct default. */
   clock_gettime(CLOCK_MONOTONIC, &g_pit.start);
+  /* No control word has been written yet. A real 8253 is undefined until
+   * one arrives; lo/hi is what nearly every guest programs, and it must be
+   * set explicitly because the zero bytes above would otherwise read as
+   * "this channel's access mode is the latch command". */
+  for (int i = 0; i < 3; i++)
+    g_pit.rw[i] = 3;
 }
 
 static uint8_t native_io_in8(hydra_machine_ctx_t *ctx, uint16_t port)
