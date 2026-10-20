@@ -305,6 +305,12 @@ int hydra_exec_run_special_modes(hydra_machine_t *m, addr_t addr, int *_done) {
 
 int hydra_exec_run(hydra_machine_t *m)
 {
+  /* The exit code belongs to the run that produced it. Clearing it here
+   * means a driver that reads it after a non-terminating run sees -1, not
+   * the previous guest's code (issue #95 Tier 2 runs more than one guest
+   * in a process). */
+  last_exit_code = -1;
+
   addr_t s = ADDR_MAKE(m->registers->cs, m->registers->ip);
 
   // Handle special capture/restore modes

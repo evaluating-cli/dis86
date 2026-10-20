@@ -91,7 +91,9 @@ HYDRA_MACHINE_STEP_HOOK_FUNC(hydra_machine_step_hook);
 
 /* The exit code of the guest that terminated, or -1 if no guest has
  * terminated yet. Only meaningful after hydra_machine_exec() returned
- * HYDRA_EXEC_TERMINATED. */
+ * HYDRA_EXEC_TERMINATED, and only until the next hydra_machine_exec()
+ * call: the exec layer clears it on every run, so a driver that reads it
+ * after a non-terminating run sees -1 rather than an earlier guest's code. */
 int hydra_machine_exit_code(void);
 
 typedef HYDRA_MACHINE_INIT_FUNC((*hydra_machine_init_fn_t));

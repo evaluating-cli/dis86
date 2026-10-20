@@ -315,10 +315,10 @@ static int g_probe_exit_code;
  * look exactly like a child that reported the code and carried on. */
 static int g_probe_int_result = -1;
 
-/* The byte the child reports: the exit code the primitive returned, or
- * PROBE_INT_CONTINUED when the interrupt was serviced and the guest
- * continues. 0xFF cannot be an exit code, so the two are unambiguous. */
-#define PROBE_INT_CONTINUED 0xFF
+/* The result travels as an int, not as a byte: the exit code is AL, so every
+ * byte value is a legal exit code (0..255) and none of them can serve as a
+ * sentinel for "the interrupt was serviced and the guest continues". The
+ * primitive returns -1 for that case, and -1 is not a legal exit code. */
 
 static void probe_impl_exit(void)
 {
@@ -354,24 +354,22 @@ static int probe_int_reports(void (*probe)(void), int expected)
   if (pid == 0) {
     close(fds[0]);
     probe();
-    unsigned char byte = (g_probe_int_result < 0)
-                             ? (unsigned char)PROBE_INT_CONTINUED
-                             : (unsigned char)g_probe_int_result;
-    ssize_t n = write(fds[1], &byte, 1);
+    int result = g_probe_int_result;
+    ssize_t n = write(fds[1], &result, sizeof result);
     (void)n;
     fflush(stdout);
     _exit(PROBE_NO_EXIT_STATUS);        /* the hook must not end the process */
   }
   close(fds[1]);
-  unsigned char byte = 0;
-  ssize_t n = read(fds[0], &byte, 1);    /* ends when the child closes it */
+  int got = 0;
+  ssize_t n = read(fds[0], &got, sizeof got);  /* ends when the child closes it */
   close(fds[0]);
   int status = 0;
   if (waitpid(pid, &status, 0) != pid)
     return 0;
   if (stdin_flags >= 0)
     fcntl(STDIN_FILENO, F_SETFL, stdin_flags);
-  return n == 1 && byte == (unsigned char)expected &&
+  return n == (ssize_t)sizeof got && got == expected &&
          WIFEXITED(status) && WEXITSTATUS(status) == PROBE_NO_EXIT_STATUS;
 }
 
@@ -493,11 +491,21 @@ static void probe_guest_termination(void)
   int ret = HYDRA_EXEC_RESUME;
   while (calls < 10) {
     ret = hydra_machine_exec(&m, 0);
+
+    /* Hydra's callstack bookkeeping is a two-phase event: the exec records
+     * it and the host must drain it with notify() (the dosemu host driver
+     * does this right after every exec). */
+    hydra_machine_notify(&m);
+
     calls++;
     if (ret != HYDRA_EXEC_REDIRECT)
       break;
   }
 
+  /* One call is structural, not a coincidence: the hook is registered at
+   * 0:0 and the machine starts at CS:IP = 0:0, so the very first dispatch is
+   * the terminating one. A second call would mean the guest kept running
+   * after it had already asked to terminate. */
   int code = hydra_machine_exit_code();
   if (ret != HYDRA_EXEC_TERMINATED || code != 0x05 || g_post_int_ran || calls != 1)
     _exit(PROBE_DRIVER_FAILED);
@@ -646,8 +654,15 @@ int hydra_backend_linktest(hydra_machine_t *m)
   g_probe_exit_code = 0x00;
   TCHECK(probe_int_reports(probe_impl_exit, 0x00),
          "wiring: INT 21h AH=4Ch reports 0 when AL is 0");
-  /* A serviced interrupt says so: the guest continues. */
-  TCHECK(probe_int_reports(probe_impl_serviced, PROBE_INT_CONTINUED),
+  /* 255 is a legal exit code, and every byte value is one, so the report
+   * must not be packed into a byte with a sentinel: this case is what a
+   * single-byte protocol would have confused with "the guest continues". */
+  g_probe_exit_code = 0xFF;
+  TCHECK(probe_int_reports(probe_impl_exit, 0xFF),
+         "wiring: INT 21h AH=4Ch reports 255 (every byte is a legal code)");
+  /* A serviced interrupt says so: the guest continues. -1 is not a legal
+   * exit code, so the two cannot be confused. */
+  TCHECK(probe_int_reports(probe_impl_serviced, -1),
          "wiring: a serviced interrupt continues the guest");
   TCHECK(probe_aborts(probe_impl_no_context),
          "wiring: primitive with no execution context aborts, not SIGSEGV");
