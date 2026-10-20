@@ -80,6 +80,84 @@ static uint8_t *native_mem_hostaddr(hydra_machine_ctx_t *ctx, uint32_t addr)
   return &nc->mem[addr];
 }
 
+/********************************************************************/
+/* text window: guest stores into video memory (B8000h / B0000h).
+ *
+ * A text-mode guest that draws by writing straight into the text window
+ * bypasses the BIOS completely, and before this the store landed in the flat
+ * array where nothing ever rendered it. Mirror those stores into the active
+ * backend's shadow buffer so the canonical DOS text idiom is visible.
+ *
+ * The flat array stays authoritative: the mirror is a projection of it, never
+ * a replacement, so a guest that reads back what it wrote sees its own bytes
+ * even when no backend renders anything. Writes to a window the backend does
+ * not display (page 1+, or B8000h while in MDA mode) keep their old behaviour:
+ * they land in guest memory and render nowhere, which is what the real
+ * hardware address space does too.
+ *
+ * Only the two accessors below are mirrored. Stores that go through a pointer
+ * from mem_hostaddr() bypass this, which is deliberate: those are Hydra's own
+ * bookkeeping — raw-code slots and the data-section base — not guest drawing.
+ */
+
+#define TEXT_WINDOW_SCAN_START 0xA0000u
+#define TEXT_WINDOW_SCAN_END   0xC0000u
+
+static void text_window_byte(const hydra_backend_t *be, void *st,
+                             const hydra_text_geometry_t *geo, uint32_t off,
+                             uint8_t val)
+{
+  const uint32_t cell = off / 2u;
+  const uint8_t row = (uint8_t)(cell / geo->cols);
+  const uint8_t col = (uint8_t)(cell % geo->cols);
+  uint8_t ch = 0, attr = 0;
+
+  if (be->get_cell(st, row, col, &ch, &attr) < 0)
+    return;
+  if (off & 1u)
+    attr = val;
+  else
+    ch = val;
+  be->putchar_text(st, row, col, ch, attr);
+}
+
+static void text_window_store(uint32_t addr, size_t width, uint16_t val)
+{
+  /* Fast path: ordinary guest stores are outside the video range, and one
+   * compare keeps them from ever reaching the backend. */
+  if (addr < TEXT_WINDOW_SCAN_START || addr >= TEXT_WINDOW_SCAN_END)
+    return;
+
+  /* A backend is always selected before guest code can run (hydra_user_init),
+   * so this is a plain read, not a lazy initialisation. */
+  void *st = NULL;
+  const hydra_backend_t *be = hydra_native_backend_active(&st);
+  if (!be->text_geometry || !be->putchar_text || !be->get_cell)
+    return;
+
+  hydra_text_geometry_t geo;
+  if (be->text_geometry(st, &geo) != 0 || geo.base == 0 || addr < geo.base)
+    return;
+
+  const uint32_t off = addr - geo.base;
+  const uint32_t window_bytes = (uint32_t)geo.rows * (uint32_t)geo.cols * 2u;
+  if (off + width > window_bytes)
+    return;
+
+  /* An aligned word store is one cell. An odd-aligned word store is two bus
+   * cycles on 8086-class hardware, so route it as two byte stores rather than
+   * inventing a word-level video protocol. */
+  if (width == 2 && (off & 1u) == 0) {
+    const uint32_t cell = off / 2u;
+    be->putchar_text(st, (uint8_t)(cell / geo.cols), (uint8_t)(cell % geo.cols),
+                     (uint8_t)(val & 0xff), (uint8_t)(val >> 8));
+    return;
+  }
+  text_window_byte(be, st, &geo, off, (uint8_t)(val & 0xff));
+  if (width == 2)
+    text_window_byte(be, st, &geo, off + 1u, (uint8_t)(val >> 8));
+}
+
 static uint8_t native_mem_read8(hydra_machine_ctx_t *ctx, uint32_t addr)
 {
   native_host_ctx_t *nc = native_ctx_of(ctx);
@@ -99,6 +177,7 @@ static void native_mem_write8(hydra_machine_ctx_t *ctx, uint32_t addr, uint8_t v
   native_host_ctx_t *nc = native_ctx_of(ctx);
   mem_bounds_check(addr, 1);
   nc->mem[addr] = val;
+  text_window_store(addr, 1, val);
 }
 
 static void native_mem_write16(hydra_machine_ctx_t *ctx, uint32_t addr, uint16_t val)
@@ -107,6 +186,7 @@ static void native_mem_write16(hydra_machine_ctx_t *ctx, uint32_t addr, uint16_t
   mem_bounds_check(addr, 2);
   nc->mem[addr] = (uint8_t)(val & 0xff);
   nc->mem[addr + 1] = (uint8_t)(val >> 8);
+  text_window_store(addr, 2, val);
 }
 
 /********************************************************************/
