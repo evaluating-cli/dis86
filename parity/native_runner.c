@@ -119,26 +119,34 @@ int main(int argc, char **argv)
     m.registers->ip = 0;
     m.registers->sp = ENTRY_SP;
 
-    /* Guest termination is process-wide, not a return value: if the fixture
-     * ever reaches INT 21h AH=4Ch, the native host ends the process from
-     * inside the INT hook and control never comes back here. That means none
-     * of the reporting below runs — no outbox_scan, no verify, no snapshot —
-     * and a guest exiting with AL=0 is indistinguishable from this runner
-     * succeeding. Today's fixture parks instead of terminating
-     * (fixture.asm drives AH=4Ch only in the lane's planned v2), so this is
-     * latent. Before v2 lands, the reporting either has to move into an
-     * atexit handler registered after hydra_machine_init, or termination has
-     * to become something the exec loop can observe. See the "Guest
-     * termination" note in hydra/README.md. */
+    /* Guest termination is a result the exec loop reports, not a process
+     * exit: when the fixture asks to terminate (INT 21h AH=4Ch), the core
+     * stops the hook at the interrupt — the guest's post-INT code never
+     * runs — and hydra_machine_exec returns HYDRA_EXEC_TERMINATED. Control
+     * comes back here, so the reporting below (outbox_scan, verify,
+     * snapshot) runs before this process ends, and the guest's exit code is
+     * known to the driver instead of being swallowed by an exit() nobody
+     * could report from.
+     *
+     * Today's fixture parks instead of terminating (fixture.asm drives
+     * AH=4Ch only in the lane's planned v2), so this branch is not taken yet
+     * — it is here because the lane's v2 needs it, and because a driver that
+     * cannot tell "the guest finished" from "the guest is stuck" is the
+     * failure mode the livelock cap below only detects after 100000 steps. */
+    int guest_exit_code = -1;
     for (;;) {
-        int running = hydra_machine_exec(&m, 0);
+        int ret = hydra_machine_exec(&m, 0);
 
         /* Hydra's callstack bookkeeping is a two-phase event: the exec
          * records it and the host must drain it with notify() (the dosemu
          * host driver does this right after every exec). */
         hydra_machine_notify(&m);
 
-        if (!running)
+        if (ret == HYDRA_EXEC_TERMINATED) {
+            guest_exit_code = hydra_machine_exit_code();
+            break;
+        }
+        if (ret == HYDRA_EXEC_RESUME)
             break;
         if (++steps > 100000) {
             fprintf(stderr, "native_runner: livelocked at %04x:%04x after "
@@ -165,5 +173,11 @@ int main(int argc, char **argv)
 
     printf("native: PASS (steps=%d, outbox at module 0x%04x)\n",
            steps, (unsigned)(header - ctx->mem - base));
+    if (guest_exit_code >= 0)
+        printf("native: guest exit code %d\n", guest_exit_code);
+    /* The exit status of this process is the lane's verdict, not the guest's
+     * exit code: a guest that exits with a non-zero code is a normal
+     * outcome, and reporting it as a lane failure would make the parity
+     * comparison unreachable. */
     return 0;
 }

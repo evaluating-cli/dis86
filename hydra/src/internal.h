@@ -39,18 +39,20 @@ extern hydra_mode_t HYDRA_MODE[1];
  * which reserves no raw-code region. Hosts that run raw code (dosemu2)
  * never reach it, and hosts that provide no symbol leave it NULL.
  *
- * Return convention:
- *   0   the interrupt was serviced
- *   1   the guest requested termination (exit code in AL). A host that reaches
- *       this state must end the process itself and must not return: INT 21h
- *       AH=4Ch does not return, so letting the decompiled hook continue would
- *       run code the guest never meant to reach. Ending the process is the
- *       host's call, not the core's, because only the host knows what teardown
- *       has to happen first.
+ * Return convention (the named value is declared in hydra_machine.h, which
+ * the hook's translation unit does include):
+ *   0   the interrupt was serviced; the guest continues
+ *   HYDRA_USER_INT_TERMINATE
+ *       the guest requested termination (exit code in AL). The core stops
+ *       the hook at the interrupt and reports the termination to the host
+ *       driver as HYDRA_EXEC_TERMINATED: INT 21h AH=4Ch does not return,
+ *       so letting the decompiled hook continue would run code the guest
+ *       never meant to reach. Ending the process is the driver's call,
+ *       because only the driver knows what reporting has to happen first.
  *   <0  not handled by this host
  *
- * Anything else is a host that failed to service the INT; hydra_impl_int fails
- * loud on it. The core never exits the process on any return value.
+ * Anything else is a host that failed to service the INT; hydra_impl_int
+ * fails loud on it. The core never exits the process on any return value.
  */
 
 extern int (*hydra_user_int_hook)(hydra_machine_t *m, u8 num);
@@ -121,6 +123,7 @@ int hydra_exec_run(hydra_machine_t *m);
 
 /* Exposed for the dosemu2 host driver (host_driver.c). */
 int   hydra_exec_last_result_type(void);
+int   hydra_exec_last_exit_code(void);
 u16   hydra_exec_active_id(void);
 size_t hydra_exec_hook_dispatch_count(void);
 

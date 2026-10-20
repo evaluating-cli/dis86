@@ -306,14 +306,73 @@ static void probe_impl_unhandled(void)
 #define PROBE_NO_EXIT_STATUS 0xFE
 
 /* Exit code for probe_impl_exit, so one probe can check that AL is what the
- * process actually exits with. */
+ * core reports. */
 static int g_probe_exit_code;
+
+/* What hydra_impl_int() returned in the child. The parent reads it over a
+ * pipe rather than through the exit status: the previous contract ended the
+ * process from inside the hook, so a child that exited with the code would
+ * look exactly like a child that reported the code and carried on. */
+static int g_probe_int_result = -1;
+
+/* The byte the child reports: the exit code the primitive returned, or
+ * PROBE_INT_CONTINUED when the interrupt was serviced and the guest
+ * continues. 0xFF cannot be an exit code, so the two are unambiguous. */
+#define PROBE_INT_CONTINUED 0xFF
 
 static void probe_impl_exit(void)
 {
   /* AH=4Ch (terminate), AL = exit code */
   g_probe_m->registers->ax = 0x4c00u | (uint8_t)g_probe_exit_code;
-  hydra_impl_int(0x21);
+  g_probe_int_result = hydra_impl_int(0x21);
+}
+
+/* A serviced interrupt: the guest continues, so the primitive says so. */
+static void probe_impl_serviced(void)
+{
+  g_probe_m->registers->ax = 0x0200;     /* INT 21h AH=02h */
+  g_probe_int_result = hydra_impl_int(0x21);
+}
+
+/* The child must survive the interrupt and report what the primitive
+ * returned. Both halves matter: the byte proves the code, and the sentinel
+ * exit status proves the hook did not end the process — the core reports a
+ * termination now, it does not act on it. */
+static int probe_int_reports(void (*probe)(void), int expected)
+{
+  int fds[2];
+  if (pipe(fds) != 0)
+    return 0;
+  fflush(stdout);
+  int stdin_flags = fcntl(STDIN_FILENO, F_GETFL, 0);
+  pid_t pid = fork();
+  if (pid < 0) {
+    close(fds[0]);
+    close(fds[1]);
+    return 0;
+  }
+  if (pid == 0) {
+    close(fds[0]);
+    probe();
+    unsigned char byte = (g_probe_int_result < 0)
+                             ? (unsigned char)PROBE_INT_CONTINUED
+                             : (unsigned char)g_probe_int_result;
+    ssize_t n = write(fds[1], &byte, 1);
+    (void)n;
+    fflush(stdout);
+    _exit(PROBE_NO_EXIT_STATUS);        /* the hook must not end the process */
+  }
+  close(fds[1]);
+  unsigned char byte = 0;
+  ssize_t n = read(fds[0], &byte, 1);    /* ends when the child closes it */
+  close(fds[0]);
+  int status = 0;
+  if (waitpid(pid, &status, 0) != pid)
+    return 0;
+  if (stdin_flags >= 0)
+    fcntl(STDIN_FILENO, F_SETFL, stdin_flags);
+  return n == 1 && byte == (unsigned char)expected &&
+         WIFEXITED(status) && WEXITSTATUS(status) == PROBE_NO_EXIT_STATUS;
 }
 
 /* --- does the teardown actually run? ------------------------------------ */
@@ -342,12 +401,17 @@ static const hydra_backend_t ATEXIT_PROBE_BACKEND = {
   .shutdown = atexit_probe_shutdown,
 };
 
-/* Child side: swap in the probe backend, then terminate as a guest would. */
+/* Child side: swap in the probe backend, terminate as a guest would, and
+ * then exit the way a host driver does - with the guest's exit code. The
+ * termination itself no longer ends the process: the core reports it and
+ * the driver decides. */
+static int g_atexit_exit_code;
+
 static void probe_impl_exit_atexit_probe(void)
 {
   hydra_native_backend_install_probe(&ATEXIT_PROBE_BACKEND, NULL);
   g_probe_m->registers->ax = 0x4c10u;      /* AH=4Ch, AL=0x10 */
-  hydra_impl_int(0x21);
+  g_atexit_exit_code = hydra_impl_int(0x21);
 }
 
 /* Parent side: the child must exit with AL (0x10) *and* the handler must have
@@ -371,7 +435,9 @@ static int probe_atexit_ran(void)
     g_atexit_pipe = fds[1];
     probe_impl_exit_atexit_probe();
     fflush(stdout);
-    _exit(PROBE_NO_EXIT_STATUS);           /* did not terminate */
+    /* exit(), not _exit(): a driver leaves through the normal exit path, and
+     * that is the path the atexit teardown hangs off. */
+    exit(g_atexit_exit_code < 0 ? PROBE_NO_EXIT_STATUS : g_atexit_exit_code);
   }
   close(fds[1]);
   char byte = 0;
@@ -382,6 +448,83 @@ static int probe_atexit_ran(void)
     return 0;
   return n == 1 && byte == 'X' &&
          WIFEXITED(status) && WEXITSTATUS(status) == 0x10;
+}
+
+/* --- the guest's termination, end to end (issue #114) ---------------------- */
+
+/* The guest the issue names: B8 05 4C CD 21 (mov ax, 0x4c05; int 21h). The
+ * hook body below is its decompiled form, plus a marker statement after the
+ * INT that must never run: INT 21h AH=4Ch does not return, and whatever the
+ * decompiler emitted after it is code the guest never meant to reach. */
+static int g_post_int_ran;
+
+static hydra_result_t probe_terminating_hook(hydra_machine_t *m)
+{
+  AX = 0x4c05;
+  INT(0x21);
+  g_post_int_ran = 1;
+  return HYDRA_RESULT_RESUME();
+}
+
+/* Status the child exits with when one of its own checks fails, so the
+ * parent can tell "the guest exited with 5" from "the driver's check
+ * failed". */
+#define PROBE_DRIVER_FAILED 0xE0
+
+/* The driver: run the machine until it stops, then report and exit with the
+ * guest's code. The exec loop must report the termination by itself - one
+ * call, no livelock cap - and the code after the INT must not have run. */
+static void probe_guest_termination(void)
+{
+  hydra_machine_t m = {0};
+  hydra_machine_audio_t audio = {0};
+
+  hydra_machine_init(m.hardware, &audio, "native|code_load=0|data_seg=0");
+  hydra_impl_register_addr(probe_terminating_hook, 0, 0, 0);
+
+  m.registers->cs = 0;
+  m.registers->ip = 0;
+  m.registers->ds = 0;
+  m.registers->es = 0;
+  m.registers->ss = 0;
+  m.registers->sp = 0x100;
+
+  int calls = 0;
+  int ret = HYDRA_EXEC_RESUME;
+  while (calls < 10) {
+    ret = hydra_machine_exec(&m, 0);
+    calls++;
+    if (ret != HYDRA_EXEC_REDIRECT)
+      break;
+  }
+
+  int code = hydra_machine_exit_code();
+  if (ret != HYDRA_EXEC_TERMINATED || code != 0x05 || g_post_int_ran || calls != 1)
+    _exit(PROBE_DRIVER_FAILED);
+
+  /* The driver reports first and exits with the guest's code afterwards. */
+  _exit(code);
+}
+
+/* Parent side: the child must exit with the guest's exit code (5). */
+static int probe_guest_terminates(void)
+{
+  fflush(stdout);
+  int stdin_flags = fcntl(STDIN_FILENO, F_GETFL, 0);
+  pid_t pid = fork();
+  if (pid < 0)
+    return 0;
+  if (pid == 0) {
+    probe_guest_termination();
+    fflush(stdout);
+    _exit(PROBE_DRIVER_FAILED);           /* the driver must have exited */
+  }
+  int status = 0;
+  if (waitpid(pid, &status, 0) != pid)
+    return 0;
+  if (stdin_flags >= 0)
+    fcntl(STDIN_FILENO, F_SETFL, stdin_flags);
+  return WIFEXITED(status) && WEXITSTATUS(status) == 0x05;
 }
 
 /* Finding 5: with no execution context installed, a primitive used to
@@ -494,25 +637,33 @@ int hydra_backend_linktest(hydra_machine_t *m)
   g_probe_m = &exec.machine;
   TCHECK(probe_aborts(probe_impl_unhandled),
          "wiring: unhandled vector via hydra_impl_int aborts");
-  /* INT 21h AH=4Ch ends the process with the exit code from AL. Check a
-   * distinctive non-zero value as well as zero, so a hardcoded status could
-   * not pass by accident. */
+  /* INT 21h AH=4Ch reports the exit code from AL; it does not end the
+   * process. Check a distinctive non-zero value as well as zero, so a
+   * hardcoded value could not pass by accident. */
   g_probe_exit_code = 0x42;
-  TCHECK(probe_exits_with(probe_impl_exit, 0x42),
-         "wiring: INT 21h AH=4Ch exits with the code from AL");
+  TCHECK(probe_int_reports(probe_impl_exit, 0x42),
+         "wiring: INT 21h AH=4Ch reports the code from AL");
   g_probe_exit_code = 0x00;
-  TCHECK(probe_exits_with(probe_impl_exit, 0x00),
-         "wiring: INT 21h AH=4Ch exits 0 when AL is 0");
+  TCHECK(probe_int_reports(probe_impl_exit, 0x00),
+         "wiring: INT 21h AH=4Ch reports 0 when AL is 0");
+  /* A serviced interrupt says so: the guest continues. */
+  TCHECK(probe_int_reports(probe_impl_serviced, PROBE_INT_CONTINUED),
+         "wiring: a serviced interrupt continues the guest");
   TCHECK(probe_aborts(probe_impl_no_context),
          "wiring: primitive with no execution context aborts, not SIGSEGV");
   /* Expects the sentinel: nop must not end the process. Expecting 0 here would
    * make this pass whether or not nop ever exits. */
   TCHECK(probe_exits_with(probe_impl_nop_no_context, PROBE_NO_EXIT_STATUS),
          "wiring: nop with no execution context stays a no-op");
-  /* The teardown itself, not just the status: a child that exits through the
-   * guest-termination path must run the backend's atexit handler. */
+  /* The teardown itself, not just the status: a driver that exits after a
+   * guest termination must run the backend's atexit handler. */
   TCHECK(probe_atexit_ran(),
          "wiring: guest termination runs the backend atexit teardown");
+  /* End to end: the exec loop reports the termination to the driver, which
+   * can then exit with the guest's code - and the guest's post-INT code did
+   * not run. */
+  TCHECK(probe_guest_terminates(),
+         "wiring: the driver observes the termination and the guest's code");
 
 done:
   /* Leave the execution context as we found it, including on an early exit. */

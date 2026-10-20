@@ -247,12 +247,15 @@ void hydra_impl_outb(u16 port, u8 val)
   m->registers->dx = save_dx;
 }
 
-void hydra_impl_int(u8 num)
+int hydra_impl_int(u8 num)
 {
   if (hydra_raw_code_available()) {
     u8 machine_code[] = {0xcd, num, 0xcb};
     hydra_impl_raw_code(machine_code, ARRAY_SIZE(machine_code));
-    return;
+    /* The guest CPU executed the interrupt. Whatever it did with it, the
+     * guest continues: a terminating INT 21h AH=4Ch ends the guest process
+     * on that CPU, so the code after it never runs. */
+    return -1;
   }
 
   /* No guest CPU can execute the `int` here: this host reserved no raw-code
@@ -264,15 +267,20 @@ void hydra_impl_int(u8 num)
 
   int rc = hydra_user_int_hook ? hydra_user_int_hook(m, num) : -1;
   if (rc == 0)
-    return;
-  /* Termination is not handled here. Ending the process is the host's
-   * decision, not the core's: machine.c compiles into every host, including
-   * ones that must run their own epilogue before exiting. The native host
-   * performs the exit from inside hydra_user_int (see backend_host.c), which
-   * is also the only place that knows the backend teardown that has to run.
-   * Any non-zero return is therefore a host that failed to service the INT. */
-  FAIL("native host: INT %02xh was not serviced: no host handler is installed and "
-       "no raw-code region is reserved", (unsigned)num);
+    return -1;
+  if (rc == HYDRA_USER_INT_TERMINATE) {
+    /* The guest asked to terminate (INT 21h AH=4Ch). The exit code is in AL
+     * (DOS semantics), and it is reported to the caller so the hook can
+     * return a TERMINATE result: the guest's post-INT code must not run.
+     * Ending the process is the host driver's decision, not the core's:
+     * machine.c compiles into every host, and only the driver knows what
+     * reporting has to happen before the process goes away. */
+    return (int)(m->registers->ax & 0xff);
+  }
+  /* Anything else is a host that failed to service the INT. */
+  FAIL("native host: INT %02xh was not serviced: the host hook returned %d "
+       "(no host handler is installed, or it does not service this interrupt)",
+       (unsigned)num, rc);
 }
 
 u16 hydra_impl_inw(u16 port)
