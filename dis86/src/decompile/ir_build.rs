@@ -23,6 +23,18 @@ enum BranchTargets {
   Unresolved(branch::UnresolvedTransfer),
 }
 
+/// The outcome of resolving an indirect jump's target.
+enum IndirectTargets {
+  /// The config describes the jump table: these are its targets.
+  Resolved(Vec<SegOff>),
+  /// The jump is not of the config-described jump-table shape, so its
+  /// target is only known at run time.
+  NotTableShape,
+  /// The jump is of that shape, but the config has no table for it: a
+  /// missing annotation, not a run-time-only target.
+  NoConfigRegion,
+}
+
 /// How a transfer that is not a relative branch is modeled.
 enum Transfer {
   /// A far jump inside the function's own code segment: CS does not
@@ -220,23 +232,13 @@ impl<'a> IRBuilder<'a> {
     *self.addrmap.get(&effective).unwrap()
   }
 
-  /// Whether the memory operand has the shape of the config-described
-  /// jump table: `jmp WORD PTR cs:[bx+off]`.
-  fn is_jump_table_form(&self, m: &instr::OperandMem) -> bool {
-    m.sz == instr::Size::Size16 &&
-    m.sreg == instr::Reg::CS &&
-    m.reg1.is_some() &&
-    m.reg2.is_none() &&
-    m.off.is_some()
-  }
-
-  fn jump_indirect_targets(&self, ins: &instr::Instr, m: &instr::OperandMem) -> Option<Vec<SegOff>> {
+  fn jump_indirect_targets(&self, ins: &instr::Instr, m: &instr::OperandMem) -> IndirectTargets {
     // Matching jumps of the form: "jmp WORD PTR cs:[bx+0x6d7]"
-    if m.sz != instr::Size::Size16 { return None; }
-    if m.sreg != instr::Reg::CS    { return None; }
-    let Some(_) = m.reg1 else      { return None; };
-    if !m.reg2.is_none()           { return None; }
-    let Some(off) = m.off else     { return None; };
+    if m.sz != instr::Size::Size16 { return IndirectTargets::NotTableShape; }
+    if m.sreg != instr::Reg::CS    { return IndirectTargets::NotTableShape; }
+    let Some(_) = m.reg1 else      { return IndirectTargets::NotTableShape; };
+    if !m.reg2.is_none()           { return IndirectTargets::NotTableShape; };
+    let Some(off) = m.off else     { return IndirectTargets::NotTableShape; };
 
     // Construct a segoff address to the memory operand
     let addr = SegOff {
@@ -250,7 +252,7 @@ impl<'a> IRBuilder<'a> {
     // whole function (issue #112). The malformed-config panics below
     // stay: those describe a broken config, not an unsupported input.
     let Some(region) = self.cfg.text_region_lookup(addr, ins.addr) else {
-      return None;
+      return IndirectTargets::NoConfigRegion;
     };
 
     // Unpack the array type
@@ -278,7 +280,7 @@ impl<'a> IRBuilder<'a> {
       tgts.push(SegOff { seg: self.spec.start.seg, off });
     }
 
-    Some(tgts)
+    IndirectTargets::Resolved(tgts)
   }
 
   /// Branch targets of `ins`: the explicit targets plus, for branches
@@ -295,7 +297,7 @@ impl<'a> IRBuilder<'a> {
     // target table the config describes resolves to a set of targets.
     if ins.opcode == instr::Opcode::OP_JMP {
       if let Some(instr::Operand::Mem(m)) = ins.operands.get(0) {
-        if let Some(targets) = self.jump_indirect_targets(ins, m) {
+        if let IndirectTargets::Resolved(targets) = self.jump_indirect_targets(ins, m) {
           return Some(BranchTargets::Targets { targets, fallthrough: None });
         }
         // Otherwise the target is only known at run time: unresolved.
@@ -318,10 +320,19 @@ impl<'a> IRBuilder<'a> {
   /// belongs to the original program's address space, which this
   /// segment model does not represent, so every far jump there is
   /// unmodelled.
+  ///
+  /// The comparison is numeric: the encoded segment is a runtime segment
+  /// value, and the function's segment is the one it was loaded into.
+  /// That is the same assumption the rest of the decompiler makes about
+  /// segment values (see `process_callf`), and it is why the overlay
+  /// case is refused rather than compared.
   fn transfer_model(&self, kind: branch::UnresolvedTransfer) -> Transfer {
     let branch::UnresolvedTransfer::FarDirect { seg, off } = kind else {
       return Transfer::Unmodelled;
     };
+    // Belt and braces: `overlay` is derived from the start address
+    // being an overlay address, so the segment match below already
+    // rejects it.
     if self.overlay { return Transfer::Unmodelled; }
     let Seg::Normal(cur_seg) = self.spec.start.seg else { return Transfer::Unmodelled; };
     if seg != cur_seg { return Transfer::Unmodelled; }
@@ -1977,25 +1988,28 @@ impl IRBuilder<'_> {
             // table. Any other indirect jump has no statically known
             // target, so it ends the block loudly instead of aborting
             // the whole decompile (issue #112).
-            if let Some(targets) = self.jump_indirect_targets(ins, m) {
-              let Some(reg) = m.reg1 else {
-                panic!("Shouldn't fail.. should be checked by jump_indirect_targets already");
-              };
-              let reg_ref = self.ir.get_var(reg, self.cur);
-              self.append_jmptbl(reg_ref, targets);
-            } else {
+            match self.jump_indirect_targets(ins, m) {
+              IndirectTargets::Resolved(targets) => {
+                let Some(reg) = m.reg1 else {
+                  panic!("Shouldn't fail.. should be checked by jump_indirect_targets already");
+                };
+                let reg_ref = self.ir.get_var(reg, self.cur);
+                self.append_jmptbl(reg_ref, targets);
+              }
               // A jump of the config-described jump-table shape whose
               // table the config does not have is a missing annotation,
-              // not a runtime-only target: say so, so the operator can
+              // not a run-time-only target: say so, so the operator can
               // add the region.
-              let msg = if self.is_jump_table_form(m) {
-                format!("Unmodelled indirect jump '{}' at {} — the config has no jump table for it; emitting UNIMPL marker",
-                  instr_str(ins), ins.addr)
-              } else {
-                format!("Unmodelled indirect jump '{}' at {} — target is only known at run time; emitting UNIMPL marker",
-                  instr_str(ins), ins.addr)
-              };
-              self.append_unmodelled_transfer(ins, &msg);
+              IndirectTargets::NoConfigRegion => {
+                self.append_unmodelled_transfer(ins, &format!(
+                  "WARN: Unmodelled indirect jump '{}' at {} — the config has no jump table for it; emitting UNIMPL marker",
+                  instr_str(ins), ins.addr));
+              }
+              IndirectTargets::NotTableShape => {
+                self.append_unmodelled_transfer(ins, &format!(
+                  "WARN: Unmodelled indirect jump '{}' at {} — target is only known at run time; emitting UNIMPL marker",
+                  instr_str(ins), ins.addr));
+              }
             }
           }
           Some(instr::Operand::Rel(rel)) => {
@@ -2006,7 +2020,7 @@ impl IRBuilder<'_> {
           // known only at run time.
           _ => {
             self.append_unmodelled_transfer(ins, &format!(
-              "Unmodelled indirect jump '{}' at {} — target is only known at run time; emitting UNIMPL marker",
+              "WARN: Unmodelled indirect jump '{}' at {} — target is only known at run time; emitting UNIMPL marker",
               instr_str(ins), ins.addr));
           }
         }
@@ -2026,16 +2040,17 @@ impl IRBuilder<'_> {
             self.append_jmp(blkref);
           }
           Transfer::Unmodelled => {
+            // A far jump is either a direct one (an explicit segment) or
+            // an indirect one (the target is read from memory); the
+            // near-indirect kind never reaches this arm.
             let msg = match kind {
               branch::UnresolvedTransfer::FarDirect { seg, off } => format!(
-                "Unmodelled far jump '{}' at {} — target {:04x}:{:04x} is not in the function's code segment; emitting UNIMPL marker",
+                "WARN: Unmodelled far jump '{}' at {} — target {:04x}:{:04x} is not in the function's code segment; emitting UNIMPL marker",
                 instr_str(ins), ins.addr, seg, off),
               branch::UnresolvedTransfer::FarIndirect => format!(
-                "Unmodelled far jump '{}' at {} — target is read from memory at run time; emitting UNIMPL marker",
+                "WARN: Unmodelled far jump '{}' at {} — target is read from memory at run time; emitting UNIMPL marker",
                 instr_str(ins), ins.addr),
-              branch::UnresolvedTransfer::NearIndirect => format!(
-                "Unmodelled jump '{}' at {} — target is only known at run time; emitting UNIMPL marker",
-                instr_str(ins), ins.addr),
+              branch::UnresolvedTransfer::NearIndirect => unreachable!("a far jump is never near-indirect"),
             };
             self.append_unmodelled_transfer(ins, &msg);
           }
@@ -4111,6 +4126,53 @@ mod tests {
     // predecessor: it is unreachable, not a fallthrough.
     let after = ir.iter_blocks().find(|b| ir.block(*b).name == "addr_0005").expect("the fallthrough block");
     assert!(ir.block(after).preds.is_empty(), "the transfer must not create a fallthrough edge");
+  }
+
+  #[test]
+  fn unmodelled_jump_warnings_carry_the_warn_prefix() {
+    // The diagnostics are the product of this change: they must be
+    // greppable on a batch run, like the sibling #67 warning.
+    let (_types, cfg, binary, spec) = bit_test_builder(&[0xFF, 0x27, 0xC3]);
+    let instrs = decode_all(&binary, &spec);
+    let mut b = test_builder(&cfg, &instrs, &spec, &binary);
+    b.build();
+    assert!(b.warnings.iter().any(|w| w.contains("target is only known at run time")),
+      "an indirect jump must report a run-time-only target: {:?}", b.warnings);
+    assert!(b.warnings.iter().all(|w| w.starts_with("WARN: ")),
+      "every diagnostic must carry the WARN prefix: {:?}", b.warnings);
+  }
+
+  #[test]
+  fn a_jump_without_a_config_table_names_the_missing_annotation() {
+    // `jmp cs:[bx+0x6d7]` (2E FF A7 D7 06) is the shape of the
+    // config-described jump table. Without the table the target is
+    // unknown, and the diagnostic must say so: that wording is the
+    // operator's cue to add the region.
+    let (_types, cfg, binary, spec) = bit_test_builder(&[0x2E, 0xFF, 0xA7, 0xD7, 0x06, 0xC3]);
+    let instrs = decode_all(&binary, &spec);
+    let mut b = test_builder(&cfg, &instrs, &spec, &binary);
+    b.build();
+    assert!(b.warnings.iter().any(|w| w.contains("the config has no jump table for it")),
+      "the config-gap diagnostic must be specific: {:?}", b.warnings);
+    assert!(!b.warnings.iter().any(|w| w.contains("only known at run time")),
+      "the config-gap case must not be reported as a run-time-only target: {:?}", b.warnings);
+  }
+
+  #[test]
+  fn a_far_jump_in_an_overlay_is_unmodelled() {
+    // In an overlay the encoded segment belongs to the original
+    // program's address space, which this segment model does not
+    // represent, so a far jump there cannot be resolved.
+    let types = Rc::new(TypeDatabase::new());
+    let cfg = Config { types: types.clone(), structs: vec![], code_segs: vec![], funcs: vec![], indirects: vec![], globals: vec![], text_section: vec![] };
+    let binary = binary::Binary::from_raw(&[0xC3], None);
+    let spec = spec::Spec::from_start_and_end(
+      Some(SegOff { seg: Seg::Overlay(0), off: Off(0) }),
+      Some(SegOff { seg: Seg::Overlay(0), off: Off(1) }));
+    let b = IRBuilder::new(&cfg, &[], &spec, &binary, true, false);
+    let kind = crate::asm::branch::UnresolvedTransfer::FarDirect { seg: 0, off: 0x10 };
+    assert!(matches!(b.transfer_model(kind), Transfer::Unmodelled),
+      "an overlay far jump must not be treated as a same-segment jump");
   }
 
   #[test]

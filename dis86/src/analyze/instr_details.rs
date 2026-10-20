@@ -25,7 +25,10 @@ impl fmt::Display for ReturnKind {
 pub enum Next {
   Fallthrough(SegOff),     // ordinary instruction fallthrough
   Return(ReturnKind),      // return instr (block terminator)
-  Jump(Vec<SegOff>),       // jump targets (block terminator)
+  // Jump targets (block terminator) plus the implicit fallthrough of a
+  // conditional branch. The two are kept apart: a fallthrough is not a
+  // branch target, and it must not be reported as one.
+  Jump { targets: Vec<SegOff>, fallthrough: Option<SegOff> },
   // Control leaves the function: the block ends here and the analysis
   // does not follow the transfer. A far jump into another segment, or a
   // jump whose target is only known at run time, has no address in the
@@ -85,14 +88,11 @@ pub struct InstrDetails {
 /// keep its own copy of the table, which lost `LOOPE`/`LOOPNE` (so
 /// `--analyze` did not treat `loopne` as a branch) and reported every far
 /// jump as a hard error, losing the whole function's analysis.
-fn jump_targets(ins: &Instr, seg: Seg) -> Option<Next> {
+fn jump_targets(ins: &Instr, analyzed_seg: Seg) -> Option<Next> {
   match branch::branch_target(ins)? {
-    branch::BranchTarget::Relative { target, fallthrough } => {
-      let mut targets = vec![target];
-      if let Some(fallthrough) = fallthrough { targets.push(fallthrough); }
-      Some(Next::Jump(targets))
-    }
-    branch::BranchTarget::Unresolved(kind) => Some(unresolved_next(ins, kind, seg)),
+    branch::BranchTarget::Relative { target, fallthrough } =>
+      Some(Next::Jump { targets: vec![target], fallthrough }),
+    branch::BranchTarget::Unresolved(kind) => Some(unresolved_next(ins, kind, analyzed_seg)),
   }
 }
 
@@ -104,30 +104,37 @@ fn jump_targets(ins: &Instr, seg: Seg) -> Option<Next> {
 /// jump whose target is only known at run time) leaves the analyzed
 /// segment, so the block ends there: following it would decode bytes
 /// from the wrong address space.
-fn unresolved_next(ins: &Instr, kind: branch::UnresolvedTransfer, seg: Seg) -> Next {
+fn unresolved_next(ins: &Instr, kind: branch::UnresolvedTransfer, analyzed_seg: Seg) -> Next {
+  // The diagnostics go to stderr: `--analyze` writes the annotation
+  // report to stdout, and that report is a fragment to be pasted into a
+  // config source.
   let branch::UnresolvedTransfer::FarDirect { seg: far_seg, off } = kind else {
-    println!("WARN: {}: jump target is only known at run time; the analysis stops the block here",
+    eprintln!("WARN: {}: jump target is only known at run time; the analysis stops the block here",
       instr_str(ins));
     return Next::Transfer;
   };
   // Only a normal (non-overlay) segment can be compared: in an overlay
   // the segment value in the code belongs to the original program's
   // address space, which the analysis does not model.
-  let Seg::Normal(cur_seg) = seg else {
-    println!("WARN: {}: far jump leaves the analyzed segment; the analysis stops the block here",
+  let Seg::Normal(cur_seg) = analyzed_seg else {
+    eprintln!("WARN: {}: far jump leaves the analyzed segment; the analysis stops the block here",
       instr_str(ins));
     return Next::Transfer;
   };
   if far_seg != cur_seg {
-    println!("WARN: {}: far jump to {:04x}:{:04x} leaves the analyzed segment; the analysis stops the block here",
+    eprintln!("WARN: {}: far jump to {:04x}:{:04x} leaves the analyzed segment; the analysis stops the block here",
       instr_str(ins), far_seg, off);
     return Next::Transfer;
   }
-  Next::Jump(vec![SegOff { seg, off: Off(off) }])
+  Next::Jump { targets: vec![SegOff { seg: analyzed_seg, off: Off(off) }], fallthrough: None }
 }
 
-pub fn instr_details(ins: &Instr, binary: &Binary, seg: Seg) -> Result<InstrDetails, String> {
-  if let Some(next) = jump_targets(ins, seg) {
+/// The details of `ins` as seen by an analysis walking `analyzed_seg`.
+/// The segment is the one the analysis walks, not the one the
+/// instruction was decoded from: what a far jump's encoded segment is
+/// compared against is the analyzed segment.
+pub fn instr_details(ins: &Instr, binary: &Binary, analyzed_seg: Seg) -> Result<InstrDetails, String> {
+  if let Some(next) = jump_targets(ins, analyzed_seg) {
     return Ok(InstrDetails { next, call: None });
   }
 
@@ -319,12 +326,13 @@ mod tests {
     // `LOOPE`/`LOOPNE`: they were not branches at all, and the analysis
     // panicked on them ("UNIMPL Opcode for loopne") instead of following
     // the branch (issue #112).
-    for opcode_bytes in [[0xE0, 0xFE], [0xE1, 0xFE], [0xE2, 0xFE]] {
+    for opcode_bytes in [[0xE0, 0xFE], [0xE1, 0xFE], [0xE2, 0xFE], [0xE3, 0xFE]] {
       let d = details_for(&[opcode_bytes[0], opcode_bytes[1], 0xC3]);
-      let Next::Jump(targets) = d.next else {
+      let Next::Jump { targets, fallthrough } = d.next else {
         panic!("loopcc must be a branch");
       };
-      assert_eq!(targets.len(), 2, "loopcc has a target and a fallthrough");
+      assert_eq!(targets.len(), 1, "loopcc has one target");
+      assert!(fallthrough.is_some(), "loopcc has a fallthrough");
     }
   }
 
@@ -333,10 +341,23 @@ mod tests {
     // `jmp far 0000:0005` (EA 05 00 00 00) does not change CS, so the
     // analysis continues at that address.
     let d = details_for(&[0xEA, 0x05, 0x00, 0x00, 0x00]);
-    let Next::Jump(targets) = d.next else {
+    let Next::Jump { targets, fallthrough } = d.next else {
       panic!("a same-segment far jump must be a jump");
     };
     assert_eq!(targets, vec![SegOff { seg: Seg::Normal(0), off: Off(5) }]);
+    assert_eq!(fallthrough, None, "a far jump does not fall through");
+  }
+
+  #[test]
+  fn a_conditional_branch_keeps_its_fallthrough_apart() {
+    // `jz +1` (74 01): the target and the fallthrough are both
+    // destinations, but the fallthrough is not a branch target.
+    let d = details_for(&[0x74, 0x01, 0xC3]);
+    let Next::Jump { targets, fallthrough } = d.next else {
+      panic!("a conditional branch must be a jump");
+    };
+    assert_eq!(targets, vec![SegOff { seg: Seg::Normal(0), off: Off(3) }]);
+    assert_eq!(fallthrough, Some(SegOff { seg: Seg::Normal(0), off: Off(2) }));
   }
 
   #[test]

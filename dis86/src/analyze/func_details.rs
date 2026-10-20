@@ -146,6 +146,11 @@ impl FuncDetails {
             if end.is_some_and(|end| target >= end) {
               block.exits = vec![];
               block_complete = true;
+            } else if !code_seg.contains(target) {
+              // The code ends with the segment: there is nothing to
+              // decode at the fallthrough address.
+              block.exits = vec![];
+              block_complete = true;
             } else {
               addr = target;
               continue;
@@ -168,20 +173,34 @@ impl FuncDetails {
             block.exits = vec![];
             block_complete = true;
           }
-          Next::Jump(targets) => {
+          Next::Jump { targets, fallthrough } => {
+            let mut followed = vec![];
             for tgt in &targets {
               // A branch target outside the analyzed segment has no code
               // to continue at: decoding there would read past the
               // segment's bytes (or from another segment entirely).
+              // The diagnostic goes to stderr: stdout carries the
+              // annotation report.
               if !code_seg.contains(*tgt) {
-                println!("WARN: branch target {} is outside the analyzed segment [{}, {}); it is not followed",
+                eprintln!("WARN: branch target {} is outside the analyzed segment [{}, {}); it is not followed",
                   tgt, code_seg.start(), code_seg_end);
                 continue;
               }
               workqueue.insert(*tgt);
+              followed.push(*tgt);
             }
-            // Add exits to block
-            block.exits = targets;
+            // The implicit fallthrough of a conditional branch is where
+            // the branch lands when it is not taken, not a branch
+            // target: it is followed when it is inside the segment, and
+            // ends the block quietly when the code simply runs out.
+            if let Some(fallthrough) = fallthrough {
+              if code_seg.contains(fallthrough) {
+                workqueue.insert(fallthrough);
+                followed.push(fallthrough);
+              }
+            }
+            // Add the exits that were actually analyzed.
+            block.exits = followed;
             block_complete = true;
           }
           Next::Transfer => {
@@ -378,6 +397,16 @@ mod tests {
   }
 
   #[test]
+  fn a_fallthrough_at_the_segment_end_ends_the_block() {
+    // A segment whose last byte is not a terminator: the fallthrough
+    // lands at the segment's end, where there is nothing to decode.
+    // That used to unwrap an empty region and take the analysis down.
+    let binary = Binary::from_raw(&[0x90], None);
+    let details = FuncDetails::build(segoff(0), None, &test_seg(1), &binary).unwrap();
+    assert_eq!(details.end_addr_inferred, segoff(1));
+  }
+
+  #[test]
   fn out_of_segment_branch_target_is_not_followed() {
     // `jmp +0x10` (EB 10) in a 2-byte segment: the target has no code
     // to continue at, and decoding there would read past the segment's
@@ -392,7 +421,11 @@ mod tests {
 // FIXME: THIS FUNCTION IS WAY TOO COMPLICATED FOR ITS SIMPLE TASK: APIs NEED IMPROVEMENT
 fn decode_one_instr(binary: &Binary, loc: SegOff, end: SegOff) -> Result<Instr, String> {
   let mut decoder = Decoder::new(binary.region_iter(loc, end));
-  let (instr, _raw) = decoder.try_next()?.unwrap();
+  // Nothing to decode at this address (the region is empty): report it
+  // instead of unwrapping a `None` and taking the analysis down.
+  let Some((instr, _raw)) = decoder.try_next()? else {
+    return Err(format!("no instruction at {}", loc));
+  };
   Ok(instr)
 }
 

@@ -123,6 +123,20 @@ fn jump_table_without_a_config_region_is_loud() {
   assert!(source.contains("UNIMPL()"), "an unmodellable transfer must be loud:\n{source}");
 }
 
+// `jcxz +1` (E3 01) carries a hidden CX operand, so its relative target
+// is operand 1, not operand 0. A wrong index in the branch table would
+// silently degrade every jcxz to a loud marker — the same shape of
+// drift the shared table fixes for the analyzer.
+#[test]
+fn jcxz_is_a_conditional_jump() {
+  let code = [0xE3, 0x01, 0xC3, 0xC3];
+  let source = decompile_raw(&code);
+
+  assert!(!source.contains("UNIMPL"), "jcxz must lower to a conditional jump:\n{source}");
+  assert!(source.contains("if (CX == 0)"), "jcxz must branch on CX:\n{source}");
+  assert!(source.contains("addr_0003"), "the taken arm must survive:\n{source}");
+}
+
 // `jmp far 0000:0100` (EA 00 01 00 00) with a target outside the
 // function's range: the same treatment a near jump out of range gets
 // (the edge is dropped with a warning), so the function still
