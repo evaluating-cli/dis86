@@ -4,12 +4,18 @@
  * standalone native host (hydra/src/native_host): a 1 MiB linear guest
  * memory, no dosemu2 process, no emulator. It loads the fixture's module at
  * segment 1 (linear 0x10), releases the fixture's park sentinel, seeds the
- * near-return landing slot, and drives the hook machinery to completion.
+ * near-return landing, and drives the hook machinery to completion.
  * The fixture writes its outbox with stores only, so the runner just reads
  * the memory back, checks it against the shared contract (parity/outbox.h)
  * and writes the same snapshot the golden lane captures.
  *
- * usage: native_runner <fixture.exe> <out.lanes>
+ * With --trace <file> the runner also records what the machine did in the
+ * Hydra trace format (issue #97). That trace is the #97 parity gate: the
+ * observations it holds are checked against the fixture's known layout
+ * (parity/annotations.py), so the tool's correctness rides on the anchored
+ * fixture instead of on itself.
+ *
+ * usage: native_runner <fixture.exe> <out.lanes> [--trace <file>]
  */
 
 #include <stdio.h>
@@ -65,7 +71,7 @@ static uint8_t *read_file(const char *path, size_t *out_size)
 
 int main(int argc, char **argv)
 {
-    const char *exe_path, *out_path;
+    const char *exe_path, *out_path, *trace_path = NULL;
     uint8_t *image;
     size_t image_size;
     hydra_machine_t m = {0};
@@ -76,12 +82,20 @@ int main(int argc, char **argv)
     const uint8_t *header;
     int steps = 0;
 
-    if (argc != 3) {
-        fprintf(stderr, "usage: %s <fixture.exe> <out.lanes>\n", argv[0]);
+    if (argc < 3) {
+        fprintf(stderr, "usage: %s <fixture.exe> <out.lanes> [--trace <file>]\n", argv[0]);
         return 2;
     }
     exe_path = argv[1];
     out_path = argv[2];
+    for (int i = 3; i < argc; i++) {
+        if (!strcmp(argv[i], "--trace") && i + 1 < argc) {
+            trace_path = argv[++i];
+        } else {
+            fprintf(stderr, "native_runner: unknown argument '%s'\n", argv[i]);
+            return 2;
+        }
+    }
 
     image = read_file(exe_path, &image_size);
     if (!image)
@@ -134,6 +148,10 @@ int main(int argc, char **argv)
      * cannot tell "the guest finished" from "the guest is stuck" is the
      * failure mode the livelock cap below only detects after 100000 steps. */
     int guest_exit_code = -1;
+    if (trace_path && hydra_trace_open(trace_path) != 0) {
+        fprintf(stderr, "native_runner: cannot write the trace to %s\n", trace_path);
+        return 1;
+    }
     for (;;) {
         int ret = hydra_machine_exec(&m, 0);
 
@@ -152,9 +170,12 @@ int main(int argc, char **argv)
             fprintf(stderr, "native_runner: livelocked at %04x:%04x after "
                     "100000 steps\n", m.registers->cs - code_seg,
                     m.registers->ip);
+            hydra_trace_close();
             return 1;
         }
     }
+    if (trace_path)
+        hydra_trace_close();
 
     header = outbox_scan(ctx->mem, NATIVE_HOST_MEM_SIZE);
     if (!header) {

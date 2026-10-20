@@ -369,6 +369,15 @@ static host_run_stop_reason_t trace_to_return(run_ctx_t *r, dosdebug_regs_t *dr,
     }
     dosdebug_drain(r->ctx->db);
 
+    /* The guest took one instruction. Announce it through the core's step
+     * seam: that is what records a step event in the trace sink. The
+     * registers are refreshed first, so the announcement carries the state
+     * the guest is actually in. */
+    if (r->opts && r->opts->trace_steps) {
+      regs_to_machine(dr, r->m->registers);
+      hydra_machine_step_hook(r->m);
+    }
+
     if (r->verbose > 1)
       printf("  trace[%zu] %04x:%04x (want %04x:%04x)\n",
              i, dr->cs, dr->ip, ret_cs, ret_ip);
@@ -719,6 +728,11 @@ static int overlay_handle_pagein(run_ctx_t *r, overlay_stub_info_t *os,
       return -1;
     }
     dosdebug_drain(r->ctx->db);
+
+    if (r->opts && r->opts->trace_steps) {
+      regs_to_machine(dr, r->m->registers);
+      hydra_machine_step_hook(r->m);
+    }
   }
   if (i == max_steps) {
     fprintf(stderr,
@@ -772,6 +786,11 @@ static int overlay_handle_pagein(run_ctx_t *r, overlay_stub_info_t *os,
       return -1;
     }
     dosdebug_drain(r->ctx->db);
+
+    if (r->opts && r->opts->trace_steps) {
+      regs_to_machine(dr, r->m->registers);
+      hydra_machine_step_hook(r->m);
+    }
   }
   if (i == max_steps) {
     fprintf(stderr,

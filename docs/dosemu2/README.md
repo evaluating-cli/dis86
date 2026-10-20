@@ -66,5 +66,6 @@ Correctness smoke tests establish no performance claim.
 | --- | --- |
 | [`HOST_DESIGN.md`](HOST_DESIGN.md) | Host design: external Hydra client via dosdebug + verified `/proc/pid/fd` mmap. |
 | [`OVERLAY_DESIGN.md`](OVERLAY_DESIGN.md) | Opt-in overlay-hook support (`overlays=armed`), fail-closed by default. |
+| [`TRACE_TOOL.md`](TRACE_TOOL.md) | The instrumented-execution trace tool (issue #97): what it observes, what it does not, and the parity gate that anchors it. |
 | [`TESTING.md`](TESTING.md) | Current hosting tests, build/run commands, and exact-head evidence. |
 | [`HISTORY.md`](HISTORY.md) | One-page history of the retired ABI-v1 differential validator. |

@@ -70,6 +70,15 @@ typedef struct host_run_options {
   int timeout_ms;             /* per go_and_wait; 0 = default (3000), <0 = wait
                                   forever (rely on stop_fn / dosemu exit) */
   int verbose;                /* print each stop to stdout */
+  /* Per-instruction observation. When set, the driver announces every guest
+   * instruction it single-steps through the core's step seam
+   * (hydra_machine_step_hook), which records a step event in the trace
+   * sink and forwards to a host's own hydra_user_step_hook. It costs a
+   * debugger round trip per instruction, so it is off unless a host asks
+   * for it: the guest otherwise runs free between the function-level
+   * breakpoints and the trace holds the boundaries, not the
+   * instructions. */
+  int trace_steps;
   host_run_before_go_fn_t before_go_fn; /* one-shot, after bp install */
   void *before_go_user;
   host_run_stop_fn_t stop_fn; /* called after each dispatch; nonzero stops */

@@ -87,6 +87,23 @@ test_userlib = shared_library(
   'test_hydra_user', 'test_userlib' / 'hydra_user.c',
 )
 
+## The instrumented-execution tool (issue #97) traces a guest with the
+## trace sink open. It drives the same host_run() loop the integration
+## tests drive, so it needs the dosemu host and nothing else.
+hydra_trace = executable(
+  'hydra_trace', 'trace_tool.c',
+  link_with : [libhydra, libhydra_dosemu],
+)
+
+## The user library the trace tool runs against: the testprog fixture's
+## metadata plus the native bodies of its hooked functions, registered
+## through hydra_user_register_hooks() (the dosemu host calls it once the
+## metadata is in place).
+test_trace_user = shared_library(
+  'test_trace_user', 'test_userlib' / 'trace_user.c',
+  link_with : libhydra,
+)
+
 test_driver = executable(
   'test_driver', 'test_driver.c',
   link_with : [libhydra, libhydra_dosemu],

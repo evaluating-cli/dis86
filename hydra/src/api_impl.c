@@ -101,7 +101,16 @@ HYDRA_MACHINE_NOTIFY_FUNC(hydra_machine_notify)
   hydra_callstack_notify(m);
 }
 
+/* One guest instruction. A host that advances the guest one instruction at a
+ * time announces it here: that is what records a step event in the trace
+ * sink, and it is the seam a host's own hydra_user_step_hook observes.
+ *
+ * The hook is not called by the exec loop. The exec loop runs once per
+ * dispatch - one per function-level breakpoint on a host with a guest CPU -
+ * and calling a "step" seam from there would tell an observer that one
+ * instruction ran when a whole function boundary did. */
 HYDRA_MACHINE_STEP_HOOK_FUNC(hydra_machine_step_hook)
 {
+  hydra_trace_step(m->registers->cs, m->registers->ip);
   if (hydra_user_step_hook) hydra_user_step_hook(m);
 }

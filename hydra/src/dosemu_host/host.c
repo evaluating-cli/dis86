@@ -752,6 +752,16 @@ static void host_load_user_library(host_ctx_t *ctx, const char *path)
 
     hydra_function_metadata_set(fmd);
     hydra_callstack_metadata_set(cmd);
+
+    /* A library that also carries the native implementations of the hooked
+     * functions registers them here, through the same name the confgen
+     * appdata uses (hydra_user_appdata__register_all_hooks()). The call
+     * comes after the metadata is in place, because registering a hook
+     * resolves its address through the metadata. A library without the
+     * entry point is fine: the driver may register the hooks itself. */
+    void (*register_hooks)(void) = NULL;
+    *(void **)&register_hooks = dlsym(ctx->user_lib, "hydra_user_register_hooks");
+    if (register_hooks) register_hooks();
 }
 
 /* ------------------------------------------------------------------ */

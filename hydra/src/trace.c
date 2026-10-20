@@ -180,6 +180,14 @@ const char *hydra_trace_mem(size_t *_len)
   return T->buf ? T->buf : "";
 }
 
+/* Whether a sink is open. Read without the lock: the kind is a single
+ * word, and the only thing a torn read could cost is a trace event that
+ * is written (or skipped) one moment late. */
+static int trace_sink_open(void)
+{
+  return T->kind != TRACE_SINK_NONE;
+}
+
 /* The name of a function at an address, or NULL. Overlay addresses have no
  * absolute segment of their own, so they carry no name here: the physical
  * segment the overlay is mapped at is what the guest branches to, and that
@@ -205,6 +213,8 @@ static void trace_abs_addr(addr_t addr, u16 *_seg, u16 *_off)
 void hydra_trace_dispatch(const char *name, u16 cs, u16 ip,
                           const char *phase, const char *result)
 {
+  if (!trace_sink_open()) return;
+
   pthread_mutex_lock(&T_MUTEX);
   char line[256];
   int n = snprintf(line, sizeof(line), "dispatch %s cs=%04x ip=%04x", phase, cs, ip);
@@ -224,8 +234,10 @@ void hydra_trace_dispatch(const char *name, u16 cs, u16 ip,
 void hydra_trace_call(const char *name, u16 from_seg, u16 from_off,
                       u16 to_seg, u16 to_off)
 {
+  __atomic_fetch_add(&T->calls, 1, __ATOMIC_RELAXED);
+  if (!trace_sink_open()) return;
+
   pthread_mutex_lock(&T_MUTEX);
-  T->calls++;
   char line[256];
   int n = snprintf(line, sizeof(line), "call from=%04x:%04x to=%04x:%04x",
                    from_seg, from_off, to_seg, to_off);
@@ -242,8 +254,10 @@ void hydra_trace_call(const char *name, u16 from_seg, u16 from_off,
 void hydra_trace_ret(const char *name, u16 from_seg, u16 from_off,
                      u16 to_seg, u16 to_off)
 {
+  __atomic_fetch_add(&T->returns, 1, __ATOMIC_RELAXED);
+  if (!trace_sink_open()) return;
+
   pthread_mutex_lock(&T_MUTEX);
-  T->returns++;
   char line[256];
   int n = snprintf(line, sizeof(line), "ret from=%04x:%04x to=%04x:%04x",
                    from_seg, from_off, to_seg, to_off);
@@ -260,6 +274,9 @@ void hydra_trace_ret(const char *name, u16 from_seg, u16 from_off,
 void hydra_trace_native_call(hydra_machine_t *m, addr_t callee, int nargs)
 {
   if (!m) FAIL("hydra_trace_native_call: no machine");
+
+  __atomic_fetch_add(&T->native_calls, 1, __ATOMIC_RELAXED);
+  if (!trace_sink_open()) return;
 
   if (nargs < 0) nargs = 0;
   if (nargs > TRACE_MAX_ARGS) nargs = TRACE_MAX_ARGS;
@@ -280,7 +297,6 @@ void hydra_trace_native_call(hydra_machine_t *m, addr_t callee, int nargs)
   const char *name = trace_name_of(callee);
 
   pthread_mutex_lock(&T_MUTEX);
-  T->native_calls++;
   char line[512];
   int n = snprintf(line, sizeof(line), "native_call from=%04x:%04x to=%04x:%04x",
                    m->registers->cs, m->registers->ip, to_seg, to_off);
@@ -304,11 +320,13 @@ void hydra_trace_native_ret(hydra_machine_t *m, addr_t callee)
 {
   if (!m) FAIL("hydra_trace_native_ret: no machine");
 
+  __atomic_fetch_add(&T->native_returns, 1, __ATOMIC_RELAXED);
+  if (!trace_sink_open()) return;
+
   u16 to_seg, to_off;
   trace_abs_addr(callee, &to_seg, &to_off);
 
   pthread_mutex_lock(&T_MUTEX);
-  T->native_returns++;
   char line[256];
   int n = snprintf(line, sizeof(line), "native_ret from=%04x:%04x to=%04x:%04x dx=%04x ax=%04x",
                    m->registers->cs, m->registers->ip, to_seg, to_off,
@@ -322,8 +340,10 @@ void hydra_trace_native_ret(hydra_machine_t *m, addr_t callee)
 
 void hydra_trace_step(u16 cs, u16 ip)
 {
+  __atomic_fetch_add(&T->steps, 1, __ATOMIC_RELAXED);
+  if (!trace_sink_open()) return;
+
   pthread_mutex_lock(&T_MUTEX);
-  T->steps++;
   char line[64];
   int n = snprintf(line, sizeof(line), "step cs=%04x ip=%04x\n", cs, ip);
   if (n > 0 && (size_t)n < sizeof(line)) trace_emit_locked(line);
@@ -332,8 +352,10 @@ void hydra_trace_step(u16 cs, u16 ip)
 
 void hydra_trace_int(u8 num, u8 ah)
 {
+  __atomic_fetch_add(&T->interrupts, 1, __ATOMIC_RELAXED);
+  if (!trace_sink_open()) return;
+
   pthread_mutex_lock(&T_MUTEX);
-  T->interrupts++;
   char line[64];
   int n = snprintf(line, sizeof(line), "int num=%02x ah=%02x\n", num, ah);
   if (n > 0 && (size_t)n < sizeof(line)) trace_emit_locked(line);
@@ -345,11 +367,11 @@ void hydra_trace_stats(hydra_run_stats_t *_out)
   if (!_out) return;
 
   pthread_mutex_lock(&T_MUTEX);
-  _out->calls = T->calls;
-  _out->returns = T->returns;
-  _out->native_calls = T->native_calls;
-  _out->native_returns = T->native_returns;
-  _out->steps = T->steps;
-  _out->interrupts = T->interrupts;
+  _out->calls = __atomic_load_n(&T->calls, __ATOMIC_RELAXED);
+  _out->returns = __atomic_load_n(&T->returns, __ATOMIC_RELAXED);
+  _out->native_calls = __atomic_load_n(&T->native_calls, __ATOMIC_RELAXED);
+  _out->native_returns = __atomic_load_n(&T->native_returns, __ATOMIC_RELAXED);
+  _out->steps = __atomic_load_n(&T->steps, __ATOMIC_RELAXED);
+  _out->interrupts = __atomic_load_n(&T->interrupts, __ATOMIC_RELAXED);
   pthread_mutex_unlock(&T_MUTEX);
 }

@@ -48,7 +48,7 @@ own registered hook. `NEAR` is required because bsl emission defaults to
 ## Running
 
 ```sh
-bash parity/build.sh     # Gate 1 (hooks, no UNIMPL) + native Gate 2
+bash parity/build.sh     # Gate 1 (hooks, no UNIMPL) + native Gate 2 + trace Gate 3
 bash parity/run_golden.sh # golden Gate 2 (needs dosemu2+fdpp) + compare
 ```
 
@@ -61,6 +61,28 @@ emitted code plus confgen appdata against `hydra/src/*.c` and
 `PARITY_TIMEOUT` (default 90 s) for the outbox, verifies it against the
 known-answer table, compares it with `native.lanes`, and then proves the
 comparison is live by flipping one byte in a copy and requiring `cmp` to fail.
+
+## Gate 3: the trace lane (issue #97)
+
+The instrumented-execution tool has to be able to say what the machine did,
+and its correctness has to ride on the anchored fixture rather than on
+itself. So the fixture is run once more with the Hydra trace sink open
+(`native_runner --trace`), and the observations the trace holds are checked
+against the fixture's known layout:
+
+- the entry function `F_parity_main` was dispatched at `0001:0000`;
+- the call into the leaf `F_parity_leaf` was recorded at `0001:0185` with
+  `nargs=0`;
+- the value the leaf returned was recorded at that same boundary.
+
+The expected addresses are read from the generated `.bsl` (which comes from
+`parity/annotations.py`) and shifted by the code load segment the native
+runner uses, so the expectation moves with the annotations instead of being
+a second copy of the layout.
+
+The lane also carries a **mutation check**: a copy of the trace with the
+leaf address tampered with must *fail* the same check. A green run then
+means "the tool saw what the fixture says", not merely "the tool ran".
 
 ### Do not use `-H1` for the golden lane
 
