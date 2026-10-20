@@ -265,14 +265,12 @@ void hydra_impl_int(u8 num)
   int rc = hydra_user_int_hook ? hydra_user_int_hook(m, num) : -1;
   if (rc == 0)
     return;
-  if (rc > 0)
-    /* Guest termination: INT 21h AH=4Ch carries the exit code in AL. End the
-     * process here instead of returning, because the decompiled hook would
-     * otherwise run whatever follows the INT — code the guest never meant to
-     * reach, since INT 21h AH=4Ch does not return. Same shape as the
-     * capture mode's exit() in hydra_exec_run_special_modes(); the backend's
-     * atexit handler restores terminal state on the way out. */
-    exit((int)(m->registers->ax & 0xff));
+  /* Termination is not handled here. Ending the process is the host's
+   * decision, not the core's: machine.c compiles into every host, including
+   * ones that must run their own epilogue before exiting. The native host
+   * performs the exit from inside hydra_user_int (see backend_host.c), which
+   * is also the only place that knows the backend teardown that has to run.
+   * Any non-zero return is therefore a host that failed to service the INT. */
   FAIL("native host: INT %02xh was not serviced: no host handler is installed and "
        "no raw-code region is reserved", (unsigned)num);
 }

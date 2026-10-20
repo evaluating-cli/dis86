@@ -9,6 +9,7 @@
  * rather than silently returning.
  */
 
+#include <fcntl.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -298,6 +299,12 @@ static void probe_impl_unhandled(void)
   hydra_impl_int(0x22);
 }
 
+/* Status a forked child exits with when the probe did *not* end the process.
+ * It must differ from every status a test checks for: with 0 here, "exited
+ * with status 0" and "never exited at all" were the same outcome, so the
+ * AL=0 assertion passed even with the exit path removed entirely. */
+#define PROBE_NO_EXIT_STATUS 0xFE
+
 /* Exit code for probe_impl_exit, so one probe can check that AL is what the
  * process actually exits with. */
 static int g_probe_exit_code;
@@ -307,6 +314,74 @@ static void probe_impl_exit(void)
   /* AH=4Ch (terminate), AL = exit code */
   g_probe_m->registers->ax = 0x4c00u | (uint8_t)g_probe_exit_code;
   hydra_impl_int(0x21);
+}
+
+/* --- does the teardown actually run? ------------------------------------ */
+
+/* The claim that terminal state is restored on the way out of a terminating
+ * guest used to rest on inspection alone: nothing asserted that the atexit
+ * handler ran. This backend exists so the parent can observe it — shutdown
+ * writes a byte down a pipe the parent is reading.
+ *
+ * It is installed with hydra_native_backend_install_probe because the
+ * by-name registry has no way to name a backend that only exists here. */
+static int g_atexit_pipe = -1;
+
+static void atexit_probe_shutdown(void *state)
+{
+  (void)state;
+  if (g_atexit_pipe >= 0) {
+    const char byte = 'X';
+    ssize_t n = write(g_atexit_pipe, &byte, 1);
+    (void)n;
+  }
+}
+
+static const hydra_backend_t ATEXIT_PROBE_BACKEND = {
+  .name     = "atexit-probe",
+  .shutdown = atexit_probe_shutdown,
+};
+
+/* Child side: swap in the probe backend, then terminate as a guest would. */
+static void probe_impl_exit_atexit_probe(void)
+{
+  hydra_native_backend_install_probe(&ATEXIT_PROBE_BACKEND, NULL);
+  g_probe_m->registers->ax = 0x4c10u;      /* AH=4Ch, AL=0x10 */
+  hydra_impl_int(0x21);
+}
+
+/* Parent side: the child must exit with AL (0x10) *and* the handler must have
+ * written its byte. Either one alone is not proof — a child that returned
+ * normally would exit with the sentinel, and a child that ran no teardown
+ * would close the pipe with nothing written. */
+static int probe_atexit_ran(void)
+{
+  int fds[2];
+  if (pipe(fds) != 0)
+    return 0;
+  fflush(stdout);
+  pid_t pid = fork();
+  if (pid < 0) {
+    close(fds[0]);
+    close(fds[1]);
+    return 0;
+  }
+  if (pid == 0) {
+    close(fds[0]);
+    g_atexit_pipe = fds[1];
+    probe_impl_exit_atexit_probe();
+    fflush(stdout);
+    _exit(PROBE_NO_EXIT_STATUS);           /* did not terminate */
+  }
+  close(fds[1]);
+  char byte = 0;
+  ssize_t n = read(fds[0], &byte, 1);      /* ends when the child closes it */
+  close(fds[0]);
+  int status = 0;
+  if (waitpid(pid, &status, 0) != pid)
+    return 0;
+  return n == 1 && byte == 'X' &&
+         WIFEXITED(status) && WEXITSTATUS(status) == 0x10;
 }
 
 /* Finding 5: with no execution context installed, a primitive used to
@@ -328,22 +403,32 @@ static void probe_impl_nop_no_context(void)
 }
 
 /* Fork into a probe that must exit normally with a specific status. Covers
- * the no-op path (0) and guest termination, where INT 21h AH=4Ch ends the
- * process with the exit code from AL. */
+ * guest termination, where INT 21h AH=4Ch ends the process with the code from
+ * AL, and the no-op path, which must *not* exit and so lands on the sentinel.
+ *
+ * stdin's status flags are saved and restored around the fork because fcntl
+ * flags live on the open file description, which fork() shares. A child that
+ * exits through the exit path runs the backend's atexit handler, which
+ * restores terminal state — and would otherwise clear O_NONBLOCK on the
+ * *parent's* stdin while the parent's terminal state still believed it was
+ * set, so a later key read would block instead of returning EAGAIN. */
 static int probe_exits_with(void (*probe)(void), int expected)
 {
   fflush(stdout);
+  int stdin_flags = fcntl(STDIN_FILENO, F_GETFL, 0);
   pid_t pid = fork();
   if (pid < 0)
     return 0;
   if (pid == 0) {
     probe();
     fflush(stdout);
-    _exit(0);
+    _exit(PROBE_NO_EXIT_STATUS);
   }
   int status = 0;
   if (waitpid(pid, &status, 0) != pid)
     return 0;
+  if (stdin_flags >= 0)
+    fcntl(STDIN_FILENO, F_SETFL, stdin_flags);
   return WIFEXITED(status) && WEXITSTATUS(status) == expected;
 }
 
@@ -420,8 +505,14 @@ int hydra_backend_linktest(hydra_machine_t *m)
          "wiring: INT 21h AH=4Ch exits 0 when AL is 0");
   TCHECK(probe_aborts(probe_impl_no_context),
          "wiring: primitive with no execution context aborts, not SIGSEGV");
-  TCHECK(probe_exits_with(probe_impl_nop_no_context, 0),
+  /* Expects the sentinel: nop must not end the process. Expecting 0 here would
+   * make this pass whether or not nop ever exits. */
+  TCHECK(probe_exits_with(probe_impl_nop_no_context, PROBE_NO_EXIT_STATUS),
          "wiring: nop with no execution context stays a no-op");
+  /* The teardown itself, not just the status: a child that exits through the
+   * guest-termination path must run the backend's atexit handler. */
+  TCHECK(probe_atexit_ran(),
+         "wiring: guest termination runs the backend atexit teardown");
 
 done:
   /* Leave the execution context as we found it, including on an early exit. */

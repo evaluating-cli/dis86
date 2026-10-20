@@ -119,6 +119,17 @@ int main(int argc, char **argv)
     m.registers->ip = 0;
     m.registers->sp = ENTRY_SP;
 
+    /* Guest termination is process-wide, not a return value: if the fixture
+     * ever reaches INT 21h AH=4Ch, the native host ends the process from
+     * inside the INT hook and control never comes back here. That means none
+     * of the reporting below runs — no outbox_scan, no verify, no snapshot —
+     * and a guest exiting with AL=0 is indistinguishable from this runner
+     * succeeding. Today's fixture parks instead of terminating
+     * (fixture.asm drives AH=4Ch only in the lane's planned v2), so this is
+     * latent. Before v2 lands, the reporting either has to move into an
+     * atexit handler registered after hydra_machine_init, or termination has
+     * to become something the exec loop can observe. See the "Guest
+     * termination" note in hydra/README.md. */
     for (;;) {
         int running = hydra_machine_exec(&m, 0);
 

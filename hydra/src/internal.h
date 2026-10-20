@@ -41,9 +41,16 @@ extern hydra_mode_t HYDRA_MODE[1];
  *
  * Return convention:
  *   0   the interrupt was serviced
- *   1   the guest requested termination (exit code in AL); hydra_impl_int
- *       ends the process with that code rather than returning
+ *   1   the guest requested termination (exit code in AL). A host that reaches
+ *       this state must end the process itself and must not return: INT 21h
+ *       AH=4Ch does not return, so letting the decompiled hook continue would
+ *       run code the guest never meant to reach. Ending the process is the
+ *       host's call, not the core's, because only the host knows what teardown
+ *       has to happen first.
  *   <0  not handled by this host
+ *
+ * Anything else is a host that failed to service the INT; hydra_impl_int fails
+ * loud on it. The core never exits the process on any return value.
  */
 
 extern int (*hydra_user_int_hook)(hydra_machine_t *m, u8 num);
