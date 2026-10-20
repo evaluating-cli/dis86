@@ -1,3 +1,5 @@
+#include <stdlib.h>
+
 #include "internal.h"
 
 void hydra_impl_unknown(const char *func, int line)
@@ -263,10 +265,12 @@ void hydra_impl_int(u8 num)
   int rc = hydra_user_int_hook ? hydra_user_int_hook(m, num) : -1;
   if (rc == 0)
     return;
-  if (rc > 0)
-    FAIL("native host: the handler for INT %02xh requested guest termination "
-         "(exit code %u) but the native host has no exit path wired yet",
-         (unsigned)num, (unsigned)(m->registers->ax & 0xff));
+  /* Termination is not handled here. Ending the process is the host's
+   * decision, not the core's: machine.c compiles into every host, including
+   * ones that must run their own epilogue before exiting. The native host
+   * performs the exit from inside hydra_user_int (see backend_host.c), which
+   * is also the only place that knows the backend teardown that has to run.
+   * Any non-zero return is therefore a host that failed to service the INT. */
   FAIL("native host: INT %02xh was not serviced: no host handler is installed and "
        "no raw-code region is reserved", (unsigned)num);
 }

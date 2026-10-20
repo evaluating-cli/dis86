@@ -96,6 +96,13 @@ int native_int_dispatch(native_host_ctx_t *ctx,
  * does not synchronize with a concurrent dispatch. */
 void hydra_native_backend_select(const char *name);
 
+/* Test seam, implemented in backend_host.c: install a backend directly instead
+ * of looking it up by name. Exists so backend_selftest.c can install a probe
+ * backend that only the test knows about, and thereby assert that the atexit
+ * teardown really runs on the guest-termination path. Not part of the host
+ * interface; no host calls it. */
+void hydra_native_backend_install_probe(const hydra_backend_t *be, void *state);
+
 /* The active backend and its state, as selected above. Non-mutating: it fails
  * loud if no backend has been selected, rather than initializing one from a
  * hook thread. Useful to a host that wants to drive the backend directly (e.g.

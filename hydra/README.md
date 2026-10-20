@@ -50,6 +50,36 @@ guest registers and memory, call x86-16 or other hooked functions, perform
 near/far returns, trigger interrupts, and use guest I/O through the machine
 bridge.
 
+## Guest termination
+
+`INT 21h AH=4Ch` ends the process. The exit code is `AL`.
+
+Termination is handled **by the host, not the core**: the core's
+`hydra_impl_int` fails loud on any non-zero return from the `hydra_user_int`
+hook and never exits the process itself. `machine.c` compiles into every host,
+so a process-wide policy there would be one the core cannot take back; hosts
+that need to observe termination instead of ending would have no seam. The
+native host performs the exit inside its own hook
+(`hydra/src/native_host/backend_host.c`), which is also the only place that
+knows the backend teardown that must run first.
+
+Two consequences an embedder has to design around:
+
+- **The process ends, so a host's epilogue only runs if it is an `atexit`
+  handler.** The hook runs on a worker thread, so the host's `main()` never
+  regains control. Handlers registered after `hydra_machine_init` run before
+  the backend's (atexit is LIFO), which is the order you want.
+- **The host cannot observe that the guest terminated.** It only sees the
+  process stop. Making termination a result the exec loop can return — so the
+  host can finish its reporting and then exit with the guest's code — is the
+  target design for issue #95 Tier 2, which covers save/exit behaviour and
+  running more than one guest in a process.
+
+Only `AH=4Ch` terminates. `INT 20h` and `INT 21h AH=00h` still fail loud, as
+do COM programs that end by far-returning to their PSP. `INT 20h` in
+particular is the common COM ending, so this is not yet complete coverage of
+how DOS programs actually finish.
+
 ## Retained runtime mechanisms
 
 Hydra retains function hooks and native execution contexts, generated-code
