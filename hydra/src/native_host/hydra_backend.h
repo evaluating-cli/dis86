@@ -24,6 +24,21 @@
 #define BACKEND_TEXT_COLS 80
 #define BACKEND_TEXT_ROWS 25
 
+/* The text window a backend renders, for hosts that mirror guest video memory
+ * and for the INT 10h services that report geometry.
+ *
+ * `base` is the linear address of the window, or 0 when the backend renders no
+ * text window at all. `mode` is the BIOS video mode most recently set. Cells
+ * are row-major and two bytes wide (character, attribute) — the text-mode
+ * layout of every adapter Hydra models: B8000h for the CGA-compatible modes
+ * 00h-03h, B0000h for MDA mono mode 07h. */
+typedef struct hydra_text_geometry {
+  uint32_t base;
+  uint8_t  mode;
+  uint8_t  rows;
+  uint8_t  cols;
+} hydra_text_geometry_t;
+
 typedef struct hydra_backend hydra_backend_t;
 
 struct hydra_backend {
@@ -43,6 +58,18 @@ struct hydra_backend {
   void (*teletype)(void *state, uint8_t ch, uint8_t attr);
   void (*putchar_text)(void *state, uint8_t row, uint8_t col, uint8_t ch, uint8_t attr);
   void (*present)(void *state);
+
+  /* Where the rendered text window lives, or -1 when the backend has none.
+   * `present()` renders only what changed since the last call, so a host may
+   * call it once per frame (or whenever it knows the guest stopped drawing)
+   * without paying for a repaint that would show the same frame again. */
+  int  (*text_geometry)(void *state, hydra_text_geometry_t *out);
+
+  /* Read one text cell, so a byte-wide guest store into video memory can be
+   * a read-modify-write: a character store must keep the cell's attribute and
+   * an attribute store must keep its character. Returns 0 on success, -1 when
+   * the cell is out of range or the backend keeps no text buffer. */
+  int  (*get_cell)(void *state, uint8_t row, uint8_t col, uint8_t *ch, uint8_t *attr);
 
   /* Input. Key words use the BIOS encoding: high byte = scan code, low byte =
    * ASCII (0 for extended keys). `poll_key` peeks at the next key and returns
@@ -107,9 +134,18 @@ void hydra_native_backend_install_probe(const hydra_backend_t *be, void *state);
 
 /* The active backend and its state, as selected above. Non-mutating: it fails
  * loud if no backend has been selected, rather than initializing one from a
- * hook thread. Useful to a host that wants to drive the backend directly (e.g.
- * to call present()), and to tests inspecting the shadow buffer. */
+ * hook thread. Useful to a host that wants to inspect the backend, and to
+ * tests reading the shadow buffer. */
 const hydra_backend_t *hydra_native_backend_active(void **state_out);
+
+/* Render whatever the active backend has drawn since its last repaint.
+ *
+ * The port driver's frame call: cheap and idempotent when nothing changed, and
+ * a no-op before a backend has been selected (rendering must never be the
+ * thing that ends a run). The terminal backend also calls it for itself before
+ * blocking on a key, so a title screen that is waiting for input is on screen.
+ */
+void hydra_native_backend_present(void);
 
 /* Self-test entry points, called from test_native_host.c so the whole native
  * host keeps a single main() (all native-host sources link into one binary).
@@ -117,7 +153,10 @@ const hydra_backend_t *hydra_native_backend_active(void **state_out);
  *
  * hydra_backend_selftest() covers the HAL and dispatch in isolation;
  * hydra_backend_linktest() covers the wiring from a live machine, i.e. that
- * hydra_impl_int reaches a backend through the dlsym hook.
+ * hydra_impl_int reaches a backend through the dlsym hook;
+ * hydra_backend_videotest() covers guest stores landing in the text window
+ * from a live machine's hardware vtable.
  */
 int hydra_backend_selftest(void);
 int hydra_backend_linktest(hydra_machine_t *m);
+int hydra_backend_videotest(hydra_machine_t *m);

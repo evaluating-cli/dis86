@@ -121,6 +121,16 @@ const hydra_backend_t *hydra_native_backend_active(void **state_out)
   return be;
 }
 
+void hydra_native_backend_present(void)
+{
+  /* No backend yet means nothing has been drawn. Presenting is a rendering
+   * nicety, so this stays a no-op rather than the fail-loud contract the
+   * interrupt path uses. */
+  if (!g_backend || !g_backend->present)
+    return;
+  g_backend->present(g_backend_state);
+}
+
 int hydra_user_int(hydra_machine_t *m, u8 num)
 {
   /* Guest memory comes from the native host's linear array, but the
