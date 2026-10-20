@@ -25,6 +25,16 @@ implements function hooks, native-to-guest calls, guest register and memory
 access, and capture/restore. The implementation and runtime evidence are
 documented in [`../docs/dosemu2/`](../docs/dosemu2/README.md).
 
+A second host lives in `src/native_host/`: the standalone substrate for
+executable ports, with no emulator process behind it. It implements the same
+bridge over a linear 1 MiB guest-memory array and layers a device HAL on top —
+a text-mode terminal backend, a selective INT dispatch table, port routing for
+the keyboard and PIT, and mirroring of direct guest writes into the text window
+(`B8000h` for the CGA-compatible text modes, `B0000h` for MDA). Graphics
+backends are not built; [`../docs/native_host/README.md`](../docs/native_host/README.md)
+covers what renders and why SDL2 is a new dependency rather than a reuse of
+dis86's optional crate.
+
 SST (SingleStepTests hardware captures) validates emu86. The dosemu2 host
 provides the execution environment for Hydra and is a separate integration
 track.
