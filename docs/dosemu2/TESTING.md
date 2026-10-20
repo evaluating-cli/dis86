@@ -210,6 +210,74 @@ emu86/SST are frozen offline tooling with no role in product validation and are
 not built by the default lane (enable with `--features emu86`); see
 [`docs/emu86/sst.md`](../emu86/sst.md).
 
+## CI job profile and cost
+
+The `dosemu-host-runtime.yml` lane runs the stock-dosemu2 acceptance matrix as
+**one job per flavour** (`fail-fast: false`, `flavor: [mz-ovl, exe, com, cap,
+ovl]`), so the wall-clock is the slowest flavour, not the sum of all twelve
+boots.
+
+Measured on `main` at `2a1176b` (run 39379043523, `ubuntu-24.04`):
+
+| Flavour | Phase 7 | Job total | Guest boots |
+|---|---|---|---|
+| mz-ovl | 9s | 1m27s | 1 |
+| ovl | 43s | 1m54s | 5 |
+| exe | 51s | 1m54s | 1 |
+| cap | 1m47s | 3m03s | 3 |
+| **com** | **2m07s** | **3m23s** | 2 |
+
+The **critical path is `com`**, not `ovl`: `ovl` boots the guest five times and
+still finishes Phase 7 in 43s, while `com` runs twice and takes 2m07s. The
+per-boot cost varies about 7× across flavours and does not track the boot
+count, because the flavours do different work per boot (`exe`/`com` drive the
+function-hook driver, `ovl` does overlay page-in/restore round-trips). These
+numbers therefore do not isolate the cost of the emulated boot itself.
+
+Each job pays a fixed overhead of about **1m15s** before Phase 7 starts
+(checkout, installing the stock dosemu2 runtime, building Hydra, the host
+state/transport test). Across the matrix, `run_driver_test.sh` boots dosemu2 12
+times in total: mz-ovl 1, exe 1, com 2, cap 3, ovl 5.
+
+The per-launch `sleep` calls are *not* the cost — they total only ~25–40s across
+the whole matrix.
+
+The repository is public, so `ubuntu-24.04` provides 4 vCPU / 16 GB.
+
+### Cost of the per-flavour split
+
+The split replaced a single serial job (~6m40s, one VM) with five parallel
+jobs — the slowest ~3m23s, at roughly 5× the runner-minutes. Free for a public
+repository, but more resource overall.
+
+Each flavour gets its own VM, so there are **no shared-state races** — the real
+advantage over parallelising inside the script, where all flavours share
+`/tmp/opencode` and `$XDG_RUNTIME_DIR` and each would need its own working
+directory. Intra-flavour ordering is preserved: `com` still runs twice inside
+its job, and `cap`/`ovl` keep capture-before-restore.
+
+**Do not drop the repeated runs.** The `.com` flavour running twice, and `cap`'s
+two restores, are deliberate idempotency and determinism checks.
+
+**Do not touch `$_cpuemu = (1)`.** It is *assumed* to be required for
+deterministic breakpoint and state inspection. The measurements above do not
+isolate it — the per-flavour cost tracks the driver's work, not the boot — so
+it is not a performance knob the numbers argue for. It has not been tested:
+treat changing it as a correctness risk, not a performance knob.
+
+### Test baselines
+
+The native-host unit test (`build/test_native_host`) counts assertions. Quote the
+commit you measured — the count moves as tests are added.
+
+| Commit | PASS | Note |
+|---|---|---|
+| `e9339ba` | 60 | before the function-hook wiring |
+| `fe70157` | 71 | +11 wiring tests |
+| `6a1a850` | 72 | +1 (guest termination: two assertions replace one) |
+
+A run is green when it exits 0 with 0 failures.
+
 ---
 
 ## Retired validator (historical)
