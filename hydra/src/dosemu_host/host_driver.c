@@ -449,10 +449,10 @@ static host_run_stop_reason_t dispatch_hook(run_ctx_t *r, dosdebug_regs_t *dr,
     hydra_machine_notify(r->m);
     int rtype = hydra_exec_last_result_type();
 
-    if (ret == 0)
+    if (ret == HYDRA_EXEC_RESUME)
       break;
 
-    if (ret == 2) {
+    if (ret == HYDRA_EXEC_RESTORE) {
       if (host_get_regs(r->ctx, dr) != 0)
         return HOST_RUN_STOP_ERROR;
       regs_to_machine(dr, r->m->registers);
@@ -463,6 +463,19 @@ static host_run_stop_reason_t dispatch_hook(run_ctx_t *r, dosdebug_regs_t *dr,
       if (r->ctx->overlays_armed && overlay_reconcile_all(r, NULL) != 0)
         return HOST_RUN_STOP_ERROR;
       return HOST_RUN_STOP_NONE;
+    }
+
+    if (ret == HYDRA_EXEC_TERMINATED) {
+      /* Unreachable on this host: the dosemu2 guest CPU executes the
+       * guest's `int`, so a terminating INT 21h AH=4Ch ends the dosemu2
+       * process (the lane sees that as HOST_RUN_STOP_DOSEMU_EXIT) and the
+       * core never sees a termination. The core reports one only for a host
+       * with no guest CPU, i.e. the native host. Treat it as the error it
+       * would be rather than as a redirect. */
+      fprintf(stderr, "host_run: the core reported a guest termination on the "
+              "dosemu2 host, which cannot happen (the guest CPU runs the "
+              "guest's interrupts)\n");
+      return HOST_RUN_STOP_ERROR;
     }
 
     r->st->redirects++;

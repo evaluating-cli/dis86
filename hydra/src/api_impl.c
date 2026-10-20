@@ -75,6 +75,14 @@ HYDRA_MACHINE_EXEC_FUNC(hydra_machine_exec)
   return hydra_exec_run(m);
 }
 
+/* The exit code of the guest that terminated. The exec layer keeps it (the
+ * guest's registers are not a reliable carrier: the guest may reuse them
+ * after it is gone), and the host driver reads it here. */
+int hydra_machine_exit_code(void)
+{
+  return hydra_exec_last_exit_code();
+}
+
 HYDRA_MACHINE_NOTIFY_FUNC(hydra_machine_notify)
 {
   hydra_callstack_notify(m);

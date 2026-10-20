@@ -7,6 +7,7 @@ static hydra_exec_ctx_t executions[MAX_EXEC];
 static hydra_exec_ctx_t *thread_active = NULL;
 static size_t hook_dispatch_count = 0;
 static int last_result_type = HYDRA_RESULT_TYPE_RESUME;
+static int last_exit_code = -1;
 
 typedef struct overlay_entry overlay_entry_t;
 struct overlay_entry
@@ -88,6 +89,16 @@ u16 hydra_exec_active_id(void)
 size_t hydra_exec_hook_dispatch_count(void)
 {
   return hook_dispatch_count;
+}
+
+/* The exit code of the guest that terminated, or -1 if none has. The host
+ * driver reads it after hydra_machine_exec() reported HYDRA_EXEC_TERMINATED;
+ * the code is kept here rather than read back from the registers because the
+ * registers belong to the guest, which is free to reuse them once it is
+ * gone. */
+int hydra_exec_last_exit_code(void)
+{
+  return last_exit_code;
 }
 
 static void *thread_func(void *_usr)
@@ -282,7 +293,7 @@ int hydra_exec_run_special_modes(hydra_machine_t *m, addr_t addr, int *_done) {
       if (hydra_hook_entry(addr)) {
         m->hardware->state_restore(m->hardware->ctx, HYDRA_MODE->state_path);
         HYDRA_MODE->mode = HYDRA_MODE_NORMAL;
-        return 2;
+        return HYDRA_EXEC_RESTORE;
       }
       return 0;
     } break;
@@ -294,6 +305,12 @@ int hydra_exec_run_special_modes(hydra_machine_t *m, addr_t addr, int *_done) {
 
 int hydra_exec_run(hydra_machine_t *m)
 {
+  /* The exit code belongs to the run that produced it. Clearing it here
+   * means a driver that reads it after a non-terminating run sees -1, not
+   * the previous guest's code (issue #95 Tier 2 runs more than one guest
+   * in a process). */
+  last_exit_code = -1;
+
   addr_t s = ADDR_MAKE(m->registers->cs, m->registers->ip);
 
   // Handle special capture/restore modes
@@ -324,16 +341,16 @@ int hydra_exec_run(hydra_machine_t *m)
   // Figure out how to update / re-direct the CS:IP
   switch (result.type) {
     case HYDRA_RESULT_TYPE_RESUME: {
-      return 0;
+      return HYDRA_EXEC_RESUME;
     } break;
     case HYDRA_RESULT_TYPE_JUMP: {
       m->registers->cs = result.new_cs + CODE_START_SEG;
       m->registers->ip = result.new_ip;
-      return 1;
+      return HYDRA_EXEC_REDIRECT;
     } break;
     case HYDRA_RESULT_TYPE_JUMP_NEAR: {
       m->registers->ip = result.new_ip;
-      return 1;
+      return HYDRA_EXEC_REDIRECT;
     } break;
     case HYDRA_RESULT_TYPE_CALL: {
       m->registers->cs = result.new_cs + CODE_START_SEG;
@@ -342,21 +359,21 @@ int hydra_exec_run(hydra_machine_t *m)
       u16 ret_seg = m->hardware->mem_read16(m->hardware->ctx, addr + 2);
       u16 ret_off = m->hardware->mem_read16(m->hardware->ctx, addr + 0);
       hydra_callstack_trigger_enter(ret_seg, ret_off);
-      return 1;
+      return HYDRA_EXEC_REDIRECT;
     } break;
     case HYDRA_RESULT_TYPE_CALL_NEAR: {
       m->registers->ip = result.new_ip;
       u32 addr = (u32)m->registers->ss * 16 + m->registers->sp;
       u16 ret_off = m->hardware->mem_read16(m->hardware->ctx, addr + 0);
       hydra_callstack_trigger_enter(m->registers->cs, ret_off);
-      return 1;
+      return HYDRA_EXEC_REDIRECT;
     } break;
     case HYDRA_RESULT_TYPE_RET_NEAR: {
       u32 addr = (u32)m->registers->ss * 16 + m->registers->sp;
       m->registers->ip = m->hardware->mem_read16(m->hardware->ctx, addr + 0);
       m->registers->sp += 2;
       hydra_callstack_ret(m);
-      return 1;
+      return HYDRA_EXEC_REDIRECT;
     } break;
     case HYDRA_RESULT_TYPE_RET_FAR: {
       u32 addr = (u32)m->registers->ss * 16 + m->registers->sp;
@@ -364,7 +381,15 @@ int hydra_exec_run(hydra_machine_t *m)
       m->registers->cs = m->hardware->mem_read16(m->hardware->ctx, addr + 2);
       m->registers->sp += 4;
       hydra_callstack_ret(m);
-      return 1;
+      return HYDRA_EXEC_REDIRECT;
+    } break;
+    case HYDRA_RESULT_TYPE_TERMINATE: {
+      /* The guest finished (INT 21h AH=4Ch). Nothing is redirected: there
+       * is no code left to run, and the guest's post-INT code was never
+       * executed (the hook returned at the interrupt). The exit code is
+       * recorded for the host driver, which decides what to do with it. */
+      last_exit_code = result.exit_code;
+      return HYDRA_EXEC_TERMINATED;
     } break;
     default:
       FAIL("UNKNOWN HOOK RESULT TYPE: %d", result.type);

@@ -26,11 +26,16 @@
 static const hydra_backend_t *g_backend = NULL;
 static void *g_backend_state = NULL;
 
-/* Guest termination ends the process from inside a hook (see hydra_impl_int),
- * so normal shutdown never reaches the host's own teardown. Restore terminal
- * state here instead: the terminal backend puts stdin into non-blocking mode
- * and would otherwise leave the user's shell that way. Aborts do not run
- * atexit handlers, but those are crash paths anyway. */
+/* The backend's teardown, run as an atexit handler so the terminal state is
+ * restored on the way out no matter how the process ends.
+ *
+ * A guest that terminates no longer ends the process: the termination is
+ * reported to the host driver, which finishes its own reporting and then
+ * exits, so the driver's epilogue runs in the right order. This handler is
+ * the safety net for the paths that do not get there — an abort, or a driver
+ * that simply returns from main. The terminal backend puts stdin into
+ * non-blocking mode and would otherwise leave the user's shell that way.
+ * Aborts do not run atexit handlers, but those are crash paths anyway. */
 static void backend_atexit(void)
 {
   if (!g_backend)
@@ -117,23 +122,22 @@ int hydra_user_int(hydra_machine_t *m, u8 num)
 
   int rc = native_int_dispatch(ctx, m->registers, num, be, g_backend_state);
   if (rc == NATIVE_INT_EXIT) {
-    /* Guest termination. INT 21h AH=4Ch does not return, so ending the process
-     * here is the only way to keep the decompiled hook from running whatever
-     * follows the INT — code the guest never meant to reach. Same shape as
-     * the capture mode's exit() in hydra_exec_run_special_modes(); the
-     * atexit handler above restores terminal state on the way out.
+    /* Guest termination. INT 21h AH=4Ch does not return, so the decompiled
+     * hook must not continue either: the statements the decompiler emitted
+     * after the INT are code the guest never meant to reach, and running them
+     * would corrupt the world the guest left behind.
      *
-     * This runs on the hook's worker thread, so the host's main() never
-     * regains control: anything a host must do after a guest terminates has
-     * to be an atexit handler registered after hydra_machine_init (LIFO puts
-     * it before the backend's). See the "guest termination" note in
-     * hydra/README.md — making termination observable to the host instead is
-     * the target design for issue #95 Tier 2.
+     * The host's own NATIVE_INT_EXIT is a private code; the core's hook
+     * convention is HYDRA_USER_INT_TERMINATE (see hydra_machine.h), which
+     * the core turns into a TERMINATE result: the hook returns at the
+     * interrupt and the exec loop reports the termination to the host
+     * driver. The driver then finishes its reporting and exits with the
+     * guest's code — which is what a playable port needs, and what the
+     * process-wide exit() this replaces could not offer.
      *
-     * TODO: present() the final frame before exiting. be->present has no
-     * caller yet, so nothing is lost today, but once the render loop exists
-     * the guest's last frame would be dropped here. */
-    exit((int)(m->registers->ax & 0xff));
+     * The exit code is AL (DOS semantics); the core reads it from the
+     * registers. */
+    return HYDRA_USER_INT_TERMINATE;
   }
   return rc;
 }

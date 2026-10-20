@@ -11,6 +11,11 @@ enum {
   HYDRA_RESULT_TYPE_CALL_NEAR,
   HYDRA_RESULT_TYPE_RET_NEAR,
   HYDRA_RESULT_TYPE_RET_FAR,
+  /* The guest finished: it asked to terminate (INT 21h AH=4Ch) and does not
+   * return. The exit code is in the result, not in the registers: the host
+   * driver has to be able to read it after the hook has returned, and the
+   * registers are the guest's to reuse. */
+  HYDRA_RESULT_TYPE_TERMINATE,
 };
 
 typedef struct hydra_result hydra_result_t;
@@ -19,13 +24,15 @@ struct hydra_result
   int      type;    /* HYDRA_RESULT_TYPE_* */
   uint16_t new_cs;
   uint16_t new_ip;
+  int      exit_code; /* valid for HYDRA_RESULT_TYPE_TERMINATE only */
 };
 
-#define HYDRA_RESULT_RESUME()       ({ hydra_result_t res = {HYDRA_RESULT_TYPE_RESUME, -1, -1}; res; })
-#define HYDRA_RESULT_JUMP(seg, off) ({ hydra_result_t res = {HYDRA_RESULT_TYPE_JUMP, seg, off}; res; })
-#define HYDRA_RESULT_JUMP_NEAR(off) ({ hydra_result_t res = {HYDRA_RESULT_TYPE_JUMP_NEAR, 0, off}; res; })
-#define HYDRA_RESULT_RET_NEAR()     ({ hydra_result_t res = {HYDRA_RESULT_TYPE_RET_NEAR, -1, -1}; res; })
-#define HYDRA_RESULT_RET_FAR()      ({ hydra_result_t res = {HYDRA_RESULT_TYPE_RET_FAR, -1, -1}; res; })
+#define HYDRA_RESULT_RESUME()       ({ hydra_result_t res = {HYDRA_RESULT_TYPE_RESUME, -1, -1, 0}; res; })
+#define HYDRA_RESULT_JUMP(seg, off) ({ hydra_result_t res = {HYDRA_RESULT_TYPE_JUMP, seg, off, 0}; res; })
+#define HYDRA_RESULT_JUMP_NEAR(off) ({ hydra_result_t res = {HYDRA_RESULT_TYPE_JUMP_NEAR, 0, off, 0}; res; })
+#define HYDRA_RESULT_RET_NEAR()     ({ hydra_result_t res = {HYDRA_RESULT_TYPE_RET_NEAR, -1, -1, 0}; res; })
+#define HYDRA_RESULT_RET_FAR()      ({ hydra_result_t res = {HYDRA_RESULT_TYPE_RET_FAR, -1, -1, 0}; res; })
+#define HYDRA_RESULT_TERMINATE(code) ({ hydra_result_t res = {HYDRA_RESULT_TYPE_TERMINATE, -1, -1, (int)(code)}; res; })
 
 /* Registration flags */
 enum {

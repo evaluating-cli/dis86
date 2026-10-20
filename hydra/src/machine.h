@@ -283,7 +283,20 @@
 #define REP_OUTSB(ds, si, cx, port) hydra_impl_rep_outsb(ds, si, cx, port)
 #define REP_OUTSW(ds, si, cx, port) hydra_impl_rep_outsw(ds, si, cx, port)
 
-#define INT(num) hydra_impl_int(num);
+/* INT: hand the interrupt to the host's device layer. The primitive reports
+ * what happened: -1 when the interrupt was serviced and the guest continues,
+ * or the exit code when the guest asked to terminate (INT 21h AH=4Ch).
+ *
+ * A terminating interrupt does not return, so the hook returns right here:
+ * the statements the decompiler emitted after the INT are code the guest
+ * never meant to reach, and running them would corrupt the world the guest
+ * left behind (its memory, its outbox). The exit code travels out as a
+ * result, so the host driver can report it and then exit with it. */
+#define INT(num) do {                                    \
+    int _hydra_int_code = hydra_impl_int(num);           \
+    if (_hydra_int_code >= 0)                            \
+      RETURN_TERMINATE(_hydra_int_code);                 \
+  } while (0)
 
 #define FRAME_ENTER(n) ({ PUSH(BP); BP = SP; SP -= n; })
 #define FRAME_LEAVE()  ({ SP = BP; BP = POP(); })
@@ -324,6 +337,7 @@
 #define RETURN_JUMP(seg, off) return HYDRA_RESULT_JUMP(seg, off)
 #define RETURN_FAR()          return HYDRA_RESULT_RET_FAR()
 #define RETURN_NEAR()         return HYDRA_RESULT_RET_NEAR()
+#define RETURN_TERMINATE(code) return HYDRA_RESULT_TERMINATE(code)
 
 #define RETURN_FAR_N(n) ({\
   REMOVE_ARGS_FAR(n); \
@@ -358,7 +372,9 @@ void     hydra_impl_rep_insb(u16 es, u16 di, u16 cx, u16 port);
 void     hydra_impl_rep_insw(u16 es, u16 di, u16 cx, u16 port);
 void     hydra_impl_rep_outsb(u16 ds, u16 si, u16 cx, u16 port);
 void     hydra_impl_rep_outsw(u16 ds, u16 si, u16 cx, u16 port);
-void     hydra_impl_int(u8 num);
+int      hydra_impl_int(u8 num); /* -1: serviced, the guest continues.
+                                   >= 0: the guest terminated with this
+                                   exit code (INT 21h AH=4Ch). */
 void     hydra_impl_nop(void);
 void     hydra_impl_raw_code_reset(void); /* host driver: reset slot counter at hook boundary */
 addr_t   hydra_impl_ptr_to_addr(hydra_machine_t *m, void *ptr);

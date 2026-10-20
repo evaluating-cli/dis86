@@ -52,28 +52,36 @@ bridge.
 
 ## Guest termination
 
-`INT 21h AH=4Ch` ends the process. The exit code is `AL`.
+`INT 21h AH=4Ch` ends the guest. The exit code is `AL`.
 
-Termination is handled **by the host, not the core**: the core's
-`hydra_impl_int` fails loud on any non-zero return from the `hydra_user_int`
-hook and never exits the process itself. `machine.c` compiles into every host,
-so a process-wide policy there would be one the core cannot take back; hosts
-that need to observe termination instead of ending would have no seam. The
-native host performs the exit inside its own hook
-(`hydra/src/native_host/backend_host.c`), which is also the only place that
-knows the backend teardown that must run first.
+Termination is **a result the exec loop reports**, not a process exit. The
+core's `hydra_impl_int` asks the host's `hydra_user_int` hook what happened;
+a terminating interrupt comes back as `HYDRA_RESULT_TERMINATE`, and the
+decompiled hook returns at the interrupt — `INT 21h AH=4Ch` does not return,
+so the statements the decompiler emitted after it are code the guest never
+meant to reach. `hydra_machine_exec` then returns `HYDRA_EXEC_TERMINATED`,
+and the exit code is available from `hydra_machine_exit_code()`.
 
-Two consequences an embedder has to design around:
+The process-wide decision stays with the host: `machine.c` compiles into every
+host, so the core reports that the guest is done and never ends the process
+itself. A host driver finishes its own reporting — write the outbox, present
+the last frame, save the state — and then exits with the guest's code.
 
-- **The process ends, so a host's epilogue only runs if it is an `atexit`
-  handler.** The hook runs on a worker thread, so the host's `main()` never
-  regains control. Handlers registered after `hydra_machine_init` run before
-  the backend's (atexit is LIFO), which is the order you want.
-- **The host cannot observe that the guest terminated.** It only sees the
-  process stop. Making termination a result the exec loop can return — so the
-  host can finish its reporting and then exit with the guest's code — is the
-  target design for issue #95 Tier 2, which covers save/exit behaviour and
-  running more than one guest in a process.
+Two things an embedder has to design around:
+
+- **The driver's `main()` regains control**, so its epilogue runs in the
+  order it wants. The backend's teardown still happens through the `atexit`
+  handler registered at init (atexit is LIFO, so handlers the driver
+  registers later run first).
+- **The guest's exit code is the driver's to use.** A port that wants the DOS
+  convention exits with it; a harness that reports a verdict (the parity
+  lane) prints it and keeps its own exit status.
+- **The machine is spent after a termination.** A guest that terminates
+  inside a function reached through a callstub leaves the caller's execution
+  context waiting for a return that never comes, so the machine cannot be
+  reused: a second guest needs a second machine. Running more than one guest
+  in a process (issue #95 Tier 2) needs an explicit teardown for the
+  contexts a terminating guest leaves behind.
 
 Only `AH=4Ch` terminates. `INT 20h` and `INT 21h AH=00h` still fail loud, as
 do COM programs that end by far-returning to their PSP. `INT 20h` in

@@ -68,7 +68,9 @@ const hydra_backend_t *hydra_backend_by_name(const char *name);
 /* Selective INT dispatch (issue #95): a two-level table, vector -> AH handler.
  *
  * Returns 0 when a handler ran, or NATIVE_INT_EXIT when the handler requests
- * program termination (INT 21h AH=4Ch; AL carries the exit code).
+ * guest termination (INT 21h AH=4Ch; AL carries the exit code). The host's
+ * hook maps that onto the core's HYDRA_USER_INT_TERMINATE, so the core stops
+ * the hook at the interrupt and reports the termination to the host driver.
  *
  * An unhandled vector, or an unhandled AH inside a handled vector, fails loud
  * (diagnostic naming both, then abort) — the house fail-closed style, and the
@@ -99,8 +101,8 @@ void hydra_native_backend_select(const char *name);
 /* Test seam, implemented in backend_host.c: install a backend directly instead
  * of looking it up by name. Exists so backend_selftest.c can install a probe
  * backend that only the test knows about, and thereby assert that the atexit
- * teardown really runs on the guest-termination path. Not part of the host
- * interface; no host calls it. */
+ * teardown really runs when a driver exits after a guest termination. Not
+ * part of the host interface; no host calls it. */
 void hydra_native_backend_install_probe(const hydra_backend_t *be, void *state);
 
 /* The active backend and its state, as selected above. Non-mutating: it fails
