@@ -395,6 +395,7 @@ int main(void)
   printf("\n--- device HAL / terminal backend / INT dispatch (issue #95) ---\n");
   g_failures += hydra_backend_selftest();
   g_failures += hydra_backend_linktest(&m);
+  g_failures += hydra_backend_videotest(&m);
 
   if (g_failures) {
     printf("FAIL: %d failures\n", g_failures);
