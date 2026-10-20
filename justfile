@@ -42,6 +42,11 @@ check:
     hydra/src/*.c hydra/src/native_host/*.c \
     -rdynamic -pthread -ldl -o build/test_native_host
   ./build/test_native_host
+  cc -std=c11 -D_GNU_SOURCE -Dtypeof=__typeof__ \
+    -Ihydra/src -Ihydra/include \
+    hydra/src/*.c hydra/src/dosemu_host/test_trace.c \
+    -rdynamic -pthread -ldl -o build/test_trace
+  ./build/test_trace
 
 # Build the hydra component only
 build-hydra:

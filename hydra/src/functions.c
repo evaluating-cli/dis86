@@ -90,3 +90,11 @@ bool hydra_function_addr(const char *name, addr_t *_out)
   }
   return false;
 }
+
+const char *hydra_function_name_at(u16 cs, u16 off)
+{
+  /* Below the code segment there is no image-relative address to look up,
+   * and the guest code there is not one of ours. */
+  if (cs < CODE_START_SEG) return NULL;
+  return hydra_function_name(ADDR_MAKE(cs - CODE_START_SEG, off));
+}

@@ -11,6 +11,7 @@
 #include "overlay.h"
 #include "callstack.h"
 #include "functions.h"
+#include "trace.h"
 
 #define ENABLE_DEBUG_CALLSTACK 0
 #define MAX_HOOKS 2048
@@ -125,7 +126,8 @@ int hydra_exec_run(hydra_machine_t *m);
 int   hydra_exec_last_result_type(void);
 int   hydra_exec_last_exit_code(void);
 u16   hydra_exec_active_id(void);
-size_t hydra_exec_hook_dispatch_count(void);
+/* hydra_exec_hook_dispatch_count() is public: it is declared in
+ * hydra_machine.h, next to the other host-facing counters. */
 
 /********************************************************************/
 /* callstack.c */

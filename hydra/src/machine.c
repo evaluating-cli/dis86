@@ -249,6 +249,15 @@ void hydra_impl_outb(u16 port, u8 val)
 
 int hydra_impl_int(u8 num)
 {
+  /* An interrupt is always serviced from inside a hook, so the execution
+   * context (and with it the guest registers) is there. Reading AH before
+   * the interrupt runs is what makes the trace record say which service was
+   * asked for. */
+  hydra_exec_ctx_t *exec = execution_context_get(NULL);
+  hydra_machine_t *m = &exec->machine;
+
+  hydra_trace_int(num, (u8)(m->registers->ax >> 8));
+
   if (hydra_raw_code_available()) {
     u8 machine_code[] = {0xcd, num, 0xcb};
     hydra_impl_raw_code(machine_code, ARRAY_SIZE(machine_code));
@@ -262,9 +271,6 @@ int hydra_impl_int(u8 num)
    * region. Hand the interrupt to the host's device layer instead (dlsym
    * hook, see internal.h). Guarded the same way as nop/cld/std/cli/sti, so
    * hosts that do execute raw code take the unchanged path above. */
-  hydra_exec_ctx_t *exec = execution_context_get(NULL);
-  hydra_machine_t *m = &exec->machine;
-
   int rc = hydra_user_int_hook ? hydra_user_int_hook(m, num) : -1;
   if (rc == 0)
     return -1;

@@ -83,6 +83,19 @@ int hydra_machine_exit_code(void)
   return hydra_exec_last_exit_code();
 }
 
+/* What the machine did since the process started. The dispatch count comes
+ * from the exec layer (it owns it), the rest from the trace module (which
+ * counts the events whether or not a trace sink is open). */
+int hydra_machine_stats(hydra_run_stats_t *_out)
+{
+  if (!_out) return -1;
+
+  memset(_out, 0, sizeof(*_out));
+  hydra_trace_stats(_out);
+  _out->dispatches = hydra_exec_hook_dispatch_count();
+  return 0;
+}
+
 HYDRA_MACHINE_NOTIFY_FUNC(hydra_machine_notify)
 {
   hydra_callstack_notify(m);

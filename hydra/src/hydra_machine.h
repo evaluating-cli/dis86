@@ -108,6 +108,29 @@ HYDRA_MACHINE_STEP_HOOK_FUNC(hydra_machine_step_hook);
  * after a non-terminating run sees -1 rather than an earlier guest's code. */
 int hydra_machine_exit_code(void);
 
+/* What the machine did since the process started. The counters advance
+ * whether or not a trace sink is open, so a driver can report them without
+ * recording a trace. They are process-wide, not per run: a driver that
+ * needs a per-run figure takes the difference, the way the dosemu2 host
+ * driver does with the hook dispatch count. */
+typedef struct hydra_run_stats {
+  uint64_t dispatches;      /* hooks dispatched */
+  uint64_t calls;           /* guest call boundaries seen by the callstack model */
+  uint64_t returns;         /* guest return boundaries seen by the callstack model */
+  uint64_t native_calls;    /* native->guest calls issued at a call seam */
+  uint64_t native_returns;  /* native->guest calls that returned a value */
+  uint64_t steps;           /* guest instructions observed one at a time */
+  uint64_t interrupts;      /* interrupts serviced */
+} hydra_run_stats_t;
+
+/* Fill *_out with the run statistics. Returns 0 on success. */
+int hydra_machine_stats(hydra_run_stats_t *_out);
+
+/* Number of hook functions dispatched since startup (run_begin, not
+ * resumed). Public so a host outside the Hydra core can read the progress
+ * signal the dosemu2 host driver already consumes. */
+size_t hydra_exec_hook_dispatch_count(void);
+
 typedef HYDRA_MACHINE_INIT_FUNC((*hydra_machine_init_fn_t));
 typedef HYDRA_MACHINE_EXEC_FUNC((*hydra_machine_exec_fn_t));
 typedef HYDRA_MACHINE_NOTIFY_FUNC((*hydra_machine_notify_fn_t));

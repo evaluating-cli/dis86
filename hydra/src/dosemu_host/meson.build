@@ -64,6 +64,13 @@ test_unimpl_trap = executable(
   'test_unimpl_trap', 'test_unimpl_trap.c',
 )
 
+## The trace sink (issue #97): a core facility, so its test needs no
+## dosemu2 either - a fake machine with flat RAM is enough.
+test_trace = executable(
+  'test_trace', 'test_trace.c',
+  link_with : libhydra,
+)
+
 ## Phase 4/5: guest program (nasm -> .COM) + driver integration test.
 
 testprog_com = custom_target(
