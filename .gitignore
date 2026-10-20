@@ -6,5 +6,6 @@ build/
 /dosemu2/
 # Local benchmark/session artifacts: never committed, never added.
 /FCD.EXE
+/native-recompile-prompt.md
 /codex-session-*.md
 __pycache__/
