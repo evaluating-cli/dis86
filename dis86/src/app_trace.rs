@@ -34,13 +34,13 @@ pub fn run(cfg: Option<&Config>, trace_path: &str) -> i32 {
 
   println!("=== trace analysis: {} ===", trace_path);
   println!("events: {}", analysis.events);
-  println!("  dispatches:    {}", analysis.dispatches);
-  println!("  calls:         {}", analysis.calls);
-  println!("  returns:       {}", analysis.returns);
-  println!("  native calls:  {}", analysis.native_calls);
-  println!("  native rets:   {}", analysis.native_returns);
-  println!("  instructions:  {}", analysis.steps);
-  println!("  interrupts:    {}", analysis.interrupts);
+  println!("  hook dispatches:  {}", analysis.dispatches);
+  println!("  calls:            {}", analysis.calls);
+  println!("  returns:          {}", analysis.returns);
+  println!("  native calls:     {}", analysis.native_calls);
+  println!("  native rets:      {}", analysis.native_returns);
+  println!("  instructions:     {}", analysis.steps);
+  println!("  interrupts:       {}", analysis.interrupts);
   println!("functions seen: {}", analysis.functions.len());
 
   print_call_graph(cfg, &analysis);
@@ -72,6 +72,20 @@ fn print_call_graph(cfg: Option<&Config>, analysis: &TraceAnalysis) {
         println!("    -> {}", callee);
       } else {
         println!("    -> {} {}", callee, callee_name);
+      }
+    }
+    // The callers are the other end of the same edges: the call seam knows
+    // both, so the graph can be read either way.
+    for caller in &info.callers {
+      let caller_info = analysis.functions.get(caller);
+      let caller_name = match caller_info {
+        Some(i) => function_name(cfg, *caller, i),
+        None => String::new(),
+      };
+      if caller_name.is_empty() {
+        println!("    <- {}", caller);
+      } else {
+        println!("    <- {} {}", caller, caller_name);
       }
     }
   }
