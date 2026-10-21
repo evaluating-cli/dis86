@@ -31,8 +31,10 @@ pub const TRACE_HEADER: &str = "# hydra trace v1";
 /// A parsed event.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TraceEvent {
-  /// A hook was dispatched (`enter`) or returned (`leave`). The address is
-  /// the image-relative entry of the hook.
+  /// A hook was dispatched (`enter`) or returned (`leave`). For `enter`
+  /// the address is the hook's entry; for `leave` it is where the hook
+  /// left the guest, which a hook that rewrites CS:IP can move away from
+  /// its entry.
   Dispatch { enter: bool, addr: Option<SegOff>, name: Option<String>, result: Option<String> },
   /// A guest call boundary seen by the callstack model: the guest reached
   /// the callee's entry (`to`), coming from an address inside the caller
@@ -40,9 +42,12 @@ pub enum TraceEvent {
   /// a call stub, the call instruction for a call the guest executed).
   /// Either way it is not a function entry.
   Call { from: Option<SegOff>, to: Option<SegOff>, name: Option<String> },
-  /// A guest return boundary seen by the callstack model: the guest left
-  /// the function at `from` and continued at `to` (an address inside the
-  /// caller). The name is the one of the function that was left.
+  /// A guest return boundary seen by the callstack model: the guest
+  /// returned from the position `from` and continued at `to` (an address
+  /// inside the caller). `from` is the hook's entry when the hook performed
+  /// the return, and otherwise the address of the return instruction,
+  /// inside the function: it is not necessarily a function entry, and
+  /// `name` is present only when it is.
   Ret { from: Option<SegOff>, to: Option<SegOff>, name: Option<String> },
   /// The native-to-guest call seam: the callee, and the arguments it was
   /// handed (read back from the guest stack).
@@ -160,8 +165,8 @@ pub fn parse_trace(text: &str) -> Result<Vec<TraceEvent>, String> {
       "int" => {
         let fields = parse_fields(&rest).map_err(|e| format!("line {}: {}", lineno, e))?;
         TraceEvent::Int {
-          num: need_u16(&fields, "num", lineno)? as u8,
-          ah: need_u16(&fields, "ah", lineno)? as u8,
+          num: need_u8(&fields, "num", lineno)?,
+          ah: need_u8(&fields, "ah", lineno)?,
         }
       }
       other => return Err(format!("line {}: unknown event '{}'", lineno, other)),
@@ -193,9 +198,11 @@ pub struct FunctionInfo {
   pub call_sites: BTreeSet<SegOff>,
   /// The argument count observed at the call seam, when there was one.
   pub observed_args: Option<u16>,
-  /// Set when two call seams disagreed about the argument count.
+  /// Set when two call seams disagreed about the argument count. The
+  /// highest count seen is the one reported, because a signature has to
+  /// hold every word the callee may read.
   pub args_conflict: bool,
-  /// How often the function was dispatched.
+  /// How often the function was dispatched (an `enter` event).
   pub dispatches: u64,
   /// How often the function returned.
   pub returns: u64,
@@ -207,6 +214,9 @@ pub struct FunctionInfo {
 pub struct TraceAnalysis {
   pub functions: BTreeMap<SegOff, FunctionInfo>,
   pub events: u64,
+  /// The number of hook dispatches: the `enter` events, one per run of a
+  /// hook. The `leave` events are not counted here, so this agrees with
+  /// the machine's dispatch count rather than doubling it.
   pub dispatches: u64,
   pub calls: u64,
   pub returns: u64,
@@ -229,7 +239,7 @@ pub fn analyze(events: &[TraceEvent]) -> TraceAnalysis {
   for event in events {
     match event {
       TraceEvent::Dispatch { enter, addr, name, .. } => {
-        a.dispatches += 1;
+        if *enter { a.dispatches += 1; }
         let Some(addr) = addr else { continue };
         let f = a.entry(*addr);
         if *enter { f.dispatches += 1; } else { f.returns += 1; }
@@ -251,15 +261,19 @@ pub fn analyze(events: &[TraceEvent]) -> TraceAnalysis {
       }
       TraceEvent::Ret { from, to, name } => {
         a.returns += 1;
-        // The guest left the function at `from` and continued at `to`, which
-        // is an address inside the caller.
+        // The position the guest returned from is a function entry only
+        // when the event names it (the metadata knew that address) or when
+        // the function is already known from another event. A return the
+        // guest executed itself leaves `from` at the return instruction,
+        // inside the function: inventing a function there would put a
+        // phantom entry in the discovery suggestions.
         if let Some(from) = from {
-          {
+          if name.is_some() || a.functions.contains_key(from) {
             let f = a.entry(*from);
             if f.name.is_none() { f.name = name.clone(); }
-          }
-          if let Some(to) = to {
-            a.entry(*from).call_sites.insert(*to);
+            if let Some(to) = to {
+              f.call_sites.insert(*to);
+            }
           }
         }
       }
@@ -272,7 +286,13 @@ pub fn analyze(events: &[TraceEvent]) -> TraceAnalysis {
             match f.observed_args {
               None => f.observed_args = Some(*nargs),
               Some(seen) if seen == *nargs => {}
-              Some(_) => f.args_conflict = true,
+              Some(seen) => {
+                f.args_conflict = true;
+                // Keep the highest count: a signature has to hold every
+                // word the callee may read, and the comment the output
+                // prints says so.
+                if *nargs > seen { f.observed_args = Some(*nargs); }
+              }
             }
           }
           if let Some(from) = from {
@@ -322,6 +342,14 @@ fn need_u16(fields: &BTreeMap<&str, &str>, key: &str, lineno: usize) -> Result<u
   parse_hex_u16(value).map_err(|e| format!("line {}: bad field '{}': {}", lineno, key, e))
 }
 
+fn need_u8(fields: &BTreeMap<&str, &str>, key: &str, lineno: usize) -> Result<u8, String> {
+  let value = need_u16(fields, key, lineno)?;
+  if value > 0xff {
+    return Err(format!("line {}: field '{}' is not a byte: {}", lineno, key, value));
+  }
+  Ok(value as u8)
+}
+
 fn need_addr(fields: &BTreeMap<&str, &str>, seg_key: &str, off_key: &str, lineno: usize)
   -> Result<(u16, u16), String>
 {
@@ -354,6 +382,11 @@ fn parse_hex_u16(s: &str) -> Result<u16, String> {
 /// those two windows to resume a suspended hook, and the trace records them
 /// because they are where the guest was - not because a function lives
 /// there.
+///
+/// The near window spans `0xff00` to `0xff00 + exec_id` for every execution
+/// context, so a real function in the top 256 bytes of an image cannot be
+/// told apart from it: those offsets are dropped too. The window is stated
+/// here rather than guessed at.
 fn resolve(seg: u16, off: u16, code_load: Option<u16>) -> Option<SegOff> {
   let load = code_load?;
   if seg < load { return None; }

@@ -97,7 +97,9 @@ fn builds_the_function_level_picture() {
   let a = analyze(&events);
 
   assert_eq!(a.events, 9);
-  assert_eq!(a.dispatches, 4);
+  // The dispatches are the `enter` events: one per run of a hook, so the
+  // number agrees with the machine's dispatch count instead of doubling it.
+  assert_eq!(a.dispatches, 2);
   assert_eq!(a.calls, 1);
   assert_eq!(a.returns, 2);
   assert_eq!(a.native_calls, 1);
@@ -119,6 +121,10 @@ fn builds_the_function_level_picture() {
   assert_eq!(leaf.name.as_deref(), Some("F_parity_leaf"));
   assert_eq!(leaf.observed_args, Some(0));
   assert_eq!(leaf.results, vec![(0x0000, 0x117a)]);
+
+  // Both ends of the call seam are known, so the graph can be read either
+  // way.
+  assert!(leaf.callers.contains(&SegOff::new(0, 0x0000)));
 }
 
 #[test]
@@ -155,5 +161,59 @@ native_call from=0001:0000 to=0001:0185 nargs=2 arg0=1234 arg1=5678
 
   let leaf = a.functions.get(&SegOff::new(0, 0x0185)).expect("the leaf");
   assert!(leaf.args_conflict);
-  assert_eq!(leaf.observed_args, Some(1));
+  // The highest count is the one reported: a signature has to hold every
+  // word the callee may read.
+  assert_eq!(leaf.observed_args, Some(2));
+}
+
+#[test]
+fn does_not_invent_a_function_for_a_return_inside_one() {
+  // A return the guest executed itself leaves the `from` of the event at
+  // the return instruction, inside the function. That address is not a
+  // function entry, so it must not become one: the discovery suggestions
+  // would offer a function that does not exist.
+  let trace = "\
+# hydra trace v1
+# code_load=0001
+dispatch enter cs=0001 ip=013e name=F_myfunc
+ret from=0001:0190 to=0001:0020
+";
+  let events = parse_trace(trace).expect("the trace parses");
+  let a = analyze(&events);
+
+  assert_eq!(a.returns, 1);
+  assert!(!a.functions.contains_key(&SegOff::new(0, 0x0190)),
+          "a mid-function address must not become a function");
+  assert_eq!(a.functions.len(), 1);
+}
+
+#[test]
+fn counts_the_hook_dispatches_and_not_the_dispatch_events() {
+  // Every hook run writes an `enter` and a `leave` event. The dispatch
+  // count is the number of hook runs, so it agrees with the machine's own
+  // count rather than doubling it.
+  let trace = "\
+# hydra trace v1
+# code_load=0001
+dispatch enter cs=0001 ip=013e name=F_myfunc
+dispatch leave cs=0001 ip=013e name=F_myfunc result=resume
+dispatch enter cs=0001 ip=013e name=F_myfunc
+dispatch leave cs=0001 ip=013e name=F_myfunc result=resume
+";
+  let events = parse_trace(trace).expect("the trace parses");
+  let a = analyze(&events);
+
+  assert_eq!(a.dispatches, 2);
+  let f = a.functions.get(&SegOff::new(0, 0x013e)).expect("the function");
+  assert_eq!(f.dispatches, 2);
+  assert_eq!(f.returns, 2);
+}
+
+#[test]
+fn rejects_an_interrupt_number_that_is_not_a_byte() {
+  let err = parse_trace("# hydra trace v1\nint num=1ff ah=4c\n").unwrap_err();
+  assert!(err.contains("not a byte"), "unexpected error: {}", err);
+
+  let err = parse_trace("# hydra trace v1\nint num=21 ah=100\n").unwrap_err();
+  assert!(err.contains("not a byte"), "unexpected error: {}", err);
 }
