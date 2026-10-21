@@ -142,15 +142,32 @@ int num=21 ah=4c
 - `name=` carries the name of the function the event is about, when there is
   one: for a dispatch it is the hook's registered name, for the other events
   it is the metadata's name for that address. A hook registered by address
-  has no name, and an address no metadata knows has none either.
+  has no name, and an address no metadata knows has none either. A name is a
+  single whitespace-free token; one that is not (the names come from the
+  user's metadata) is not recorded, because the reader could not parse the
+  line.
 - The `from=` of a `call` is an address **inside the caller**, never a
   function entry: the return address for a call the decompiler lowered
   through a call stub (there is no guest call instruction to point at), the
   call instruction for a call the guest executed.
+- The `from=` of a `ret` is the position the guest returned from: the hook's
+  entry when the hook performed the return, and otherwise the address of the
+  return instruction, **inside** the function. It is not necessarily a
+  function entry, and its name is recorded only when it is one.
+- A `dispatch`'s address is the hook's entry for an `enter` and where the
+  hook left the guest for a `leave`: a hook that rewrites CS:IP moves it.
+- A `step`'s address is the position the guest reached **after** the
+  instruction, not the address of the instruction that ran.
 - `nargs=` counts 16-bit argument words, followed by `arg0=`, `arg1=`, ... The
   words are read back from the guest stack, so they are what the callee will
   read, not the values the caller had in C.
 - `dx=`/`ax=` carry the value returned at a call boundary.
+
+A reader has to drop the two windows the core uses to resume a suspended
+hook: the far magic return address (`0xffff:exec_id`) and the near magic
+return window (`cs:0xff00+exec_id`, for an execution id up to 255). They are
+not places a function lives, but they cannot be told apart from one, so a
+function in the top 256 bytes of an image is dropped with them.
 
 The events come from the places that already know them:
 

@@ -47,16 +47,42 @@
  *     there is one: for a dispatch it is the hook's registered name, for
  *     the other events it is the metadata's name for that address. A hook
  *     registered by address has no name, and an address no metadata knows
- *     has none either.
+ *     has none either. A name is a single whitespace-free token: a name
+ *     that is not one is not recorded, because the format is whitespace
+ *     separated and the reader would not be able to parse the line.
  *   - "nargs=" counts 16-bit argument words and is followed by "arg0=",
  *     "arg1=", ... for the words themselves.
  *   - "dx=" and "ax=" carry the value returned at a call boundary; a
  *     non-zero dx means the call returned 32 bits in DX:AX.
  *
+ * What the addresses of an event are:
+ *
+ *   - A dispatch's address is the hook's entry for an "enter", and where
+ *     the hook left the guest for a "leave": a hook that rewrites CS:IP
+ *     moves it away from its entry.
+ *   - A call's "to" is the callee's entry. Its "from" is an address
+ *     inside the caller, never a function entry: the return address for
+ *     a call the decompiler lowered through a call stub (there is no
+ *     guest call instruction to point at), the call instruction for a
+ *     call the guest executed.
+ *   - A return's "from" is the position the guest returned from: the
+ *     hook's entry when the hook performed the return, and otherwise the
+ *     address of the return instruction, inside the function. It is not
+ *     necessarily a function entry, and its "name" is recorded only when
+ *     it is one. Its "to" is an address inside the caller.
+ *   - A step's address is the position the guest reached *after* the
+ *     instruction, not the address of the instruction that ran.
+ *
  * The dispatch counter and the dispatch events do not count the same
  * things: the counter counts dispatch *attempts*, and an overlay hook that
  * is not paged in yet is an attempt whose hook never ran (the host lets the
  * guest page it in instead), so it has no dispatch event.
+ *
+ * A reader has to drop two windows the core uses to resume a suspended
+ * hook: the far magic return address (0xffff:exec_id) and the near magic
+ * return window (cs:0xff00+exec_id, for an execution id up to 255). They
+ * are not places a function lives, but they cannot be told apart from one:
+ * a function in the top 256 bytes of an image is dropped with them.
  */
 
 typedef struct hydra_machine hydra_machine_t;
@@ -89,7 +115,10 @@ void hydra_trace_flush(void);
 
 /* A hook was dispatched ("enter") or returned ("leave"). The result name is
  * the hydra_result type of the return ("resume", "jump", "call", "call_near",
- * "ret_near", "ret_far", "terminate"), or NULL. */
+ * "ret_near", "ret_far", "terminate"), or NULL.
+ *
+ * The address is the hook's entry for an "enter" and where the hook left
+ * the guest for a "leave": a hook that rewrites CS:IP moves it. */
 void hydra_trace_dispatch(const char *name, u16 cs, u16 ip,
                           const char *phase, const char *result);
 
@@ -106,10 +135,15 @@ void hydra_trace_dispatch(const char *name, u16 cs, u16 ip,
  * every boundary, which a closed sink must not do. */
 void hydra_trace_call(u16 from_seg, u16 from_off, u16 to_seg, u16 to_off);
 
-/* A guest return boundary seen by the callstack model: the guest left the
- * function at the previous position and continued at the current one (an
- * address inside the caller). The name is the one of the function that was
- * left, resolved by the trace module as for a call. */
+/* A guest return boundary seen by the callstack model: the guest returned
+ * from the previous position and continued at the current one (an address
+ * inside the caller).
+ *
+ * The previous position is the hook's entry when the hook performed the
+ * return, and otherwise the address of the return instruction, inside the
+ * function: it is not necessarily a function entry, and the name is
+ * recorded only when it is one. The name is resolved by the trace module,
+ * as for a call. */
 void hydra_trace_ret(u16 from_seg, u16 from_off, u16 to_seg, u16 to_off);
 
 /* The native->guest call seam. The arguments are read back from the guest
@@ -122,7 +156,8 @@ void hydra_trace_native_call(hydra_machine_t *m, addr_t callee, int nargs);
 void hydra_trace_native_ret(hydra_machine_t *m, addr_t callee);
 
 /* One guest instruction. Emitted by a host that advances the guest one
- * instruction at a time. */
+ * instruction at a time. The address is the position the guest reached
+ * after the instruction, not the address of the instruction that ran. */
 void hydra_trace_step(u16 cs, u16 ip);
 
 /* An interrupt that was serviced. */

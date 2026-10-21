@@ -15,9 +15,20 @@
  * The user library (--lib) is the usual Hydra metadata library: it provides
  * the function metadata and, when it exports hydra_user_register_hooks(),
  * the native implementations of the hooked functions. The dosemu host calls
- * that entry point after the metadata is in place, so a library built from
- * the confgen appdata can register its hooks without the driver knowing
- * anything about them.
+ * that entry point after the metadata is in place.
+ *
+ * A library built from the confgen appdata does not export that symbol by
+ * itself: the appdata's hydra_user_appdata__register_all_hooks() is a
+ * static inline in the generated header. The library needs one function of
+ * its own:
+ *
+ *   #include "hydra_user_appdata.h"
+ *   void hydra_user_register_hooks(void) {
+ *     hydra_user_appdata__register_all_hooks();
+ *   }
+ *
+ * The driver knows nothing about the hooks either way: it only looks the
+ * entry point up.
  *
  * What the trace holds is bounded by what the host can see: the guest CPU
  * runs free between the function-level breakpoints, so the trace has the
@@ -62,11 +73,18 @@ static const char *reason_name(host_run_stop_reason_t r)
 }
 
 /* The guest is loaded by dosemu2 itself (-E program.com). Wait until its
- * bytes are in memory and the segment it runs in is known. */
+ * bytes are in memory and the segment it runs in is known.
+ *
+ * The wait is bounded: a guest that never loads the image fails the tool
+ * instead of hanging it. The bound is not the --timeout-ms one, which
+ * covers the host run that follows. */
+#define WAIT_FOR_COM_TRIES 80
+#define WAIT_FOR_COM_PAUSE_MS 250
+
 static uint16_t wait_for_com(host_ctx_t *ctx, const uint8_t *file, size_t file_len)
 {
   size_t check_len = file_len < 16 ? file_len : 16;
-  for (int i = 0; i < 80; i++) {
+  for (int i = 0; i < WAIT_FOR_COM_TRIES; i++) {
     dosdebug_regs_t r;
     if (host_get_regs(ctx, &r) != 0) return 0;
     uint8_t m16[16];
@@ -74,7 +92,7 @@ static uint16_t wait_for_com(host_ctx_t *ctx, const uint8_t *file, size_t file_l
     if (got == (int)check_len && memcmp(m16, file, check_len) == 0)
       return r.cs;
     if (dosdebug_go(ctx->db) != 0) return 0;
-    usleep(250 * 1000u);
+    usleep(WAIT_FOR_COM_PAUSE_MS * 1000u);
     if (dosdebug_stop(ctx->db) != 0) return 0;
   }
   return 0;
@@ -86,7 +104,9 @@ static int read_file(const char *path, uint8_t **out, size_t *out_len)
   if (!f) return -1;
   if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return -1; }
   long sz = ftell(f);
-  if (sz < 0 || sz > 32768) { fclose(f); return -1; }
+  /* A .COM image is at most 64 KiB. The tool needs the first bytes of it
+   * and the marker, but it reads the whole image to find the marker. */
+  if (sz < 0 || sz > 65536) { fclose(f); return -1; }
   rewind(f);
   uint8_t *buf = malloc((size_t)sz);
   if (!buf || fread(buf, 1, (size_t)sz, f) != (size_t)sz) {
@@ -231,18 +251,33 @@ int main(int argc, char **argv)
     size_t scratch_pos = marker_pos + 16;
     uint32_t com_phys = (uint32_t)com_seg << 4;
     uint32_t scratch_phys = com_phys + 0x100u + (uint32_t)scratch_pos;
-    CHECK(scratch_phys + RAW_SCRATCH_SIZE <= com_phys + 0x100u + (uint32_t)file_len,
-          "the raw-code reservation lies inside the guest image");
-    CHECK((scratch_phys & 0x0fu) == 0,
-          "the raw-code reservation is paragraph aligned (%06x)", scratch_phys);
-    CHECK(host_reserve_raw_code(ctx, scratch_phys, RAW_SCRATCH_SIZE) == 0,
-          "the guest-owned raw-code region is registered");
-    CHECK(host_raw_code_ready(ctx), "the raw-code region is ready");
+    int inside = scratch_phys + RAW_SCRATCH_SIZE <= com_phys + 0x100u + (uint32_t)file_len;
+    CHECK(inside, "the raw-code reservation lies inside the guest image");
+    int aligned = (scratch_phys & 0x0fu) == 0;
+    CHECK(aligned, "the raw-code reservation is paragraph aligned (%06x)", scratch_phys);
+    int reserved = host_reserve_raw_code(ctx, scratch_phys, RAW_SCRATCH_SIZE) == 0;
+    CHECK(reserved, "the guest-owned raw-code region is registered");
+    if (!inside || !aligned || !reserved) {
+      /* The host refuses to run without the region, and a run without it
+       * would fail in a way that says nothing about the trace. */
+      host_disconnect(ctx); free(file); return 1;
+    }
+    int ready = host_raw_code_ready(ctx);
+    CHECK(ready, "the raw-code region is ready");
+    if (!ready) { host_disconnect(ctx); free(file); return 1; }
   }
 
   if (poke_off >= 0) {
     /* The COM image starts 0x100 bytes into the segment (the PSP is in
-     * front of it), so an image offset is segment*16 + 0x100 + off. */
+     * front of it), so an image offset is segment*16 + 0x100 + off. The
+     * offset has to be inside the image: a typo would otherwise write
+     * over the low memory around it. */
+    if ((size_t)poke_off >= file_len) {
+      fprintf(stderr,
+              "hydra_trace: --poke-image offset %ld is outside the image "
+              "(%zu bytes)\n", poke_off, file_len);
+      host_disconnect(ctx); free(file); return 2;
+    }
     uint32_t phys = ((uint32_t)com_seg << 4) + 0x100u + (uint32_t)poke_off;
     lowmem_write8(ctx->lm, phys, (uint8_t)poke_val);
     printf("  poked %04x:%04x = %02x\n", com_seg,

@@ -218,6 +218,28 @@ int main(void)
         "an address with no metadata carries no name field");
   hydra_trace_close();
 
+  /* --- 6b. a name the format cannot carry is not recorded --- */
+  /* The format is whitespace separated, so a name with a space in it
+   * would break the reader. The name is dropped, the address is not.
+   * A name too long for the line is dropped for the same reason: the
+   * event itself is worth more than its name. */
+  hydra_trace_open_mem();
+  hydra_trace_dispatch("F with a space", 0x0080, 0x0010, "enter", NULL);
+  hydra_trace_dispatch("F_known", 0x0080, 0x0010, "enter", NULL);
+  {
+    char long_name[300];
+    memset(long_name, 'N', sizeof(long_name) - 1);
+    long_name[sizeof(long_name) - 1] = '\0';
+    hydra_trace_dispatch(long_name, 0x0080, 0x0011, "enter", NULL);
+  }
+  text = hydra_trace_mem(&len);
+  CHECK(text && strstr(text,
+        "dispatch enter cs=0080 ip=0010\ndispatch enter cs=0080 ip=0010 name=F_known\n") != NULL,
+        "a name that is not a single token is not recorded");
+  CHECK(text && strstr(text, "dispatch enter cs=0080 ip=0011\n") != NULL,
+        "a name too long for the line is left out, and the event is kept");
+  hydra_trace_close();
+
   /* --- 7. the counters --- */
   hydra_run_stats_t stats;
   CHECK(hydra_machine_stats(&stats) == 0, "the run statistics are readable");
