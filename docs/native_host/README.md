@@ -35,14 +35,33 @@ DOS programs use the BIOS, and plenty of them write the text window directly.
   or `B8000h` while in MDA mode) lands in guest memory and renders nowhere,
   which is what the hardware address space does too.
 
+  A word store is routed per byte, because on 8086-class hardware it is two
+  bus cycles. The two halves can straddle an end of the window — the word at
+  `B8F9Fh` in a 80x25 mode puts its low byte in the last cell's attribute and
+  its high byte past the end — so each half is clipped on its own; the half
+  that is in the window renders and the other does not.
+
+  The projection never fails. It runs after the bytes are committed to guest
+  memory, and rendering must not be the thing that ends a run, so a store that
+  arrives before a backend has been selected — or with a backend that renders
+  no text — simply lands in memory and renders nowhere.
+
 `present()` is the frame boundary. It repaints only when something was drawn
 since the last call, and it writes nothing when stdout is not a terminal, so
-batch and CI runs stay clean. Two things drive it:
+batch and CI runs stay clean. A cursor move counts as a change and is tracked
+apart from the cells, so a guest that only repositions the cursor — CR/LF to a
+prompt, backspace over an echoed key — still moves the terminal cursor without
+forcing a repaint. Two things drive it:
 
 - the terminal backend itself, immediately before `read_key()` blocks. A guest
   that draws a title screen or menu and then waits for a key must have that
   screen on the terminal while it waits;
 - the port driver, through `hydra_native_backend_present()`, once per frame.
+
+A snapshot restores the display too. `state_restore()` loads the whole image
+with a single read that never passes through the per-store mirror, so it
+re-projects the text window afterwards; without that the screen would keep
+showing the pre-restore frame while the guest reads the restored bytes.
 
 ## SDL2: a new dependency, not a reuse
 

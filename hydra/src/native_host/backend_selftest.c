@@ -37,6 +37,39 @@ static native_host_ctx_t *g_probe_ctx;
 static const hydra_backend_t *g_probe_be;
 static void *g_probe_st;
 
+/* The live hardware whose memory the later probes touch, and the snapshot the
+ * restore probe reads. */
+static hydra_machine_hardware_t *g_restore_hw;
+static const char *g_restore_path;
+
+/* A backend that renders nothing: no video methods at all. Installed in a
+ * forked child so the probe cannot disturb this process's registry. */
+static const hydra_backend_t NO_TEXT_BACKEND = { .name = "test-no-text" };
+/* Before any backend is selected. The store must land in guest memory and the
+ * projection must stay silent: aborting here would turn a valid guest store
+ * into a process exit. present() is checked too, since it shares the rule. */
+static void probe_store_without_backend(void)
+{
+  hydra_native_backend_clear_probe();
+  hydra_native_backend_present();                    /* must be a no-op */
+  g_restore_hw->mem_write16(g_restore_hw->ctx, 0xB8000u, 0x0741u);
+  g_restore_hw->mem_write8(g_restore_hw->ctx, 0xB8001u, 0x1e);
+  if (g_restore_hw->mem_read16(g_restore_hw->ctx, 0xB8000u) != 0x1e41u)
+    _exit(1);
+}
+
+static void probe_store_without_text_backend(void)
+{
+  hydra_native_backend_install_probe(&NO_TEXT_BACKEND, NULL);
+  g_restore_hw->mem_write16(g_restore_hw->ctx, 0xB8000u, 0x0741u);
+  g_restore_hw->mem_write8(g_restore_hw->ctx, 0xB8001u, 0x1e);
+  /* write16 puts 'A' + 07h, then write8 replaces the attribute: the bytes are
+   * there, which is all this probe asserts. */
+  if (g_restore_hw->mem_read16(g_restore_hw->ctx, 0xB8000u) != 0x1e41u)
+    _exit(1);
+}
+
+
 /* Deterministic input backend for the INT 16h tests: poll peeks, read
  * consumes, so the key-present path does not depend on a tty. */
 typedef struct {
@@ -226,6 +259,59 @@ static void probe_present_twice(void)
 static void probe_present_never(void)
 {
   g_probe_be->teletype(g_probe_st, 'Z', 0x07);
+}
+
+/* Count non-overlapping occurrences of `needle` in `hay`. */
+static int count_substr(const char *hay, const char *needle)
+{
+  int n = 0;
+  const size_t len = strlen(needle);
+  if (len == 0)
+    return 0;
+  for (const char *at = hay; (at = strstr(at, needle)) != NULL; at += len)
+    n++;
+  return n;
+}
+
+/* Cursor-only changes: drawing is settled by the first present(), then the
+ * guest only moves the cursor (CR/LF) and presents again. The second present
+ * must emit the cursor escape and must not repaint the cells. */
+static void probe_present_cursor_only(void)
+{
+  g_probe_be->set_video_mode(g_probe_st, 0x03);
+  g_probe_be->teletype(g_probe_st, 'A', 0x07);
+  g_probe_be->present(g_probe_st);
+  g_probe_be->teletype(g_probe_st, '\r', 0x07);
+  g_probe_be->teletype(g_probe_st, '\n', 0x07);
+  g_probe_be->present(g_probe_st);
+}
+
+/* The host-facing wrapper, driven through the selected backend's state so the
+ * wrapper and the drawing agree on which terminal this is. An empty wrapper
+ * body emits nothing here, so this is what makes its only caller a real test. */
+static void probe_wrapper_present(void)
+{
+  void *st = NULL;
+  const hydra_backend_t *be = hydra_native_backend_active(&st);
+  be->teletype(st, 'W', 0x07);
+  hydra_native_backend_present();
+  hydra_native_backend_present();
+}
+
+/* A restore loads the image with one fread, bypassing the per-store mirror,
+ * so present() must still have something to say afterwards: the frame has to
+ * be re-projected from the restored bytes. Settle the frame first, or a stale
+ * dirty flag would make the present emit for the wrong reason. */
+static void probe_restore_then_present(void)
+{
+  void *st = NULL;
+  const hydra_backend_t *be = hydra_native_backend_active(&st);
+
+  be->set_video_mode(st, 0x03);
+  hydra_native_backend_present();          /* settle: frame clean */
+
+  g_restore_hw->state_restore(g_restore_hw->ctx, g_restore_path);
+  hydra_native_backend_present();
 }
 
 /* A guest that draws a title screen and then blocks on a key must have that
@@ -535,6 +621,27 @@ int hydra_backend_selftest(void)
     free(twice);
     free(never);
     free(headless);
+  }
+
+  /* --- present(): a cursor-only change still reaches the terminal ------ */
+  {
+    char *cursor = NULL;
+    size_t cursor_len = 0;
+
+    /* Reset the frame in the parent so the child's first present() is a
+     * known one-repaint frame. */
+    be->set_video_mode(st, 0x03);
+    g_probe_be = be;
+    g_probe_st = st;
+
+    TCHECK(capture_stdout(1, probe_present_cursor_only, &cursor, &cursor_len),
+           "present(): capture of a cursor-only change");
+    TCHECK(cursor && count_substr(cursor, "\033[H\033[2J") == 1,
+           "present(): a cursor-only change does not repaint the cells");
+    /* CR then LF from (0,1) lands on row 1, column 0 -> ANSI "row 2, col 1". */
+    TCHECK(cursor && strstr(cursor, "\033[2;1H") != NULL,
+           "present(): a cursor-only change still moves the terminal cursor");
+    free(cursor);
   }
 
   /* --- fail-loud: both classes of missing service must abort ------------ */
@@ -931,18 +1038,35 @@ int hydra_backend_videotest(hydra_machine_t *m)
              hw->mem_read16(hw->ctx, 0xB9000u) == 0x0758u,
          "video mirror: page 1 stores stay in guest memory and render nowhere");
 
-  /* A word store straddling the end of the window belongs to page 1 as much
-   * as to page 0, so neither half may be rendered: without that rule the low
-   * byte would land in the last visible cell. Address B8F9Fh is the last
-   * character of the last row; its attribute half is already page 1. */
-  TCHECK(be->get_cell(st, BACKEND_TEXT_ROWS - 1, BACKEND_TEXT_COLS - 1, &ch, &attr) == 0,
-         "video mirror: last cell readable before the straddle test");
-  hw->mem_write16(hw->ctx, 0xB8000u + 80u * 25u * 2u - 1u, 0x0758u);
+  /* An odd-aligned word store is two bus cycles, so its halves are routed
+   * separately and can straddle an end of the window. At the last cell of a
+   * 80x25 window (B8F9Fh) the low byte is that cell's attribute — inside the
+   * window — and the high byte is already past the end. The in-window half
+   * renders; the other half is page 1 and renders nowhere. */
   {
     uint8_t last_ch = 0, last_attr = 0;
-    be->get_cell(st, BACKEND_TEXT_ROWS - 1, BACKEND_TEXT_COLS - 1, &last_ch, &last_attr);
-    TCHECK(last_ch == ch && last_attr == attr && ch != 'X',
-           "video mirror: a word store straddling the window end renders neither half");
+    const uint32_t window_end = 0xB8000u + 80u * 25u * 2u;
+
+    hw->mem_write16(hw->ctx, window_end - 1u, 0x4cabu);   /* lo=AB attr, hi=4C */
+
+    TCHECK(be->get_cell(st, BACKEND_TEXT_ROWS - 1, BACKEND_TEXT_COLS - 1,
+                        &last_ch, &last_attr) == 0 && last_attr == 0xab,
+           "video mirror: a word store straddling the window end renders its "
+           "in-window half");
+    TCHECK(last_ch != 0xab,
+           "video mirror: the straddle does not leak the other half into the cell");
+    TCHECK(hw->mem_read8(hw->ctx, window_end) == 0x4c,
+           "video mirror: the out-of-window half still lands in guest memory");
+
+    /* The symmetric case at the start: a store at B7FFFh puts its low byte in
+     * the gap before the window and its high byte in the first cell. */
+    hw->mem_write16(hw->ctx, 0xB8000u - 1u, 0x4707u);     /* hi=47 'G' at B8000h */
+
+    TCHECK(be->get_cell(st, 0, 0, &ch, &attr) == 0 && ch == 'G',
+           "video mirror: a word store straddling the window start renders its "
+           "in-window half");
+    TCHECK(hw->mem_read8(hw->ctx, 0xB8000u - 1u) == 0x07,
+           "video mirror: the below-window half still lands in guest memory");
   }
 
   /* --- mode 07h is MDA: the window is B0000h --------------------------- */
@@ -968,11 +1092,110 @@ int hydra_backend_videotest(hydra_machine_t *m)
   TCHECK(be->get_cell(st, 2, 5, &ch, &attr) == 0 && ch == 'U',
          "video mirror: 40-column byte stores use the same stride");
 
-  /* --- the host-facing present entry point is safe to drive ------------ */
-  be->set_video_mode(st, 0x03);
-  be->teletype(st, 'P', 0x07);
-  hydra_native_backend_present();
-  TCHECK(1, "present: host entry point runs (headless output is not asserted)");
+  /* --- the host-facing present entry point renders ----------------------- */
+  {
+    char *wrapped = NULL;
+    size_t wrapped_len = 0;
+
+    TCHECK(capture_stdout(1, probe_wrapper_present, &wrapped, &wrapped_len),
+           "present: capture through hydra_native_backend_present()");
+    TCHECK(wrapped && strstr(wrapped, "\033[H\033[2J") != NULL &&
+               strchr(wrapped, 'W') != NULL,
+           "present: the host entry point renders the drawn frame");
+    TCHECK(wrapped && count_substr(wrapped, "\033[H\033[2J") == 1,
+           "present: a second host entry point call with nothing new emits nothing");
+    free(wrapped);
+  }
+
+  /* --- state_restore() re-projects the window (kept last: it replaces the
+   * whole guest image) --------------------------------------------------- */
+  {
+    char path[] = "/tmp/native_host_restore_proj_XXXXXX";
+    int fd = mkstemp(path);
+
+    TCHECK(fd >= 0, "restore: temp snapshot created");
+    if (fd >= 0) {
+      close(fd);
+
+      be->set_video_mode(st, 0x03);
+      hw->mem_write16(hw->ctx, 0xB8000u, 0x1e41u);         /* 'A', attr 1Eh */
+      hw->state_save(hw->ctx, path);
+
+      hw->mem_write16(hw->ctx, 0xB8000u, 0x1e42u);         /* 'B' */
+      TCHECK(be->get_cell(st, 0, 0, &ch, &attr) == 0 && ch == 'B',
+             "restore: the frame follows the live store before the restore");
+
+      hw->state_restore(hw->ctx, path);
+
+      /* Both halves of the cell: a re-projection that carried the character
+       * but reset the attribute would pass a character-only assertion while
+       * drawing the restored screen in the wrong colour. */
+      TCHECK(be->get_cell(st, 0, 0, &ch, &attr) == 0 && ch == 'A' && attr == 0x1e,
+             "restore: the restored window is re-projected into the frame");
+      TCHECK(hw->mem_read16(hw->ctx, 0xB8000u) == 0x1e41u,
+             "restore: guest memory holds the restored bytes");
+
+      /* The real failure mode was invisible: the frame looked right in
+       * get_cell() only if it was re-projected, and present() stayed silent
+       * because no store had dirtied it. */
+      g_restore_hw = hw;
+      g_restore_path = path;
+      char *restored = NULL;
+      size_t restored_len = 0;
+      TCHECK(capture_stdout(1, probe_restore_then_present, &restored, &restored_len),
+             "restore: capture of the first frame after a restore");
+      TCHECK(restored && strstr(restored, "\033[H\033[2J") != NULL &&
+                 strchr(restored, 'A') != NULL,
+             "restore: present() emits the restored frame (the restore marks it dirty)");
+      free(restored);
+
+      unlink(path);
+    }
+  }
+
+  /* --- a store into the text window with no text backend is a clean no-op.
+   * Same guard the "no backend selected yet" case takes: the bytes are already
+   * in guest memory, and a projection must never abort the process. ---------- */
+  {
+    g_restore_hw = hw;
+    fflush(stdout);
+    const int stdin_flags = fcntl(STDIN_FILENO, F_GETFL, 0);
+    pid_t pid = fork();
+    if (pid == 0) {
+      probe_store_without_text_backend();
+      fflush(stdout);
+      _exit(0);
+    }
+    int status = 0;
+    const pid_t waited = pid > 0 ? waitpid(pid, &status, 0) : -1;
+    if (stdin_flags >= 0)
+      fcntl(STDIN_FILENO, F_SETFL, stdin_flags);
+
+    TCHECK(waited == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+           "video mirror: a store with a backend that renders no text is a "
+           "clean no-op (no abort)");
+  }
+
+  /* --- the same store before any backend is selected --------------------- */
+  {
+    g_restore_hw = hw;
+    fflush(stdout);
+    const int stdin_flags = fcntl(STDIN_FILENO, F_GETFL, 0);
+    pid_t pid = fork();
+    if (pid == 0) {
+      probe_store_without_backend();
+      fflush(stdout);
+      _exit(0);
+    }
+    int status = 0;
+    const pid_t waited = pid > 0 ? waitpid(pid, &status, 0) : -1;
+    if (stdin_flags >= 0)
+      fcntl(STDIN_FILENO, F_SETFL, stdin_flags);
+
+    TCHECK(waited == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+           "video mirror: a store before any backend is selected keeps the "
+           "bytes and does not abort");
+  }
 
   return t_failures;
 }

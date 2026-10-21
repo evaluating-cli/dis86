@@ -102,14 +102,22 @@ void hydra_native_backend_install_probe(const hydra_backend_t *be, void *state)
   g_backend_state = state;
 }
 
+void hydra_native_backend_clear_probe(void)
+{
+  if (g_backend && g_backend->shutdown)
+    g_backend->shutdown(g_backend_state);
+  g_backend = NULL;
+  g_backend_state = NULL;
+}
+
 /* The backend is chosen exactly once, in hydra_user_init(), before any guest
  * code can run. Nothing here mutates state: a dispatch from a hook thread can
  * no longer race with a first-use initialization. */
 static const hydra_backend_t *active_backend(void)
 {
   if (!g_backend)
-    FAIL("native host: interrupt dispatched before hydra_user_init() selected "
-         "a backend");
+    FAIL("native host: device dispatch before hydra_user_init() selected a "
+         "backend (interrupts and port I/O both need one)");
   return g_backend;
 }
 
@@ -119,6 +127,13 @@ const hydra_backend_t *hydra_native_backend_active(void **state_out)
   if (state_out)
     *state_out = g_backend_state;
   return be;
+}
+
+const hydra_backend_t *hydra_native_backend_try_active(void **state_out)
+{
+  if (state_out)
+    *state_out = g_backend_state;
+  return g_backend;
 }
 
 void hydra_native_backend_present(void)
