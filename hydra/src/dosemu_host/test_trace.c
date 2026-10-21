@@ -128,8 +128,8 @@ int main(void)
 
   hydra_trace_dispatch("F_known", 0x0080, 0x0010, "enter", NULL);
   hydra_trace_dispatch("F_known", 0x0080, 0x0010, "leave", "resume");
-  hydra_trace_call("F_known", 0x0080, 0x0012, 0x0080, 0x0010);
-  hydra_trace_ret(NULL, 0x0080, 0x0014, 0x0080, 0x0012);
+  hydra_trace_call(0x0080, 0x0012, 0x0080, 0x0010);
+  hydra_trace_ret(0x0080, 0x0014, 0x0080, 0x0012);
   hydra_trace_step(0x0080, 0x0134);
   hydra_trace_int(0x21, 0x4c);
 
@@ -165,7 +165,22 @@ int main(void)
   hydra_trace_close();
   CHECK(!hydra_trace_enabled(), "the sink closes");
 
-  /* --- 4. the arguments captured at the call seam --- */
+  /* --- 4. the name of a function is resolved by the trace module --- */
+  /* The name of a function is resolved by the trace module: the callee for
+   * a call, the function that was left for a return. */
+  hydra_trace_open_mem();
+  hydra_trace_call(0x0080, 0x0012, 0x0080, 0x0010);
+  hydra_trace_ret(0x0080, 0x0010, 0x0080, 0x0012);
+  text = hydra_trace_mem(&len);
+  CHECK(text && strstr(text,
+        "call from=0080:0012 to=0080:0010 name=F_known\n") != NULL,
+        "a call event names the callee");
+  CHECK(text && strstr(text,
+        "ret from=0080:0010 to=0080:0012 name=F_known\n") != NULL,
+        "a return event names the function that was left");
+  hydra_trace_close();
+
+  /* --- 5. the arguments captured at the call seam --- */
   memset(g_ram, 0, sizeof(g_ram));
   m->registers->cs = 0x0080;
   m->registers->ip = 0x0012;
@@ -194,7 +209,7 @@ int main(void)
         "the call seam records the returned value");
   hydra_trace_close();
 
-  /* --- 5. an unknown callee carries no name --- */
+  /* --- 6. an unknown callee carries no name --- */
   hydra_trace_open_mem();
   hydra_trace_native_call(m, ADDR_MAKE(0x0000, 0x00ff), 0);
   text = hydra_trace_mem(&len);
@@ -203,7 +218,7 @@ int main(void)
         "an address with no metadata carries no name field");
   hydra_trace_close();
 
-  /* --- 6. the counters --- */
+  /* --- 7. the counters --- */
   hydra_run_stats_t stats;
   CHECK(hydra_machine_stats(&stats) == 0, "the run statistics are readable");
   CHECK(stats.calls >= 1, "the call counter moved");
@@ -213,7 +228,21 @@ int main(void)
   CHECK(stats.steps >= 2, "the step counter moved");
   CHECK(stats.interrupts >= 1, "the interrupt counter moved");
 
-  /* --- 7. a file sink writes the same text --- */
+  /* The counters advance whether or not a sink is open: a host can report
+   * what the machine did without recording anything. */
+  {
+    hydra_run_stats_t before, after;
+    hydra_machine_stats(&before);
+    hydra_trace_call(0x0080, 0x0012, 0x0080, 0x0010);
+    hydra_trace_ret(0x0080, 0x0010, 0x0080, 0x0012);
+    hydra_trace_step(0x0080, 0x0201);
+    hydra_machine_stats(&after);
+    CHECK(after.calls == before.calls + 1, "the call counter moves with the sink closed");
+    CHECK(after.returns == before.returns + 1, "the return counter moves with the sink closed");
+    CHECK(after.steps == before.steps + 1, "the step counter moves with the sink closed");
+  }
+
+  /* --- 8. a file sink writes the same text --- */
   const char *path = "/tmp/hydra-trace-test.trace";
   if (hydra_trace_open(path) == 0) {
     hydra_trace_step(0x0080, 0x0200);

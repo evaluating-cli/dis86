@@ -35,13 +35,15 @@ pub enum TraceEvent {
   /// the image-relative entry of the hook.
   Dispatch { enter: bool, addr: Option<SegOff>, name: Option<String>, result: Option<String> },
   /// A guest call boundary seen by the callstack model: the guest reached
-  /// the callee's entry (`to`), coming from the address it will return to
-  /// (`from`, a return address in the caller, not a function entry).
+  /// the callee's entry (`to`), coming from an address inside the caller
+  /// (`from`: the return address for a call the decompiler lowered through
+  /// a call stub, the call instruction for a call the guest executed).
+  /// Either way it is not a function entry.
   Call { from: Option<SegOff>, to: Option<SegOff>, name: Option<String> },
   /// A guest return boundary seen by the callstack model: the guest left
-  /// the function at `from` and continued at `to` (the return address in
-  /// the caller).
-  Ret { from: Option<SegOff>, to: Option<SegOff> },
+  /// the function at `from` and continued at `to` (an address inside the
+  /// caller). The name is the one of the function that was left.
+  Ret { from: Option<SegOff>, to: Option<SegOff>, name: Option<String> },
   /// The native-to-guest call seam: the callee, and the arguments it was
   /// handed (read back from the guest stack).
   NativeCall { from: Option<SegOff>, to: Option<SegOff>, name: Option<String>, nargs: u16, args: Vec<u16> },
@@ -119,7 +121,7 @@ pub fn parse_trace(text: &str) -> Result<Vec<TraceEvent>, String> {
         if kind == "call" {
           TraceEvent::Call { from, to, name: opt_str(&fields, "name") }
         } else {
-          TraceEvent::Ret { from, to }
+          TraceEvent::Ret { from, to, name: opt_str(&fields, "name") }
         }
       }
       "native_call" => {
@@ -185,9 +187,9 @@ pub struct FunctionInfo {
   /// The functions this one was observed to be called from.
   pub callers: BTreeSet<SegOff>,
   /// The addresses the calls into this function were seen at. These are
-  /// *return addresses* in the caller, not function entries: the guest ran
-  /// free between the breakpoints, so the caller's own entry is not known
-  /// from them.
+  /// *addresses inside the caller* (a return address, or the call
+  /// instruction), not function entries: the guest ran free between the
+  /// breakpoints, so the caller's own entry is not known from them.
   pub call_sites: BTreeSet<SegOff>,
   /// The argument count observed at the call seam, when there was one.
   pub observed_args: Option<u16>,
@@ -236,7 +238,7 @@ pub fn analyze(events: &[TraceEvent]) -> TraceAnalysis {
       TraceEvent::Call { from, to, name } => {
         a.calls += 1;
         // The guest reached the callee's entry; the address it came from is
-        // the return address in the caller, not a function entry.
+        // inside the caller, not a function entry.
         if let Some(to) = to {
           {
             let f = a.entry(*to);
@@ -247,11 +249,15 @@ pub fn analyze(events: &[TraceEvent]) -> TraceAnalysis {
           }
         }
       }
-      TraceEvent::Ret { from, to } => {
+      TraceEvent::Ret { from, to, name } => {
         a.returns += 1;
         // The guest left the function at `from` and continued at `to`, which
-        // is the return address in the caller.
+        // is an address inside the caller.
         if let Some(from) = from {
+          {
+            let f = a.entry(*from);
+            if f.name.is_none() { f.name = name.clone(); }
+          }
           if let Some(to) = to {
             a.entry(*from).call_sites.insert(*to);
           }

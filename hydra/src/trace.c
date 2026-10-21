@@ -176,8 +176,17 @@ int hydra_trace_enabled(void)
 const char *hydra_trace_mem(size_t *_len)
 {
   if (T->kind != TRACE_SINK_MEM) return NULL;
+
+  /* The pointer and the length are read together, so they agree at the
+   * moment of the call. The buffer may still move afterwards: a hook
+   * running concurrently can grow it, which is why the sink may only be
+   * read while the machine is stopped. */
+  pthread_mutex_lock(&T_MUTEX);
   if (_len) *_len = T->len;
-  return T->buf ? T->buf : "";
+  const char *buf = T->buf ? T->buf : "";
+  pthread_mutex_unlock(&T_MUTEX);
+
+  return buf;
 }
 
 /* Whether a sink is open. Read without the lock: the kind is a single
@@ -231,11 +240,15 @@ void hydra_trace_dispatch(const char *name, u16 cs, u16 ip,
   pthread_mutex_unlock(&T_MUTEX);
 }
 
-void hydra_trace_call(const char *name, u16 from_seg, u16 from_off,
-                      u16 to_seg, u16 to_off)
+void hydra_trace_call(u16 from_seg, u16 from_off, u16 to_seg, u16 to_off)
 {
   __atomic_fetch_add(&T->calls, 1, __ATOMIC_RELAXED);
   if (!trace_sink_open()) return;
+
+  /* The callee's name. It is resolved here, after the sink check, because
+   * the lookup is a scan over the metadata: a closed sink must not pay for
+   * it. */
+  const char *name = hydra_function_name_at(to_seg, to_off);
 
   pthread_mutex_lock(&T_MUTEX);
   char line[256];
@@ -251,11 +264,13 @@ void hydra_trace_call(const char *name, u16 from_seg, u16 from_off,
   pthread_mutex_unlock(&T_MUTEX);
 }
 
-void hydra_trace_ret(const char *name, u16 from_seg, u16 from_off,
-                     u16 to_seg, u16 to_off)
+void hydra_trace_ret(u16 from_seg, u16 from_off, u16 to_seg, u16 to_off)
 {
   __atomic_fetch_add(&T->returns, 1, __ATOMIC_RELAXED);
   if (!trace_sink_open()) return;
+
+  /* The name of the function that was left (the previous position). */
+  const char *name = hydra_function_name_at(from_seg, from_off);
 
   pthread_mutex_lock(&T_MUTEX);
   char line[256];
