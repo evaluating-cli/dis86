@@ -95,6 +95,30 @@ int num=21 ah=4c
 The format is pinned by `hydra/src/dosemu_host/test_trace.c`, which the
 reader in `dis86 --trace-analyze` matches.
 
+## Reading a trace
+
+```
+dis86 --trace-analyze --trace <trace file> [--config <config.bsl>]
+```
+
+The reader turns the record into the function-level picture: the boundaries
+the run touched, the calls between them, the argument counts observed at the
+call seams, and the values the callees left behind. It prints the call graph
+and - for the functions the configuration does not know yet - suggestion
+lines in the same shape `--analyze` prints, so a trace and a static analysis
+can be pasted into the same annotation file.
+
+Two things the reader deliberately does not infer:
+
+- the **end** of a discovered function. Tracing sees where a function was
+  entered, not where it stops.
+- the **return type** of a call. The trace records the registers the callee
+  left behind, and a callee that returns 16 bits in AX leaves whatever was
+  in DX.
+
+The **argument count** is exact: it is the number of words the call stub
+pushed, which is what the configuration's `args` field states.
+
 ## Correctness: the parity anchor
 
 The tool's own correctness rides on the [#96](https://github.com/evaluating-cli/dis86/issues/96)

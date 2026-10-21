@@ -118,6 +118,11 @@ static void callstack_enter(const char *type, hydra_machine_registers_t *registe
    * default, so this costs nothing unless a host asked for the record; the
    * printf below stays the interactive debugging aid it always was.
    *
+   * The addresses follow the model's own convention: the guest moved from
+   * the previous position to the current one. For a call, the current
+   * position is the callee's entry and the previous one is the address the
+   * guest will return to (the call site in the caller).
+   *
    * The addresses are the absolute guest ones: the trace records where the
    * guest actually was, and a reader turns them into the image-relative
    * space of a configuration table with the recorded code load. */
@@ -162,10 +167,14 @@ static void callstack_leave(const char *type, hydra_machine_registers_t *registe
   size_t depth = 0;
   call_t *call = callstack_pop(&depth);
 
-  /* The structured record of this boundary (see callstack_enter). */
+  /* The structured record of this boundary (see callstack_enter). The
+   * addresses follow the model's own convention: the guest moved from the
+   * previous position to the current one. For a return, the previous
+   * position is the function that was left and the current one is the
+   * address the guest returned to. */
   hydra_trace_ret(hydra_function_name_at(registers->cs, registers->ip),
-                  addr_seg(cur), addr_off(cur),
-                  addr_seg(c->last_code), addr_off(c->last_code));
+                  addr_seg(c->last_code), addr_off(c->last_code),
+                  addr_seg(cur), addr_off(cur));
 
   // Adjust all the addresses for the base load segment
   addr_t from = addr_relative_to_segment(c->last_code, CODE_START_SEG);

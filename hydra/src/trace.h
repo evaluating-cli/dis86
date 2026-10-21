@@ -82,11 +82,16 @@ void hydra_trace_flush(void);
 void hydra_trace_dispatch(const char *name, u16 cs, u16 ip,
                           const char *phase, const char *result);
 
-/* A guest call boundary seen by the callstack model. */
+/* A guest call boundary seen by the callstack model. The guest moved from
+ * the previous position to the current one: for a call, the current
+ * position is the callee's entry and the previous one is the address the
+ * guest will return to (the call site in the caller). */
 void hydra_trace_call(const char *name, u16 from_seg, u16 from_off,
                       u16 to_seg, u16 to_off);
 
-/* A guest return boundary seen by the callstack model. */
+/* A guest return boundary seen by the callstack model: the guest left the
+ * function at the previous position and continued at the current one (the
+ * call site in the caller). */
 void hydra_trace_ret(const char *name, u16 from_seg, u16 from_off,
                      u16 to_seg, u16 to_off);
 
