@@ -45,8 +45,35 @@ jobs:
         run: bash parity/build.sh
 
       - name: Install stock dosemu2 runtime
+        id: runtime
         run: |
           set -euo pipefail
+          . /etc/os-release
+
+          # Launchpad's PPA archive can be down for hours, taking every index
+          # and pool path with it (2026-10-21: ppa.launchpadcontent.net
+          # answered 503 to all of them, and the legacy ppa.launchpad.net
+          # name fails TLS verification from runners - curl exit 60). No
+          # dosemu2 package can be fetched while that lasts, so the golden
+          # lane cannot run. Do not fail this lane on an upstream outage:
+          # record the gap loudly and let the dosemu2-free gates stand,
+          # rather than reporting a fixture failure that is not one.
+          if ! curl -fsS --max-time 20 -o /dev/null \
+              "https://ppa.launchpadcontent.net/dosemu2/ppa/ubuntu/dists/${VERSION_CODENAME}/InRelease"; then
+            echo "::warning title=golden lane skipped::Launchpad's PPA archive is unreachable; run_golden.sh did not run, so golden/native parity is NOT verified by this run."
+            {
+              echo "### Golden lane SKIPPED - Launchpad archive unreachable"
+              echo ""
+              echo 'The dosemu2 PPA index could not be fetched, so `parity/run_golden.sh` did not run.'
+              echo "Gate 2 (native) still rebuilt the decompiled code and checked it against the"
+              echo "expected lane table, but the golden comparison is unverified by this run."
+              echo ""
+              echo "Re-run this workflow once Launchpad is serving its archive again."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "golden=skip" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
           sudo apt-get install -y software-properties-common
 
           added=0
@@ -74,6 +101,7 @@ jobs:
           dosemu --version || true
 
       - name: Golden lane + byte comparison
+        if: steps.runtime.outputs.golden != 'skip'
         run: bash parity/run_golden.sh
 
       - name: Export parity evidence
