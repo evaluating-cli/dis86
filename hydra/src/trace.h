@@ -43,12 +43,20 @@
  *     reader turns it into the image-relative space of a configuration table
  *     by subtracting the code load segment; addresses below it are outside
  *     the image (DOS or ROM).
- *   - "name=" appears only when Hydra's metadata resolves the address to a
- *     known function.
+ *   - "name=" carries the name of the function the event is about, when
+ *     there is one: for a dispatch it is the hook's registered name, for
+ *     the other events it is the metadata's name for that address. A hook
+ *     registered by address has no name, and an address no metadata knows
+ *     has none either.
  *   - "nargs=" counts 16-bit argument words and is followed by "arg0=",
  *     "arg1=", ... for the words themselves.
  *   - "dx=" and "ax=" carry the value returned at a call boundary; a
  *     non-zero dx means the call returned 32 bits in DX:AX.
+ *
+ * The dispatch counter and the dispatch events do not count the same
+ * things: the counter counts dispatch *attempts*, and an overlay hook that
+ * is not paged in yet is an attempt whose hook never ran (the host lets the
+ * guest page it in instead), so it has no dispatch event.
  */
 
 typedef struct hydra_machine hydra_machine_t;
@@ -60,7 +68,6 @@ int hydra_trace_open(const char *path);
 /* Open an in-memory sink. The recorded text is available through
  * hydra_trace_mem() until the sink is closed. Used by the tests. */
 int hydra_trace_open_mem(void);
-
 /* Close the sink (if any) and flush it. Safe to call when no sink is open. */
 void hydra_trace_close(void);
 
@@ -68,7 +75,11 @@ void hydra_trace_close(void);
 int hydra_trace_enabled(void);
 
 /* The recorded text of an in-memory sink, or NULL when the open sink is not a
- * memory sink. The buffer stays valid until the sink is closed. */
+ * memory sink.
+ *
+ * The buffer may only be read while the machine is stopped: a hook running
+ * concurrently can grow the buffer, which moves it. The pointer and the
+ * length are read together, so they agree at the moment of the call. */
 const char *hydra_trace_mem(size_t *_len);
 
 /* Flush an open sink. */
@@ -84,16 +95,22 @@ void hydra_trace_dispatch(const char *name, u16 cs, u16 ip,
 
 /* A guest call boundary seen by the callstack model. The guest moved from
  * the previous position to the current one: for a call, the current
- * position is the callee's entry and the previous one is the address the
- * guest will return to (the call site in the caller). */
-void hydra_trace_call(const char *name, u16 from_seg, u16 from_off,
-                      u16 to_seg, u16 to_off);
+ * position is the callee's entry and the previous one is an address inside
+ * the caller - the return address for a call the decompiler lowered
+ * through a call stub (there is no guest call instruction to point at),
+ * the call instruction for a call the guest executed. Either way it is not
+ * a function entry.
+ *
+ * The name is resolved by the trace module, and only once it knows a sink
+ * is open: resolving it at the call site would cost a metadata scan on
+ * every boundary, which a closed sink must not do. */
+void hydra_trace_call(u16 from_seg, u16 from_off, u16 to_seg, u16 to_off);
 
 /* A guest return boundary seen by the callstack model: the guest left the
- * function at the previous position and continued at the current one (the
- * call site in the caller). */
-void hydra_trace_ret(const char *name, u16 from_seg, u16 from_off,
-                     u16 to_seg, u16 to_off);
+ * function at the previous position and continued at the current one (an
+ * address inside the caller). The name is the one of the function that was
+ * left, resolved by the trace module as for a call. */
+void hydra_trace_ret(u16 from_seg, u16 from_off, u16 to_seg, u16 to_off);
 
 /* The native->guest call seam. The arguments are read back from the guest
  * stack (they are the words the callee will read, not the C-level values),

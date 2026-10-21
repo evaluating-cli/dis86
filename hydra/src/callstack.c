@@ -120,14 +120,17 @@ static void callstack_enter(const char *type, hydra_machine_registers_t *registe
    *
    * The addresses follow the model's own convention: the guest moved from
    * the previous position to the current one. For a call, the current
-   * position is the callee's entry and the previous one is the address the
-   * guest will return to (the call site in the caller).
+   * position is the callee's entry and the previous one is an address
+   * inside the caller - the return address for a call the decompiler
+   * lowered through a call stub, the call instruction for a call the guest
+   * executed. Either way it is not a function entry.
    *
    * The addresses are the absolute guest ones: the trace records where the
    * guest actually was, and a reader turns them into the image-relative
-   * space of a configuration table with the recorded code load. */
-  hydra_trace_call(hydra_function_name_at(registers->cs, registers->ip),
-                   addr_seg(_from), addr_off(_from),
+   * space of a configuration table with the recorded code load. The name is
+   * resolved by the trace module, so a closed sink does not pay for the
+   * lookup. */
+  hydra_trace_call(addr_seg(_from), addr_off(_from),
                    addr_seg(cur), addr_off(cur));
 
   if (!ENABLE_DEBUG_CALLSTACK) return;
@@ -170,10 +173,10 @@ static void callstack_leave(const char *type, hydra_machine_registers_t *registe
   /* The structured record of this boundary (see callstack_enter). The
    * addresses follow the model's own convention: the guest moved from the
    * previous position to the current one. For a return, the previous
-   * position is the function that was left and the current one is the
-   * address the guest returned to. */
-  hydra_trace_ret(hydra_function_name_at(registers->cs, registers->ip),
-                  addr_seg(c->last_code), addr_off(c->last_code),
+   * position is the function that was left and the current one is an
+   * address inside the caller. The name is the one of the function that
+   * was left, resolved by the trace module. */
+  hydra_trace_ret(addr_seg(c->last_code), addr_off(c->last_code),
                   addr_seg(cur), addr_off(cur));
 
   // Adjust all the addresses for the base load segment

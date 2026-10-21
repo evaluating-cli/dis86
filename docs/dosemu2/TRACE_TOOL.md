@@ -56,10 +56,15 @@ single most important fact about this tool, and it bounds everything below.
 | the guest call/return boundaries the callstack model sees at those boundaries | a call to a function that is neither hooked nor reached through a call seam |
 | the native-to-guest call seam: the callee, the arguments it was handed, and the value it returned | the arguments of a call the decompiler did not lower through a call stub |
 | - with `--step` - the individual guest instructions of the regions the host single-steps | port I/O, and any device state (see the limits below) |
+| the interrupts the decompiled code raises | the interrupts the free-running guest raises (they never reach the core) |
 
 So the discovery unit is the **function**, not the instruction. A traced call
 records the calling function's *entry* address, because the decompiler does
 not model intra-function instruction addresses.
+
+The dispatch counter counts dispatch *attempts*: an overlay hook that is not
+paged in yet is an attempt whose hook never ran (the host lets the guest page
+it in instead), so it has no `dispatch` event.
 
 ## The trace format
 
@@ -69,7 +74,7 @@ Line oriented text, one event per line:
 # hydra trace v1
 # code_load=0080
 dispatch enter cs=0080 ip=0013 name=F_myfunc
-dispatch leave cs=0080 ip=0013 result=resume
+dispatch leave cs=0080 ip=0013 name=F_myfunc result=resume
 call from=0080:0010 to=0080:0185 name=F_parity_leaf
 ret from=0080:0189 to=0080:0016
 native_call from=0080:0012 to=0080:0185 name=F_parity_leaf nargs=0
@@ -84,7 +89,13 @@ int num=21 ah=4c
   a reader applies the most recent preceding line. Subtracting the code load
   turns a guest address into the image-relative space a configuration table
   uses.
-- `name=` appears only when the metadata resolves the address.
+- `name=` carries the name of the function the event is about, when there is
+  one: for a dispatch it is the hook's registered name, for the other events
+  it is the metadata's name for that address.
+- The `from=` of a `call` is an address **inside the caller**, never a
+  function entry: the return address for a call the decompiler lowered
+  through a call stub (there is no guest call instruction to point at), the
+  call instruction for a call the guest executed.
 - `nargs=` counts 16-bit argument words, followed by `arg0=`, `arg1=`, ... The
   words are read back from the guest stack, so they are what the callee will
   read, not the values the caller had in C.

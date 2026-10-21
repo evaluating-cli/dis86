@@ -114,7 +114,7 @@ The file is line oriented, one event per line:
 # hydra trace v1
 # code_load=0080
 dispatch enter cs=0080 ip=0013 name=F_myfunc
-dispatch leave cs=0080 ip=0013 result=resume
+dispatch leave cs=0080 ip=0013 name=F_myfunc result=resume
 call from=0080:0010 to=0080:0185 name=F_parity_leaf
 ret from=0080:0189 to=0080:0016
 native_call from=0080:0012 to=0080:0185 name=F_parity_leaf nargs=0
@@ -129,7 +129,14 @@ int num=21 ah=4c
   a reader applies the most recent preceding line. Subtracting the code load
   turns a guest address into the image-relative space a configuration table
   uses.
-- `name=` appears only when the metadata resolves the address.
+- `name=` carries the name of the function the event is about, when there is
+  one: for a dispatch it is the hook's registered name, for the other events
+  it is the metadata's name for that address. A hook registered by address
+  has no name, and an address no metadata knows has none either.
+- The `from=` of a `call` is an address **inside the caller**, never a
+  function entry: the return address for a call the decompiler lowered
+  through a call stub (there is no guest call instruction to point at), the
+  call instruction for a call the guest executed.
 - `nargs=` counts 16-bit argument words, followed by `arg0=`, `arg1=`, ... The
   words are read back from the guest stack, so they are what the callee will
   read, not the values the caller had in C.
@@ -149,6 +156,9 @@ The events come from the places that already know them:
 so a host can report what the machine did with the trace switched off. The
 counters are process-wide; a host that needs a per-run figure takes the
 difference, the way the dosemu2 host driver does with the hook dispatch count.
+The dispatch counter counts dispatch *attempts*: an overlay hook that is not
+paged in yet is an attempt whose hook never ran (the host lets the guest page
+it in instead), so it has no `dispatch` event.
 
 **What the trace can and cannot see.** On the dosemu2 host the guest CPU runs
 free between function-level breakpoints, so the free-running guest is not in
@@ -159,6 +169,11 @@ regions the host single-steps (the native-to-guest callthrough trace). The
 discovery unit is therefore the function, not the instruction, and a traced
 call records the calling function's entry address rather than an intra-function
 call site.
+
+Two more things the free-running guest keeps to itself: the interrupts it
+raises (they never reach the core, so they are neither traced nor counted -
+only the interrupts decompiled code raises are), and the calls it makes into
+code that is neither hooked nor reached through a call seam.
 
 ## Building
 

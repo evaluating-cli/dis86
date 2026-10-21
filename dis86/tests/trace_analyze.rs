@@ -15,7 +15,7 @@ dispatch leave cs=0001 ip=0000 name=F_parity_main result=call_near
 call from=0001:ff00 to=0001:0185 name=F_parity_leaf
 dispatch enter cs=0001 ip=0185 name=F_parity_leaf
 dispatch leave cs=0001 ip=0185 name=F_parity_leaf result=ret_near
-ret from=0001:0185 to=0001:ff00
+ret from=0001:0185 to=0001:ff00 name=F_parity_leaf
 native_ret from=0001:0000 to=0001:0185 dx=0000 ax=117a
 ret from=0001:ff00 to=0001:0189
 ";
@@ -57,6 +57,22 @@ fn maps_the_guest_addresses_into_the_image_space() {
 }
 
 #[test]
+fn names_the_function_a_return_event_left() {
+  // A function that only ever shows up in a return event still gets the
+  // name the trace carries.
+  let trace = "\
+# hydra trace v1
+# code_load=0001
+ret from=0001:0200 to=0001:0180 name=F_only_returned
+";
+  let events = parse_trace(trace).expect("the trace parses");
+  let a = analyze(&events);
+
+  let f = a.functions.get(&SegOff::new(0, 0x0200)).expect("the function");
+  assert_eq!(f.name.as_deref(), Some("F_only_returned"));
+}
+
+#[test]
 fn drops_the_magic_return_addresses() {
   let events = parse_trace(PARITY_TRACE).expect("the trace parses");
 
@@ -65,7 +81,7 @@ fn drops_the_magic_return_addresses() {
   for event in &events {
     let addrs = match event {
       TraceEvent::Call { from, to, .. } => (*from, *to),
-      TraceEvent::Ret { from, to } => (*from, *to),
+      TraceEvent::Ret { from, to, .. } => (*from, *to),
       _ => continue,
     };
     for addr in [addrs.0, addrs.1].into_iter().flatten() {
