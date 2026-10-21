@@ -28,6 +28,10 @@ fn print_help() {
   println!("MODE: ANALYZE");
   println!("  --analyze         analyze the binary using the configuration annotations");
   println!("");
+  println!("MODE: TRACE");
+  println!("  --trace-analyze   analyze a recorded Hydra trace (issue #97)");
+  println!("  --trace PATH      the trace file to analyze (required with --trace-analyze)");
+  println!("");
   println!("MODE: ADDRESS RANGE");
   println!("  --start-addr      start seg:off address (maybe required)");
   println!("  --end-addr        end seg:off address (maybe required)");
@@ -76,8 +80,8 @@ fn write_to_path(path: &str, data: &str) {
 
 #[derive(Debug)]
 struct Args {
-  binary: binary::Fmt,
-  config: String,
+  binary: Option<binary::Fmt>,
+  config: Option<String>,
 
   start_addr: Option<SegOff>,
   end_addr: Option<SegOff>,
@@ -85,6 +89,8 @@ struct Args {
   codeseg_name: Option<String>,
 
   analyze: bool,
+  trace_analyze: bool,
+  trace: Option<String>,
 
   emit_dis: Option<String>,
   emit_ir_initial: Option<String>,
@@ -136,17 +142,24 @@ fn parse_relocatable_segs(list: &str) -> Result<Vec<u16>, String> {
   Ok(set.into_iter().collect())
 }
 
-fn parse_binary_fmt(pargs: &mut pico_args::Arguments) -> Result<binary::Fmt, pico_args::Error> {
+// The binary is required by every mode but --trace-analyze: a trace
+// carries the addresses it saw, so there is nothing to load.
+fn parse_binary_fmt(pargs: &mut pico_args::Arguments, required: bool)
+  -> Result<Option<binary::Fmt>, pico_args::Error>
+{
   let binary_exe = pargs.opt_value_from_str("--binary-exe")?;
   let binary_raw = pargs.opt_value_from_str("--binary-raw")?;
   if 1 != binary_exe.is_some() as i32 + binary_raw.is_some() as i32 {
-    panic!("Exactly one of --binary-exe or --binary-raw must be set");
+    if required {
+      panic!("Exactly one of --binary-exe or --binary-raw must be set");
+    }
+    return Ok(None);
   }
   if let Some(path) = binary_exe {
-    return Ok(binary::Fmt::Exe(path));
+    return Ok(Some(binary::Fmt::Exe(path)));
   }
   if let Some(path) = binary_raw {
-    return Ok(binary::Fmt::Raw(path));
+    return Ok(Some(binary::Fmt::Raw(path)));
   }
   unreachable!();
 }
@@ -160,11 +173,17 @@ fn parse_args() -> Result<Args, pico_args::Error> {
     std::process::exit(0);
   }
 
+  // The trace mode is known before the rest is parsed: it is the one mode
+  // that needs neither a configuration nor a binary.
+  let trace_analyze = pargs.contains("--trace-analyze");
+
   // Parse out all args
   let mut args = Args {
-    config:          pargs.value_from_str("--config")?,
-    binary:          parse_binary_fmt(&mut pargs)?,
+    config:          pargs.opt_value_from_str("--config")?,
+    binary:          parse_binary_fmt(&mut pargs, !trace_analyze)?,
     analyze:         false,
+    trace_analyze:   trace_analyze,
+    trace:           pargs.opt_value_from_str("--trace")?,
     start_addr:      pargs.opt_value_from_str("--start-addr")?,
     end_addr:        pargs.opt_value_from_str("--end-addr")?,
     name:            pargs.opt_value_from_str("--name")?,
@@ -208,7 +227,27 @@ pub fn run() -> i32 {
     }
   };
 
-  let cfg = Config::from_path(&args.config).unwrap();
+  // The trace mode needs neither a configuration nor a binary: a trace
+  // carries the addresses it saw. The configuration is still useful (it
+  // names the functions the run did not discover), so it is read when it
+  // is there.
+  if args.trace_analyze {
+    let Some(trace_path) = &args.trace else {
+      eprintln!("Error: --trace-analyze needs --trace <file>.");
+      return 1;
+    };
+    let cfg = match &args.config {
+      Some(path) => Some(Config::from_path(path).unwrap()),
+      None => None,
+    };
+    return crate::app_trace::run(cfg.as_ref(), trace_path);
+  }
+
+  let Some(config_path) = &args.config else {
+    eprintln!("Error: --config is required.");
+    return 1;
+  };
+  let cfg = Config::from_path(config_path).unwrap();
 
   // Parse the relocation table once per run (not per function): a bad
   // value is a single upfront error, even without --codegen-hydra, and
@@ -237,11 +276,12 @@ pub fn run() -> i32 {
   }
 
   if args.analyze {
-    let binary::Fmt::Exe(path) = &args.binary else { panic!("expected --binary-exe in --analyze mode") };
+    let Some(binary::Fmt::Exe(path)) = &args.binary else { panic!("expected --binary-exe in --analyze mode") };
     return crate::app_analyze::run(&cfg, path);
   }
 
-  let binary = Binary::from_fmt(&args.binary, Some(&cfg)).unwrap();
+  let Some(binary_fmt) = &args.binary else { panic!("expected a binary") };
+  let binary = Binary::from_fmt(binary_fmt, Some(&cfg)).unwrap();
 
   let specs =
     if let Some(name) = &args.name {

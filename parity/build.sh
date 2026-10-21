@@ -170,4 +170,33 @@ if grep -Eq -- "$LEAF_CALL_RE" "$MUT"; then
 fi
 rm -f "$MUT"
 
-echo "Gate 3 trace: PASS ($TRACE; main=$MAIN_ABS leaf=$LEAF_ABS)"
+# The consumer (dis86 --trace-analyze) has to read the trace the tool
+# wrote, and it has to reach the same conclusion the fixture states: the
+# leaf is a function of its own, called with no arguments.
+#
+# With the configuration, both functions are known, so the analysis names
+# them and discovers nothing.
+ANALYSIS="$OUT/fixture.analysis"
+"$DIS86" --trace-analyze --trace "$TRACE" --config "$OUT/fixture.bsl" > "$ANALYSIS"
+grep -q "0000:0185" "$ANALYSIS" || {
+    echo "FAIL: Gate 3: the trace analysis does not mention the leaf" >&2
+    cat "$ANALYSIS" >&2
+    exit 1
+}
+grep -q "no function the configuration does not know was discovered" "$ANALYSIS" || {
+    echo "FAIL: Gate 3: the trace analysis reports a discovery the configuration already knows" >&2
+    cat "$ANALYSIS" >&2
+    exit 1
+}
+
+# Without the configuration, the leaf is a discovery, and its suggestion
+# carries the argument count the trace observed.
+DISCOVERY="$OUT/fixture.discovery"
+"$DIS86" --trace-analyze --trace "$TRACE" > "$DISCOVERY"
+grep -Eq "F\( \"F_[0-9a-zA-Z_]+\", +None, +0, +\"0000:0185\", \"\" \)," "$DISCOVERY" || {
+    echo "FAIL: Gate 3: the trace analysis does not suggest the leaf with its argument count" >&2
+    cat "$DISCOVERY" >&2
+    exit 1
+}
+
+echo "Gate 3 trace: PASS ($TRACE; main=$MAIN_ABS leaf=$LEAF_ABS; analysis=$ANALYSIS)"

@@ -27,3 +27,7 @@ pub mod emu86;
 // Main application glue
 pub mod app;
 pub mod app_analyze;
+pub mod app_trace;
+
+// The Hydra trace format (issue #97) and what can be learned from it.
+pub mod trace;
