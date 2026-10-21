@@ -11,6 +11,7 @@
 #include "../../src/overlay.h"
 #include "../../src/functions.h"
 #include "../../src/callstack.h"
+#include "../../src/trace.h"
 #include "../../src/callstubs.h"
 
 u8 * hydra_datasection_baseptr(void);

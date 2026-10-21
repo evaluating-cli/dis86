@@ -95,6 +95,71 @@ register/memory/stack macros, native-to-guest call stubs and return semantics,
 overlay handling, data-section integration, callstack tracking/backtraces, and
 annotation metadata.
 
+## The trace sink
+
+The core can record what the machine did, as structured text (issue #97). The
+sink is **off by default**: every emission helper returns immediately when no
+sink is open, so an ordinary run neither changes behaviour nor pays for the
+record. A host opens one explicitly:
+
+```c
+hydra_trace_open("/tmp/trace.out");   /* 0 on success */
+...
+hydra_trace_close();
+```
+
+The file is line oriented, one event per line:
+
+```
+# hydra trace v1
+# code_load=0080
+dispatch enter cs=0080 ip=0013 name=F_myfunc
+dispatch leave cs=0080 ip=0013 result=resume
+call from=0080:0010 to=0080:0185 name=F_parity_leaf
+ret from=0080:0189 to=0080:0016
+native_call from=0080:0012 to=0080:0185 name=F_parity_leaf nargs=0
+native_ret from=0080:0012 to=0080:0185 dx=0000 ax=0001
+step cs=0080 ip=0134
+int num=21 ah=4c
+```
+
+- Addresses are **absolute guest `seg:off`**. `# code_load=SSSS` states the
+  load segment in effect from that point on; it is re-emitted when the load
+  segment changes (the MZ path moves the code after the image is loaded), so
+  a reader applies the most recent preceding line. Subtracting the code load
+  turns a guest address into the image-relative space a configuration table
+  uses.
+- `name=` appears only when the metadata resolves the address.
+- `nargs=` counts 16-bit argument words, followed by `arg0=`, `arg1=`, ... The
+  words are read back from the guest stack, so they are what the callee will
+  read, not the values the caller had in C.
+- `dx=`/`ax=` carry the value returned at a call boundary.
+
+The events come from the places that already know them:
+
+| Event | Emitted at |
+| --- | --- |
+| `dispatch` | a hook was dispatched / returned (`exec.c`) |
+| `call`, `ret` | the callstack model's guest call/return boundaries (`callstack.c`) |
+| `native_call`, `native_ret` | the native-to-guest call seam: the arguments and the returned DX:AX (`callstubs.h`) |
+| `step` | one guest instruction, emitted by a host that advances the guest one instruction at a time |
+| `int` | an interrupt that was serviced (`machine.c`) |
+
+`hydra_machine_stats()` reports the same counts without recording anything,
+so a host can report what the machine did with the trace switched off. The
+counters are process-wide; a host that needs a per-run figure takes the
+difference, the way the dosemu2 host driver does with the hook dispatch count.
+
+**What the trace can and cannot see.** On the dosemu2 host the guest CPU runs
+free between function-level breakpoints, so the free-running guest is not in
+the trace: what is there is the function-level hook boundaries, the guest
+call/return boundaries the callstack model sees at those boundaries, the
+native-to-guest call seam, and the individual guest instructions of the
+regions the host single-steps (the native-to-guest callthrough trace). The
+discovery unit is therefore the function, not the instruction, and a traced
+call records the calling function's entry address rather than an intra-function
+call site.
+
 ## Building
 
 No git submodule is required for the Hydra core:

@@ -167,6 +167,22 @@ static hydra_result_t run_wait(hydra_exec_ctx_t *exec, hydra_machine_t *m)
   return result;
 }
 
+/* The name of a result type, for the trace record. */
+static const char *result_type_name(int type)
+{
+  switch (type) {
+    case HYDRA_RESULT_TYPE_RESUME:    return "resume";
+    case HYDRA_RESULT_TYPE_JUMP:      return "jump";
+    case HYDRA_RESULT_TYPE_JUMP_NEAR: return "jump_near";
+    case HYDRA_RESULT_TYPE_CALL:      return "call";
+    case HYDRA_RESULT_TYPE_CALL_NEAR: return "call_near";
+    case HYDRA_RESULT_TYPE_RET_NEAR:  return "ret_near";
+    case HYDRA_RESULT_TYPE_RET_FAR:   return "ret_far";
+    case HYDRA_RESULT_TYPE_TERMINATE: return "terminate";
+  }
+  return "unknown";
+}
+
 static hydra_result_t run_begin(hydra_hook_t *hook, hydra_machine_t *m)
 {
   hook_dispatch_count++;
@@ -216,10 +232,21 @@ static hydra_result_t run_begin(hydra_hook_t *hook, hydra_machine_t *m)
   exec->hook = hook;
   memcpy(&exec->machine, m, sizeof(*m));
 
+  /* The dispatch boundary: the hook is about to run natively. The trace
+   * sink is off by default, so this costs nothing unless a host asked for
+   * the record. */
+  hydra_trace_dispatch(hook->name, m->registers->cs, m->registers->ip,
+                       "enter", NULL);
+
   int ret = pthread_create(&exec->thread, NULL, thread_func, exec);
   if (ret != 0) FAIL("Failed to create thread");
 
-  return run_wait(exec, m);
+  hydra_result_t result = run_wait(exec, m);
+
+  hydra_trace_dispatch(hook->name, m->registers->cs, m->registers->ip,
+                       "leave", result_type_name(result.type));
+
+  return result;
 }
 
 static hydra_result_t run_continue(hydra_machine_t *m, hydra_exec_ctx_t *exec)

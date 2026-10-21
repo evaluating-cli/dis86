@@ -11,6 +11,7 @@ HYDRA_SRC = files([
   'overlay.c',
   'addr.c',
   'dump.c',
+  'trace.c',
 ])
 
 libhydra = shared_library(

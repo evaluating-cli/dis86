@@ -81,6 +81,12 @@ jobs:
           echo "test_overlay_budget: PASS" >> "$GITHUB_STEP_SUMMARY"
           echo "test_unimpl_trap: PASS" >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Verify the trace sink (dosemu2-free)
+        run: |
+          set -euo pipefail
+          hydra/build/src/dosemu_host/test_trace
+          echo "test_trace: PASS" >> "$GITHUB_STEP_SUMMARY"
+
       - name: Verify native host skeleton (dosemu2-free)
         run: |
           set -euo pipefail
