@@ -24,7 +24,7 @@ layout constants match its defines. Expected lanes:
 ```
 c0 c1 00 01 10 00 02 81 81 80 0b 2c 78 02 8c 02
 34 34 12 34 20 01 78 12 34 34 7a 11 80 88 f8 08
-04 e0 ff 23 56 cd ff d1 00
+04 e0 ff 23 56 cd ff fe ff ce 00
 ```
 
 The fixture covers: ADC/SBB carry-in seeds, word carry, SHL/SAR/RCL/RCR/ROL/ROR,
@@ -39,8 +39,8 @@ of executing those bytes.
 `annotations.py` declares **two** functions, both `ret="u16"` and
 `flags="NEAR"`:
 
-* `F_parity_main` `[0x0000, 0x01CA)`
-* `F_parity_leaf` `[0x01CA, 0x01CE)` (near-call target)
+* `F_parity_main` `[0x0000, 0x01D9)`
+* `F_parity_leaf` `[0x01D9, 0x01DD)` (near-call target)
 
 Hydra hook lookup matches exact entry addresses and the call site lowers
 through the generated callstub (`F_parity_leaf(m)`), so the leaf must be its
@@ -73,7 +73,7 @@ itself. So the fixture is run once more with the Hydra trace sink open
 against the fixture's known layout:
 
 - the entry function `F_parity_main` was dispatched at `0001:0000`;
-- the call into the leaf `F_parity_leaf` was recorded at `0001:01ca` with
+- the call into the leaf `F_parity_leaf` was recorded at `0001:01d9` with
   `nargs=0`;
 - the value the leaf returned was recorded at that same boundary.
 
@@ -108,6 +108,6 @@ remain raw-code/host-seam operations and the fixture deliberately avoids them.
 
 None outstanding: the former gaps (byte `MUL`/`IMUL` panics, the loud-only
 `DIV`/`IDIV` remainder, and the byte-`SAR` sign loss) are now lowered exactly
-and covered by fixture lanes 30..38, and the word `IDIV`/`IMUL` signed-cast
+and covered by fixture lanes 30..40, and the word `IDIV`/`IMUL` signed-cast
 truncation is width-aware. A follow-up fixture version can add byte DIV/IDIV
 lanes the same way.

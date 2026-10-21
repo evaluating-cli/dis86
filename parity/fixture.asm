@@ -16,7 +16,7 @@
 ;   - Zero INTs: `INT()` decompiles to hydra_impl_int, which executes via
 ;     raw code on the emulated CPU (dosemu-host-only seam). v1 has no INT
 ;     dispatch at all; the "exit-AL" analog is the outbox checksum lane
-;     via a plain store (v3: lanes 0..38 arithmetic, lane 39 checksum),
+;     via a plain store (v3: lanes 0..40 arithmetic, lane 41 checksum),
 ;     and AH=4Ch/file-channel moves to a later version's lanes.
 ;   - Deterministic ops only, chosen to stay exactly-lowered (no UNIMPL on
 ;     either side): adc/sbb chains with explicit carry seeds, immediate
@@ -45,11 +45,10 @@ MODULE_SIZE equ 0x400           ; module bytes (pinned below via `times`)
 ; parity/outbox.h - build.sh asserts PARK_M and OUTBOX_VERSION agree with
 ; its C defines.
 OUTBOX_M    equ 0x0200          ; 16-byte outbox header
-LANE_M      equ 0x0210          ; lanes (41 used of 64 reserved)
-LANE_N      equ 41              ; lanes actually written
+LANE_M      equ 0x0210          ; lanes (43 used of 64 reserved)
 LANE_RESERVE equ 64             ; outbox.g cap (the scanner's expectation)
 PARK_M      equ 0x0260          ; park sentinel byte
-END_STALL_M equ 0x01CE          ; raw `jmp $` landing (outside both functions)
+END_STALL_M equ 0x01DD          ; raw `jmp $` landing (outside both functions)
 SRC_A_M     equ 0x0270          ; REP MOVSB source (8 bytes)
 SRC_B_M     equ 0x0278          ; REP MOVSB dest  (8 bytes)
 SRC_C_M     equ 0x0280          ; REP CMPSB run 2 (8 bytes)
@@ -274,16 +273,26 @@ parity_main:
         mov [LANE_M+37], al     ; 0xCD (AX = 0xFFCD)
         mov [LANE_M+38], dl     ; 0xFF (DX = 0xFFFF)
 
-        ; L39: checksum ("exit-AL" analog) = sum of lanes 0..38 mod 256.
+        ; L39/L40: word IMUL - the signed full product: AX=0xFFFF (-1)
+        ; * CX=2 = -2 = 0xFFFFFFFE, so DX:AX = FFFF:FFFE. The word forms
+        ; are the regression case for the width-aware signed cast: a
+        ; zero-extended 0xFFFF would give 0001:FFFE.
+        mov ax, 0xFFFF
+        mov cx, 2
+        imul cx
+        mov [LANE_M+39], al     ; 0xFE (AX = 0xFFFE)
+        mov [LANE_M+40], dl     ; 0xFF (DX = 0xFFFF)
+
+        ; L41: checksum ("exit-AL" analog) = sum of lanes 0..40 mod 256.
         mov si, LANE_M
-        mov cx, 39
+        mov cx, 41
         mov ax, 0
 .sum:
         add al, [si]
         inc si
         dec cx
         jnz .sum
-        mov [LANE_M+39], al
+        mov [LANE_M+41], al
 
         ; Write the outbox header LAST: the reader scans for it, so its
         ; presence alone proves a complete world.

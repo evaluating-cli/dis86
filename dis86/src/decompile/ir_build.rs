@@ -1969,8 +1969,15 @@ impl IRBuilder<'_> {
           assert!(
             matches!(ins.operands[0], instr::Operand::Reg(instr::OperandReg(instr::Reg::DX))) &&
             matches!(ins.operands[1], instr::Operand::Reg(instr::OperandReg(instr::Reg::AX))));
-          let lhs = self.append_asm_src_operand(&ins.operands[1]);
-          let rhs = self.append_asm_src_operand(&ins.operands[2]);
+          // Word IMUL is signed over the *16-bit* operands: sign-extend
+          // them so the U32 product is a genuine signed 32-bit value. The
+          // AST casts a U32 multiply's operands to i32 (right only when
+          // they already hold signed values); zero-extending 0xFFFF to
+          // 65535 would put 0001:FFFE in DX:AX for -1 * 2.
+          let lhs_ref = self.append_asm_src_operand(&ins.operands[1]);
+          let rhs_ref = self.append_asm_src_operand(&ins.operands[2]);
+          let lhs = self.sign_word_to_dword(lhs_ref);
+          let rhs = self.sign_word_to_dword(rhs_ref);
           let res = self.append_instr(Type::U32, Opcode::IMul, vec![lhs, rhs]);
           let (upper, lower) = self.append_upper_lower_split(res);
           self.append_asm_dst_operand(&ins.operands[0], upper);

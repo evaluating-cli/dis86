@@ -141,9 +141,45 @@ fn byte_idiv_divides_ax_with_exact_remainder() {
     source.contains("% (i16)"),
     "the remainder must be computed exactly:\n{source}"
   );
+  // Pin the half-register split: AH gets the remainder and AL the
+  // quotient (the quotient term is the `& 255` one, the remainder feeds
+  // the `<< 8` half). A swap would still contain `%`, so check the order.
+  let rem = source.find("% (i16)").expect("remainder term");
+  let sh = source.find(">> 8").expect("AH split");
+  let quo = source.find("/ (i16)").expect("quotient term");
+  assert!(
+    rem < sh && sh < quo,
+    "AH must take the remainder and AL the quotient:\n{source}"
+  );
   assert!(
     !source.contains("UNIMPL("),
     "no unmodeled remainder marker may remain:\n{source}"
+  );
+}
+
+// Word IMUL is signed over its 16-bit operands, so a masked 0xFFFF is -1:
+// the U32 product must be built from sign-extended operands (casting a
+// zero-extended 65535 to i32 would give DX:AX = 0001:FFFE for -1 * 2).
+#[test]
+fn word_imul_signs_both_operands() {
+  let source = decompile_raw(&[0xF7, 0xE9, 0xC3]);
+  assert!(
+    source.contains("(i32)(i16)AX") && source.contains("(i32)(i16)CX"),
+    "word imul must sign-extend both operands before the multiply:\n{source}"
+  );
+  assert!(
+    source.contains("MAKE_32"),
+    "word imul must split the product over DX:AX:\n{source}"
+  );
+}
+
+// Word MUL is unsigned: the operands must NOT be sign-extended.
+#[test]
+fn word_mul_stays_unsigned() {
+  let source = decompile_raw(&[0xF7, 0xE1, 0xC3]);
+  assert!(
+    source.contains("AX * CX") && !source.contains("(i16)"),
+    "word mul must multiply the zero-extended registers:\n{source}"
   );
 }
 
