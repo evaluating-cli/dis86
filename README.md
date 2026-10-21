@@ -17,6 +17,7 @@ Everything else in the repository supports that.
 | --- | --- |
 | `dis86/` decompiler | **The product**: decode → analysis → SSA IR → optimization → control flow → AST → C codegen. |
 | `hydra/` | Support runtime: links decompiled C with remaining x86-16 machine code for native recompiles. |
+| `hydra/src/native_host/` | Standalone execution substrate: an emulator-free `hydra_machine_hardware_t` over a linear 1 MiB guest memory, a device HAL whose reference backend renders text mode on a terminal, and a selective INT dispatch table. Runs a decompiled program with no dosemu2 process; no graphics backend yet ([`docs/native_host/`](docs/native_host/README.md)). |
 | dosemu2 (+ simx86, FDPP) | Trusted third-party component: runs the original binary as the parity oracle and hosts Hydra hybrid execution. We neither validate, patch, nor fork it. |
 | `bsl/`, `confgen/` | Configuration/annotation tooling for the decompiler. |
 | `dis86/src/emu86/` + SST harness | **Frozen offline tooling**: a retained 8086/286 interpreter and its SingleStepTests hardware-corpus harness. No development; no role in product validation; not built by the default lane (enable with `--features emu86`). |
@@ -48,7 +49,7 @@ under [`docs/dosemu2/`](docs/dosemu2/README.md).
 | `bsl/` | Barebones Specification Language (small C parser) for configuration/annotation tables. |
 | `confgen/` | Python generators that produce `.bsl` configuration. |
 | `hydra/` | Hybrid runtime (C, Meson) linking native decompiled code with remaining x86-16 machine code. Emulator-independent core; see [`hydra/README.md`](hydra/README.md). |
-| `docs/` | 8086/DOS reference notes and the dosemu2 migration corpus (`docs/dosemu2/`). |
+| `docs/` | 8086/DOS reference notes, the dosemu2 migration corpus (`docs/dosemu2/`), and the native-host notes and SDL2 decision (`docs/native_host/`). |
 | `scripts/` | SST corpus-fetch tooling. |
 
 ## Goals and Non-goals

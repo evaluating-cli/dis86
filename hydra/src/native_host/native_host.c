@@ -80,6 +80,153 @@ static uint8_t *native_mem_hostaddr(hydra_machine_ctx_t *ctx, uint32_t addr)
   return &nc->mem[addr];
 }
 
+/********************************************************************/
+/* text window: guest stores into video memory (B8000h / B0000h).
+ *
+ * A text-mode guest that draws by writing straight into the text window
+ * bypasses the BIOS completely, and before this the store landed in the flat
+ * array where nothing ever rendered it. Mirror those stores into the active
+ * backend's shadow buffer so the canonical DOS text idiom is visible.
+ *
+ * The flat array stays authoritative: the mirror is a projection of it, never
+ * a replacement, so a guest that reads back what it wrote sees its own bytes
+ * even when no backend renders anything. Writes to a window the backend does
+ * not display (page 1+, or B8000h while in MDA mode) keep their old behaviour:
+ * they land in guest memory and render nowhere, which is what the real
+ * hardware address space does too.
+ *
+ * The projection never fails. The bytes are already committed to guest memory
+ * by the time it runs, and rendering must not be the thing that ends a run
+ * (compare hydra_native_backend_present), so a store that arrives before a
+ * backend has been selected simply renders nowhere.
+ *
+ * Only the two accessors below are mirrored. Stores that go through a pointer
+ * from mem_hostaddr() bypass this, which is deliberate: those are Hydra's own
+ * bookkeeping — raw-code slots and the data-section base — not guest drawing.
+ */
+
+#define TEXT_WINDOW_SCAN_START 0xA0000u
+#define TEXT_WINDOW_SCAN_END   0xC0000u
+
+/* The backend and the window it renders, or NULL when nothing renders text.
+ * One lookup and one geometry query serve a whole store. */
+static const hydra_backend_t *text_window_backend(void **st_out,
+                                                  hydra_text_geometry_t *geo,
+                                                  uint32_t *window_bytes)
+{
+  const hydra_backend_t *be = hydra_native_backend_try_active(st_out);
+  if (!be || !be->text_geometry || !be->putchar_text || !be->get_cell)
+    return NULL;
+  if (be->text_geometry(*st_out, geo) != 0)
+    return NULL;
+  /* A backend that renders text reports a non-empty window (see the contract
+   * on hydra_text_geometry_t); this keeps a malformed geometry from dividing
+   * by zero below instead of trusting the invariant blindly. */
+  if (geo->rows == 0 || geo->cols == 0)
+    return NULL;
+  *window_bytes = (uint32_t)geo->rows * (uint32_t)geo->cols * 2u;
+  return be;
+}
+
+static void text_window_byte(const hydra_backend_t *be, void *st,
+                             const hydra_text_geometry_t *geo, uint32_t off,
+                             uint8_t val)
+{
+  const uint32_t cell = off / 2u;
+  const uint8_t row = (uint8_t)(cell / geo->cols);
+  const uint8_t col = (uint8_t)(cell % geo->cols);
+  uint8_t ch = 0, attr = 0;
+
+  if (be->get_cell(st, row, col, &ch, &attr) < 0)
+    return;
+  if (off & 1u)
+    attr = val;
+  else
+    ch = val;
+  be->putchar_text(st, row, col, ch, attr);
+}
+
+static void text_window_store(uint32_t addr, size_t width, uint16_t val)
+{
+  /* Fast path for ordinary guest stores: they are outside the video range, so
+   * this is two comparisons and an add and the backend is never reached. The
+   * width is added first because a store that starts just below the range can
+   * still reach a window above it. */
+  if ((uint64_t)addr + width <= TEXT_WINDOW_SCAN_START ||
+      addr >= TEXT_WINDOW_SCAN_END)
+    return;
+
+  /* Inside the range, every store re-reads the geometry through the vtable
+   * rather than caching it. Measured on the terminal backend at -O2: 15.4 ns
+   * per in-window word store, so a full 80x25 redraw (2,000 stores) costs
+   * ~31 us — 0.2% of a 70 Hz frame, and a redraw happens at most once per
+   * frame. That does not justify a cache yet, and a cache would have to be
+   * more than a memo: the window moves with the video mode (B8000h <-> B0000h
+   * at mode 07h), so it needs a generation counter the backend bumps on
+   * set_video_mode, or a mode change would mirror into the wrong place. Add
+   * that when a backend makes the query measurably expensive. */
+
+  void *st = NULL;
+  hydra_text_geometry_t geo;
+  uint32_t window_bytes = 0;
+  const hydra_backend_t *be = text_window_backend(&st, &geo, &window_bytes);
+  if (!be)
+    return;
+
+  /* Common case: an aligned word store of one whole cell (a screen clear, a
+   * string draw). It skips two read-modify-writes. */
+  if (width == 2 && addr >= geo.base) {
+    const uint32_t off = addr - geo.base;
+    if ((off & 1u) == 0 && off + 2u <= window_bytes) {
+      const uint32_t cell = off / 2u;
+      be->putchar_text(st, (uint8_t)(cell / geo.cols), (uint8_t)(cell % geo.cols),
+                       (uint8_t)(val & 0xff), (uint8_t)(val >> 8));
+      return;
+    }
+  }
+
+  /* Otherwise per byte. An odd-aligned word store is two bus cycles on
+   * 8086-class hardware, and its two halves can straddle the end of the
+   * window: at the last cell the low byte is that cell's attribute, inside
+   * the window, while the high byte is already past it. The half that falls
+   * inside renders; the half that falls outside is page 1 (or the gap before
+   * it) and renders nowhere. Clipping the whole store would silently drop a
+   * byte the guest put on screen. */
+  for (size_t i = 0; i < width; i++) {
+    const uint32_t at = addr + (uint32_t)i;
+    if (at < geo.base || at - geo.base >= window_bytes)
+      continue;
+    text_window_byte(be, st, &geo, at - geo.base, (uint8_t)(val >> (8u * i)));
+  }
+}
+
+/* Push the whole window from guest memory into the backend's frame.
+ *
+ * The per-store mirror covers guest drawing, but state_restore() loads the
+ * image with one fread, so a restored window would otherwise never reach the
+ * frame: the screen would keep showing the pre-restore picture while the
+ * guest reads the restored bytes. Re-projecting also marks the frame dirty
+ * through putchar_text, so the next present() shows it. */
+static void text_window_reproject(native_host_ctx_t *nc)
+{
+  void *st = NULL;
+  hydra_text_geometry_t geo;
+  uint32_t window_bytes = 0;
+  const hydra_backend_t *be = text_window_backend(&st, &geo, &window_bytes);
+  if (!be)
+    return;
+  if ((uint64_t)geo.base + window_bytes > NATIVE_HOST_MEM_SIZE)
+    return;
+
+  for (uint8_t row = 0; row < geo.rows; row++) {
+    for (uint8_t col = 0; col < geo.cols; col++) {
+      const uint32_t off = ((uint32_t)row * geo.cols + col) * 2u;
+      be->putchar_text(st, row, col, nc->mem[geo.base + off],
+                       nc->mem[geo.base + off + 1u]);
+    }
+  }
+}
+
 static uint8_t native_mem_read8(hydra_machine_ctx_t *ctx, uint32_t addr)
 {
   native_host_ctx_t *nc = native_ctx_of(ctx);
@@ -99,6 +246,7 @@ static void native_mem_write8(hydra_machine_ctx_t *ctx, uint32_t addr, uint8_t v
   native_host_ctx_t *nc = native_ctx_of(ctx);
   mem_bounds_check(addr, 1);
   nc->mem[addr] = val;
+  text_window_store(addr, 1, val);
 }
 
 static void native_mem_write16(hydra_machine_ctx_t *ctx, uint32_t addr, uint16_t val)
@@ -107,6 +255,7 @@ static void native_mem_write16(hydra_machine_ctx_t *ctx, uint32_t addr, uint16_t
   mem_bounds_check(addr, 2);
   nc->mem[addr] = (uint8_t)(val & 0xff);
   nc->mem[addr + 1] = (uint8_t)(val >> 8);
+  text_window_store(addr, 2, val);
 }
 
 /********************************************************************/
@@ -537,6 +686,11 @@ static void native_state_restore(hydra_machine_ctx_t *ctx, const char *path)
 
   if (fclose(f) != 0)
     FAIL("native host: state_restore close failed: %s", path);
+
+  /* The image was loaded with one fread, so the per-store mirror never saw
+   * it. Put the restored text window on screen, or the display would keep
+   * showing the pre-restore frame. */
+  text_window_reproject(nc);
 }
 
 /********************************************************************/

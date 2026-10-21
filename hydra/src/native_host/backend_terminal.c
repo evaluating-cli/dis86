@@ -7,6 +7,10 @@
  * The backend keeps a shadow text buffer, so it is testable without a
  * terminal: `present()` only writes when stdout is a tty, which keeps batch
  * and CI output clean.
+ *
+ * `present()` repaints only when something was drawn since the last call
+ * (`dirty`), so a driver can call it once per frame — or once per hook
+ * dispatch — and pay nothing while the guest is idle.
  */
 
 #include <errno.h>
@@ -28,6 +32,8 @@ typedef struct {
   uint8_t mode;
   uint8_t cur_row;
   uint8_t cur_col;
+  int dirty;                    /* cells drawn since the last present() */
+  int cursor_dirty;             /* cursor moved since the last present() */
   struct timespec start;
   uint16_t key_buf;
   int key_pending;
@@ -41,6 +47,8 @@ static void term_clear(terminal_t *t)
   memset(t->attr, 0x07, sizeof(t->attr));
   t->cur_row = 0;
   t->cur_col = 0;
+  t->dirty = 1;
+  t->cursor_dirty = 1;
 }
 
 static void term_scroll(terminal_t *t)
@@ -51,11 +59,13 @@ static void term_scroll(terminal_t *t)
   memmove(t->attr, t->attr + rowbytes, last);
   memset(t->ch + last, ' ', rowbytes);
   memset(t->attr + last, 0x07, rowbytes);
+  t->dirty = 1;
 }
 
 static void term_newline(terminal_t *t)
 {
   t->cur_col = 0;
+  t->cursor_dirty = 1;
   if (t->cur_row + 1 < t->rows) {
     t->cur_row++;
   } else {
@@ -119,10 +129,25 @@ static void term_teletype(void *state, uint8_t ch, uint8_t attr)
 {
   terminal_t *t = (terminal_t *)state;
 
-  if (ch == '\r') { t->cur_col = 0; return; }
+  /* Control characters change no cell but do move the cursor, and the cursor
+   * position is part of what present() renders. Not dirtying here is how a
+   * guest that only moves the cursor (CR/LF to a prompt, backspace over an
+   * echoed key) would leave the terminal's cursor behind until the next
+   * printable character arrived. A move that changes nothing (CR at column 0,
+   * backspace at column 0) stays clean. */
+  if (ch == '\r') {
+    if (t->cur_col != 0) {
+      t->cur_col = 0;
+      t->cursor_dirty = 1;
+    }
+    return;
+  }
   if (ch == '\n') { term_newline(t); return; }
   if (ch == '\b') {
-    if (t->cur_col > 0) t->cur_col--;
+    if (t->cur_col > 0) {
+      t->cur_col--;
+      t->cursor_dirty = 1;
+    }
     return;
   }
 
@@ -130,6 +155,7 @@ static void term_teletype(void *state, uint8_t ch, uint8_t attr)
   t->ch[idx] = ch;
   /* In text mode BL is ignored, so 0 means "keep the default attribute". */
   t->attr[idx] = attr ? attr : (uint8_t)0x07;
+  t->dirty = 1;
 
   if (++t->cur_col >= t->cols)
     term_newline(t);
@@ -145,28 +171,84 @@ static void term_putchar_text(void *state, uint8_t row, uint8_t col, uint8_t ch,
   /* Explicit-cell writes carry a real attribute; 0x00 is black-on-black and
    * must not be replaced with the teletype default. */
   t->attr[idx] = attr;
+  t->dirty = 1;
+}
+
+static int term_text_geometry(void *state, hydra_text_geometry_t *out)
+{
+  terminal_t *t = (terminal_t *)state;
+
+  /* MDA mono text drives B0000h; every other mode this backend accepts is a
+   * CGA-compatible text mode on B8000h. A mode that is not text has no window
+   * to describe, which set_video_mode already refuses to enter. */
+  uint32_t base;
+  switch (t->mode) {
+    case 0x00: case 0x01: case 0x02: case 0x03: base = 0xB8000u; break;
+    case 0x07:                                base = 0xB0000u; break;
+    default: return -1;
+  }
+
+  out->base = base;
+  out->mode = t->mode;
+  out->rows = t->rows;
+  out->cols = t->cols;
+  return 0;
+}
+
+static int term_get_cell(void *state, uint8_t row, uint8_t col, uint8_t *ch, uint8_t *attr)
+{
+  terminal_t *t = (terminal_t *)state;
+  if (row >= t->rows || col >= t->cols)
+    return -1;
+  const size_t idx = (size_t)row * t->cols + col;
+  if (ch)
+    *ch = t->ch[idx];
+  if (attr)
+    *attr = t->attr[idx];
+  return 0;
 }
 
 static void term_present(void *state)
 {
   terminal_t *t = (terminal_t *)state;
 
+  /* Nothing to say since the last call: no cell changed and the cursor is
+   * where it already was. This is the common case for a driver that presents
+   * once per frame, and for a guest that blocks on a key it has already drawn
+   * the prompt for. */
+  if (!t->dirty && !t->cursor_dirty)
+    return;
+
+  /* The two changes cost different things: a cursor move needs only the
+   * positioning escape, while a repaint moves the cursor anyway. */
+  const int repaint = t->dirty;
+  t->dirty = 0;
+  t->cursor_dirty = 0;
+
   /* Headless (piped/CI) runs produce no escape sequences; a real terminal
-   * gets a full repaint. */
+   * gets whatever changed. The change is consumed either way, so a later call
+   * does not replay it. */
   if (!isatty(STDOUT_FILENO))
     return;
 
-  fputs("\033[H\033[2J", stdout);
-  for (uint8_t r = 0; r < t->rows; r++) {
-    for (uint8_t c = 0; c < t->cols; c++) {
-      const size_t idx = (size_t)r * t->cols + c;
-      uint8_t ch = t->ch[idx];
-      if (ch < 0x20 || ch == 0x7f)
-        ch = ' ';
-      fputc((int)ch, stdout);
+  if (repaint) {
+    fputs("\033[H\033[2J", stdout);
+    for (uint8_t r = 0; r < t->rows; r++) {
+      for (uint8_t c = 0; c < t->cols; c++) {
+        const size_t idx = (size_t)r * t->cols + c;
+        uint8_t ch = t->ch[idx];
+        if (ch < 0x20 || ch == 0x7f)
+          ch = ' ';
+        fputc((int)ch, stdout);
+      }
+      fputc('\n', stdout);
     }
-    fputc('\n', stdout);
   }
+
+  /* Leave the terminal's cursor where the guest's cursor is: a port that
+   * echoes keys next to its prompt, or that only moves the cursor between
+   * frames, depends on it. Rows and columns are 1-based in ANSI. */
+  printf("\033[%u;%uH", (unsigned)t->cur_row + 1u, (unsigned)t->cur_col + 1u);
   fflush(stdout);
 }
 
@@ -242,6 +324,13 @@ static int term_read_key(void *state, uint16_t *key)
     return 1;
   }
 
+  /* About to block. This is the point where the backend knows the guest has
+   * stopped producing output and is waiting for the user, so it is the last
+   * chance to show a title screen or menu that is waiting on the key. A guest
+   * that draws and then blocks on input would otherwise sit in the shadow
+   * buffer, invisible, until something else triggered a repaint. */
+  term_present(t);
+
   unsigned char c;
   if (t->stdin_nonblock) {
     struct pollfd pfd = { .fd = STDIN_FILENO, .events = POLLIN };
@@ -294,6 +383,8 @@ const hydra_backend_t *hydra_backend_terminal(void)
     .teletype       = term_teletype,
     .putchar_text   = term_putchar_text,
     .present        = term_present,
+    .text_geometry  = term_text_geometry,
+    .get_cell       = term_get_cell,
     .poll_key       = term_poll_key,
     .read_key       = term_read_key,
     .ticks          = term_ticks,

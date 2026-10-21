@@ -9,7 +9,9 @@
  * rather than silently returning.
  */
 
+#include <errno.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -34,6 +36,39 @@ static int t_failures;
 static native_host_ctx_t *g_probe_ctx;
 static const hydra_backend_t *g_probe_be;
 static void *g_probe_st;
+
+/* The live hardware whose memory the later probes touch, and the snapshot the
+ * restore probe reads. */
+static hydra_machine_hardware_t *g_restore_hw;
+static const char *g_restore_path;
+
+/* A backend that renders nothing: no video methods at all. Installed in a
+ * forked child so the probe cannot disturb this process's registry. */
+static const hydra_backend_t NO_TEXT_BACKEND = { .name = "test-no-text" };
+/* Before any backend is selected. The store must land in guest memory and the
+ * projection must stay silent: aborting here would turn a valid guest store
+ * into a process exit. present() is checked too, since it shares the rule. */
+static void probe_store_without_backend(void)
+{
+  hydra_native_backend_clear_probe();
+  hydra_native_backend_present();                    /* must be a no-op */
+  g_restore_hw->mem_write16(g_restore_hw->ctx, 0xB8000u, 0x0741u);
+  g_restore_hw->mem_write8(g_restore_hw->ctx, 0xB8001u, 0x1e);
+  if (g_restore_hw->mem_read16(g_restore_hw->ctx, 0xB8000u) != 0x1e41u)
+    _exit(1);
+}
+
+static void probe_store_without_text_backend(void)
+{
+  hydra_native_backend_install_probe(&NO_TEXT_BACKEND, NULL);
+  g_restore_hw->mem_write16(g_restore_hw->ctx, 0xB8000u, 0x0741u);
+  g_restore_hw->mem_write8(g_restore_hw->ctx, 0xB8001u, 0x1e);
+  /* write16 puts 'A' + 07h, then write8 replaces the attribute: the bytes are
+   * there, which is all this probe asserts. */
+  if (g_restore_hw->mem_read16(g_restore_hw->ctx, 0xB8000u) != 0x1e41u)
+    _exit(1);
+}
+
 
 /* Deterministic input backend for the INT 16h tests: poll peeks, read
  * consumes, so the key-present path does not depend on a tty. */
@@ -103,6 +138,265 @@ static int probe_aborts(void (*probe)(void))
   if (waitpid(pid, &status, 0) != pid)
     return 0;
   return WIFSIGNALED(status) && WTERMSIG(status) == SIGABRT;
+}
+
+/* Run `probe` in a forked child with stdout redirected, and return everything
+ * the child wrote in a malloc'd NUL-terminated buffer.
+ *
+ * `use_pty` picks what the child's stdout looks like: a pty makes it a
+ * terminal (the backend renders) and a pipe makes it a file (the backend must
+ * stay silent). Either way the child inherits the parent's backend state by
+ * copy-on-write, so it draws into the same shadow buffer without the parent
+ * ever seeing the drawing. Returns 0 on setup or child failure. */
+static int capture_stdout(int use_pty, void (*probe)(void), char **out, size_t *out_len)
+{
+  int read_fd = -1, write_fd = -1;
+
+  if (use_pty) {
+    int master = posix_openpt(O_RDWR | O_NOCTTY);
+    if (master < 0)
+      return 0;
+    if (grantpt(master) != 0 || unlockpt(master) != 0) {
+      close(master);
+      return 0;
+    }
+    const char *slave_name = ptsname(master);
+    if (!slave_name) {
+      close(master);
+      return 0;
+    }
+    read_fd = master;
+    write_fd = open(slave_name, O_RDWR | O_NOCTTY);
+    if (write_fd < 0) {
+      close(master);
+      return 0;
+    }
+  } else {
+    int fds[2];
+    if (pipe(fds) != 0)
+      return 0;
+    read_fd = fds[0];
+    write_fd = fds[1];
+  }
+
+  fflush(stdout);
+  pid_t pid = fork();
+  if (pid < 0) {
+    close(read_fd);
+    close(write_fd);
+    return 0;
+  }
+  if (pid == 0) {
+    close(read_fd);
+    if (dup2(write_fd, STDOUT_FILENO) < 0)
+      _exit(1);
+    close(write_fd);
+    probe();
+    fflush(stdout);
+    _exit(0);
+  }
+
+  close(write_fd);
+
+  char *acc = NULL;
+  size_t len = 0, cap = 0;
+  char buf[4096];
+  for (;;) {
+    ssize_t n = read(read_fd, buf, sizeof(buf));
+    if (n > 0) {
+      if (len + (size_t)n + 1 > cap) {
+        cap = (len + (size_t)n + 1) * 2;
+        char *grown = realloc(acc, cap);
+        if (!grown) {
+          free(acc);
+          close(read_fd);
+          return 0;
+        }
+        acc = grown;
+      }
+      memcpy(acc + len, buf, (size_t)n);
+      len += (size_t)n;
+    } else if (n < 0 && errno == EINTR) {
+      continue;
+    } else {
+      break;
+    }
+  }
+  close(read_fd);
+
+  int status = 0;
+  if (waitpid(pid, &status, 0) != pid || !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    free(acc);
+    return 0;
+  }
+  if (!acc) {
+    acc = malloc(1);
+    if (!acc)
+      return 0;
+  }
+  acc[len] = '\0';
+  *out = acc;
+  *out_len = len;
+  return 1;
+}
+
+/* present() probes. They draw the same character and differ only in how often
+ * they present, so identical captures are the assertion. They reuse the
+ * g_probe_be / g_probe_st handles the abort probes already carry. */
+static void probe_present_once(void)
+{
+  g_probe_be->teletype(g_probe_st, 'Z', 0x07);
+  g_probe_be->present(g_probe_st);
+}
+
+static void probe_present_twice(void)
+{
+  g_probe_be->teletype(g_probe_st, 'Z', 0x07);
+  g_probe_be->present(g_probe_st);
+  g_probe_be->present(g_probe_st);
+}
+
+static void probe_present_never(void)
+{
+  g_probe_be->teletype(g_probe_st, 'Z', 0x07);
+}
+
+/* Count non-overlapping occurrences of `needle` in `hay`. */
+static int count_substr(const char *hay, const char *needle)
+{
+  int n = 0;
+  const size_t len = strlen(needle);
+  if (len == 0)
+    return 0;
+  for (const char *at = hay; (at = strstr(at, needle)) != NULL; at += len)
+    n++;
+  return n;
+}
+
+/* Cursor-only changes: drawing is settled by the first present(), then the
+ * guest only moves the cursor (CR/LF) and presents again. The second present
+ * must emit the cursor escape and must not repaint the cells. */
+static void probe_present_cursor_only(void)
+{
+  g_probe_be->set_video_mode(g_probe_st, 0x03);
+  g_probe_be->teletype(g_probe_st, 'A', 0x07);
+  g_probe_be->present(g_probe_st);
+  g_probe_be->teletype(g_probe_st, '\r', 0x07);
+  g_probe_be->teletype(g_probe_st, '\n', 0x07);
+  g_probe_be->present(g_probe_st);
+}
+
+/* The host-facing wrapper, driven through the selected backend's state so the
+ * wrapper and the drawing agree on which terminal this is. An empty wrapper
+ * body emits nothing here, so this is what makes its only caller a real test. */
+static void probe_wrapper_present(void)
+{
+  void *st = NULL;
+  const hydra_backend_t *be = hydra_native_backend_active(&st);
+  be->teletype(st, 'W', 0x07);
+  hydra_native_backend_present();
+  hydra_native_backend_present();
+}
+
+/* A restore loads the image with one fread, bypassing the per-store mirror,
+ * so present() must still have something to say afterwards: the frame has to
+ * be re-projected from the restored bytes. Settle the frame first, or a stale
+ * dirty flag would make the present emit for the wrong reason. */
+static void probe_restore_then_present(void)
+{
+  void *st = NULL;
+  const hydra_backend_t *be = hydra_native_backend_active(&st);
+
+  be->set_video_mode(st, 0x03);
+  hydra_native_backend_present();          /* settle: frame clean */
+
+  g_restore_hw->state_restore(g_restore_hw->ctx, g_restore_path);
+  hydra_native_backend_present();
+}
+
+/* A guest that draws a title screen and then blocks on a key must have that
+ * screen on the terminal *while it waits*. The child gets a pty as stdin and
+ * stdout, so read_key() takes its blocking path; the parent reads the frame
+ * off the master before it sends the key. A read_key() that does not present
+ * first leaves the child silent, the 2 s window expires, and the test fails —
+ * it cannot pass on a frame written after the key arrived. */
+static int present_before_blocking(void)
+{
+  int master = posix_openpt(O_RDWR | O_NOCTTY);
+  if (master < 0)
+    return 0;
+  if (grantpt(master) != 0 || unlockpt(master) != 0) {
+    close(master);
+    return 0;
+  }
+  const char *slave_name = ptsname(master);
+  if (!slave_name) {
+    close(master);
+    return 0;
+  }
+  int slave = open(slave_name, O_RDWR | O_NOCTTY);
+  if (slave < 0) {
+    close(master);
+    return 0;
+  }
+
+  fflush(stdout);
+  pid_t pid = fork();
+  if (pid < 0) {
+    close(master);
+    close(slave);
+    return 0;
+  }
+  if (pid == 0) {
+    close(master);
+    if (dup2(slave, STDIN_FILENO) < 0 || dup2(slave, STDOUT_FILENO) < 0)
+      _exit(1);
+    close(slave);
+    g_probe_be->set_video_mode(g_probe_st, 0x03);
+    g_probe_be->teletype(g_probe_st, 'K', 0x07);
+    uint16_t key = 0;
+    int ok = g_probe_be->read_key(g_probe_st, &key);
+    fflush(stdout);
+    _exit(ok && key ? 0 : 1);
+  }
+  close(slave);
+
+  char seen[4096];
+  size_t seen_len = 0;
+  int saw_frame = 0;
+
+  /* 2 s of slices: enough for a loaded CI runner, short enough that a
+   * regression fails the suite instead of hanging it. */
+  for (int tries = 0; tries < 200 && !saw_frame; tries++) {
+    struct pollfd pfd = { .fd = master, .events = POLLIN };
+    if (poll(&pfd, 1, 10) <= 0)
+      continue;
+    ssize_t n = read(master, seen + seen_len, sizeof(seen) - 1 - seen_len);
+    if (n <= 0)
+      break;
+    seen_len += (size_t)n;
+    seen[seen_len] = '\0';
+    if (strstr(seen, "\033[H\033[2J") && strchr(seen, 'K'))
+      saw_frame = 1;
+  }
+
+  /* Sent after the loop either way, so a failing child still exits. The
+   * newline is what makes a canonical-mode pty slave deliver the line: a bare
+   * byte would sit in the input queue and the child would block forever. */
+  if (write(master, "a\n", 2) < 0) {
+    saw_frame = 0;
+    /* Closing the master is EOF on the slave, so a child that never got the
+     * key still leaves read_key() instead of wedging the whole run. */
+    close(master);
+    master = -1;
+  }
+
+  int status = 0;
+  waitpid(pid, &status, 0);
+  if (master >= 0)
+    close(master);
+
+  return saw_frame && WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
 
 int hydra_backend_selftest(void)
@@ -260,6 +554,94 @@ int hydra_backend_selftest(void)
     regs.ax = 0x4c00;
     TCHECK(native_int_dispatch(ctx, &regs, 0x21, be, st) == NATIVE_INT_EXIT,
            "INT 21h AH=4Ch signals exit");
+  }
+
+  /* --- text geometry and cell reads (host-side video mirroring) --------- */
+  {
+    hydra_text_geometry_t geo;
+    uint8_t ch = 0, attr = 0;
+
+    TCHECK(be->set_video_mode(st, 0x03) == 0 && be->text_geometry(st, &geo) == 0 &&
+               geo.base == 0xB8000u && geo.mode == 0x03 &&
+               geo.rows == BACKEND_TEXT_ROWS && geo.cols == BACKEND_TEXT_COLS,
+           "text_geometry: mode 03h renders the 80x25 window at B8000h");
+
+    TCHECK(be->set_video_mode(st, 0x01) == 0 && be->text_geometry(st, &geo) == 0 &&
+               geo.base == 0xB8000u && geo.cols == 40,
+           "text_geometry: mode 01h keeps B8000h and reports 40 columns");
+
+    TCHECK(be->set_video_mode(st, 0x07) == 0 && be->text_geometry(st, &geo) == 0 &&
+               geo.base == 0xB0000u && geo.rows == BACKEND_TEXT_ROWS && geo.cols == 80,
+           "text_geometry: mode 07h moves the window to B0000h");
+
+    TCHECK(be->set_video_mode(st, 0x03) == 0, "text_geometry: back to 80x25 text mode");
+
+    be->putchar_text(st, 5, 7, 'Q', 0x1e);
+    TCHECK(be->get_cell(st, 5, 7, &ch, &attr) == 0 && ch == 'Q' && attr == 0x1e,
+           "get_cell: reads back an explicit cell write (character and attribute)");
+    TCHECK(be->get_cell(st, BACKEND_TEXT_ROWS, 0, &ch, &attr) < 0 &&
+               be->get_cell(st, 0, BACKEND_TEXT_COLS, &ch, &attr) < 0,
+           "get_cell: refuses cells outside the geometry");
+  }
+
+  /* --- present(): repaint only what changed, and only on a terminal ----- */
+  {
+    char *once = NULL, *twice = NULL, *never = NULL, *headless = NULL;
+    size_t once_len = 0, twice_len = 0, never_len = 0, headless_len = 0;
+
+    /* Reset the frame and the cursor so the probes start from a known state;
+     * each probe runs in a forked child, so this parent-side reset is what
+     * every child sees. */
+    be->set_video_mode(st, 0x03);
+    g_probe_be = be;
+    g_probe_st = st;
+
+    TCHECK(capture_stdout(1, probe_present_once, &once, &once_len),
+           "present(): capture on a pty");
+    TCHECK(once_len > 0 && strstr(once, "\033[H\033[2JZ") != NULL,
+           "present(): a terminal gets the drawn frame");
+
+    TCHECK(capture_stdout(1, probe_present_never, &never, &never_len),
+           "present(): capture without a present() call");
+    TCHECK(never_len == 0, "present(): drawing alone emits nothing");
+
+    TCHECK(capture_stdout(1, probe_present_twice, &twice, &twice_len),
+           "present(): capture of two calls");
+    TCHECK(twice_len == once_len && memcmp(twice, once, once_len) == 0,
+           "present(): a second call with nothing new emits nothing");
+
+    TCHECK(capture_stdout(0, probe_present_once, &headless, &headless_len),
+           "present(): capture on a pipe");
+    TCHECK(headless_len == 0, "present(): silent when stdout is not a terminal");
+
+    TCHECK(present_before_blocking(),
+           "present(): read_key renders the frame before it blocks on a key");
+
+    free(once);
+    free(twice);
+    free(never);
+    free(headless);
+  }
+
+  /* --- present(): a cursor-only change still reaches the terminal ------ */
+  {
+    char *cursor = NULL;
+    size_t cursor_len = 0;
+
+    /* Reset the frame in the parent so the child's first present() is a
+     * known one-repaint frame. */
+    be->set_video_mode(st, 0x03);
+    g_probe_be = be;
+    g_probe_st = st;
+
+    TCHECK(capture_stdout(1, probe_present_cursor_only, &cursor, &cursor_len),
+           "present(): capture of a cursor-only change");
+    TCHECK(cursor && count_substr(cursor, "\033[H\033[2J") == 1,
+           "present(): a cursor-only change does not repaint the cells");
+    /* CR then LF from (0,1) lands on row 1, column 0 -> ANSI "row 2, col 1". */
+    TCHECK(cursor && strstr(cursor, "\033[2;1H") != NULL,
+           "present(): a cursor-only change still moves the terminal cursor");
+    free(cursor);
   }
 
   /* --- fail-loud: both classes of missing service must abort ------------ */
@@ -581,6 +963,241 @@ static int probe_exits_with(void (*probe)(void), int expected)
   if (stdin_flags >= 0)
     fcntl(STDIN_FILENO, F_SETFL, stdin_flags);
   return WIFEXITED(status) && WEXITSTATUS(status) == expected;
+}
+
+/********************************************************************/
+/* Video-memory mirroring, from a live machine's hardware vtable.
+ *
+ * A text-mode guest draws by storing into the text window, so the store must
+ * reach the backend's frame through native_mem_write8/16. The flat array stays
+ * authoritative: every assertion about the frame is paired with one about
+ * guest memory, because a mirror that replaced the store instead of
+ * projecting it would pass the first and fail the second. */
+
+int hydra_backend_videotest(hydra_machine_t *m)
+{
+  t_failures = 0;
+
+  hydra_machine_hardware_t *hw = m->hardware;
+  hydra_native_backend_select("terminal");
+  void *st = NULL;
+  const hydra_backend_t *be = hydra_native_backend_active(&st);
+  if (!be || !st || !be->text_buffer) {
+    TCHECK(0, "video mirror: terminal backend selected");
+    return t_failures;
+  }
+
+  uint8_t ch = 0, attr = 0;
+  const uint8_t *frame = be->text_buffer(st, NULL, NULL);
+  const size_t frame_bytes = BACKEND_TEXT_ROWS * BACKEND_TEXT_COLS;
+
+  /* --- mode 03h: 80x25 at B8000h, cells are (character, attribute) ------ */
+  be->set_video_mode(st, 0x03);
+
+  hw->mem_write8(hw->ctx, 0xB8000u, 'A');
+  TCHECK(be->get_cell(st, 0, 0, &ch, &attr) == 0 && ch == 'A',
+         "video mirror: B8000h character store reaches the shared frame");
+  TCHECK(hw->mem_read8(hw->ctx, 0xB8000u) == 'A',
+         "video mirror: guest memory stays authoritative (readback)");
+  TCHECK(attr == 0x07,
+         "video mirror: a character store keeps the cell's attribute");
+
+  hw->mem_write8(hw->ctx, 0xB8001u, 0x1e);
+  TCHECK(be->get_cell(st, 0, 0, &ch, &attr) == 0 && ch == 'A' && attr == 0x1e,
+         "video mirror: an attribute store keeps the cell's character");
+
+  hw->mem_write16(hw->ctx, 0xB8002u, 0x0742u);   /* 'B', attribute 07h */
+  TCHECK(be->get_cell(st, 0, 1, &ch, &attr) == 0 && ch == 'B' && attr == 0x07,
+         "video mirror: an aligned word store fills one cell");
+
+  /* An odd-aligned word store is two bus cycles: the low byte lands in the
+   * attribute of cell 2 and the high byte in the character of cell 3. */
+  hw->mem_write16(hw->ctx, 0xB8005u, 0x0843u);
+  TCHECK(be->get_cell(st, 0, 2, &ch, &attr) == 0 && ch == ' ' && attr == 0x43,
+         "video mirror: an odd word store splits (attribute half)");
+  TCHECK(be->get_cell(st, 0, 3, &ch, &attr) == 0 && ch == 0x08 && attr == 0x07,
+         "video mirror: an odd word store splits (character half)");
+
+  /* Row stride comes from the backend's geometry, not from a constant. */
+  hw->mem_write16(hw->ctx, 0xB8000u + 80u * 2u, 0x0743u);   /* 'C', row 1 col 0 */
+  TCHECK(be->get_cell(st, 1, 0, &ch, &attr) == 0 && ch == 'C',
+         "video mirror: the row stride follows the 80-column geometry");
+
+  /* --- what must not render --------------------------------------------- */
+  uint8_t before[BACKEND_TEXT_ROWS * BACKEND_TEXT_COLS];
+
+  memcpy(before, frame, frame_bytes);
+  hw->mem_write8(hw->ctx, 0x1234u, 'Z');
+  TCHECK(memcmp(before, frame, frame_bytes) == 0,
+         "video mirror: ordinary memory stores leave the frame alone");
+
+  /* Page 1 of an 80x25 mode starts at B9000h. It is real guest memory and
+   * nothing displays it, exactly as on the hardware. */
+  hw->mem_write16(hw->ctx, 0xB9000u, 0x0758u);   /* 'X' */
+  TCHECK(memcmp(before, frame, frame_bytes) == 0 &&
+             hw->mem_read16(hw->ctx, 0xB9000u) == 0x0758u,
+         "video mirror: page 1 stores stay in guest memory and render nowhere");
+
+  /* An odd-aligned word store is two bus cycles, so its halves are routed
+   * separately and can straddle an end of the window. At the last cell of a
+   * 80x25 window (B8F9Fh) the low byte is that cell's attribute — inside the
+   * window — and the high byte is already past the end. The in-window half
+   * renders; the other half is page 1 and renders nowhere. */
+  {
+    uint8_t last_ch = 0, last_attr = 0;
+    const uint32_t window_end = 0xB8000u + 80u * 25u * 2u;
+
+    hw->mem_write16(hw->ctx, window_end - 1u, 0x4cabu);   /* lo=AB attr, hi=4C */
+
+    TCHECK(be->get_cell(st, BACKEND_TEXT_ROWS - 1, BACKEND_TEXT_COLS - 1,
+                        &last_ch, &last_attr) == 0 && last_attr == 0xab,
+           "video mirror: a word store straddling the window end renders its "
+           "in-window half");
+    TCHECK(last_ch != 0xab,
+           "video mirror: the straddle does not leak the other half into the cell");
+    TCHECK(hw->mem_read8(hw->ctx, window_end) == 0x4c,
+           "video mirror: the out-of-window half still lands in guest memory");
+
+    /* The symmetric case at the start: a store at B7FFFh puts its low byte in
+     * the gap before the window and its high byte in the first cell. */
+    hw->mem_write16(hw->ctx, 0xB8000u - 1u, 0x4707u);     /* hi=47 'G' at B8000h */
+
+    TCHECK(be->get_cell(st, 0, 0, &ch, &attr) == 0 && ch == 'G',
+           "video mirror: a word store straddling the window start renders its "
+           "in-window half");
+    TCHECK(hw->mem_read8(hw->ctx, 0xB8000u - 1u) == 0x07,
+           "video mirror: the below-window half still lands in guest memory");
+  }
+
+  /* --- mode 07h is MDA: the window is B0000h --------------------------- */
+  be->set_video_mode(st, 0x07);
+  hw->mem_write16(hw->ctx, 0xB0000u, 0x0753u);   /* 'S' */
+  TCHECK(be->get_cell(st, 0, 0, &ch, &attr) == 0 && ch == 'S',
+         "video mirror: mode 07h renders the B0000h window");
+
+  hw->mem_write16(hw->ctx, 0xB8000u, 0x0759u);   /* 'Y', no window there */
+  TCHECK(be->get_cell(st, 0, 0, &ch, &attr) == 0 && ch == 'S' &&
+             hw->mem_read16(hw->ctx, 0xB8000u) == 0x0759u,
+         "video mirror: mode 07h leaves B8000h unrendered (but stored)");
+
+  /* --- 40-column text modes use the same base and a 40-cell row -------- */
+  be->set_video_mode(st, 0x00);
+  hw->mem_write16(hw->ctx, 0xB8000u + 40u * 2u, 0x0754u);   /* 'T', row 1 col 0 */
+  TCHECK(be->get_cell(st, 1, 0, &ch, &attr) == 0 && ch == 'T',
+         "video mirror: 40-column modes use a 40-cell row stride");
+
+  /* The byte path has its own copy of the row arithmetic, so it gets its own
+   * store: row 2, column 5, at 40 cells per row. */
+  hw->mem_write8(hw->ctx, 0xB8000u + 2u * (40u * 2u) + 5u * 2u, 'U');
+  TCHECK(be->get_cell(st, 2, 5, &ch, &attr) == 0 && ch == 'U',
+         "video mirror: 40-column byte stores use the same stride");
+
+  /* --- the host-facing present entry point renders ----------------------- */
+  {
+    char *wrapped = NULL;
+    size_t wrapped_len = 0;
+
+    TCHECK(capture_stdout(1, probe_wrapper_present, &wrapped, &wrapped_len),
+           "present: capture through hydra_native_backend_present()");
+    TCHECK(wrapped && strstr(wrapped, "\033[H\033[2J") != NULL &&
+               strchr(wrapped, 'W') != NULL,
+           "present: the host entry point renders the drawn frame");
+    TCHECK(wrapped && count_substr(wrapped, "\033[H\033[2J") == 1,
+           "present: a second host entry point call with nothing new emits nothing");
+    free(wrapped);
+  }
+
+  /* --- state_restore() re-projects the window (kept last: it replaces the
+   * whole guest image) --------------------------------------------------- */
+  {
+    char path[] = "/tmp/native_host_restore_proj_XXXXXX";
+    int fd = mkstemp(path);
+
+    TCHECK(fd >= 0, "restore: temp snapshot created");
+    if (fd >= 0) {
+      close(fd);
+
+      be->set_video_mode(st, 0x03);
+      hw->mem_write16(hw->ctx, 0xB8000u, 0x1e41u);         /* 'A', attr 1Eh */
+      hw->state_save(hw->ctx, path);
+
+      hw->mem_write16(hw->ctx, 0xB8000u, 0x1e42u);         /* 'B' */
+      TCHECK(be->get_cell(st, 0, 0, &ch, &attr) == 0 && ch == 'B',
+             "restore: the frame follows the live store before the restore");
+
+      hw->state_restore(hw->ctx, path);
+
+      /* Both halves of the cell: a re-projection that carried the character
+       * but reset the attribute would pass a character-only assertion while
+       * drawing the restored screen in the wrong colour. */
+      TCHECK(be->get_cell(st, 0, 0, &ch, &attr) == 0 && ch == 'A' && attr == 0x1e,
+             "restore: the restored window is re-projected into the frame");
+      TCHECK(hw->mem_read16(hw->ctx, 0xB8000u) == 0x1e41u,
+             "restore: guest memory holds the restored bytes");
+
+      /* The real failure mode was invisible: the frame looked right in
+       * get_cell() only if it was re-projected, and present() stayed silent
+       * because no store had dirtied it. */
+      g_restore_hw = hw;
+      g_restore_path = path;
+      char *restored = NULL;
+      size_t restored_len = 0;
+      TCHECK(capture_stdout(1, probe_restore_then_present, &restored, &restored_len),
+             "restore: capture of the first frame after a restore");
+      TCHECK(restored && strstr(restored, "\033[H\033[2J") != NULL &&
+                 strchr(restored, 'A') != NULL,
+             "restore: present() emits the restored frame (the restore marks it dirty)");
+      free(restored);
+
+      unlink(path);
+    }
+  }
+
+  /* --- a store into the text window with no text backend is a clean no-op.
+   * Same guard the "no backend selected yet" case takes: the bytes are already
+   * in guest memory, and a projection must never abort the process. ---------- */
+  {
+    g_restore_hw = hw;
+    fflush(stdout);
+    const int stdin_flags = fcntl(STDIN_FILENO, F_GETFL, 0);
+    pid_t pid = fork();
+    if (pid == 0) {
+      probe_store_without_text_backend();
+      fflush(stdout);
+      _exit(0);
+    }
+    int status = 0;
+    const pid_t waited = pid > 0 ? waitpid(pid, &status, 0) : -1;
+    if (stdin_flags >= 0)
+      fcntl(STDIN_FILENO, F_SETFL, stdin_flags);
+
+    TCHECK(waited == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+           "video mirror: a store with a backend that renders no text is a "
+           "clean no-op (no abort)");
+  }
+
+  /* --- the same store before any backend is selected --------------------- */
+  {
+    g_restore_hw = hw;
+    fflush(stdout);
+    const int stdin_flags = fcntl(STDIN_FILENO, F_GETFL, 0);
+    pid_t pid = fork();
+    if (pid == 0) {
+      probe_store_without_backend();
+      fflush(stdout);
+      _exit(0);
+    }
+    int status = 0;
+    const pid_t waited = pid > 0 ? waitpid(pid, &status, 0) : -1;
+    if (stdin_flags >= 0)
+      fcntl(STDIN_FILENO, F_SETFL, stdin_flags);
+
+    TCHECK(waited == pid && WIFEXITED(status) && WEXITSTATUS(status) == 0,
+           "video mirror: a store before any backend is selected keeps the "
+           "bytes and does not abort");
+  }
+
+  return t_failures;
 }
 
 int hydra_backend_linktest(hydra_machine_t *m)
