@@ -1,5 +1,8 @@
 #pragma once
 #include "addr.h"
+#include "hydra_machine.h"
+#include "machine.h"
+#include "overlay.h"
 #include "trace.h"
 
 #define HYDRA_MAYBE_UNUSED __attribute__((unused))

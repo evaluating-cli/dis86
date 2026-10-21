@@ -99,3 +99,75 @@ cc -std=c11 -O2 -D_GNU_SOURCE -Dtypeof=__typeof__ \
 
 "$OUT/native_runner" "$OUT/fixture.exe" "$OUT/native.lanes"
 echo "Gate 2 native: PASS ($OUT/native.lanes)"
+
+# ---- 4. trace lane (Gate 3) ------------------------------------------------
+#
+# The instrumented-execution tool (#97) must be able to say what the
+# machine did, and its correctness has to ride on the anchored fixture
+# rather than on itself. So the fixture is run again with the trace sink
+# open, and the observations the trace holds are checked against the
+# fixture's known layout - the same layout the generated config states, so
+# both sides read one contract.
+#
+# The expected addresses are read from the generated config (which comes
+# from parity/annotations.py) and shifted by the code load segment the
+# native runner uses. Nothing here is a second copy of the fixture's
+# layout: a change to the annotations moves the expectation with it.
+
+TRACE="$OUT/fixture.trace"
+CODE_LOAD=1
+
+"$OUT/native_runner" "$OUT/fixture.exe" "$OUT/native.lanes" --trace "$TRACE"
+
+[ -s "$TRACE" ] || { echo "FAIL: Gate 3 produced no trace" >&2; exit 1; }
+
+bsl_addr() { # <function name> -> the image-relative "seg:off" it starts at
+    awk -v fn="$1" '$1 == fn { for (i = 1; i <= NF; i++) if ($i == "start") { print $(i+1); exit } }' \
+        "$OUT/fixture.bsl"
+}
+
+abs_addr() { # <"seg:off"> -> the absolute guest address the trace records
+    local seg="${1%%:*}" off="${1##*:}"
+    printf "%04x:%04x" $(( 0x$seg + CODE_LOAD )) $(( 0x$off ))
+}
+
+MAIN_ABS=$(abs_addr "$(bsl_addr F_parity_main)")
+LEAF_ABS=$(abs_addr "$(bsl_addr F_parity_leaf)")
+
+[ -n "$MAIN_ABS" ] && [ -n "$LEAF_ABS" ] || {
+    echo "FAIL: Gate 3 could not read the fixture's function addresses from the config" >&2
+    exit 1
+}
+
+check_trace() { # <file> <label> <extended regex>
+    grep -Eq -- "$3" "$1" && return 0
+    echo "FAIL: Gate 3 $2" >&2
+    echo "--- trace ---" >&2
+    cat "$1" >&2
+    exit 1
+}
+
+# The patterns are kept in variables so the mutation check below can run
+# exactly the same check against a tampered trace.
+LEAF_CALL_RE="^native_call from=[0-9a-f]{4}:[0-9a-f]{4} to=${LEAF_ABS} name=F_parity_leaf nargs=0\$"
+LEAF_RET_RE="^native_ret from=[0-9a-f]{4}:[0-9a-f]{4} to=${LEAF_ABS} dx=[0-9a-f]{4} ax=[0-9a-f]{4}\$"
+
+check_trace "$TRACE" "the trace has no version header" '^# hydra trace v1$'
+check_trace "$TRACE" "the trace does not record the code load" "^# code_load=$(printf '%04x' $CODE_LOAD)\$"
+check_trace "$TRACE" "the entry function was not dispatched" \
+    "^dispatch enter cs=${MAIN_ABS%%:*} ip=${MAIN_ABS##*:} name=F_parity_main\$"
+check_trace "$TRACE" "the call into the leaf was not recorded" "$LEAF_CALL_RE"
+check_trace "$TRACE" "the value the leaf returned was not recorded" "$LEAF_RET_RE"
+
+# The mutation check: the gate must fail when the observation is wrong, so
+# that a green run means "the tool saw what the fixture says" and not
+# merely "the tool ran".
+MUT="$OUT/fixture.trace.mutated"
+sed "s/to=${LEAF_ABS}/to=dead:beef/g" "$TRACE" > "$MUT"
+if grep -Eq -- "$LEAF_CALL_RE" "$MUT"; then
+    echo "FAIL: Gate 3 mutation check: a wrong leaf address still passes" >&2
+    exit 1
+fi
+rm -f "$MUT"
+
+echo "Gate 3 trace: PASS ($TRACE; main=$MAIN_ABS leaf=$LEAF_ABS)"
