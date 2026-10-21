@@ -18,6 +18,8 @@ pub enum Opcode {
   UMul,  // unsigned
   IDiv,  // signed
   UDiv,  // unsigned
+  IRem,  // signed remainder, e.g. x86 IDIV
+  URem,  // unsigned remainder, e.g. x86 DIV
 
   Neg,
   Not,  // bitwise
@@ -168,6 +170,8 @@ impl Opcode {
       Opcode::UMul        => "umul",
       Opcode::IDiv        => "idiv",
       Opcode::UDiv        => "udiv",
+      Opcode::IRem        => "irem",
+      Opcode::URem        => "urem",
       Opcode::Neg         => "neg",
       Opcode::Not         => "not",
       Opcode::SignExtTo16 => "signext16",

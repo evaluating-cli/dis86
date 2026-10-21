@@ -393,6 +393,8 @@ impl<'a> Builder<'a> {
       ir::Opcode::UMul => (BinaryOperator::Mul,  false),
       ir::Opcode::IDiv => (BinaryOperator::Div,  true),
       ir::Opcode::UDiv => (BinaryOperator::Div,  false),
+      ir::Opcode::IRem => (BinaryOperator::Mod,  true),
+      ir::Opcode::URem => (BinaryOperator::Mod,  false),
       ir::Opcode::And  => (BinaryOperator::And,  false),
       ir::Opcode::Or   => (BinaryOperator::Or,   false),
       ir::Opcode::Xor  => (BinaryOperator::Xor,  false),
@@ -424,8 +426,16 @@ impl<'a> Builder<'a> {
     let mut rhs = self.ref_to_expr_hex(instr.operands[1], depth+1, hex_const);
 
     if signed {
-      lhs = Expr::Cast(Type::I16, Box::new(lhs));
-      rhs = Expr::Cast(Type::I16, Box::new(rhs));
+      // The cast width follows the instruction's own type, not a fixed
+      // 16: a word IDIV divides a 32-bit dividend (`MAKE_32(DX,AX)`), and
+      // casting that to i16 would truncate the upper half away before
+      // the divide even ran.
+      let cast = match instr.typ {
+        Type::U32 => Type::I32,
+        _ => Type::I16,
+      };
+      lhs = Expr::Cast(cast.clone(), Box::new(lhs));
+      rhs = Expr::Cast(cast, Box::new(rhs));
     }
 
     Some(Expr::Binary(Box::new(BinaryExpr {

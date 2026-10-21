@@ -744,6 +744,21 @@ impl IRBuilder<'_> {
     self.append_instr(Type::U16, Opcode::And, vec![r, mask])
   }
 
+  /// Interpret an 8-bit fragment as signed and widen it to 16 bits. A
+  /// fragment read is always masked, so its stored value is the
+  /// zero-extended unsigned byte; the signed operations that read one
+  /// (byte IDIV's divisor, byte IMUL's operands) need the sign back.
+  fn sign_byte_to_word(&mut self, r: Ref) -> Ref {
+    self.append_instr(Type::U16, Opcode::SignExtTo16, vec![r])
+  }
+
+  /// Interpret a 16-bit value as signed and widen it to 32 bits: the
+  /// divisor of word IDIV is a signed half-word (0x8001 is -32767, not
+  /// +32769). Renders the same double cast CWD's AX-to-DX:AX uses.
+  fn sign_word_to_dword(&mut self, r: Ref) -> Ref {
+    self.append_instr(Type::U32, Opcode::SignExtTo32, vec![r])
+  }
+
   /// Update flags for a simple ALU binary op, tracking the carry-out where
   /// known: word ADD and any-width SUB/CMP enable carry chains, shifts
   /// with constant counts publish their last-bit-out, the logical ops
@@ -1517,39 +1532,54 @@ impl IRBuilder<'_> {
     else { Type::Unknown }
   }
 
-  /// Lower DIV (`signed == false`, `UDiv`) and IDIV (`signed == true`,
-  /// `IDiv`). Word form divides `DX:AX` by `r/m16` (quotient `AX`,
-  /// remainder `DX`); byte form divides `AX` by `r/m8` (quotient `AL`,
-  /// remainder `AH`). The quotient is exact; the remainder has no IR
-  /// reader, so it is an explicit unknown (fatal only if read). Flags
-  /// are architecturally undefined and clobbered to the loud-but-non-fatal
-  /// unknown marker. Divide-overflow traps (#DE) are not modeled.
+  /// Lower DIV (`signed == false`, `UDiv`/`URem`) and IDIV (`signed ==
+  /// true`, `IDiv`/`IRem`). Word form divides `DX:AX` by `r/m16`
+  /// (quotient `AX`, remainder `DX`); byte form divides `AX` by `r/m8`
+  /// (quotient `AL`, remainder `AH`). The quotient and the remainder
+  /// are both exact: C truncates division toward zero with the
+  /// dividend's sign, which is the x86 IDIV rule, and the remainder
+  /// lands in the register the format table lists (DX/AH). The signed
+  /// divisor is a narrower value than the divide it feeds - IDIV r/m16
+  /// divides by the signed *16* bits of the divisor and IDIV r/m8 by
+  /// the signed *8* bits - so those are sign-extended before the
+  /// divide; a zero-extended divisor would read 0x8001 as +32769
+  /// instead of -32767. Flags are architecturally undefined and
+  /// clobbered to the loud-but-non-fatal unknown marker. Divide
+  /// overflow (#DE) is not modeled.
   fn lower_div(&mut self, ins: &instr::Instr, signed: bool) {
     let upper_in = self.append_asm_src_operand(&ins.operands[0]);
     let lower_in = self.append_asm_src_operand(&ins.operands[1]);
     let divisor = self.append_asm_src_operand(&ins.operands[2]);
-    let op = if signed { Opcode::IDiv } else { Opcode::UDiv };
+    let qop = if signed { Opcode::IDiv } else { Opcode::UDiv };
+    let rop = if signed { Opcode::IRem } else { Opcode::URem };
     if Self::operand_is_word(&ins.operands[2]) {
       let dividend = self.append_instr(Type::U32, Opcode::Make32, vec![upper_in, lower_in]);
-      let quotient = self.append_instr(Type::U32, op, vec![dividend, divisor]);
+      let divisor = if signed { self.sign_word_to_dword(divisor) } else { divisor };
+      let quotient = self.append_instr(Type::U32, qop, vec![dividend, divisor]);
       let (_, lower_out) = self.append_upper_lower_split(quotient);
       self.append_asm_dst_operand(&ins.operands[1], lower_out);
+      let rem = self.append_instr(Type::U32, rop, vec![dividend, divisor]);
+      let (_, rem_lo) = self.append_upper_lower_split(rem);
+      // DX is the 16-bit remainder; a signed result carries its
+      // sign-extension in the low half (0xFFFFFFFF -> 0xFFFF), so the
+      // lower split is right for both signed and unsigned.
+      self.append_asm_dst_operand(&ins.operands[0], rem_lo);
     } else {
-      // Byte form: the 16-bit dividend is AH:AL, not a 32-bit Make32.
+      // Byte form: the dividend is AH:AL, not a 32-bit Make32.
       let hi = self.to_byte(upper_in);
       let lo = self.to_byte(lower_in);
       let eight = self.ir.const_new(8);
       let shifted = self.append_instr(Type::U16, Opcode::Shl, vec![hi, eight]);
       let dividend = self.append_instr(Type::U16, Opcode::Or, vec![shifted, lo]);
       let divisor = self.to_byte(divisor);
-      let quotient = self.append_instr(Type::U16, op, vec![dividend, divisor]);
+      let divisor = if signed { self.sign_byte_to_word(divisor) } else { divisor };
+      let quotient = self.append_instr(Type::U16, qop, vec![dividend, divisor]);
       let (_, lower_out) = self.append_byte_split(quotient);
       self.append_asm_dst_operand(&ins.operands[1], lower_out);
+      let rem = self.append_instr(Type::U16, rop, vec![dividend, divisor]);
+      let (upper_out, _) = self.append_byte_split(rem);
+      self.append_asm_dst_operand(&ins.operands[0], upper_out);
     }
-    // Remainder (DX/AH): no URem/IRem IR opcode exists; an explicit
-    // unknown beats the old silent zero (Upper16 of a <64K quotient).
-    let rem = self.append_instr(Type::U16, Opcode::Unimpl, vec![upper_in, lower_in, divisor]);
-    self.append_asm_dst_operand(&ins.operands[0], rem);
     self.clobber_flags();
   }
 
@@ -1610,12 +1640,19 @@ impl IRBuilder<'_> {
     // process simple binary operations
     if let Some(opcode) = simple_binary_operation(ins.opcode) {
       let attr = if operand_is_stack_reg(&ins.operands[0]) { Attribute::STACK_PTR } else { Attribute::NONE };
+      let word = Self::operand_is_word(&ins.operands[0]);
       let a = self.append_asm_src_operand(&ins.operands[0]);
       let b = self.append_asm_src_operand(&ins.operands[1]);
+      // SAR lowers to the signed shift, but a byte destination holds a
+      // zero-extended fragment: the sign the shift has to propagate is
+      // the low byte's bit 7, which the mask threw away (`sar al,1` of
+      // 0xF0 must read -16, not 240). Restore it before the shift.
+      let a = if opcode == Opcode::Shr && !word {
+        self.sign_byte_to_word(a)
+      } else { a };
       let typ = self.deduce_type_binary(a, b);
       let vref = self.append_instr_with_attrs(typ, attr, opcode, vec![a, b]);
       self.append_asm_dst_operand(&ins.operands[0], vref);
-      let word = Self::operand_is_word(&ins.operands[0]);
       self.set_flags_for_binary(opcode, vref, a, b, word);
       return;
     }
@@ -1924,34 +1961,60 @@ impl IRBuilder<'_> {
         self.clear_carry(); // MUL/IMUL write CF/OF; no modeled carry
       }
       instr::Opcode::OP_IMUL => {
-        // IMUL has many forms, let's be conservative for now and hard sanity check the version we need
-        assert!(
-          ins.operands.len() == 3 &&
-          matches!(ins.operands[0], instr::Operand::Reg(instr::OperandReg(instr::Reg::DX))) &&
-          matches!(ins.operands[1], instr::Operand::Reg(instr::OperandReg(instr::Reg::AX))));
-
-        let lhs = self.append_asm_src_operand(&ins.operands[1]);
-        let rhs = self.append_asm_src_operand(&ins.operands[2]);
-        let res = self.append_instr(Type::U32, Opcode::IMul, vec![lhs, rhs]);
-        let (upper, lower) = self.append_upper_lower_split(res);
-        self.append_asm_dst_operand(&ins.operands[0], upper);
-        self.append_asm_dst_operand(&ins.operands[1], lower);
+        // IMUL has many forms; this handles the full-product ones the
+        // 0xF6/0xF7 tables produce, and the truncating 0x69/0x6B forms
+        // are OP_IMUL_TRUNC above. Word is `AX * r/m16` split over
+        // DX:AX; byte is `AL * r/m8`, a signed 16-bit product in AX.
+        if Self::operand_is_word(&ins.operands[2]) {
+          assert!(
+            matches!(ins.operands[0], instr::Operand::Reg(instr::OperandReg(instr::Reg::DX))) &&
+            matches!(ins.operands[1], instr::Operand::Reg(instr::OperandReg(instr::Reg::AX))));
+          let lhs = self.append_asm_src_operand(&ins.operands[1]);
+          let rhs = self.append_asm_src_operand(&ins.operands[2]);
+          let res = self.append_instr(Type::U32, Opcode::IMul, vec![lhs, rhs]);
+          let (upper, lower) = self.append_upper_lower_split(res);
+          self.append_asm_dst_operand(&ins.operands[0], upper);
+          self.append_asm_dst_operand(&ins.operands[1], lower);
+        } else {
+          assert!(
+            matches!(ins.operands[0], instr::Operand::Reg(instr::OperandReg(instr::Reg::AX))) &&
+            matches!(ins.operands[1], instr::Operand::Reg(instr::OperandReg(instr::Reg::AL))));
+          // The byte operands are signed values: a fragment holds its
+          // byte masked, so 0xF0 reads +240 and the product would
+          // answer for `mul` instead of for `imul`.
+          let lhs_ref = self.append_asm_src_operand(&ins.operands[1]);
+          let rhs_ref = self.append_asm_src_operand(&ins.operands[2]);
+          let lhs = self.sign_byte_to_word(lhs_ref);
+          let rhs = self.sign_byte_to_word(rhs_ref);
+          let res = self.append_instr(Type::U16, Opcode::IMul, vec![lhs, rhs]);
+          self.append_asm_dst_operand(&ins.operands[0], res);
+        }
         self.clear_carry(); // MUL/IMUL write CF/OF; no modeled carry
       }
       instr::Opcode::OP_MUL => {
-        // Sanity check the form we have
-        assert!(
-          matches!(ins.operands[0], instr::Operand::Reg(instr::OperandReg(instr::Reg::DX))) &&
-          matches!(ins.operands[1], instr::Operand::Reg(instr::OperandReg(instr::Reg::AX))));
-
-        let lhs = self.append_asm_src_operand(&ins.operands[1]);
-        let rhs = self.append_asm_src_operand(&ins.operands[2]);
-        let res = self.append_instr(Type::U32, Opcode::UMul, vec![lhs, rhs]);
-        let (upper, lower) = self.append_upper_lower_split(res);
-        self.append_asm_dst_operand(&ins.operands[0], upper);
-        self.append_asm_dst_operand(&ins.operands[1], lower);
+        // The byte form's product is `AL * r/m8` - 16 bits, all of AX -
+        // and the word form's is `AX * r/m16` split over DX:AX.
+        if Self::operand_is_word(&ins.operands[2]) {
+          assert!(
+            matches!(ins.operands[0], instr::Operand::Reg(instr::OperandReg(instr::Reg::DX))) &&
+            matches!(ins.operands[1], instr::Operand::Reg(instr::OperandReg(instr::Reg::AX))));
+          let lhs = self.append_asm_src_operand(&ins.operands[1]);
+          let rhs = self.append_asm_src_operand(&ins.operands[2]);
+          let res = self.append_instr(Type::U32, Opcode::UMul, vec![lhs, rhs]);
+          let (upper, lower) = self.append_upper_lower_split(res);
+          self.append_asm_dst_operand(&ins.operands[0], upper);
+          self.append_asm_dst_operand(&ins.operands[1], lower);
+        } else {
+          assert!(
+            matches!(ins.operands[0], instr::Operand::Reg(instr::OperandReg(instr::Reg::AX))) &&
+            matches!(ins.operands[1], instr::Operand::Reg(instr::OperandReg(instr::Reg::AL))));
+          let lhs = self.append_asm_src_operand(&ins.operands[1]);
+          let rhs = self.append_asm_src_operand(&ins.operands[2]);
+          let res = self.append_instr(Type::U16, Opcode::UMul, vec![lhs, rhs]);
+          self.append_asm_dst_operand(&ins.operands[0], res);
+        }
         self.clear_carry(); // MUL/IMUL write CF/OF; no modeled carry
-     }
+      }
       instr::Opcode::OP_INC => {
         let attr = if operand_is_stack_reg(&ins.operands[0]) { Attribute::STACK_PTR } else { Attribute::NONE };
         let one = self.ir.const_new(1);
