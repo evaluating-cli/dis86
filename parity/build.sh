@@ -178,7 +178,7 @@ rm -f "$MUT"
 # them and discovers nothing.
 ANALYSIS="$OUT/fixture.analysis"
 "$DIS86" --trace-analyze --trace "$TRACE" --config "$OUT/fixture.bsl" > "$ANALYSIS"
-grep -q "0000:0185" "$ANALYSIS" || {
+grep -q "$(bsl_addr F_parity_leaf)" "$ANALYSIS" || {
     echo "FAIL: Gate 3: the trace analysis does not mention the leaf" >&2
     cat "$ANALYSIS" >&2
     exit 1
@@ -193,7 +193,7 @@ grep -q "no function the configuration does not know was discovered" "$ANALYSIS"
 # carries the argument count the trace observed.
 DISCOVERY="$OUT/fixture.discovery"
 "$DIS86" --trace-analyze --trace "$TRACE" > "$DISCOVERY"
-grep -Eq "F\( \"F_[0-9a-zA-Z_]+\", +None, +0, +\"0000:0185\", \"\" \)," "$DISCOVERY" || {
+grep -Eq "F\( \"F_[0-9a-zA-Z_]+\", +None, +0, +\"$(bsl_addr F_parity_leaf)\", \"\" \)," "$DISCOVERY" || {
     echo "FAIL: Gate 3: the trace analysis does not suggest the leaf with its argument count" >&2
     cat "$DISCOVERY" >&2
     exit 1

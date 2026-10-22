@@ -617,6 +617,8 @@ fn allow_cse(opcode: Opcode) -> bool {
     Opcode::UMul => true,
     Opcode::IDiv => true,
     Opcode::UDiv => true,
+    Opcode::IRem => true,
+    Opcode::URem => true,
     Opcode::Neg => true,
     Opcode::SignExtTo32 => true,
     Opcode::Lower16 => true,
@@ -1527,7 +1529,8 @@ mod tests {
   fn mul_and_div_are_not_zf_exact_producers() {
     // Mul/Div leave ZF undefined, so equality tests after them must stay as
     // UNIMPL_FLAGS markers instead of being rewritten against zero.
-    for producer in [Opcode::IMul, Opcode::UMul, Opcode::IDiv, Opcode::UDiv] {
+    for producer in [Opcode::IMul, Opcode::UMul, Opcode::IDiv, Opcode::UDiv,
+                     Opcode::IRem, Opcode::URem] {
       let (mut ir, blk) = test_ir();
       let (_prod, condition) = flags_over(&mut ir, blk, producer, Opcode::EqFlags);
 

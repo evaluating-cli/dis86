@@ -102,28 +102,101 @@ fn xlat_lowers_to_indexed_byte_load() {
   );
 }
 
-// idiv mirrors div with a signed division.
+// idiv mirrors div with a signed division and divides the full 32-bit
+// dividend without truncating it, sign-extends the 16-bit divisor
+// (0x8001 is -32767, not +32769), and produces the exact remainder
+// (truncation toward zero, `IDIV`'s rule) in DX rather than an unknown.
 #[test]
 fn idiv_lowers_to_signed_division() {
   let source = decompile_raw(&[0xF7, 0xF9, 0xC3]);
   assert!(
-    source.contains("MAKE_32") && source.contains("/ (i16)"),
-    "idiv cx must emit a signed DX:AX division:\n{source}"
+    source.contains("MAKE_32") && source.contains("/ (i32)") && source.contains("% (i32)"),
+    "idiv cx must emit a signed DX:AX division and its exact remainder:\n{source}"
+  );
+  assert!(
+    source.contains("(i32)(i16)CX"),
+    "the 16-bit divisor must be sign-extended, not zero-extended:\n{source}"
+  );
+  assert!(
+    !source.contains("UNIMPL("),
+    "no unmodeled remainder marker may remain:\n{source}"
   );
 }
 
-// Byte idiv divides the 16-bit AX (AH:AL), not a 32-bit Make32, and the
-// unmodeled remainder stays loud instead of a silent zero.
+// Byte idiv divides the 16-bit AX (AH:AL), not a 32-bit Make32; its
+// divisor is a signed byte (sign-extended, not zero-extended); and the
+// remainder is exact: AH holds the low byte of the signed remainder.
 #[test]
-fn byte_idiv_divides_ax_with_loud_remainder() {
+fn byte_idiv_divides_ax_with_exact_remainder() {
   let source = decompile_raw(&[0xF6, 0xFB, 0xC3]);
   assert!(
-    source.contains("((AH << 8) | AL) / (i16)BL"),
-    "byte idiv must emit a signed 16-bit AX (AH:AL) division:\n{source}"
+    source.contains("(AH << 8) | AL"),
+    "byte idiv must divide the 16-bit AX (AH:AL):\n{source}"
   );
   assert!(
-    source.contains("UNIMPL("),
-    "the unmodeled remainder must stay a loud marker:\n{source}"
+    source.contains("(i16)(i8)BL"),
+    "the byte divisor must be sign-extended, not zero-extended:\n{source}"
+  );
+  assert!(
+    source.contains("% (i16)"),
+    "the remainder must be computed exactly:\n{source}"
+  );
+  // Pin the half-register split: AH gets the remainder and AL the
+  // quotient (the quotient term is the `& 255` one, the remainder feeds
+  // the `<< 8` half). A swap would still contain `%`, so check the order.
+  let rem = source.find("% (i16)").expect("remainder term");
+  let sh = source.find(">> 8").expect("AH split");
+  let quo = source.find("/ (i16)").expect("quotient term");
+  assert!(
+    rem < sh && sh < quo,
+    "AH must take the remainder and AL the quotient:\n{source}"
+  );
+  assert!(
+    !source.contains("UNIMPL("),
+    "no unmodeled remainder marker may remain:\n{source}"
+  );
+}
+
+// Word IMUL is signed over its 16-bit operands, so a masked 0xFFFF is -1:
+// the U32 product must be built from sign-extended operands (casting a
+// zero-extended 65535 to i32 would give DX:AX = 0001:FFFE for -1 * 2).
+#[test]
+fn word_imul_signs_both_operands() {
+  let source = decompile_raw(&[0xF7, 0xE9, 0xC3]);
+  assert!(
+    source.contains("(i32)(i16)AX") && source.contains("(i32)(i16)CX"),
+    "word imul must sign-extend both operands before the multiply:\n{source}"
+  );
+  assert!(
+    source.contains("MAKE_32"),
+    "word imul must split the product over DX:AX:\n{source}"
+  );
+}
+
+// Word MUL is unsigned: the operands must NOT be sign-extended.
+#[test]
+fn word_mul_stays_unsigned() {
+  let source = decompile_raw(&[0xF7, 0xE1, 0xC3]);
+  assert!(
+    source.contains("AX * CX") && !source.contains("(i16)"),
+    "word mul must multiply the zero-extended registers:\n{source}"
+  );
+}
+
+// Byte MUL/IMUL were an unmodeled form: the old word-only assert rejected
+// the AX/AL operand pair and panicked the build. The byte product is
+// `AL * r/m8`, a signed product for IMUL, all 16 bits of AX.
+#[test]
+fn byte_mul_and_imul_lower() {
+  let mul = decompile_raw(&[0xF6, 0xE3, 0xC3]);
+  assert!(
+    mul.contains("AL * BL"),
+    "byte mul must emit the unsigned AL * BL product:\n{mul}"
+  );
+  let imul = decompile_raw(&[0xF6, 0xEB, 0xC3]);
+  assert!(
+    imul.contains("(i8)AL") && imul.contains("(i8)BL"),
+    "byte imul must sign-extend both operands:\n{imul}"
   );
 }
 

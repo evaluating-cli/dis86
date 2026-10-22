@@ -33,11 +33,11 @@
 
 #define OUTBOX_MAGIC "PHYPAR16"
 #define OUTBOX_MAGIC_LEN 8
-#define OUTBOX_VERSION 2
+#define OUTBOX_VERSION 3
 #define OUTBOX_LANE_RESERVE 64
 #define OUTBOX_HEADER_SIZE 16
 #define OUTBOX_LANE_M 0x0210
-#define OUTBOX_LANE_N 32
+#define OUTBOX_LANE_N 43
 #define OUTBOX_M 0x0200
 #define OUTBOX_PARK_M 0x0260
 
@@ -49,13 +49,17 @@
 #define OUTBOX_SNAPSHOT_SIZE (OUTBOX_HEADER_SIZE + OUTBOX_LANE_RESERVE)
 
 /* The fixture's complete, known observable surface: lanes 0..29 are the
- * arithmetic/string/aliasing lanes, lane 30 is the "exit-AL" checksum
- * (sum of lanes 0..29 mod 256), lane 31 is unused (zero). */
+ * arithmetic/string/aliasing lanes, lanes 30..40 exercise the byte-SAR /
+ * byte-MUL / byte-IMUL / word-IMUL / word-DIV / word-IDIV remainder
+ * lowerings, lane 41 is the "exit-AL" checksum (sum of lanes 0..40 mod
+ * 256), lane 42 is unused (zero). */
 static const uint8_t outbox_expected_lanes[OUTBOX_LANE_N] = {
     0xC0, 0xC1, 0x00, 0x01, 0x10, 0x00, 0x02, 0x81,
     0x81, 0x80, 0x0B, 0x2C, 0x78, 0x02, 0x8C, 0x02,
     0x34, 0x34, 0x12, 0x34, 0x20, 0x01, 0x78, 0x12,
-    0x34, 0x34, 0x7A, 0x11, 0x80, 0x88, 0xA9, 0x00,
+    0x34, 0x34, 0x7A, 0x11, 0x80, 0x88, 0xF8, 0x08,
+    0x04, 0xE0, 0xFF, 0x23, 0x56, 0xCD, 0xFF, 0xFE,
+    0xFF, 0xCE, 0x00,
 };
 
 /* ---- shared helpers ------------------------------------------------------- */

@@ -15,12 +15,14 @@
 ;     cannot leak into the diff.
 ;   - Zero INTs: `INT()` decompiles to hydra_impl_int, which executes via
 ;     raw code on the emulated CPU (dosemu-host-only seam). v1 has no INT
-;     dispatch at all; the "exit-AL" checksum is outbox lane 31 via a
-;     plain store, and AH=4Ch/file-channel moves to the lane's v2.
+;     dispatch at all; the "exit-AL" analog is the outbox checksum lane
+;     via a plain store (v3: lanes 0..40 arithmetic, lane 41 checksum),
+;     and AH=4Ch/file-channel moves to a later version's lanes.
 ;   - Deterministic ops only, chosen to stay exactly-lowered (no UNIMPL on
 ;     either side): adc/sbb chains with explicit carry seeds, immediate
-;     shifts/rotates, REP MOVSB/STOSW/CMPSB with a cld-ed DF, MUL/DIV/IDIV
-;     result lanes (no flag use after), byte/word aliasing, one near call.
+;     shifts/rotates, REP MOVSB/STOSW/CMPSB with a cld-ed DF, byte/word
+;     MUL/IMUL/DIV/IDIV result lanes (no flag use after), byte/word
+;     aliasing, one near call.
 ;   - The outbox lives inside the image and the reader scans for a
 ;     magic+version+count header (parity/outbox.h), so no absolute guest
 ;     address is hardcoded anywhere; load-segment skew between dosemu and
@@ -43,18 +45,17 @@ MODULE_SIZE equ 0x400           ; module bytes (pinned below via `times`)
 ; parity/outbox.h - build.sh asserts PARK_M and OUTBOX_VERSION agree with
 ; its C defines.
 OUTBOX_M    equ 0x0200          ; 16-byte outbox header
-LANE_M      equ 0x0210          ; lanes (32 used of 64 reserved)
-LANE_N      equ 32              ; lanes actually written
+LANE_M      equ 0x0210          ; lanes (43 used of 64 reserved)
 LANE_RESERVE equ 64             ; outbox.g cap (the scanner's expectation)
 PARK_M      equ 0x0260          ; park sentinel byte
-END_STALL_M equ 0x0189          ; raw `jmp $` landing (outside both functions)
+END_STALL_M equ 0x01DD          ; raw `jmp $` landing (outside both functions)
 SRC_A_M     equ 0x0270          ; REP MOVSB source (8 bytes)
 SRC_B_M     equ 0x0278          ; REP MOVSB dest  (8 bytes)
 SRC_C_M     equ 0x0280          ; REP CMPSB run 2 (8 bytes)
 FILL_M      equ 0x0288          ; REP STOSW fill (4 bytes)
 ALIAS_M     equ 0x0290          ; byte/word aliasing cells
 STACK_M     equ 0x0400          ; one past the image stack (grows down)
-OUTBOX_VERSION equ 2
+OUTBOX_VERSION equ 3
 
 ; MZ header (canonical RBIL Table 01403 layout, hand-rolled like testprog_
 ; exe.asm: reloc count @06, header paragraphs @08, ss/sp @0E/@10, ip/cs
@@ -142,11 +143,7 @@ parity_main:
         rcr al, 1               ; (3>>1)|(1<<7) = 0x81
         mov [LANE_M+8], al
 
-        ; L9..L11: ROL/ROR value-exact; SHL imm-mask exact. NOTE: SAR is
-        ; deliberately NOT used: with a folded unsigned byte constant the
-        ; decompiler widens as (i16) and shifts out the sign bit (emitted
-        ; `(i16)0xF0 >> 1` = 0x78, not the hardware 0xF8) - filed for a
-        ; dis86 lowering follow-up (see parity/README.md).
+        ; L9..L11: ROL/ROR value-exact; SHL imm-mask exact.
         mov al, 0xF0
         shl al, 3               ; (0xF0<<3)&255 = 0x80
         mov [LANE_M+9], al
@@ -203,10 +200,7 @@ parity_main:
 
         ; L22..L25: register-movement conventions that IR lowers exactly
         ; (native xchg reg-reg plus a push/pop round-trip through the image
-        ; stack). Byte/word DIV and IDIV are NOT used: both forms lower
-        ; only "loud" on the remainder half-register (dis86 emits UNIMPL);
-        ; adding those lanes waits for a lowering contribution (recorded in
-        ; parity/README.md).
+        ; stack).
         mov ax, 0x1234
         mov dx, 0x5678
         xchg ax, dx             ; AX=0x5678, DX=0x1234
@@ -237,16 +231,68 @@ parity_main:
         mov ax, di              ; SRC_C_M+8 = 0x0288
         mov [LANE_M+29], al
 
-        ; L30: checksum ("exit-AL" analog) = sum of lanes 0..29 mod 256.
+        ; L30: byte SAR (the previously-filed sign-loss gap): hardware
+        ; widens 0xF0 as -16, so sar by 1 yields 0xF8 - not (0x78, the
+        ; masked-source value the old lowering shifted).
+        mov al, 0xF0
+        sar al, 1               ; signed 240 -> -8 = 0xF8
+        mov [LANE_M+30], al
+
+        ; L31/L32: byte MUL - the previously-panicked form: the product is
+        ; AL*r/m8, 16 bits, and every bit lands in AX (0x81 * 8 = 0x0408).
+        mov al, 0x81
+        mov bl, 8
+        mul bl
+        mov [LANE_M+31], al     ; 0x08
+        mov [LANE_M+32], ah     ; 0x04
+
+        ; L33/L34: byte IMUL - signed: 0xF0 reads as -16, * 2 = -32 =
+        ; 0xFFE0 (the unsigned product would put 0x01 in AH instead of FF).
+        mov al, 0xF0
+        mov bl, 2
+        imul bl
+        mov [LANE_M+33], al     ; 0xE0
+        mov [LANE_M+34], ah     ; 0xFF
+
+        ; L35/L36: word DIV - quotient in AX, exact remainder in DX
+        ; (0x123456 / 0x1000 = 291 r 1110).
+        mov dx, 0x0012
+        mov ax, 0x3456
+        mov cx, 0x1000
+        div cx
+        mov [LANE_M+35], al     ; 0x23 (AX = 0x0123)
+        mov [LANE_M+36], dl     ; 0x56 (DX = 0x0456)
+
+        ; L37/L38: word IDIV - signed: DX:AX = 0xFFFFFF66 = -154, /3 =
+        ; -51 r -1 (truncation toward zero; the remainder keeps the
+        ; dividend's sign - a floor division would answer -52 r 2).
+        mov dx, 0xFFFF
+        mov ax, 0xFF66
+        mov cx, 3
+        idiv cx
+        mov [LANE_M+37], al     ; 0xCD (AX = 0xFFCD)
+        mov [LANE_M+38], dl     ; 0xFF (DX = 0xFFFF)
+
+        ; L39/L40: word IMUL - the signed full product: AX=0xFFFF (-1)
+        ; * CX=2 = -2 = 0xFFFFFFFE, so DX:AX = FFFF:FFFE. The word forms
+        ; are the regression case for the width-aware signed cast: a
+        ; zero-extended 0xFFFF would give 0001:FFFE.
+        mov ax, 0xFFFF
+        mov cx, 2
+        imul cx
+        mov [LANE_M+39], al     ; 0xFE (AX = 0xFFFE)
+        mov [LANE_M+40], dl     ; 0xFF (DX = 0xFFFF)
+
+        ; L41: checksum ("exit-AL" analog) = sum of lanes 0..40 mod 256.
         mov si, LANE_M
-        mov cx, 30
+        mov cx, 41
         mov ax, 0
 .sum:
         add al, [si]
         inc si
         dec cx
         jnz .sum
-        mov [LANE_M+30], al
+        mov [LANE_M+41], al
 
         ; Write the outbox header LAST: the reader scans for it, so its
         ; presence alone proves a complete world.

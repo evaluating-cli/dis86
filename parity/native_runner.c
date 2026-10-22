@@ -33,12 +33,12 @@
 /* Defined by hydra/src/conf.c; declared here to avoid internal.h. */
 extern hydra_conf_t HYDRA_CONF[1];
 
-/* The fixture's own landing: the `jmp $` stall at module 0x0189 lives
+/* The fixture's own landing: the `jmp $` stall at module 0x01DD lives
  * outside both annotated functions, so a hook miss there makes
  * hydra_exec_run return RESUME (0) and ends the loop without ever running
  * raw bytes. We seed the entry-return word with it because the decompiled
  * epilogue pops the near-return IP from [SS:SP0] (SP0 = 0x400). */
-#define END_STALL_M 0x0189
+#define END_STALL_M 0x01DD
 #define ENTRY_SP 0x400
 
 static uint8_t *read_file(const char *path, size_t *out_size)
