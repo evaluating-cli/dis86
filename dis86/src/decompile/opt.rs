@@ -13,6 +13,10 @@ fn operand_propagate(ir: &IR, mut r: Ref) -> Ref {
   loop {
     let Some(instr) = ir.instr(r) else { return r };
     if instr.opcode != Opcode::Ref { return r; }
+    // A MATERIALISE ref is a deliberate snapshot taken before a register gets
+    // rewritten; propagating through it would put the value back after the
+    // write and lose the pre-write state.
+    if (instr.attrs & Attribute::MATERIALISE) != 0 { return r; }
     if !seen.insert(r) { return r; }
     r = instr.operands[0];
   }

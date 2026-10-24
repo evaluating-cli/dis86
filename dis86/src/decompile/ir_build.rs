@@ -1279,13 +1279,26 @@ impl IRBuilder<'_> {
   /// would be a no-op (this also keeps a `push reg`/`pop reg` pair that folds
   /// away from gaining a write). Segment registers are deliberately out of
   /// scope here; that decision is pinned by a test.
-  fn write_back_exit_registers(&mut self, dx_is_return: bool) {
+  ///
+  /// The return expression can read a register this write-back rewrites
+  /// (`mov ax,cx; dec cx; ret` returns the pre-decrement CX). `Ref::Init(reg)`
+  /// renders as the live C variable, so such a value has to be frozen into a
+  /// `MATERIALISE` temporary *before* the writes, or the return would observe
+  /// the exit state instead of the value the caller receives. The snapshot is
+  /// taken even when the value is the pending expression itself: the pending
+  /// expression re-reads `Init(reg)`, which is exactly what the write changes.
+  fn write_back_exit_registers(&mut self, ret_vals: &mut [Ref], dx_is_return: bool) {
     let mut pending = vec![];
     for reg in [instr::Reg::BX, instr::Reg::CX, instr::Reg::DX, instr::Reg::SI, instr::Reg::DI] {
       if dx_is_return && reg == instr::Reg::DX { continue; }
       let vref = self.ir.get_var(reg, self.cur);
       if vref == Ref::Init(reg) { continue; }
       pending.push((reg, vref));
+    }
+    for v in ret_vals.iter_mut() {
+      if pending.iter().any(|(reg, _)| Self::ref_reads_init(&self.ir, *v, *reg)) {
+        *v = self.append_instr_with_attrs(Type::U16, Attribute::MATERIALISE, Opcode::Ref, vec![*v]);
+      }
     }
     for (reg, vref) in Self::order_guest_writes(&self.ir, &pending) {
       self.write_guest_register(reg, vref);
@@ -1973,15 +1986,17 @@ impl IRBuilder<'_> {
         self.ir.set_var(instr::Reg::BP, self.cur, vref);
       }
       instr::Opcode::OP_RETF => {
-        let ret_vals = self.return_vals();
-        self.write_back_exit_registers(ret_vals.len() == 2);
+        let mut ret_vals = self.return_vals();
+        let dx_is_return = ret_vals.len() == 2;
+        self.write_back_exit_registers(&mut ret_vals, dx_is_return);
         self.pin_registers();
         self.append_instr(Type::Void, Opcode::RetFar, ret_vals);
 
       }
       instr::Opcode::OP_RET => {
-        let ret_vals = self.return_vals();
-        self.write_back_exit_registers(ret_vals.len() == 2);
+        let mut ret_vals = self.return_vals();
+        let dx_is_return = ret_vals.len() == 2;
+        self.write_back_exit_registers(&mut ret_vals, dx_is_return);
         self.pin_registers();
         self.append_instr(Type::Void, Opcode::RetNear, ret_vals);
       }

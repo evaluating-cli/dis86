@@ -298,3 +298,63 @@ fn hydra_flavour_writes_exit_state_before_the_return() {
   assert!(restore < find(&source, "RETURN_NEAR()"), "restore must precede the return:\n{source}");
 }
 
+/// The return value may read a register that the exit write-back is about to
+/// change. `mov ax,cx; dec cx; ret` returns the *pre-decrement* CX, so the
+/// write-back must not make the return expression observe the new value.
+#[test]
+fn ret_value_reading_a_written_register_is_snapshotted() {
+  let code = [
+    0x89, 0xC8, // mov ax,cx
+    0x49,       // dec cx
+    0xC3,       // ret
+  ];
+  let source = standard(&code, vec![func_ret("main", 0x0000, 0x0004, None, Type::U16)]);
+  let snapshot = find(&source, "tmp_0 = CX;");
+  let write_back = find(&source, "CX = CX - 1;");
+  assert!(snapshot < write_back, "the return value must be captured before the write:\n{source}");
+  let ret = source.rfind("return").expect("a return");
+  let ret_line = &source[ret..];
+  assert!(ret_line.contains("tmp_0"), "the return must read the snapshot:\n{source}");
+  assert!(!ret_line.contains("CX"), "the return must not read the rewritten CX:\n{source}");
+}
+
+/// The same hazard through an indirect read: the return expression dereferences
+/// SI, and `add si,2` runs as exit state before the return.
+#[test]
+fn ret_value_reading_a_pointer_register_is_snapshotted() {
+  let code = [
+    0x8B, 0x04,       // mov ax,[si]
+    0x83, 0xC6, 0x02, // add si,2
+    0xC3,             // ret
+  ];
+  let source = standard(&code, vec![func_ret("main", 0x0000, 0x0006, None, Type::U16)]);
+  let snapshot = find(&source, "tmp_0 = ");
+  let write_back = find(&source, "SI = SI + 2;");
+  assert!(snapshot < write_back, "the dereference must be captured before the write:\n{source}");
+  let ret = source.rfind("return").expect("a return");
+  let ret_line = &source[ret..];
+  assert!(ret_line.contains("tmp_0"), "the return must read the snapshot:\n{source}");
+  assert!(!ret_line.contains("SI"), "the return must not read the rewritten SI:\n{source}");
+}
+
+/// The Hydra flavour assigns AX instead of returning, but the snapshot must
+/// still be taken before the exit write and used by that assignment.
+#[test]
+fn hydra_uses_the_snapshot_for_the_return_value() {
+  let code = [
+    0x89, 0xC8, // mov ax,cx
+    0x49,       // dec cx
+    0xC3,       // ret
+  ];
+  let source = decompile(
+    &code,
+    vec![func_ret("main", 0x0000, 0x0004, None, Type::U16)],
+    Flavor::Hydra { relocatable_segs: vec![] },
+  );
+  let snapshot = find(&source, "tmp_0 = CX;");
+  let write_back = find(&source, "CX = CX - 1;");
+  let ret_assign = find(&source, "AX = tmp_0;");
+  assert!(snapshot < write_back, "the value must be captured before the write:\n{source}");
+  assert!(write_back < ret_assign, "the return value must follow the write:\n{source}");
+  assert!(ret_assign < find(&source, "RETURN_NEAR()"), "the assignment must precede the return:\n{source}");
+}
