@@ -150,6 +150,29 @@ struct IRBuilder<'a> {
   // two or three times to fixpoint the carry analysis), so messages are
   // buffered and only the retained pass's warnings are printed, exactly once.
   warnings: Vec<String>,
+
+  // Known calls whose undeclared-but-dirty registers may be callee inputs.
+  // Recorded while building; checked once against the finished IR in `build`
+  // (see `check_regargs_setups`), so each call site warns at most once.
+  regargs_candidates: Vec<RegargsCandidate>,
+
+  // Instructions emitted only to materialise the exit register state at a
+  // `ret` (see `write_back_exit_registers`). They are not caller reads, so the
+  // #132 "is this setup value still used" check ignores them.
+  exit_state_writes: HashSet<Ref>,
+}
+
+/// A known call with registers that hold a non-entry value but are absent from
+/// the callee's `regargs` annotation. `missing` pairs the register with the SSA
+/// value live at the call so the check can tell whether the caller reads it
+/// again. See `check_regargs_setups` (issue #132).
+#[derive(Clone)]
+struct RegargsCandidate {
+  blk: BlockRef,
+  call_ref: Ref,
+  call_addr: SegOff,
+  callee: String,
+  missing: Vec<(instr::Reg, Ref)>,
 }
 
 /// The SSA variable name under which CF is threaded across blocks. It renders
@@ -186,6 +209,8 @@ impl<'a> IRBuilder<'a> {
       exit_known: HashMap::new(),
       entry_known_default: false,
       warnings: Vec::new(),
+      regargs_candidates: Vec::new(),
+      exit_state_writes: HashSet::new(),
     };
 
     // Create and seal the entry block
@@ -1199,7 +1224,7 @@ impl IRBuilder<'_> {
     self.save_return_value(ret_type, ret_ref);
   }
 
-  fn process_call_known(&mut self, func: &config::Func, ins: &instr::Instr) {
+  fn process_call_known(&mut self, func: &config::Func, ins: &instr::Instr) -> Ref {
     let idx = self.ir.funcs.len();
     self.ir.funcs.push(func.name.to_string());
 
@@ -1221,10 +1246,18 @@ impl IRBuilder<'_> {
       let sp = self.append_instr_with_attrs(Type::U16, Attribute::STACK_PTR, Opcode::Add, vec![sp, k]);
       self.ir.set_var(instr::Reg::SP, self.cur, sp);
     }
+
+    ret_ref
   }
 
-  fn append_regargs(&mut self, regargs: &Option<Vec<instr::Reg>>) {
-    let Some(regargs) = regargs else { return };
+  /// Emit the callee's declared register inputs and return the dirty registers
+  /// the annotation does *not* declare.
+  ///
+  /// The returned values are candidates for the #132 diagnostic: they exist at
+  /// the call but only the callee could read them (the caller's own uses are
+  /// checked later, on the finished IR, by `check_regargs_setups`).
+  fn append_regargs(&mut self, regargs: &Option<Vec<instr::Reg>>) -> Vec<(instr::Reg, Ref)> {
+    let Some(regargs) = regargs else { return vec![] };
     // Same hazard as `process_int` (issues #78/#101): each pinned write is a
     // guest register assignment in the emitted C, so a copy recorded as
     // `Ref::Init(src)` would observe the value its source gets *after* the
@@ -1248,15 +1281,31 @@ impl IRBuilder<'_> {
     for (reg, vref) in Self::order_guest_writes(&self.ir, &pending) {
       self.write_guest_register(reg, vref);
     }
+
+    // Undeclared registers holding a non-entry value are the callee inputs the
+    // annotation may have forgotten. `process_int` pins the same set for a
+    // handler, which may read any of them; a known callee is trusted to read
+    // only its declared regargs, so this is where that trust is checked.
+    let declared: HashSet<instr::Reg> =
+      regargs.iter().map(|reg| Self::init_storage_parent(*reg)).collect();
+    let mut missing = vec![];
+    for reg in [instr::Reg::AX, instr::Reg::BX, instr::Reg::CX, instr::Reg::DX,
+                instr::Reg::SI, instr::Reg::DI, instr::Reg::DS, instr::Reg::ES] {
+      if declared.contains(&reg) { continue; }
+      let vref = self.ir.get_var(reg, self.cur);
+      if vref == Ref::Init(reg) { continue; }
+      missing.push((reg, vref));
+    }
+    missing
   }
 
   /// Emit a guest register assignment. Unlike `pin_register` (whose `Pin` is
   /// transparent to AST emission, see ast.rs), this renders as a real write to
   /// the register variable: it is how a synchronised value becomes observable
   /// to the caller, the interrupt handler, or the machine's exit state.
-  fn write_guest_register(&mut self, reg: instr::Reg, vref: Ref) {
+  fn write_guest_register(&mut self, reg: instr::Reg, vref: Ref) -> Ref {
     let sym = self.ir.symbols.find_ref_by_name(sym::Table::Register, reg.info().name).unwrap();
-    self.append_instr_with_attrs(Type::U16, Attribute::PIN, Opcode::WriteVar16, vec![Ref::Symbol(sym), vref]);
+    self.append_instr_with_attrs(Type::U16, Attribute::PIN, Opcode::WriteVar16, vec![Ref::Symbol(sym), vref])
   }
 
   /// Materialise the function's exit register state at a `ret`.
@@ -1301,7 +1350,8 @@ impl IRBuilder<'_> {
       }
     }
     for (reg, vref) in Self::order_guest_writes(&self.ir, &pending) {
-      self.write_guest_register(reg, vref);
+      let write = self.write_guest_register(reg, vref);
+      self.exit_state_writes.insert(write);
     }
   }
 
@@ -1311,8 +1361,17 @@ impl IRBuilder<'_> {
       if func.mode != mode {
         panic!("Found function but it's call mode doesn't match! Expected {:?}, Got {:?}", mode, func.mode);
       }
-      self.append_regargs(&func.regargs);
-      self.process_call_known(func, ins);
+      let missing = self.append_regargs(&func.regargs);
+      let call_ref = self.process_call_known(func, ins);
+      if !missing.is_empty() {
+        self.regargs_candidates.push(RegargsCandidate {
+          blk: self.cur,
+          call_ref,
+          call_addr: ins.addr,
+          callee: func.name.to_string(),
+          missing,
+        });
+      }
     } else {
       // Unknown function
       let ret_type = Type::Unknown;
@@ -2633,6 +2692,7 @@ impl IRBuilder<'_> {
         analyze_carry(cfg, instrs, spec, binary, overlay, pin_all, df_entry.as_ref());
     }
     retained.build_once();
+    retained.check_regargs_setups();
 
     retained.emit_warnings();
     *self = retained;
@@ -2642,6 +2702,70 @@ impl IRBuilder<'_> {
   fn emit_warnings(&self) {
     for w in &self.warnings {
       eprintln!("{}", w);
+    }
+  }
+
+  /// Warn when a known call sets up a register its `regargs` does not declare
+  /// and the caller never reads that value again (issue #132).
+  ///
+  /// Such a value exists only for the callee: no caller instruction consumes
+  /// it, so dead-code elimination removes the setup and the callee reads
+  /// whatever the register held before. That outcome is silent otherwise, so
+  /// the operator gets a diagnostic instead. The check runs on the finished
+  /// raw IR (after `build_once`), where "does the caller read it later" is a
+  /// simple reachability question. `regargs: None` is not checked: there is no
+  /// annotation to be incomplete, and unannotated callees are common.
+  fn check_regargs_setups(&mut self) {
+    if self.regargs_candidates.is_empty() { return; }
+    for cand in self.regargs_candidates.clone() {
+      let wanted: HashSet<Ref> = cand.missing.iter().map(|(_, vref)| *vref).collect();
+      let read = self.reads_after_call(&cand, &wanted);
+      let dropped: Vec<&str> = cand.missing.iter()
+        .filter(|(_, vref)| !read.contains(vref))
+        .map(|(reg, _)| reg.info().name)
+        .collect();
+      if dropped.is_empty() { continue; }
+      let pronoun = if dropped.len() == 1 { "it" } else { "them" };
+      self.warn(format!(
+        "WARN: {}: call to {} at {} sets up {} but the callee's regargs does not declare {}; the setup is dropped and the callee reads the stale register value",
+        self.spec.name, cand.callee, cand.call_addr, dropped.join(", "), pronoun));
+    }
+  }
+
+  /// Which of `wanted` are read on any path after the call instruction: the
+  /// rest of the call's block, then every block reachable through
+  /// `block_exits`. Exit-state write-backs do not count — they materialise the
+  /// value for the caller's `ret`, not for this call.
+  fn reads_after_call(&self, cand: &RegargsCandidate, wanted: &HashSet<Ref>) -> HashSet<Ref> {
+    let mut reads = HashSet::new();
+    let mut after_call = false;
+    for r in self.ir.iter_instrs(cand.blk) {
+      if r == cand.call_ref {
+        after_call = true;
+        continue;
+      }
+      if !after_call { continue; }
+      Self::collect_reads(&self.ir, r, wanted, &self.exit_state_writes, &mut reads);
+    }
+
+    let mut seen = HashSet::new();
+    let mut stack = self.ir.block_exits(cand.blk);
+    while let Some(blk) = stack.pop() {
+      if !seen.insert(blk) { continue; }
+      for r in self.ir.iter_instrs(blk) {
+        Self::collect_reads(&self.ir, r, wanted, &self.exit_state_writes, &mut reads);
+      }
+      stack.extend(self.ir.block_exits(blk));
+    }
+    reads
+  }
+
+  fn collect_reads(ir: &IR, r: Ref, wanted: &HashSet<Ref>,
+                   exit_state_writes: &HashSet<Ref>, reads: &mut HashSet<Ref>) {
+    if exit_state_writes.contains(&r) { return; }
+    let Some(instr) = ir.instr(r) else { return; };
+    for operand in &instr.operands {
+      if wanted.contains(operand) { reads.insert(*operand); }
     }
   }
 
@@ -4340,5 +4464,180 @@ mod tests {
       assert!(matches!(targets, Some(BranchTargets::Unresolved(_))),
         "{op:?} with a non-relative operand must be unresolved, not a target");
     }
+  }
+
+  fn operand(reg: instr::Reg) -> instr::Operand {
+    instr::Operand::Reg(instr::OperandReg(reg))
+  }
+
+  fn imm_operand(val: u16) -> instr::Operand {
+    instr::Operand::Imm(instr::OperandImm { sz: instr::Size::Size16, val })
+  }
+
+  fn rel_operand(val: u16) -> instr::Operand {
+    instr::Operand::Rel(instr::OperandRel { val })
+  }
+
+  fn located_instr(opcode: instr::Opcode, addr_off: u16, n_bytes: u16,
+                   operands: Vec<instr::Operand>) -> instr::Instr {
+    let mut ops = ArrayVec::new();
+    for op in operands { ops.push(op); }
+    instr::Instr {
+      rep: None,
+      opcode,
+      operands: ops,
+      addr: SegOff { seg: Seg::Normal(0), off: Off(addr_off) },
+      n_bytes,
+      intel_hidden_operand_bitmask: 0,
+    }
+  }
+
+  /// A caller range plus one configured near callee at `callee_start`.
+  fn test_spec_with_callee(
+    start: u16, end: u16, code: &[u8],
+    callee_start: u16, callee_regargs: Option<Vec<instr::Reg>>,
+  ) -> (Rc<TypeDatabase>, Config, binary::Binary, spec::Spec<'static>) {
+    let (types, mut cfg, binary, spec) = test_spec(start, end, code);
+    cfg.funcs.push(config::Func {
+      name: "callee".to_string(),
+      start: SegOff { seg: Seg::Normal(0), off: Off(callee_start) },
+      end: Some(SegOff { seg: Seg::Normal(0), off: Off(callee_start + 1) }),
+      entry: None,
+      mode: config::CallMode::Near,
+      ret: None,
+      args: Some(0),
+      regargs: callee_regargs,
+      dont_pop_args: false,
+    });
+    (types, cfg, binary, spec)
+  }
+
+  fn regargs_warning_count(b: &IRBuilder) -> usize {
+    b.warnings.iter().filter(|w| w.contains("regargs")).count()
+  }
+
+  /// The issue #132 shape: the caller sets up SI for the callee, restores it
+  /// afterwards, and the annotation does not declare SI. The setup dies at the
+  /// call; the build must say so instead of dropping it silently.
+  #[test]
+  fn incomplete_regargs_warns_about_a_dropped_setup() {
+    let (_types, cfg, binary, spec) =
+      test_spec_with_callee(0x0000, 0x0009, &[0xC3], 0x0100, Some(vec![instr::Reg::AX]));
+    let instrs = [
+      located_instr(instr::Opcode::OP_PUSH, 0x0000, 1, vec![operand(instr::Reg::SI)]),
+      located_instr(instr::Opcode::OP_MOV, 0x0001, 3,
+        vec![operand(instr::Reg::SI), imm_operand(0x1234)]),
+      located_instr(instr::Opcode::OP_CALL, 0x0004, 3, vec![rel_operand(0x00f9)]),
+      located_instr(instr::Opcode::OP_POP, 0x0007, 1, vec![operand(instr::Reg::SI)]),
+      located_instr(instr::Opcode::OP_RET, 0x0008, 1, vec![]),
+    ];
+    let mut b = test_builder(&cfg, &instrs, &spec, &binary);
+    b.build();
+
+    assert_eq!(regargs_warning_count(&b), 1, "one warning for the dropped SI setup: {:?}", b.warnings);
+    let w = &b.warnings[0];
+    assert!(w.starts_with("WARN: "), "diagnostics carry the WARN prefix: {w}");
+    assert!(w.contains("SI"), "the dropped register must be named: {w}");
+    assert!(w.contains("callee"), "the callee must be named: {w}");
+    assert!(w.contains("0000:0004"), "the call site must be named: {w}");
+  }
+
+  /// Declaring the register keeps the setup and produces no diagnostic.
+  #[test]
+  fn complete_regargs_does_not_warn() {
+    let (_types, cfg, binary, spec) =
+      test_spec_with_callee(0x0000, 0x0009, &[0xC3], 0x0100,
+        Some(vec![instr::Reg::AX, instr::Reg::SI]));
+    let instrs = [
+      located_instr(instr::Opcode::OP_PUSH, 0x0000, 1, vec![operand(instr::Reg::SI)]),
+      located_instr(instr::Opcode::OP_MOV, 0x0001, 3,
+        vec![operand(instr::Reg::SI), imm_operand(0x1234)]),
+      located_instr(instr::Opcode::OP_CALL, 0x0004, 3, vec![rel_operand(0x00f9)]),
+      located_instr(instr::Opcode::OP_POP, 0x0007, 1, vec![operand(instr::Reg::SI)]),
+      located_instr(instr::Opcode::OP_RET, 0x0008, 1, vec![]),
+    ];
+    let mut b = test_builder(&cfg, &instrs, &spec, &binary);
+    b.build();
+
+    assert_eq!(regargs_warning_count(&b), 0, "complete regargs must stay quiet: {:?}", b.warnings);
+  }
+
+  /// A value the caller reads after the call has a caller purpose, so it is
+  /// not treated as a callee-only setup.
+  #[test]
+  fn register_live_after_the_call_does_not_warn() {
+    let (_types, cfg, binary, spec) =
+      test_spec_with_callee(0x0000, 0x0009, &[0xC3], 0x0100, Some(vec![]));
+    let instrs = [
+      located_instr(instr::Opcode::OP_MOV, 0x0000, 3,
+        vec![operand(instr::Reg::SI), imm_operand(0x1234)]),
+      located_instr(instr::Opcode::OP_CALL, 0x0003, 3, vec![rel_operand(0x00fa)]),
+      located_instr(instr::Opcode::OP_MOV, 0x0006, 2,
+        vec![operand(instr::Reg::AX), operand(instr::Reg::SI)]),
+      located_instr(instr::Opcode::OP_RET, 0x0008, 1, vec![]),
+    ];
+    let mut b = test_builder(&cfg, &instrs, &spec, &binary);
+    b.build();
+
+    assert_eq!(regargs_warning_count(&b), 0, "a live value is not a dropped setup: {:?}", b.warnings);
+  }
+
+  /// `regargs: None` means no annotation to be incomplete: stay silent.
+  #[test]
+  fn missing_regargs_annotation_does_not_warn() {
+    let (_types, cfg, binary, spec) =
+      test_spec_with_callee(0x0000, 0x0009, &[0xC3], 0x0100, None);
+    let instrs = [
+      located_instr(instr::Opcode::OP_MOV, 0x0000, 3,
+        vec![operand(instr::Reg::SI), imm_operand(0x1234)]),
+      located_instr(instr::Opcode::OP_CALL, 0x0003, 3, vec![rel_operand(0x00fa)]),
+      located_instr(instr::Opcode::OP_POP, 0x0006, 1, vec![operand(instr::Reg::SI)]),
+      located_instr(instr::Opcode::OP_RET, 0x0007, 1, vec![]),
+    ];
+    let mut b = test_builder(&cfg, &instrs, &spec, &binary);
+    b.build();
+
+    assert_eq!(regargs_warning_count(&b), 0, "no annotation, no warning: {:?}", b.warnings);
+  }
+
+  /// The new exit-state write-back at `ret` materialises the setup value; that
+  /// is not a caller read, so a call immediately before the return still warns.
+  #[test]
+  fn exit_state_write_back_is_not_a_caller_read() {
+    let (_types, cfg, binary, spec) =
+      test_spec_with_callee(0x0000, 0x0007, &[0xC3], 0x0100, Some(vec![]));
+    let instrs = [
+      located_instr(instr::Opcode::OP_MOV, 0x0000, 3,
+        vec![operand(instr::Reg::SI), imm_operand(0x1234)]),
+      located_instr(instr::Opcode::OP_CALL, 0x0003, 3, vec![rel_operand(0x00fa)]),
+      located_instr(instr::Opcode::OP_RET, 0x0006, 1, vec![]),
+    ];
+    let mut b = test_builder(&cfg, &instrs, &spec, &binary);
+    b.build();
+
+    assert_eq!(regargs_warning_count(&b), 1, "the exit write must not mask the dropped setup: {:?}", b.warnings);
+  }
+
+  /// The carry analysis rebuilds the IR speculatively; the diagnostic must be
+  /// reported once for the retained pass, like the other build warnings.
+  #[test]
+  fn regargs_warning_is_not_duplicated_across_analysis_passes() {
+    let (_types, cfg, binary, spec) =
+      test_spec_with_callee(0x0000, 0x000b, &[0xC3], 0x0100, Some(vec![instr::Reg::AX]));
+    let instrs = [
+      // ADC forces the carry analysis (and therefore multi-pass builds).
+      located_instr(instr::Opcode::OP_ADC, 0x0000, 2,
+        vec![operand(instr::Reg::AX), operand(instr::Reg::BX)]),
+      located_instr(instr::Opcode::OP_PUSH, 0x0002, 1, vec![operand(instr::Reg::SI)]),
+      located_instr(instr::Opcode::OP_MOV, 0x0003, 3,
+        vec![operand(instr::Reg::SI), imm_operand(0x1234)]),
+      located_instr(instr::Opcode::OP_CALL, 0x0006, 3, vec![rel_operand(0x00f7)]),
+      located_instr(instr::Opcode::OP_POP, 0x0009, 1, vec![operand(instr::Reg::SI)]),
+      located_instr(instr::Opcode::OP_RET, 0x000a, 1, vec![]),
+    ];
+    let mut b = test_builder(&cfg, &instrs, &spec, &binary);
+    b.build();
+
+    assert_eq!(regargs_warning_count(&b), 1, "the SI diagnostic must be emitted once: {:?}", b.warnings);
   }
 }
