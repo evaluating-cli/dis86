@@ -13,6 +13,10 @@ fn operand_propagate(ir: &IR, mut r: Ref) -> Ref {
   loop {
     let Some(instr) = ir.instr(r) else { return r };
     if instr.opcode != Opcode::Ref { return r; }
+    // A MATERIALISE ref is a deliberate snapshot taken before a register gets
+    // rewritten; propagating through it would put the value back after the
+    // write and lose the pre-write state.
+    if (instr.attrs & Attribute::MATERIALISE) != 0 { return r; }
     if !seen.insert(r) { return r; }
     r = instr.operands[0];
   }
@@ -1013,8 +1017,47 @@ pub fn simplify_chained_comparisons(ir: &mut IR) {
 }
 
 const N_OPT_PASSES: usize = 5;
+/// Drop guest-register self-writes (`SI = SI`).
+///
+/// The exit-state write-back (ir_build `write_back_exit_registers`) emits its
+/// write from the SSA value at the `ret`, which is dirty whenever a `pop`
+/// has a consumer. A later `forward_store_to_load` can then fold that value
+/// back to the register's entry value, turning the emitted write into a
+/// no-op. Dropping it keeps the final IR (`--emit-ir-final`) and the C honest;
+/// it cannot change behaviour, since writing a register's own value is inert.
+fn remove_register_self_writes(ir: &mut IR) {
+  let blocks: Vec<BlockRef> = ir.iter_blocks().collect();
+  for blk in blocks {
+    let instrs: Vec<Ref> = ir.iter_instrs(blk).collect();
+    for r in instrs {
+      let Some(instr) = ir.instr(r) else { continue };
+      if instr.opcode != Opcode::WriteVar16 { continue; }
+      let Ref::Symbol(dst) = instr.operands[0] else { continue };
+      if dst.table() != sym::Table::Register { continue; }
+      let name = dst.name(&ir.symbols);
+      let self_write = match instr.operands[1] {
+        // Init(SP)/Init(BP) do not render as "SP"/"BP": the AST names the
+        // entry snapshots "SP0"/"BP0" (ast.rs), so `SP = SP0`/`BP = BP0` is a
+        // real restore of the caller's value, not a self-write.
+        Ref::Init(reg) => !matches!(reg, crate::asm::instr::Reg::SP | crate::asm::instr::Reg::BP)
+          && reg.info().name == name,
+        Ref::Symbol(src) => {
+          src.table() == sym::Table::Register && src.name(&ir.symbols) == name
+        }
+        _ => false,
+      };
+      if !self_write { continue; }
+      let instr = ir.instr_mut(r).unwrap();
+      instr.opcode = Opcode::Nop;
+      instr.attrs = Attribute::NONE;
+      instr.operands.clear();
+    }
+  }
+}
+
 pub fn optimize(ir: &mut IR) {
   deadblock_elimination(ir);
+  remove_register_self_writes(ir);
   for _ in 0..N_OPT_PASSES {
     reduce_xor(ir);
     reduce_make_32_signext_32(ir);
@@ -1850,5 +1893,28 @@ mod tests {
 
     assert!(ir.blocks[dead.0].is_some(), "referenced dead block must be kept");
     assert_eq!(ir.instr(write).unwrap().opcode, Opcode::WriteArr16);
+  }
+
+  #[test]
+  fn register_self_write_detection_ignores_entry_snapshots() {
+    // Init(SP)/Init(BP) render as the SP0/BP0 snapshots, not the live
+    // register, so SP = SP0 and BP = BP0 are real restores. Only a write
+    // whose source renders as the same live name is a self-write.
+    let (mut ir, blk) = test_ir();
+    let cx = ir.symbols.find_ref_by_name(sym::Table::Register, "CX").unwrap();
+    let sp = ir.symbols.find_ref_by_name(sym::Table::Register, "SP").unwrap();
+    let bp = ir.symbols.find_ref_by_name(sym::Table::Register, "BP").unwrap();
+    let cx_write = append_typed(&mut ir, blk, Type::U16, Opcode::WriteVar16,
+      vec![Ref::Symbol(cx), Ref::Init(crate::asm::instr::Reg::CX)]);
+    let sp_write = append_typed(&mut ir, blk, Type::U16, Opcode::WriteVar16,
+      vec![Ref::Symbol(sp), Ref::Init(crate::asm::instr::Reg::SP)]);
+    let bp_write = append_typed(&mut ir, blk, Type::U16, Opcode::WriteVar16,
+      vec![Ref::Symbol(bp), Ref::Init(crate::asm::instr::Reg::BP)]);
+
+    remove_register_self_writes(&mut ir);
+
+    assert_eq!(ir.instr(cx_write).unwrap().opcode, Opcode::Nop);
+    assert_eq!(ir.instr(sp_write).unwrap().opcode, Opcode::WriteVar16);
+    assert_eq!(ir.instr(bp_write).unwrap().opcode, Opcode::WriteVar16);
   }
 }

@@ -37,6 +37,13 @@ pub mod Attribute {
   pub const MAY_ESCAPE: u8 = 1<<0;
   pub const STACK_PTR: u8 = 1<<1;
   pub const PIN: u8 = 1<<2;
+  /// Force the AST to emit this value as a named temporary at its position,
+  /// even though it has a single use. Also stops `operand_propagate` from
+  /// resolving through it: a snapshot exists precisely to freeze a value that
+  /// a later materialised write would otherwise change (see the ret
+  /// write-back in `ir_build`), so folding it back into its consumer defeats
+  /// the purpose.
+  pub const MATERIALISE: u8 = 1<<3;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
