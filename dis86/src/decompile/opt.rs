@@ -1036,7 +1036,11 @@ fn remove_register_self_writes(ir: &mut IR) {
       if dst.table() != sym::Table::Register { continue; }
       let name = dst.name(&ir.symbols);
       let self_write = match instr.operands[1] {
-        Ref::Init(reg) => reg.info().name == name,
+        // Init(SP)/Init(BP) do not render as "SP"/"BP": the AST names the
+        // entry snapshots "SP0"/"BP0" (ast.rs), so `SP = SP0`/`BP = BP0` is a
+        // real restore of the caller's value, not a self-write.
+        Ref::Init(reg) => !matches!(reg, crate::asm::instr::Reg::SP | crate::asm::instr::Reg::BP)
+          && reg.info().name == name,
         Ref::Symbol(src) => {
           src.table() == sym::Table::Register && src.name(&ir.symbols) == name
         }
@@ -1889,5 +1893,28 @@ mod tests {
 
     assert!(ir.blocks[dead.0].is_some(), "referenced dead block must be kept");
     assert_eq!(ir.instr(write).unwrap().opcode, Opcode::WriteArr16);
+  }
+
+  #[test]
+  fn register_self_write_detection_ignores_entry_snapshots() {
+    // Init(SP)/Init(BP) render as the SP0/BP0 snapshots, not the live
+    // register, so SP = SP0 and BP = BP0 are real restores. Only a write
+    // whose source renders as the same live name is a self-write.
+    let (mut ir, blk) = test_ir();
+    let cx = ir.symbols.find_ref_by_name(sym::Table::Register, "CX").unwrap();
+    let sp = ir.symbols.find_ref_by_name(sym::Table::Register, "SP").unwrap();
+    let bp = ir.symbols.find_ref_by_name(sym::Table::Register, "BP").unwrap();
+    let cx_write = append_typed(&mut ir, blk, Type::U16, Opcode::WriteVar16,
+      vec![Ref::Symbol(cx), Ref::Init(crate::asm::instr::Reg::CX)]);
+    let sp_write = append_typed(&mut ir, blk, Type::U16, Opcode::WriteVar16,
+      vec![Ref::Symbol(sp), Ref::Init(crate::asm::instr::Reg::SP)]);
+    let bp_write = append_typed(&mut ir, blk, Type::U16, Opcode::WriteVar16,
+      vec![Ref::Symbol(bp), Ref::Init(crate::asm::instr::Reg::BP)]);
+
+    remove_register_self_writes(&mut ir);
+
+    assert_eq!(ir.instr(cx_write).unwrap().opcode, Opcode::Nop);
+    assert_eq!(ir.instr(sp_write).unwrap().opcode, Opcode::WriteVar16);
+    assert_eq!(ir.instr(bp_write).unwrap().opcode, Opcode::WriteVar16);
   }
 }
