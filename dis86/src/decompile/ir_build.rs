@@ -1038,19 +1038,20 @@ impl IRBuilder<'_> {
   }
 
   fn pin_registers(&mut self) {
-    // Caller-saved: so don't bother.. unless pin_all
+    // The general-purpose registers that can carry exit state are materialised
+    // as real writes by `write_back_exit_registers`; a `Pin` here is ignored by
+    // AST emission, so leaving them pinned too would only imply an exit-state
+    // marker that never reaches the output. Pin the rest: AX is the return
+    // value (pinned only for the debugging `pin_all`), ES is caller-saved
+    // (pin_all only), and SP/BP/SS/DS are frame or segment state this change
+    // does not write back.
     if self.pin_all {
       self.pin_register(instr::Reg::AX);
-      self.pin_register(instr::Reg::CX);
-      self.pin_register(instr::Reg::DX);
-      self.pin_register(instr::Reg::BX);
       self.pin_register(instr::Reg::ES);
     }
 
     self.pin_register(instr::Reg::SP);
     self.pin_register(instr::Reg::BP);
-    self.pin_register(instr::Reg::SI);
-    self.pin_register(instr::Reg::DI);
 
     self.pin_register(instr::Reg::SS);
     self.pin_register(instr::Reg::DS);
@@ -1245,8 +1246,62 @@ impl IRBuilder<'_> {
       pending.push((reg, vref));
     }
     for (reg, vref) in Self::order_guest_writes(&self.ir, &pending) {
-      let sym = self.ir.symbols.find_ref_by_name(sym::Table::Register, reg.info().name).unwrap();
-      self.append_instr_with_attrs(Type::U16, Attribute::PIN, Opcode::WriteVar16, vec![Ref::Symbol(sym), vref]);
+      self.write_guest_register(reg, vref);
+    }
+  }
+
+  /// Emit a guest register assignment. Unlike `pin_register` (whose `Pin` is
+  /// transparent to AST emission, see ast.rs), this renders as a real write to
+  /// the register variable: it is how a synchronised value becomes observable
+  /// to the caller, the interrupt handler, or the machine's exit state.
+  fn write_guest_register(&mut self, reg: instr::Reg, vref: Ref) {
+    let sym = self.ir.symbols.find_ref_by_name(sym::Table::Register, reg.info().name).unwrap();
+    self.append_instr_with_attrs(Type::U16, Attribute::PIN, Opcode::WriteVar16, vec![Ref::Symbol(sym), vref]);
+  }
+
+  /// Materialise the function's exit register state at a `ret`.
+  ///
+  /// A bare `Pin` is not a register write (ast.rs drops it), so without this a
+  /// function that saves registers, calls out, and restores them with `push`/
+  /// `pop` returns having emitted only the pushes: the pops are SSA values with
+  /// no consumer once the return is emitted, and callers that trust the
+  /// callee-saved model (see `save_return_value`) then read the mid-function
+  /// value instead of the restored one (issue #133).
+  ///
+  /// The set is the one callers assume the callee leaves intact: `BX`/`SI`/`DI`
+  /// are the callee-saved set, and the caller keeps the pre-call `CX`/`DX`
+  /// (`save_return_value` refreshes their fragments from the current value), so
+  /// an explicit restore of those is exit state too. `AX` is the return value
+  /// the return expression already writes, `DX` is skipped when it is the high
+  /// half of that return value, and `SP`/`BP` belong to the frame sequence
+  /// (`FRAME_LEAVE`). Registers still holding their entry value are skipped: in
+  /// the emitted model `Ref::Init(reg)` *is* the live register, so writing it
+  /// would be a no-op (this also keeps a `push reg`/`pop reg` pair that folds
+  /// away from gaining a write). Segment registers are deliberately out of
+  /// scope here; that decision is pinned by a test.
+  ///
+  /// The return expression can read a register this write-back rewrites
+  /// (`mov ax,cx; dec cx; ret` returns the pre-decrement CX). `Ref::Init(reg)`
+  /// renders as the live C variable, so such a value has to be frozen into a
+  /// `MATERIALISE` temporary *before* the writes, or the return would observe
+  /// the exit state instead of the value the caller receives. The snapshot is
+  /// taken even when the value is the pending expression itself: the pending
+  /// expression re-reads `Init(reg)`, which is exactly what the write changes.
+  fn write_back_exit_registers(&mut self, ret_vals: &mut [Ref], dx_is_return: bool) {
+    let mut pending = vec![];
+    for reg in [instr::Reg::BX, instr::Reg::CX, instr::Reg::DX, instr::Reg::SI, instr::Reg::DI] {
+      if dx_is_return && reg == instr::Reg::DX { continue; }
+      let vref = self.ir.get_var(reg, self.cur);
+      if vref == Ref::Init(reg) { continue; }
+      pending.push((reg, vref));
+    }
+    for v in ret_vals.iter_mut() {
+      if pending.iter().any(|(reg, _)| Self::ref_reads_init(&self.ir, *v, *reg)) {
+        *v = self.append_instr_with_attrs(Type::U16, Attribute::MATERIALISE, Opcode::Ref, vec![*v]);
+      }
+    }
+    for (reg, vref) in Self::order_guest_writes(&self.ir, &pending) {
+      self.write_guest_register(reg, vref);
     }
   }
 
@@ -1420,8 +1475,7 @@ impl IRBuilder<'_> {
     // Copies must observe program-order values (issue #78): a batched write
     // whose value reads another pending register's entry value goes first.
     for (reg, vref) in Self::order_guest_writes(&self.ir, &pending) {
-      let sym = self.ir.symbols.find_ref_by_name(sym::Table::Register, reg.info().name).unwrap();
-      self.append_instr_with_attrs(Type::U16, Attribute::PIN, Opcode::WriteVar16, vec![Ref::Symbol(sym), vref]);
+      self.write_guest_register(reg, vref);
     }
 
     let num = self.append_asm_src_operand(&ins.operands[0]);
@@ -1932,14 +1986,18 @@ impl IRBuilder<'_> {
         self.ir.set_var(instr::Reg::BP, self.cur, vref);
       }
       instr::Opcode::OP_RETF => {
+        let mut ret_vals = self.return_vals();
+        let dx_is_return = ret_vals.len() == 2;
+        self.write_back_exit_registers(&mut ret_vals, dx_is_return);
         self.pin_registers();
-        let ret_vals = self.return_vals();
         self.append_instr(Type::Void, Opcode::RetFar, ret_vals);
 
       }
       instr::Opcode::OP_RET => {
+        let mut ret_vals = self.return_vals();
+        let dx_is_return = ret_vals.len() == 2;
+        self.write_back_exit_registers(&mut ret_vals, dx_is_return);
         self.pin_registers();
-        let ret_vals = self.return_vals();
         self.append_instr(Type::Void, Opcode::RetNear, ret_vals);
       }
       instr::Opcode::OP_MOV => {

@@ -495,7 +495,11 @@ impl<'a> Builder<'a> {
     }
 
     let instr = self.ir.instr(r).unwrap();
-    if depth != 0 && (self.lookup_uses(r) != 1 || instr.opcode.is_call()) {
+    // A MATERIALISE ref is a snapshot whose statement the emit loop generates
+    // even though it has one use, so this check must match the one there
+    // (emit_blk's default arm).
+    if depth != 0 && (self.lookup_uses(r) != 1 || instr.opcode.is_call()
+        || (instr.attrs & ir::Attribute::MATERIALISE) != 0) {
       let name = self.ref_name(r);
       return Expr::Name(name);
     }
@@ -1236,7 +1240,9 @@ impl<'a> Builder<'a> {
         }
         _ => {
           let uses = self.n_uses.get(&r).cloned().unwrap_or(0);
-          if uses != 1 || instr.opcode.is_call() {
+          // Keep in sync with the name-return gate in ref_to_expr_impl.
+          if uses != 1 || instr.opcode.is_call()
+              || (instr.attrs & ir::Attribute::MATERIALISE) != 0 {
             let rvalue = self.ref_to_expr(r, 0);
             let typ = self.ir.instr(r).unwrap().typ.clone();
             if typ == Type::Void {
