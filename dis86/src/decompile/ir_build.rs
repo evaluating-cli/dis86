@@ -1293,7 +1293,7 @@ impl IRBuilder<'_> {
                 instr::Reg::SI, instr::Reg::DI, instr::Reg::DS, instr::Reg::ES] {
       if declared.contains(&reg) { continue; }
       let vref = self.ir.get_var(reg, self.cur);
-      if vref == Ref::Init(reg) { continue; }
+      if Self::is_entry_value(&self.ir, vref, reg) { continue; }
       missing.push((reg, vref));
     }
     missing
@@ -1341,7 +1341,7 @@ impl IRBuilder<'_> {
     for reg in [instr::Reg::BX, instr::Reg::CX, instr::Reg::DX, instr::Reg::SI, instr::Reg::DI] {
       if dx_is_return && reg == instr::Reg::DX { continue; }
       let vref = self.ir.get_var(reg, self.cur);
-      if vref == Ref::Init(reg) { continue; }
+      if Self::is_entry_value(&self.ir, vref, reg) { continue; }
       pending.push((reg, vref));
     }
     for v in ret_vals.iter_mut() {
@@ -1456,6 +1456,48 @@ impl IRBuilder<'_> {
       instr::Reg::DL | instr::Reg::DH => instr::Reg::DX,
       _ => reg,
     }
+  }
+
+  /// Whether `r` is still the register's entry value. A plain `Ref::Init` is,
+  /// and so is a phi or copy that only ever carries entry values: at a control
+  /// flow merge, `get_var` materializes `Phi(Init(SI), Init(SI))` for a
+  /// register no path writes (`ir/methods.rs` leaves trivial phis in place),
+  /// and such a value is not a setup.
+  ///
+  /// A phi with no operands is *not* entry: it is an incomplete phi, created
+  /// while its block is still unsealed, and its operands are only known after
+  /// sealing. Callers querying during lowering (the exit write-back) must
+  /// treat it as dirty; the #132 candidate check re-evaluates after
+  /// `build_once`, when it can collapse.
+  fn is_entry_value(ir: &IR, r: Ref, reg: instr::Reg) -> bool {
+    let mut memo = HashMap::new();
+    let mut visiting = HashSet::new();
+    Self::is_entry_value_inner(ir, r, reg, &mut memo, &mut visiting)
+  }
+
+  fn is_entry_value_inner(ir: &IR, r: Ref, reg: instr::Reg,
+                          memo: &mut HashMap<Ref, bool>, visiting: &mut HashSet<Ref>) -> bool {
+    if let Some(known) = memo.get(&r) { return *known; }
+    let result = match r {
+      Ref::Init(other) => Self::init_storage_parent(other) == reg,
+      Ref::Instr(_, _) => {
+        if !visiting.insert(r) { return true; }
+        let instr = ir.instr(r);
+        let result = match instr {
+          Some(instr) => match instr.opcode {
+            Opcode::Phi | Opcode::Ref => !instr.operands.is_empty() && instr.operands.iter()
+              .all(|operand| Self::is_entry_value_inner(ir, *operand, reg, memo, visiting)),
+            _ => false,
+          },
+          None => false,
+        };
+        visiting.remove(&r);
+        result
+      }
+      _ => false,
+    };
+    memo.insert(r, result);
+    result
   }
 
   /// Whether the SSA value `r` (transitively) reads the live entry value
@@ -2706,21 +2748,31 @@ impl IRBuilder<'_> {
   }
 
   /// Warn when a known call sets up a register its `regargs` does not declare
-  /// and the caller never reads that value again (issue #132).
+  /// and no live caller instruction reads that value afterwards (issue #132).
   ///
-  /// Such a value exists only for the callee: no caller instruction consumes
-  /// it, so dead-code elimination removes the setup and the callee reads
-  /// whatever the register held before. That outcome is silent otherwise, so
-  /// the operator gets a diagnostic instead. The check runs on the finished
-  /// raw IR (after `build_once`), where "does the caller read it later" is a
-  /// simple reachability question. `regargs: None` is not checked: there is no
-  /// annotation to be incomplete, and unannotated callees are common.
+  /// Such a value exists only for the callee: nothing observable consumes it,
+  /// so dead-code elimination removes the setup and the callee reads whatever
+  /// the register held before. That outcome is silent otherwise, so the
+  /// operator gets a diagnostic instead. The check runs on the finished raw IR
+  /// (after `build_once`), so "does the caller read it later" is a def-use
+  /// question over the instructions that will actually survive into the output
+  /// (`live_refs`). `regargs: None` is not checked: there is no annotation to
+  /// be incomplete, and unannotated callees are common.
   fn check_regargs_setups(&mut self) {
     if self.regargs_candidates.is_empty() { return; }
+    let live = self.live_refs();
     for cand in self.regargs_candidates.clone() {
-      let wanted: HashSet<Ref> = cand.missing.iter().map(|(_, vref)| *vref).collect();
-      let read = self.reads_after_call(&cand, &wanted);
-      let dropped: Vec<&str> = cand.missing.iter()
+      // Candidates are recorded while blocks are unsealed, so a merge-block
+      // phi looked dirty then. Now that every phi has its operands, drop the
+      // ones that turned out to carry only entry values.
+      let missing: Vec<(instr::Reg, Ref)> = cand.missing.iter()
+        .filter(|(reg, vref)| !Self::is_entry_value(&self.ir, *vref, *reg))
+        .copied()
+        .collect();
+      if missing.is_empty() { continue; }
+      let wanted: HashSet<Ref> = missing.iter().map(|(_, vref)| *vref).collect();
+      let read = self.reads_after_call(&cand, &wanted, &live);
+      let dropped: Vec<&str> = missing.iter()
         .filter(|(_, vref)| !read.contains(vref))
         .map(|(reg, _)| reg.info().name)
         .collect();
@@ -2732,11 +2784,42 @@ impl IRBuilder<'_> {
     }
   }
 
-  /// Which of `wanted` are read on any path after the call instruction: the
-  /// rest of the call's block, then every block reachable through
-  /// `block_exits`. Exit-state write-backs do not count — they materialise the
-  /// value for the caller's `ret`, not for this call.
-  fn reads_after_call(&self, cand: &RegargsCandidate, wanted: &HashSet<Ref>) -> HashSet<Ref> {
+  /// The instructions whose values reach the emitted output, mirroring the
+  /// roots `deadcode_elimination` uses (`opt.rs`): side-effecting or `PIN`.
+  /// Two roots are not evidence that the emitted C uses a value: `Pin` (the
+  /// AST drops it, see ast.rs) and the exit-state write-backs (they preserve
+  /// the caller's `ret` state, not this call's inputs). Leaves them out so the
+  /// diagnostic does not mistake either for a caller read.
+  fn live_refs(&self) -> HashSet<Ref> {
+    let mut roots = vec![];
+    for blk in self.ir.iter_blocks() {
+      for r in self.ir.iter_instrs(blk) {
+        let Some(instr) = self.ir.instr(r) else { continue; };
+        let root = (instr.opcode.has_side_effects() || (instr.attrs & Attribute::PIN) != 0)
+          && instr.opcode != Opcode::Pin
+          && !self.exit_state_writes.contains(&r);
+        if root { roots.push(r); }
+      }
+    }
+
+    let mut live = HashSet::new();
+    while let Some(r) = roots.pop() {
+      if !live.insert(r) { continue; }
+      let Some(instr) = self.ir.instr(r) else { continue; };
+      for operand in &instr.operands {
+        if matches!(operand, Ref::Instr(_, _)) { roots.push(*operand); }
+      }
+    }
+    live
+  }
+
+  /// Which of `wanted` a live instruction reads on any path after the call:
+  /// the rest of the call's block, then every block reachable through
+  /// `block_exits`. Matching follows the def-use graph, so a caller that reads
+  /// a derived value (a byte fragment, a recompose, a copy) counts as reading
+  /// the setup it was derived from.
+  fn reads_after_call(&self, cand: &RegargsCandidate, wanted: &HashSet<Ref>,
+                      live: &HashSet<Ref>) -> HashSet<Ref> {
     let mut reads = HashSet::new();
     let mut after_call = false;
     for r in self.ir.iter_instrs(cand.blk) {
@@ -2744,8 +2827,8 @@ impl IRBuilder<'_> {
         after_call = true;
         continue;
       }
-      if !after_call { continue; }
-      Self::collect_reads(&self.ir, r, wanted, &self.exit_state_writes, &mut reads);
+      if !after_call || !live.contains(&r) { continue; }
+      Self::collect_reads(&self.ir, r, wanted, &mut reads);
     }
 
     let mut seen = HashSet::new();
@@ -2753,19 +2836,33 @@ impl IRBuilder<'_> {
     while let Some(blk) = stack.pop() {
       if !seen.insert(blk) { continue; }
       for r in self.ir.iter_instrs(blk) {
-        Self::collect_reads(&self.ir, r, wanted, &self.exit_state_writes, &mut reads);
+        if live.contains(&r) {
+          Self::collect_reads(&self.ir, r, wanted, &mut reads);
+        }
       }
       stack.extend(self.ir.block_exits(blk));
     }
     reads
   }
 
-  fn collect_reads(ir: &IR, r: Ref, wanted: &HashSet<Ref>,
-                   exit_state_writes: &HashSet<Ref>, reads: &mut HashSet<Ref>) {
-    if exit_state_writes.contains(&r) { return; }
+  fn collect_reads(ir: &IR, r: Ref, wanted: &HashSet<Ref>, reads: &mut HashSet<Ref>) {
     let Some(instr) = ir.instr(r) else { return; };
     for operand in &instr.operands {
-      if wanted.contains(operand) { reads.insert(*operand); }
+      let mut seen = HashSet::new();
+      Self::collect_value_reads(ir, *operand, wanted, reads, &mut seen);
+    }
+  }
+
+  fn collect_value_reads(ir: &IR, r: Ref, wanted: &HashSet<Ref>,
+                         reads: &mut HashSet<Ref>, seen: &mut HashSet<Ref>) {
+    if wanted.contains(&r) {
+      reads.insert(r);
+      return;
+    }
+    if !seen.insert(r) { return; }
+    let Some(instr) = ir.instr(r) else { return; };
+    for operand in &instr.operands {
+      Self::collect_value_reads(ir, *operand, wanted, reads, seen);
     }
   }
 
@@ -4639,5 +4736,115 @@ mod tests {
     b.build();
 
     assert_eq!(regargs_warning_count(&b), 1, "the SI diagnostic must be emitted once: {:?}", b.warnings);
+  }
+
+  /// A diamond merge creates phis for every register the call's annotation
+  /// leaves out; when no path writes the register those phis carry only entry
+  /// values and must not be reported as setups.
+  #[test]
+  fn call_at_a_merge_with_untouched_registers_does_not_warn() {
+    let (_types, cfg, binary, spec) =
+      test_spec_with_callee(0x0000, 0x000b, &[0xC3], 0x0100, Some(vec![instr::Reg::DX]));
+    let instrs = [
+      located_instr(instr::Opcode::OP_CMP, 0x0000, 2,
+        vec![operand(instr::Reg::AX), operand(instr::Reg::BX)]),
+      jmp_instr(instr::Opcode::OP_JNE, 0x0002, 2, 3),
+      located_instr(instr::Opcode::OP_MOV, 0x0004, 3,
+        vec![operand(instr::Reg::DX), imm_operand(1)]),
+      located_instr(instr::Opcode::OP_CALL, 0x0007, 3, vec![rel_operand(0x00f6)]),
+      located_instr(instr::Opcode::OP_RET, 0x000a, 1, vec![]),
+    ];
+    let mut b = test_builder(&cfg, &instrs, &spec, &binary);
+    b.build();
+
+    assert_eq!(regargs_warning_count(&b), 0,
+      "registers untouched on every path are not setups: {:?}", b.warnings);
+  }
+
+  /// A phi that carries a real write on one path is a genuine setup and must
+  /// still be reported; the trivial-phi fix must not suppress it.
+  #[test]
+  fn a_phi_with_one_real_write_still_warns() {
+    let (_types, cfg, binary, spec) =
+      test_spec_with_callee(0x0000, 0x000b, &[0xC3], 0x0100, Some(vec![instr::Reg::DX]));
+    let instrs = [
+      located_instr(instr::Opcode::OP_CMP, 0x0000, 2,
+        vec![operand(instr::Reg::AX), operand(instr::Reg::BX)]),
+      jmp_instr(instr::Opcode::OP_JNE, 0x0002, 2, 3),
+      located_instr(instr::Opcode::OP_MOV, 0x0004, 3,
+        vec![operand(instr::Reg::SI), imm_operand(0x1234)]),
+      located_instr(instr::Opcode::OP_CALL, 0x0007, 3, vec![rel_operand(0x00f6)]),
+      located_instr(instr::Opcode::OP_RET, 0x000a, 1, vec![]),
+    ];
+    let mut b = test_builder(&cfg, &instrs, &spec, &binary);
+    b.build();
+
+    assert_eq!(regargs_warning_count(&b), 1,
+      "the path that sets SI still makes it a setup: {:?}", b.warnings);
+    assert!(b.warnings[0].contains("SI"), "the warning must name SI: {}", b.warnings[0]);
+  }
+
+  /// A caller read of a byte fragment is a read of the setup it was split
+  /// from, even though the operand is a derived `And` ref, not the setup ref.
+  #[test]
+  fn a_fragment_read_after_the_call_does_not_warn() {
+    let (_types, cfg, binary, spec) =
+      test_spec_with_callee(0x0000, 0x0009, &[0xC3], 0x0100, Some(vec![]));
+    let instrs = [
+      located_instr(instr::Opcode::OP_MOV, 0x0000, 3,
+        vec![operand(instr::Reg::BX), imm_operand(0x1234)]),
+      located_instr(instr::Opcode::OP_CALL, 0x0003, 3, vec![rel_operand(0x00fa)]),
+      located_instr(instr::Opcode::OP_MOV, 0x0006, 2,
+        vec![operand(instr::Reg::AL), operand(instr::Reg::BL)]),
+      located_instr(instr::Opcode::OP_RET, 0x0008, 1, vec![]),
+    ];
+    let mut b = test_builder(&cfg, &instrs, &spec, &binary);
+    b.build();
+
+    assert_eq!(regargs_warning_count(&b), 0,
+      "reading BL uses the BX setup: {:?}", b.warnings);
+  }
+
+  /// `pin_registers` emits `Pin(get_var(DS))` at every return, but ast.rs
+  /// drops `Pin`, so it is not a caller read of a dropped DS setup.
+  #[test]
+  fn a_ret_pin_does_not_mask_a_ds_setup() {
+    let (_types, cfg, binary, spec) =
+      test_spec_with_callee(0x0000, 0x0006, &[0xC3], 0x0100, Some(vec![]));
+    let instrs = [
+      located_instr(instr::Opcode::OP_MOV, 0x0000, 2,
+        vec![operand(instr::Reg::DS), operand(instr::Reg::AX)]),
+      located_instr(instr::Opcode::OP_CALL, 0x0002, 3, vec![rel_operand(0x00fb)]),
+      located_instr(instr::Opcode::OP_RET, 0x0005, 1, vec![]),
+    ];
+    let mut b = test_builder(&cfg, &instrs, &spec, &binary);
+    b.build();
+
+    assert_eq!(regargs_warning_count(&b), 1,
+      "the transparent ret pin must not hide the DS setup: {:?}", b.warnings);
+    assert!(b.warnings[0].contains("DS"), "the warning must name DS: {}", b.warnings[0]);
+  }
+
+  /// `save_return_value` refreshes the CX byte fragments after every call from
+  /// the pre-call value; that dead refresh is not a caller read, so a CX setup
+  /// overwritten right after the call is still reported.
+  #[test]
+  fn a_dead_cx_refresh_does_not_mask_the_setup() {
+    let (_types, cfg, binary, spec) =
+      test_spec_with_callee(0x0000, 0x000a, &[0xC3], 0x0100, Some(vec![]));
+    let instrs = [
+      located_instr(instr::Opcode::OP_MOV, 0x0000, 3,
+        vec![operand(instr::Reg::CX), imm_operand(5)]),
+      located_instr(instr::Opcode::OP_CALL, 0x0003, 3, vec![rel_operand(0x00fa)]),
+      located_instr(instr::Opcode::OP_MOV, 0x0006, 3,
+        vec![operand(instr::Reg::CX), imm_operand(6)]),
+      located_instr(instr::Opcode::OP_RET, 0x0009, 1, vec![]),
+    ];
+    let mut b = test_builder(&cfg, &instrs, &spec, &binary);
+    b.build();
+
+    assert_eq!(regargs_warning_count(&b), 1,
+      "the overwritten CX setup must be reported: {:?}", b.warnings);
+    assert!(b.warnings[0].contains("CX"), "the warning must name CX: {}", b.warnings[0]);
   }
 }
