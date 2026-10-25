@@ -2748,32 +2748,37 @@ impl IRBuilder<'_> {
   }
 
   /// Warn when a known call sets up a register its `regargs` does not declare
-  /// and no live caller instruction reads that value afterwards (issue #132).
+  /// and nothing live in the caller reads that value (issue #132).
   ///
   /// Such a value exists only for the callee: nothing observable consumes it,
   /// so dead-code elimination removes the setup and the callee reads whatever
   /// the register held before. That outcome is silent otherwise, so the
   /// operator gets a diagnostic instead. The check runs on the finished raw IR
-  /// (after `build_once`), so "does the caller read it later" is a def-use
-  /// question over the instructions that will actually survive into the output
-  /// (`live_refs`). `regargs: None` is not checked: there is no annotation to
-  /// be incomplete, and unannotated callees are common.
+  /// (after `build_once`), so "does anything read it" is a def-use question
+  /// over the instructions that will actually survive into the output
+  /// (`live_refs`). A use before the call (for example copying the value into
+  /// a declared regarg) counts: the value is not dropped. `regargs: None` and
+  /// calls in unreachable blocks are not checked; there is no emitted call to
+  /// warn about. So are values that are just a call's return: AX/DX after a
+  /// call hold its result, not a caller setup for the next one.
   fn check_regargs_setups(&mut self) {
     if self.regargs_candidates.is_empty() { return; }
-    let live = self.live_refs();
+    let reachable = self.reachable_blocks();
+    let live = self.live_refs(&reachable);
+    let reads = self.live_reads(&live);
     for cand in self.regargs_candidates.clone() {
+      if !reachable.contains(&cand.blk) { continue; }
       // Candidates are recorded while blocks are unsealed, so a merge-block
       // phi looked dirty then. Now that every phi has its operands, drop the
       // ones that turned out to carry only entry values.
       let missing: Vec<(instr::Reg, Ref)> = cand.missing.iter()
         .filter(|(reg, vref)| !Self::is_entry_value(&self.ir, *vref, *reg))
+        .filter(|(_, vref)| !Self::is_call_result(&self.ir, *vref))
         .copied()
         .collect();
       if missing.is_empty() { continue; }
-      let wanted: HashSet<Ref> = missing.iter().map(|(_, vref)| *vref).collect();
-      let read = self.reads_after_call(&cand, &wanted, &live);
       let dropped: Vec<&str> = missing.iter()
-        .filter(|(_, vref)| !read.contains(vref))
+        .filter(|(_, vref)| !reads.contains(vref))
         .map(|(reg, _)| reg.info().name)
         .collect();
       if dropped.is_empty() { continue; }
@@ -2784,15 +2789,30 @@ impl IRBuilder<'_> {
     }
   }
 
-  /// The instructions whose values reach the emitted output, mirroring the
-  /// roots `deadcode_elimination` uses (`opt.rs`): side-effecting or `PIN`.
-  /// Two roots are not evidence that the emitted C uses a value: `Pin` (the
-  /// AST drops it, see ast.rs) and the exit-state write-backs (they preserve
-  /// the caller's `ret` state, not this call's inputs). Leaves them out so the
-  /// diagnostic does not mistake either for a caller read.
-  fn live_refs(&self) -> HashSet<Ref> {
+  /// The blocks control flow can reach from the entry block (`BlockRef(0)`,
+  /// created first by `IRBuilder::new`). Calls in the rest are never emitted,
+  /// so their unpopulated phis must not produce warnings.
+  fn reachable_blocks(&self) -> HashSet<BlockRef> {
+    let mut reachable = HashSet::new();
+    let mut stack = vec![BlockRef(0)];
+    while let Some(blk) = stack.pop() {
+      if !reachable.insert(blk) { continue; }
+      stack.extend(self.ir.block_exits(blk));
+    }
+    reachable
+  }
+
+  /// The instructions in reachable blocks whose values reach the emitted
+  /// output, mirroring the roots `deadcode_elimination` uses (`opt.rs`):
+  /// side-effecting or `PIN`. Two roots are not evidence that the emitted C
+  /// uses a value: `Pin` (the AST drops it, see ast.rs) and the exit-state
+  /// write-backs (they preserve the caller's `ret` state, not this call's
+  /// inputs). Leaves them out so the diagnostic does not mistake either for a
+  /// caller read.
+  fn live_refs(&self, reachable: &HashSet<BlockRef>) -> HashSet<Ref> {
     let mut roots = vec![];
     for blk in self.ir.iter_blocks() {
+      if !reachable.contains(&blk) { continue; }
       for r in self.ir.iter_instrs(blk) {
         let Some(instr) = self.ir.instr(r) else { continue; };
         let root = (instr.opcode.has_side_effects() || (instr.attrs & Attribute::PIN) != 0)
@@ -2813,57 +2833,67 @@ impl IRBuilder<'_> {
     live
   }
 
-  /// Which of `wanted` a live instruction reads on any path after the call:
-  /// the rest of the call's block, then every block reachable through
-  /// `block_exits`. Matching follows the def-use graph, so a caller that reads
-  /// a derived value (a byte fragment, a recompose, a copy) counts as reading
-  /// the setup it was derived from.
-  fn reads_after_call(&self, cand: &RegargsCandidate, wanted: &HashSet<Ref>,
-                      live: &HashSet<Ref>) -> HashSet<Ref> {
+  /// Every value that a live instruction reads, directly or through a derived
+  /// value (a byte fragment, a recompose, a copy). A setup used before the
+  /// call is a real consumer too, so this is not restricted to the call's
+  /// successors the way a "still live afterwards" question would be.
+  fn live_reads(&self, live: &HashSet<Ref>) -> HashSet<Ref> {
     let mut reads = HashSet::new();
-    let mut after_call = false;
-    for r in self.ir.iter_instrs(cand.blk) {
-      if r == cand.call_ref {
-        after_call = true;
-        continue;
+    let mut stack = vec![];
+    for r in live {
+      if let Some(instr) = self.ir.instr(*r) {
+        stack.extend(instr.operands.iter().copied());
       }
-      if !after_call || !live.contains(&r) { continue; }
-      Self::collect_reads(&self.ir, r, wanted, &mut reads);
     }
-
-    let mut seen = HashSet::new();
-    let mut stack = self.ir.block_exits(cand.blk);
-    while let Some(blk) = stack.pop() {
-      if !seen.insert(blk) { continue; }
-      for r in self.ir.iter_instrs(blk) {
-        if live.contains(&r) {
-          Self::collect_reads(&self.ir, r, wanted, &mut reads);
-        }
+    while let Some(r) = stack.pop() {
+      if !reads.insert(r) { continue; }
+      if let Some(instr) = self.ir.instr(r) {
+        stack.extend(instr.operands.iter().copied());
       }
-      stack.extend(self.ir.block_exits(blk));
     }
     reads
   }
 
-  fn collect_reads(ir: &IR, r: Ref, wanted: &HashSet<Ref>, reads: &mut HashSet<Ref>) {
-    let Some(instr) = ir.instr(r) else { return; };
-    for operand in &instr.operands {
-      let mut seen = HashSet::new();
-      Self::collect_value_reads(ir, *operand, wanted, reads, &mut seen);
-    }
+  /// Whether `r` is a call's return value or a pure projection of one
+  /// (`save_return_value` splits a U32 result with Upper16/Lower16 and
+  /// refreshes byte fragments with masks and shifts). When the caller ignores
+  /// such a result it is exit state, not a setup for the next call, so it must
+  /// not be reported as a dropped callee input.
+  fn is_call_result(ir: &IR, r: Ref) -> bool {
+    let mut memo = HashMap::new();
+    let mut visiting = HashSet::new();
+    Self::is_call_result_inner(ir, r, &mut memo, &mut visiting)
   }
 
-  fn collect_value_reads(ir: &IR, r: Ref, wanted: &HashSet<Ref>,
-                         reads: &mut HashSet<Ref>, seen: &mut HashSet<Ref>) {
-    if wanted.contains(&r) {
-      reads.insert(r);
-      return;
-    }
-    if !seen.insert(r) { return; }
-    let Some(instr) = ir.instr(r) else { return; };
-    for operand in &instr.operands {
-      Self::collect_value_reads(ir, *operand, wanted, reads, seen);
-    }
+  fn is_call_result_inner(ir: &IR, r: Ref, memo: &mut HashMap<Ref, bool>,
+                          visiting: &mut HashSet<Ref>) -> bool {
+    if let Some(known) = memo.get(&r) { return *known; }
+    if !visiting.insert(r) { return false; }
+    let result = match r {
+      Ref::Instr(_, _) => match ir.instr(r) {
+        Some(instr) => match instr.opcode {
+          Opcode::CallNear | Opcode::CallFar | Opcode::CallPtr | Opcode::CallArgs => true,
+          Opcode::Ref | Opcode::Upper16 | Opcode::Lower16 => instr.operands.iter()
+            .any(|operand| Self::is_call_result_inner(ir, *operand, memo, visiting)),
+          Opcode::And | Opcode::Or | Opcode::UShr | Opcode::Shl => {
+            let mut saw_value = false;
+            let mut all_from_call = true;
+            for operand in &instr.operands {
+              if matches!(operand, Ref::Const(_)) { continue; }
+              saw_value = true;
+              all_from_call &= Self::is_call_result_inner(ir, *operand, memo, visiting);
+            }
+            saw_value && all_from_call
+          }
+          _ => false,
+        },
+        None => false,
+      },
+      _ => false,
+    };
+    visiting.remove(&r);
+    memo.insert(r, result);
+    result
   }
 
   fn build_once(&mut self) {
@@ -4846,5 +4876,63 @@ mod tests {
     assert_eq!(regargs_warning_count(&b), 1,
       "the overwritten CX setup must be reported: {:?}", b.warnings);
     assert!(b.warnings[0].contains("CX"), "the warning must name CX: {}", b.warnings[0]);
+  }
+
+  /// A previous call's return value is caller-saved exit state, not a setup for
+  /// the next call. Ignoring the result must not make the next call warn about
+  /// AX/DX.
+  #[test]
+  fn a_previous_call_result_is_not_a_dropped_setup() {
+    let (_types, cfg, binary, spec) =
+      test_spec_with_callee(0x0000, 0x0007, &[0xC3], 0x0100, Some(vec![]));
+    let instrs = [
+      located_instr(instr::Opcode::OP_CALL, 0x0000, 3, vec![rel_operand(0x00fd)]),
+      located_instr(instr::Opcode::OP_CALL, 0x0003, 3, vec![rel_operand(0x00fa)]),
+      located_instr(instr::Opcode::OP_RET, 0x0006, 1, vec![]),
+    ];
+    let mut b = test_builder(&cfg, &instrs, &spec, &binary);
+    b.build();
+
+    assert_eq!(regargs_warning_count(&b), 0,
+      "a stale call result is not a callee setup: {:?}", b.warnings);
+  }
+
+  /// A scratch value consumed while preparing a declared regarg is not a
+  /// dropped setup for the callee: the live pinned write reads it.
+  #[test]
+  fn a_copy_into_a_declared_regarg_is_not_a_dropped_setup() {
+    let (_types, cfg, binary, spec) =
+      test_spec_with_callee(0x0000, 0x0009, &[0xC3], 0x0100, Some(vec![instr::Reg::BX]));
+    let instrs = [
+      located_instr(instr::Opcode::OP_MOV, 0x0000, 3,
+        vec![operand(instr::Reg::AX), imm_operand(0x1234)]),
+      located_instr(instr::Opcode::OP_MOV, 0x0003, 2,
+        vec![operand(instr::Reg::BX), operand(instr::Reg::AX)]),
+      located_instr(instr::Opcode::OP_CALL, 0x0005, 3, vec![rel_operand(0x00f8)]),
+      located_instr(instr::Opcode::OP_RET, 0x0008, 1, vec![]),
+    ];
+    let mut b = test_builder(&cfg, &instrs, &spec, &binary);
+    b.build();
+
+    assert_eq!(regargs_warning_count(&b), 0,
+      "AX is consumed by the live BX write: {:?}", b.warnings);
+  }
+
+  /// A call in a block that control flow cannot reach is not an emitted call,
+  /// so it must not warn about the register "state" of dead code.
+  #[test]
+  fn a_call_in_an_unreachable_block_does_not_warn() {
+    let (_types, cfg, binary, spec) =
+      test_spec_with_callee(0x0000, 0x0006, &[0xC3], 0x0100, Some(vec![]));
+    let instrs = [
+      jmp_instr(instr::Opcode::OP_JMP, 0x0000, 2, 3),
+      located_instr(instr::Opcode::OP_CALL, 0x0002, 3, vec![rel_operand(0x00fb)]),
+      located_instr(instr::Opcode::OP_RET, 0x0005, 1, vec![]),
+    ];
+    let mut b = test_builder(&cfg, &instrs, &spec, &binary);
+    b.build();
+
+    assert_eq!(regargs_warning_count(&b), 0,
+      "a jump-over call is not emitted: {:?}", b.warnings);
   }
 }
