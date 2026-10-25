@@ -208,6 +208,48 @@ fn ret_does_not_write_registers_that_never_changed() {
   }
 }
 
+/// A merge block is unsealed while lowering, so an untouched callee-saved
+/// register looks dirty there. The exit write-back runs after sealing: it must
+/// not invent writes, and a return value that reads the untouched register
+/// must not be snapshotted.
+#[test]
+fn ret_through_a_merge_does_not_write_untouched_registers() {
+  let code = [
+    0x85, 0xC0,       // test ax,ax
+    0x75, 0x03,       // jnz +3 (to 0x0007)
+    0xBB, 0x01, 0x00, // mov bx,1
+    0x89, 0xF0,       // 0x0007: mov ax,si
+    0xC3,             // ret
+  ];
+  let source = standard(&code, vec![func_ret("main", 0x0000, 0x000a, None, Type::U16)]);
+  assert!(source.contains("return SI;"), "the untouched SI is returned directly:\n{source}");
+  for reg in ["CX", "DX", "SI", "DI"] {
+    assert_eq!(count(&source, &format!("{reg} = ")), 0, "{reg} must not be written:\n{source}");
+  }
+  assert_eq!(count(&source, "= SI;"), 0, "the return must not be snapshotted:\n{source}");
+}
+
+/// The deferral must not drop a snapshot that is genuinely needed at a merge:
+/// the return value reads SI's entry value while one path writes SI.
+#[test]
+fn ret_through_a_merge_still_snapshots_a_dirty_register() {
+  let code = [
+    0x89, 0xF0,       // mov ax,si
+    0x85, 0xC0,       // test ax,ax
+    0x74, 0x03,       // jz +3 (to 0x0009)
+    0xBE, 0x01, 0x00, // mov si,1
+    0xC3,             // 0x0009: ret
+  ];
+  let source = standard(&code, vec![func_ret("main", 0x0000, 0x000a, None, Type::U16)]);
+  let snapshot = find(&source, "tmp_0 = SI;");
+  let write_back = find(&source, "SI = ");
+  assert!(snapshot < write_back, "the return value must be captured before the write:\n{source}");
+  let ret = source.rfind("return").expect("a return");
+  let ret_line = &source[ret..];
+  assert!(ret_line.contains("tmp_0"), "the return must read the snapshot:\n{source}");
+  assert!(!ret_line.contains("SI"), "the return must not read the rewritten SI:\n{source}");
+}
+
 /// A `push reg`/`pop reg` pair that folds back to the entry value gains no
 /// write: the emitted register was never changed, so the restore is a no-op.
 #[test]

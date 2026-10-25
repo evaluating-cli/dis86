@@ -160,6 +160,14 @@ struct IRBuilder<'a> {
   // `ret` (see `write_back_exit_registers`). They are not caller reads, so the
   // #132 "is this setup value still used" check ignores them.
   exit_state_writes: HashSet<Ref>,
+
+  // Return instructions awaiting their exit register write-back, paired with
+  // whether DX is part of the return value. Recorded while lowering and
+  // materialised by `write_back_exit_registers` after `build_once` has sealed
+  // every block: before sealing, `get_var` hands out incomplete phis, so an
+  // untouched register looks dirty and a return value read through such a phi
+  // hides that it reads the register.
+  ret_exits: Vec<(Ref, bool)>,
 }
 
 /// A known call with registers that hold a non-entry value but are absent from
@@ -211,6 +219,7 @@ impl<'a> IRBuilder<'a> {
       warnings: Vec::new(),
       regargs_candidates: Vec::new(),
       exit_state_writes: HashSet::new(),
+      ret_exits: Vec::new(),
     };
 
     // Create and seal the entry block
@@ -368,16 +377,25 @@ impl<'a> IRBuilder<'a> {
     self.append_instr_with_attrs(typ, Attribute::NONE, opcode, operands)
   }
 
-  fn append_instr_with_attrs(&mut self, typ: Type, attrs: u8, opcode: Opcode, operands: Vec<Ref>) -> Ref {
-    let instr = Instr {
+  fn make_instr(typ: Type, attrs: u8, opcode: Opcode, operands: Vec<Ref>) -> Instr {
+    Instr {
       typ,
       compare_width: None,
       attrs,
       opcode,
       operands,
-    };
+    }
+  }
 
+  fn append_instr_with_attrs(&mut self, typ: Type, attrs: u8, opcode: Opcode, operands: Vec<Ref>) -> Ref {
+    let instr = Self::make_instr(typ, attrs, opcode, operands);
     self.ir.block_instr_append(self.cur, instr)
+  }
+
+  fn insert_instr_before(&mut self, blk: BlockRef, before: Ref, typ: Type, attrs: u8,
+                         opcode: Opcode, operands: Vec<Ref>) -> Ref {
+    let instr = Self::make_instr(typ, attrs, opcode, operands);
+    self.ir.block_instr_insert_before(blk, before, instr)
   }
 
   fn append_jmp(&mut self, next: BlockRef) {
@@ -1308,6 +1326,15 @@ impl IRBuilder<'_> {
     self.append_instr_with_attrs(Type::U16, Attribute::PIN, Opcode::WriteVar16, vec![Ref::Symbol(sym), vref])
   }
 
+  /// The same guest write, placed immediately before `before` in `blk`. Used by
+  /// the deferred exit write-back, which runs after lowering has moved on.
+  fn write_guest_register_before(&mut self, blk: BlockRef, before: Ref,
+                                 reg: instr::Reg, vref: Ref) -> Ref {
+    let sym = self.ir.symbols.find_ref_by_name(sym::Table::Register, reg.info().name).unwrap();
+    self.insert_instr_before(blk, before, Type::U16, Attribute::PIN, Opcode::WriteVar16,
+                             vec![Ref::Symbol(sym), vref])
+  }
+
   /// Materialise the function's exit register state at a `ret`.
   ///
   /// A bare `Pin` is not a register write (ast.rs drops it), so without this a
@@ -1336,22 +1363,44 @@ impl IRBuilder<'_> {
   /// the exit state instead of the value the caller receives. The snapshot is
   /// taken even when the value is the pending expression itself: the pending
   /// expression re-reads `Init(reg)`, which is exactly what the write changes.
-  fn write_back_exit_registers(&mut self, ret_vals: &mut [Ref], dx_is_return: bool) {
-    let mut pending = vec![];
-    for reg in [instr::Reg::BX, instr::Reg::CX, instr::Reg::DX, instr::Reg::SI, instr::Reg::DI] {
-      if dx_is_return && reg == instr::Reg::DX { continue; }
-      let vref = self.ir.get_var(reg, self.cur);
-      if Self::is_entry_value(&self.ir, vref, reg) { continue; }
-      pending.push((reg, vref));
-    }
-    for v in ret_vals.iter_mut() {
-      if pending.iter().any(|(reg, _)| Self::ref_reads_init(&self.ir, *v, *reg)) {
-        *v = self.append_instr_with_attrs(Type::U16, Attribute::MATERIALISE, Opcode::Ref, vec![*v]);
+  ///
+  /// Runs after `build_once` has sealed every block (see the `ret_exits`
+  /// field). Recomputing both the pending set and the return operands here
+  /// rather than while lowering is what makes the write-back sound: an
+  /// unsealed block's `get_var` returns an incomplete phi even for a register
+  /// no path writes, so a lowering-time check cannot tell an entry value from
+  /// a setup, and a return value read through such a phi does not look like a
+  /// read of the register (its snapshot would be missed and the return would
+  /// observe the exit state). Once sealed, trivial phis and single-predecessor
+  /// chains resolve to the value they actually carry.
+  fn write_back_exit_registers(&mut self) {
+    for (ret_ref, dx_is_return) in std::mem::take(&mut self.ret_exits) {
+      let Ref::Instr(blk, _) = ret_ref else { continue; };
+
+      let mut pending = vec![];
+      for reg in [instr::Reg::BX, instr::Reg::CX, instr::Reg::DX, instr::Reg::SI, instr::Reg::DI] {
+        if dx_is_return && reg == instr::Reg::DX { continue; }
+        let vref = self.ir.get_var(reg, blk);
+        if Self::is_entry_value(&self.ir, vref, reg) { continue; }
+        pending.push((reg, vref));
       }
-    }
-    for (reg, vref) in Self::order_guest_writes(&self.ir, &pending) {
-      let write = self.write_guest_register(reg, vref);
-      self.exit_state_writes.insert(write);
+      if pending.is_empty() { continue; }
+
+      // Snapshot first, then insert the writes: each insert lands immediately
+      // before the `ret`, leaving the snapshots ahead of the writes.
+      let mut operands = self.ir.instr(ret_ref).unwrap().operands.clone();
+      for v in operands.iter_mut() {
+        if pending.iter().any(|(reg, _)| Self::ref_reads_init(&self.ir, *v, *reg)) {
+          *v = self.insert_instr_before(blk, ret_ref, Type::U16,
+                                        Attribute::MATERIALISE, Opcode::Ref, vec![*v]);
+        }
+      }
+      self.ir.instr_mut(ret_ref).unwrap().operands = operands;
+
+      for (reg, vref) in Self::order_guest_writes(&self.ir, &pending) {
+        let write = self.write_guest_register_before(blk, ret_ref, reg, vref);
+        self.exit_state_writes.insert(write);
+      }
     }
   }
 
@@ -1466,9 +1515,9 @@ impl IRBuilder<'_> {
   ///
   /// A phi with no operands is *not* entry: it is an incomplete phi, created
   /// while its block is still unsealed, and its operands are only known after
-  /// sealing. Callers querying during lowering (the exit write-back) must
-  /// treat it as dirty; the #132 candidate check re-evaluates after
-  /// `build_once`, when it can collapse.
+  /// sealing. Querying during lowering must treat it as dirty; the exit
+  /// write-back and the #132 candidate check therefore run after `build_once`,
+  /// when it can collapse.
   fn is_entry_value(ir: &IR, r: Ref, reg: instr::Reg) -> bool {
     let mut memo = HashMap::new();
     let mut visiting = HashSet::new();
@@ -2087,19 +2136,19 @@ impl IRBuilder<'_> {
         self.ir.set_var(instr::Reg::BP, self.cur, vref);
       }
       instr::Opcode::OP_RETF => {
-        let mut ret_vals = self.return_vals();
+        let ret_vals = self.return_vals();
         let dx_is_return = ret_vals.len() == 2;
-        self.write_back_exit_registers(&mut ret_vals, dx_is_return);
         self.pin_registers();
-        self.append_instr(Type::Void, Opcode::RetFar, ret_vals);
-
+        let ret_ref = self.append_instr(Type::Void, Opcode::RetFar, ret_vals);
+        // The write-back needs sealed blocks; see `ret_exits`.
+        self.ret_exits.push((ret_ref, dx_is_return));
       }
       instr::Opcode::OP_RET => {
-        let mut ret_vals = self.return_vals();
+        let ret_vals = self.return_vals();
         let dx_is_return = ret_vals.len() == 2;
-        self.write_back_exit_registers(&mut ret_vals, dx_is_return);
         self.pin_registers();
-        self.append_instr(Type::Void, Opcode::RetNear, ret_vals);
+        let ret_ref = self.append_instr(Type::Void, Opcode::RetNear, ret_vals);
+        self.ret_exits.push((ret_ref, dx_is_return));
       }
       instr::Opcode::OP_MOV => {
         let vref = self.append_asm_src_operand(&ins.operands[1]);
@@ -2734,6 +2783,7 @@ impl IRBuilder<'_> {
         analyze_carry(cfg, instrs, spec, binary, overlay, pin_all, df_entry.as_ref());
     }
     retained.build_once();
+    retained.write_back_exit_registers();
     retained.check_regargs_setups();
 
     retained.emit_warnings();
@@ -4789,6 +4839,43 @@ mod tests {
 
     assert_eq!(regargs_warning_count(&b), 0,
       "registers untouched on every path are not setups: {:?}", b.warnings);
+  }
+
+  /// The exit write-back runs after sealing. Before that, every non-entry
+  /// block's `get_var` yields an incomplete phi, so a merge looked dirty for
+  /// every callee-saved register; the write-back must not emit no-op writes.
+  #[test]
+  fn ret_at_a_merge_does_not_write_untouched_registers() {
+    let (_types, cfg, binary, spec) = test_spec(0x0000, 0x000a, &[0u8; 0x000a]);
+    let instrs = [
+      alu_instr(instr::Opcode::OP_CMP, instr::Reg::AX, instr::Reg::BX),
+      jmp_instr(instr::Opcode::OP_JNE, 0x0002, 2, 3),
+      located_instr(instr::Opcode::OP_MOV, 0x0004, 3,
+        vec![operand(instr::Reg::BX), imm_operand(1)]),
+      located_instr(instr::Opcode::OP_MOV, 0x0007, 2,
+        vec![operand(instr::Reg::AX), operand(instr::Reg::SI)]),
+      located_instr(instr::Opcode::OP_RET, 0x0009, 1, vec![]),
+    ];
+    let mut b = test_builder(&cfg, &instrs, &spec, &binary);
+    b.build();
+
+    let mut writes: HashMap<String, usize> = HashMap::new();
+    let mut materialised = 0;
+    for blk in b.ir.iter_blocks() {
+      for r in b.ir.iter_instrs(blk) {
+        let instr = b.ir.instr(r).unwrap();
+        if instr.attrs & Attribute::MATERIALISE != 0 { materialised += 1; }
+        if instr.opcode != Opcode::WriteVar16 { continue; }
+        let Ref::Symbol(dst) = instr.operands[0] else { continue; };
+        *writes.entry(dst.name(&b.ir.symbols).to_string()).or_insert(0) += 1;
+      }
+    }
+    assert_eq!(writes.get("BX"), Some(&1), "BX is written on one path: {writes:?}");
+    for reg in ["CX", "DX", "SI", "DI"] {
+      assert!(!writes.contains_key(reg), "{reg} is untouched on every path: {writes:?}");
+    }
+    assert_eq!(materialised, 0, "an entry-value return needs no snapshot");
+    assert_eq!(b.exit_state_writes.len(), 1, "only the BX write is exit state");
   }
 
   /// A phi that carries a real write on one path is a genuine setup and must
