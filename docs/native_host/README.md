@@ -36,8 +36,10 @@ DOS programs use the BIOS, and plenty of them write the text window directly.
   a `present()` change. A cursor position or scroll window outside the
   geometry fails loud instead of being clipped. Scrolling takes an inclusive
   window, treats `AL=0` (or at least the window height) as "clear", uses `BH`
-  as the blank attribute, and leaves the cursor where it was; the character
-  services also write at the cursor without moving it.
+  as the blank attribute, and leaves the cursor where it was. The character
+  services write `CX` cells starting at the cursor, wrapping at the screen
+  width without moving the cursor; `AH=0Ah` keeps each target cell's own
+  attribute, and a run that would leave the window fails loud.
 
   These services draw into the backend's shadow frame, not into guest video
   memory. Direct stores remain the authoritative path for guest read-back;

@@ -253,9 +253,45 @@ static int v_read_char(native_host_ctx_t *ctx, hydra_machine_registers_t *regs,
   return 0;
 }
 
-/* AH=09h: write AL with attribute BL, CX times, at the cursor. Text mode has
- * one cell there, so one write is equivalent to the repetition, and the
- * cursor stays put. */
+/* AH=09h/0Ah: write a run of CX cells starting at the cursor. Text mode
+ * repeats row-major, wrapping at the screen width, and does not move the
+ * cursor. A run that would leave the active window fails loud instead of
+ * writing past the rendered cells into memory this host does not model. With
+ * use_attr clear (AH=0Ah), each target cell keeps its own attribute; the run
+ * only replaces its character. */
+static void write_repeated_or_fail(const hydra_backend_t *be, void *st,
+                                   uint8_t row, uint8_t col, uint16_t count,
+                                   uint8_t ch, uint8_t attr, int use_attr,
+                                   const char *service)
+{
+  hydra_text_geometry_t geo;
+  text_geometry_or_fail(be, st, &geo, service);
+  if (row >= geo.rows || col >= geo.cols)
+    FAIL("native host: INT 10h %s start cell (%u,%u) is outside the %ux%u "
+         "text window", service, (unsigned)row, (unsigned)col,
+         (unsigned)geo.rows, (unsigned)geo.cols);
+
+  uint32_t start = (uint32_t)row * geo.cols + col;
+  uint32_t total = (uint32_t)geo.rows * geo.cols;
+  if ((uint32_t)count > total - start)
+    FAIL("native host: INT 10h %s run of %u cells from (%u,%u) leaves the "
+         "%ux%u text window", service, (unsigned)count, (unsigned)row,
+         (unsigned)col, (unsigned)geo.rows, (unsigned)geo.cols);
+
+  for (uint32_t i = 0; i < count; i++) {
+    uint32_t idx = start + i;
+    uint8_t r = (uint8_t)(idx / geo.cols);
+    uint8_t c = (uint8_t)(idx % geo.cols);
+    uint8_t cell_attr = attr;
+    if (!use_attr) {
+      uint8_t old_ch = 0;
+      get_cell_or_fail(be, st, r, c, &old_ch, &cell_attr, service);
+    }
+    putcell_or_fail(be, st, r, c, ch, cell_attr, service);
+  }
+}
+
+/* AH=09h: write AL with attribute BL, CX times, at the cursor. */
 static int v_write_char_attr(native_host_ctx_t *ctx, hydra_machine_registers_t *regs,
                              const hydra_backend_t *be, void *st)
 {
@@ -265,13 +301,14 @@ static int v_write_char_attr(native_host_ctx_t *ctx, hydra_machine_registers_t *
     return 0;
   uint8_t row = 0, col = 0;
   get_cursor_or_fail(be, st, &row, &col, "AH=09h");
-  putcell_or_fail(be, st, row, col, (uint8_t)(regs->ax & 0xff),
-                  (uint8_t)(regs->bx & 0xff), "AH=09h");
+  write_repeated_or_fail(be, st, row, col, regs->cx,
+                         (uint8_t)(regs->ax & 0xff),
+                         (uint8_t)(regs->bx & 0xff), 1, "AH=09h");
   return 0;
 }
 
-/* AH=0Ah: write AL with the cell's current attribute, CX times. BL is a
- * graphics-mode color and is ignored here. */
+/* AH=0Ah: write AL with each target cell's current attribute, CX times. BL is
+ * a graphics-mode color and is ignored here. */
 static int v_write_char(native_host_ctx_t *ctx, hydra_machine_registers_t *regs,
                         const hydra_backend_t *be, void *st)
 {
@@ -279,10 +316,10 @@ static int v_write_char(native_host_ctx_t *ctx, hydra_machine_registers_t *regs,
   require_page_zero(regs, "AH=0Ah");
   if (regs->cx == 0)
     return 0;
-  uint8_t row = 0, col = 0, ch = 0, attr = 0;
+  uint8_t row = 0, col = 0;
   get_cursor_or_fail(be, st, &row, &col, "AH=0Ah");
-  get_cell_or_fail(be, st, row, col, &ch, &attr, "AH=0Ah");
-  putcell_or_fail(be, st, row, col, (uint8_t)(regs->ax & 0xff), attr, "AH=0Ah");
+  write_repeated_or_fail(be, st, row, col, regs->cx,
+                         (uint8_t)(regs->ax & 0xff), 0, 0, "AH=0Ah");
   return 0;
 }
 
