@@ -9,9 +9,11 @@
  * fails loud: a diagnostic naming the vector, the service and the AH value,
  * then abort. That is the house fail-closed style and #95's stated contract.
  *
- * Skeletons are provided for the minimum surface a text-mode, keyboard-driven
- * Tier-1 target needs: video mode set + teletype, DOS print char / print
- * string / exit, timer ticks, and key status / blocking key read.
+ * The video surface is the text-mode subset a DOS program drives: mode set and
+ * teletype, cursor get/set, scroll, character/attribute read/write, and video
+ * state. DOS print char / print string / exit, timer ticks, and key status /
+ * blocking key read complete the minimum surface a keyboard-driven Tier-1
+ * target needs.
  */
 
 #include <stdio.h>
@@ -33,6 +35,76 @@ static void putc_or_fail(const hydra_backend_t *be, void *st, uint8_t ch, uint8_
   if (!be || !be->teletype)
     FAIL("native host: no backend supplies teletype output");
   be->teletype(st, ch, attr);
+}
+
+/* Every service below addresses page 0 only: the shadow frame and the text
+ * window model one active page, so a call naming another page would otherwise
+ * report success while drawing somewhere the guest cannot see. */
+static void require_page_zero(const hydra_machine_registers_t *regs, const char *service)
+{
+  uint8_t page = (uint8_t)((regs->bx >> 8) & 0xff);
+  if (page != 0)
+    FAIL("native host: INT 10h %s page %u is not modeled (page 0 only)",
+         service, (unsigned)page);
+}
+
+static void text_geometry_or_fail(const hydra_backend_t *be, void *st,
+                                  hydra_text_geometry_t *geo, const char *service)
+{
+  if (!be || !be->text_geometry)
+    FAIL("native host: no backend supplies text geometry for INT 10h %s", service);
+  if (be->text_geometry(st, geo) < 0 || geo->rows == 0 || geo->cols == 0)
+    FAIL("native host: the '%s' backend has no text window for INT 10h %s",
+         be->name ? be->name : "?", service);
+}
+
+static void get_cursor_or_fail(const hydra_backend_t *be, void *st,
+                               uint8_t *row, uint8_t *col, const char *service)
+{
+  if (!be || !be->get_cursor)
+    FAIL("native host: no backend supplies a text cursor for INT 10h %s", service);
+  if (be->get_cursor(st, row, col) < 0)
+    FAIL("native host: the '%s' backend has no text cursor for INT 10h %s",
+         be->name ? be->name : "?", service);
+}
+
+static void set_cursor_or_fail(const hydra_backend_t *be, void *st,
+                               uint8_t row, uint8_t col, const char *service)
+{
+  if (!be || !be->set_cursor)
+    FAIL("native host: no backend supplies a text cursor for INT 10h %s", service);
+  if (be->set_cursor(st, row, col) == 0)
+    return;
+
+  hydra_text_geometry_t geo;
+  if (be->text_geometry && be->text_geometry(st, &geo) == 0 &&
+      geo.rows != 0 && geo.cols != 0)
+    FAIL("native host: INT 10h %s cursor (%u,%u) is outside the %ux%u text window",
+         service, (unsigned)row, (unsigned)col,
+         (unsigned)geo.rows, (unsigned)geo.cols);
+  FAIL("native host: INT 10h %s cursor (%u,%u) is outside the text window",
+       service, (unsigned)row, (unsigned)col);
+}
+
+static void get_cell_or_fail(const hydra_backend_t *be, void *st,
+                             uint8_t row, uint8_t col, uint8_t *ch, uint8_t *attr,
+                             const char *service)
+{
+  if (!be || !be->get_cell)
+    FAIL("native host: no backend supplies text cells for INT 10h %s", service);
+  if (be->get_cell(st, row, col, ch, attr) < 0)
+    FAIL("native host: INT 10h %s cell (%u,%u) is outside the text window",
+         service, (unsigned)row, (unsigned)col);
+}
+
+static void putcell_or_fail(const hydra_backend_t *be, void *st,
+                            uint8_t row, uint8_t col, uint8_t ch, uint8_t attr,
+                            const char *service)
+{
+  if (!be || !be->putchar_text)
+    FAIL("native host: no backend supplies explicit text cells for INT 10h %s",
+         service);
+  be->putchar_text(st, row, col, ch, attr);
 }
 
 /********************************************************************/
@@ -60,9 +132,206 @@ static int v_teletype(native_host_ctx_t *ctx, hydra_machine_registers_t *regs,
                       const hydra_backend_t *be, void *st)
 {
   (void)ctx;
+  require_page_zero(regs, "AH=0Eh");
   uint8_t ch = (uint8_t)(regs->ax & 0xff);
   uint8_t attr = (uint8_t)(regs->bx & 0xff);
   putc_or_fail(be, st, ch, attr);
+  return 0;
+}
+
+/* AH=02h: set cursor position. DH = row, DL = column, BH = page. */
+static int v_set_cursor(native_host_ctx_t *ctx, hydra_machine_registers_t *regs,
+                        const hydra_backend_t *be, void *st)
+{
+  (void)ctx;
+  require_page_zero(regs, "AH=02h");
+  set_cursor_or_fail(be, st, (uint8_t)((regs->dx >> 8) & 0xff),
+                     (uint8_t)(regs->dx & 0xff), "AH=02h");
+  return 0;
+}
+
+/* AH=03h: read cursor position and shape. DH/DL = row/column, CX = 0607h
+ * (the default shape; AH=01h is not modeled, so the shape never changes). */
+static int v_get_cursor(native_host_ctx_t *ctx, hydra_machine_registers_t *regs,
+                        const hydra_backend_t *be, void *st)
+{
+  (void)ctx;
+  require_page_zero(regs, "AH=03h");
+  uint8_t row = 0, col = 0;
+  get_cursor_or_fail(be, st, &row, &col, "AH=03h");
+  regs->dx = (uint16_t)(((uint16_t)row << 8) | col);
+  regs->cx = 0x0607;
+  return 0;
+}
+
+/* AH=06h/07h: scroll a window. AL = lines (0 = clear), BH = blank attribute,
+ * CH/CL = upper-left, DH/DL = lower-right. The cursor does not move. */
+static void blank_window(const hydra_backend_t *be, void *st,
+                         uint8_t top, uint8_t left, uint8_t bottom, uint8_t right,
+                         uint8_t attr, const char *service)
+{
+  for (uint8_t r = top; r <= bottom; r++)
+    for (uint8_t c = left; c <= right; c++)
+      putcell_or_fail(be, st, r, c, ' ', attr, service);
+}
+
+static int v_scroll(native_host_ctx_t *ctx, hydra_machine_registers_t *regs,
+                    const hydra_backend_t *be, void *st, int up,
+                    const char *service)
+{
+  (void)ctx;
+  hydra_text_geometry_t geo;
+  text_geometry_or_fail(be, st, &geo, service);
+
+  uint8_t lines = (uint8_t)(regs->ax & 0xff);
+  uint8_t attr = (uint8_t)((regs->bx >> 8) & 0xff);
+  uint8_t top = (uint8_t)((regs->cx >> 8) & 0xff);
+  uint8_t left = (uint8_t)(regs->cx & 0xff);
+  uint8_t bottom = (uint8_t)((regs->dx >> 8) & 0xff);
+  uint8_t right = (uint8_t)(regs->dx & 0xff);
+
+  if (top > bottom || left > right || bottom >= geo.rows || right >= geo.cols)
+    FAIL("native host: INT 10h %s window (%u,%u)-(%u,%u) is outside the "
+         "%ux%u text window", service,
+         (unsigned)top, (unsigned)left, (unsigned)bottom, (unsigned)right,
+         (unsigned)geo.rows, (unsigned)geo.cols);
+
+  uint8_t height = (uint8_t)(bottom - top + 1u);
+  if (lines == 0 || lines >= height) {
+    blank_window(be, st, top, left, bottom, right, attr, service);
+    return 0;
+  }
+
+  /* Copy in the direction that never reads a cell already overwritten: up
+   * moves a row toward row 0, so increasing rows; down is the reverse. */
+  if (up) {
+    for (uint8_t r = top; r <= (uint8_t)(bottom - lines); r++) {
+      for (uint8_t c = left; c <= right; c++) {
+        uint8_t ch = 0, cell_attr = 0;
+        get_cell_or_fail(be, st, (uint8_t)(r + lines), c, &ch, &cell_attr, service);
+        putcell_or_fail(be, st, r, c, ch, cell_attr, service);
+      }
+    }
+    blank_window(be, st, (uint8_t)(bottom - lines + 1u), left, bottom, right,
+                 attr, service);
+  } else {
+    for (uint8_t r = bottom; r >= (uint8_t)(top + lines); r--) {
+      for (uint8_t c = left; c <= right; c++) {
+        uint8_t ch = 0, cell_attr = 0;
+        get_cell_or_fail(be, st, (uint8_t)(r - lines), c, &ch, &cell_attr, service);
+        putcell_or_fail(be, st, r, c, ch, cell_attr, service);
+      }
+    }
+    blank_window(be, st, top, left, (uint8_t)(top + lines - 1u), right, attr,
+                 service);
+  }
+  return 0;
+}
+
+static int v_scroll_up(native_host_ctx_t *ctx, hydra_machine_registers_t *regs,
+                       const hydra_backend_t *be, void *st)
+{
+  return v_scroll(ctx, regs, be, st, 1, "AH=06h");
+}
+
+static int v_scroll_down(native_host_ctx_t *ctx, hydra_machine_registers_t *regs,
+                         const hydra_backend_t *be, void *st)
+{
+  return v_scroll(ctx, regs, be, st, 0, "AH=07h");
+}
+
+/* AH=08h: read the character and attribute at the cursor into AL/AH. */
+static int v_read_char(native_host_ctx_t *ctx, hydra_machine_registers_t *regs,
+                       const hydra_backend_t *be, void *st)
+{
+  (void)ctx;
+  require_page_zero(regs, "AH=08h");
+  uint8_t row = 0, col = 0, ch = 0, attr = 0;
+  get_cursor_or_fail(be, st, &row, &col, "AH=08h");
+  get_cell_or_fail(be, st, row, col, &ch, &attr, "AH=08h");
+  regs->ax = (uint16_t)(((uint16_t)attr << 8) | ch);
+  return 0;
+}
+
+/* AH=09h/0Ah: write a run of CX cells starting at the cursor. Text mode
+ * repeats row-major, wrapping at the screen width, and does not move the
+ * cursor. A run that would leave the active window fails loud instead of
+ * writing past the rendered cells into memory this host does not model. With
+ * use_attr clear (AH=0Ah), each target cell keeps its own attribute; the run
+ * only replaces its character. */
+static void write_repeated_or_fail(const hydra_backend_t *be, void *st,
+                                   uint8_t row, uint8_t col, uint16_t count,
+                                   uint8_t ch, uint8_t attr, int use_attr,
+                                   const char *service)
+{
+  hydra_text_geometry_t geo;
+  text_geometry_or_fail(be, st, &geo, service);
+  if (row >= geo.rows || col >= geo.cols)
+    FAIL("native host: INT 10h %s start cell (%u,%u) is outside the %ux%u "
+         "text window", service, (unsigned)row, (unsigned)col,
+         (unsigned)geo.rows, (unsigned)geo.cols);
+
+  uint32_t start = (uint32_t)row * geo.cols + col;
+  uint32_t total = (uint32_t)geo.rows * geo.cols;
+  if ((uint32_t)count > total - start)
+    FAIL("native host: INT 10h %s run of %u cells from (%u,%u) leaves the "
+         "%ux%u text window", service, (unsigned)count, (unsigned)row,
+         (unsigned)col, (unsigned)geo.rows, (unsigned)geo.cols);
+
+  for (uint32_t i = 0; i < count; i++) {
+    uint32_t idx = start + i;
+    uint8_t r = (uint8_t)(idx / geo.cols);
+    uint8_t c = (uint8_t)(idx % geo.cols);
+    uint8_t cell_attr = attr;
+    if (!use_attr) {
+      uint8_t old_ch = 0;
+      get_cell_or_fail(be, st, r, c, &old_ch, &cell_attr, service);
+    }
+    putcell_or_fail(be, st, r, c, ch, cell_attr, service);
+  }
+}
+
+/* AH=09h: write AL with attribute BL, CX times, at the cursor. */
+static int v_write_char_attr(native_host_ctx_t *ctx, hydra_machine_registers_t *regs,
+                             const hydra_backend_t *be, void *st)
+{
+  (void)ctx;
+  require_page_zero(regs, "AH=09h");
+  if (regs->cx == 0)
+    return 0;
+  uint8_t row = 0, col = 0;
+  get_cursor_or_fail(be, st, &row, &col, "AH=09h");
+  write_repeated_or_fail(be, st, row, col, regs->cx,
+                         (uint8_t)(regs->ax & 0xff),
+                         (uint8_t)(regs->bx & 0xff), 1, "AH=09h");
+  return 0;
+}
+
+/* AH=0Ah: write AL with each target cell's current attribute, CX times. BL is
+ * a graphics-mode color and is ignored here. */
+static int v_write_char(native_host_ctx_t *ctx, hydra_machine_registers_t *regs,
+                        const hydra_backend_t *be, void *st)
+{
+  (void)ctx;
+  require_page_zero(regs, "AH=0Ah");
+  if (regs->cx == 0)
+    return 0;
+  uint8_t row = 0, col = 0;
+  get_cursor_or_fail(be, st, &row, &col, "AH=0Ah");
+  write_repeated_or_fail(be, st, row, col, regs->cx,
+                         (uint8_t)(regs->ax & 0xff), 0, 0, "AH=0Ah");
+  return 0;
+}
+
+/* AH=0Fh: video state. AL = mode, AH = columns, BH = active page (0). */
+static int v_get_mode(native_host_ctx_t *ctx, hydra_machine_registers_t *regs,
+                      const hydra_backend_t *be, void *st)
+{
+  (void)ctx;
+  hydra_text_geometry_t geo;
+  text_geometry_or_fail(be, st, &geo, "AH=0Fh");
+  regs->ax = (uint16_t)(((uint16_t)geo.cols << 8) | geo.mode);
+  regs->bx = (uint16_t)(regs->bx & 0x00ff);
   return 0;
 }
 
@@ -171,7 +440,15 @@ static int t_get_ticks(native_host_ctx_t *ctx, hydra_machine_registers_t *regs,
 
 static const hydra_int_ah_fn video_ah[VIDEO_AH_N] = {
   [0x00] = v_set_mode,
+  [0x02] = v_set_cursor,
+  [0x03] = v_get_cursor,
+  [0x06] = v_scroll_up,
+  [0x07] = v_scroll_down,
+  [0x08] = v_read_char,
+  [0x09] = v_write_char_attr,
+  [0x0a] = v_write_char,
   [0x0e] = v_teletype,
+  [0x0f] = v_get_mode,
 };
 
 static const hydra_int_ah_fn kbd_ah[KBD_AH_N] = {

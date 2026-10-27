@@ -208,6 +208,31 @@ static int term_get_cell(void *state, uint8_t row, uint8_t col, uint8_t *ch, uin
   return 0;
 }
 
+static int term_get_cursor(void *state, uint8_t *row, uint8_t *col)
+{
+  terminal_t *t = (terminal_t *)state;
+  if (!t)
+    return -1;
+  if (row)
+    *row = t->cur_row;
+  if (col)
+    *col = t->cur_col;
+  return 0;
+}
+
+static int term_set_cursor(void *state, uint8_t row, uint8_t col)
+{
+  terminal_t *t = (terminal_t *)state;
+  if (!t || row >= t->rows || col >= t->cols)
+    return -1;
+  if (t->cur_row != row || t->cur_col != col) {
+    t->cur_row = row;
+    t->cur_col = col;
+    t->cursor_dirty = 1;
+  }
+  return 0;
+}
+
 static void term_present(void *state)
 {
   terminal_t *t = (terminal_t *)state;
@@ -385,6 +410,8 @@ const hydra_backend_t *hydra_backend_terminal(void)
     .present        = term_present,
     .text_geometry  = term_text_geometry,
     .get_cell       = term_get_cell,
+    .get_cursor     = term_get_cursor,
+    .set_cursor     = term_set_cursor,
     .poll_key       = term_poll_key,
     .read_key       = term_read_key,
     .ticks          = term_ticks,

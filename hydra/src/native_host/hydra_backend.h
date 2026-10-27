@@ -88,6 +88,15 @@ struct hydra_backend {
    * the cell is out of range or the backend keeps no text buffer. */
   int  (*get_cell)(void *state, uint8_t row, uint8_t col, uint8_t *ch, uint8_t *attr);
 
+  /* Text cursor, in zero-based cells of the current text geometry. `get_cursor`
+   * returns 0 on success and -1 when the backend keeps no text cursor.
+   * `set_cursor` returns 0 on success and -1 when the cell is outside the
+   * current geometry (or there is no text window). A move that changes the
+   * position is a change for `present`; setting it to the cell it already
+   * occupies is not. */
+  int  (*get_cursor)(void *state, uint8_t *row, uint8_t *col);
+  int  (*set_cursor)(void *state, uint8_t row, uint8_t col);
+
   /* Input. Key words use the BIOS encoding: high byte = scan code, low byte =
    * ASCII (0 for extended keys). `poll_key` peeks at the next key and returns
    * 1 without consuming it, or 0 when none is pending; it never blocks.

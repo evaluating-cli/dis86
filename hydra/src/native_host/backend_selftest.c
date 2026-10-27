@@ -4,9 +4,10 @@
  *
  * Covers: backend lookup, text-mode accept / graphics-mode reject (the
  * fail-closed contract), 40-column geometry, teletype into the shadow buffer,
- * tick scaling, the implemented INT functions (including INT 16h peek /
- * consume), and — via fork — that both classes of unimplemented service abort
- * rather than silently returning.
+ * tick scaling, the implemented INT functions (including the INT 10h text
+ * services and INT 16h peek / consume), and — via fork — that unimplemented
+ * services and out-of-range text requests abort rather than silently
+ * returning.
  */
 
 #include <errno.h>
@@ -120,6 +121,74 @@ static void probe_graphics_mode(void)
 {
   hydra_machine_registers_t regs = { 0 };
   regs.ax = 0x0013;                 /* AH=00h, AL=13h (VGA 320x200x256) */
+  native_int_dispatch(g_probe_ctx, &regs, 0x10, g_probe_be, g_probe_st);
+}
+
+static void probe_cursor_page_one(void)
+{
+  hydra_machine_registers_t regs = { 0 };
+  regs.ax = 0x0200;
+  regs.bx = 0x0100;                 /* BH=1: page 1 */
+  regs.dx = 0x0000;
+  native_int_dispatch(g_probe_ctx, &regs, 0x10, g_probe_be, g_probe_st);
+}
+
+static void probe_cursor_out_of_range(void)
+{
+  hydra_machine_registers_t regs = { 0 };
+  regs.ax = 0x0200;
+  regs.dx = 0x1900;                 /* row 25 in a 25-row window */
+  native_int_dispatch(g_probe_ctx, &regs, 0x10, g_probe_be, g_probe_st);
+}
+
+static void probe_scroll_window_out_of_range(void)
+{
+  hydra_machine_registers_t regs = { 0 };
+  regs.ax = 0x0601;
+  regs.bx = 0x0700;                 /* blank attribute */
+  regs.cx = 0x0000;                 /* top 0, left 0 */
+  regs.dx = 0x1900;                 /* bottom 25 */
+  native_int_dispatch(g_probe_ctx, &regs, 0x10, g_probe_be, g_probe_st);
+}
+
+static void probe_write_page_one(void)
+{
+  hydra_machine_registers_t regs = { 0 };
+  regs.ax = 0x0941;                 /* AH=09h, AL='A' */
+  regs.bx = 0x011e;                 /* BH=1: page 1 */
+  regs.cx = 1;
+  native_int_dispatch(g_probe_ctx, &regs, 0x10, g_probe_be, g_probe_st);
+}
+
+static void probe_teletype_page_one(void)
+{
+  hydra_machine_registers_t regs = { 0 };
+  regs.ax = 0x0e41;                 /* AH=0Eh, AL='A' */
+  regs.bx = 0x0107;                 /* BH=1: page 1 */
+  native_int_dispatch(g_probe_ctx, &regs, 0x10, g_probe_be, g_probe_st);
+}
+
+/* A run starting at the last row's penultimate cell would write past the
+ * visible window, which this host does not model: both character writers must
+ * fail loud rather than clip or wrap somewhere the guest cannot see. */
+static void probe_write_run_out_of_range(void)
+{
+  hydra_machine_registers_t regs = { 0 };
+  g_probe_be->set_cursor(g_probe_st, BACKEND_TEXT_ROWS - 1,
+                         BACKEND_TEXT_COLS - 2);
+  regs.ax = 0x0941;                 /* AH=09h, AL='A' */
+  regs.bx = 0x001e;                 /* page 0, attribute 1Eh */
+  regs.cx = 3;                      /* one cell past the last one */
+  native_int_dispatch(g_probe_ctx, &regs, 0x10, g_probe_be, g_probe_st);
+}
+
+static void probe_write_char_run_out_of_range(void)
+{
+  hydra_machine_registers_t regs = { 0 };
+  g_probe_be->set_cursor(g_probe_st, BACKEND_TEXT_ROWS - 1,
+                         BACKEND_TEXT_COLS - 2);
+  regs.ax = 0x0a41;                 /* AH=0Ah, AL='A' */
+  regs.cx = 3;
   native_int_dispatch(g_probe_ctx, &regs, 0x10, g_probe_be, g_probe_st);
 }
 
@@ -284,6 +353,32 @@ static void probe_present_cursor_only(void)
   g_probe_be->teletype(g_probe_st, '\r', 0x07);
   g_probe_be->teletype(g_probe_st, '\n', 0x07);
   g_probe_be->present(g_probe_st);
+}
+
+/* A cursor move through INT 10h is the same kind of change: it must reach the
+ * terminal even though no cell was rewritten. */
+static void probe_cursor_int_present(void)
+{
+  g_probe_be->set_video_mode(g_probe_st, 0x03);
+  g_probe_be->present(g_probe_st);
+
+  hydra_machine_registers_t regs = { 0 };
+  regs.ax = 0x0200;                 /* AH=02h, BH=0 (page 0) */
+  regs.dx = 0x0305;                 /* row 3, column 5 */
+  native_int_dispatch(g_probe_ctx, &regs, 0x10, g_probe_be, g_probe_st);
+  g_probe_be->present(g_probe_st);
+}
+
+/* Fill a 3x3 window with distinct cells and put markers just outside it, so
+ * a scroll test can tell a window copy from a full-screen one. */
+static void seed_scroll_window(const hydra_backend_t *be, void *st)
+{
+  for (uint8_t r = 1; r <= 3; r++)
+    for (uint8_t c = 1; c <= 3; c++)
+      be->putchar_text(st, r, c, (uint8_t)('a' + (r - 1) * 3 + (c - 1)), 0x07);
+  be->putchar_text(st, 0, 0, 'Z', 0x07);
+  be->putchar_text(st, 4, 1, 'Q', 0x07);
+  be->set_cursor(st, 10, 20);
 }
 
 /* The host-facing wrapper, driven through the selected backend's state so the
@@ -499,6 +594,184 @@ int hydra_backend_selftest(void)
            "INT 21h AH=09h printed the guest string");
   }
 
+  /* INT 10h text services: cursor, scroll and character/attribute I/O. */
+  {
+    hydra_machine_registers_t regs = { 0 };
+    uint8_t ch = 0, attr = 0;
+    uint8_t row = 0, col = 0;
+
+    TCHECK(be->set_video_mode(st, 0x03) == 0, "INT 10h text: reset to 80x25");
+    TCHECK(be->set_cursor(st, 3, 5) == 0 &&
+               be->get_cursor(st, &row, &col) == 0 && row == 3 && col == 5,
+           "INT 10h text: cursor accessors round-trip");
+    TCHECK(be->set_cursor(st, BACKEND_TEXT_ROWS, 0) < 0 &&
+               be->set_cursor(st, 0, BACKEND_TEXT_COLS) < 0,
+           "INT 10h text: cursor accessors refuse cells outside the geometry");
+
+    regs.ax = 0x0200;
+    regs.dx = 0x050a;               /* row 5, column 10 */
+    TCHECK(native_int_dispatch(ctx, &regs, 0x10, be, st) == 0,
+           "INT 10h AH=02h handled");
+    regs.ax = 0x0300;
+    TCHECK(native_int_dispatch(ctx, &regs, 0x10, be, st) == 0,
+           "INT 10h AH=03h handled");
+    TCHECK(regs.dx == 0x050a && regs.cx == 0x0607,
+           "INT 10h AH=03h returns the cursor and the default shape");
+
+    regs.ax = 0x0941;               /* AH=09h, AL='A' */
+    regs.bx = 0x001e;               /* BH=0 page, BL=1Eh attribute */
+    regs.cx = 3;
+    TCHECK(native_int_dispatch(ctx, &regs, 0x10, be, st) == 0,
+           "INT 10h AH=09h handled");
+    TCHECK(be->get_cell(st, 5, 10, &ch, &attr) == 0 && ch == 'A' && attr == 0x1e &&
+               be->get_cell(st, 5, 11, &ch, &attr) == 0 && ch == 'A' &&
+               attr == 0x1e &&
+               be->get_cell(st, 5, 12, &ch, &attr) == 0 && ch == 'A' &&
+               attr == 0x1e,
+           "INT 10h AH=09h writes CX cells with the character and attribute");
+    TCHECK(be->get_cell(st, 5, 13, &ch, &attr) == 0 && ch == ' ' && attr == 0x07,
+           "INT 10h AH=09h stops after CX cells");
+    TCHECK(be->get_cursor(st, &row, &col) == 0 && row == 5 && col == 10,
+           "INT 10h AH=09h leaves the cursor alone");
+
+    regs.ax = 0x0800;
+    TCHECK(native_int_dispatch(ctx, &regs, 0x10, be, st) == 0,
+           "INT 10h AH=08h handled");
+    TCHECK(regs.ax == 0x1e41, "INT 10h AH=08h returns character and attribute");
+
+    /* Give the second target a different attribute so AH=0Ah has to keep each
+     * cell's own attribute rather than copying the cursor cell's. */
+    be->putchar_text(st, 5, 11, 'x', 0x2e);
+    regs.ax = 0x0a42;               /* AH=0Ah, AL='B' */
+    regs.bx = 0x0000;               /* BL is ignored for AH=0Ah */
+    regs.cx = 2;
+    TCHECK(native_int_dispatch(ctx, &regs, 0x10, be, st) == 0,
+           "INT 10h AH=0Ah handled");
+    TCHECK(be->get_cell(st, 5, 10, &ch, &attr) == 0 && ch == 'B' && attr == 0x1e,
+           "INT 10h AH=0Ah writes the cursor cell with its attribute");
+    TCHECK(be->get_cell(st, 5, 11, &ch, &attr) == 0 && ch == 'B' && attr == 0x2e,
+           "INT 10h AH=0Ah keeps each target cell's attribute");
+    TCHECK(be->get_cell(st, 5, 12, &ch, &attr) == 0 && ch == 'A' && attr == 0x1e,
+           "INT 10h AH=0Ah stops after CX cells");
+    TCHECK(be->get_cursor(st, &row, &col) == 0 && row == 5 && col == 10,
+           "INT 10h AH=0Ah leaves the cursor alone");
+
+    regs.ax = 0x0a43;               /* AL='C' */
+    regs.cx = 0;
+    TCHECK(native_int_dispatch(ctx, &regs, 0x10, be, st) == 0,
+           "INT 10h AH=0Ah with CX=0 handled");
+    TCHECK(be->get_cell(st, 5, 10, &ch, &attr) == 0 && ch == 'B',
+           "INT 10h AH=0Ah with CX=0 writes nothing");
+
+    /* Repetition wraps at the screen width, not at the cursor's line. */
+    TCHECK(be->set_cursor(st, 5, 78) == 0,
+           "INT 10h text: cursor to row 5, column 78");
+    regs.ax = 0x0944;               /* AH=09h, AL='D' */
+    regs.bx = 0x002e;
+    regs.cx = 3;
+    TCHECK(native_int_dispatch(ctx, &regs, 0x10, be, st) == 0,
+           "INT 10h AH=09h handles a run across a row boundary");
+    TCHECK(be->get_cell(st, 5, 78, &ch, &attr) == 0 && ch == 'D' && attr == 0x2e &&
+               be->get_cell(st, 5, 79, &ch, &attr) == 0 && ch == 'D' &&
+               attr == 0x2e &&
+               be->get_cell(st, 6, 0, &ch, &attr) == 0 && ch == 'D' &&
+               attr == 0x2e,
+           "INT 10h AH=09h wraps the run into the next row");
+    TCHECK(be->get_cell(st, 6, 1, &ch, &attr) == 0 && ch == ' ' && attr == 0x07,
+           "INT 10h AH=09h stops after CX cells across the wrap");
+
+    /* A run ending exactly on the last cell is still inside the window. */
+    TCHECK(be->set_cursor(st, BACKEND_TEXT_ROWS - 1, BACKEND_TEXT_COLS - 2) == 0,
+           "INT 10h text: cursor to the last row's penultimate cell");
+    regs.ax = 0x0a45;               /* AH=0Ah, AL='E' */
+    regs.cx = 2;
+    TCHECK(native_int_dispatch(ctx, &regs, 0x10, be, st) == 0,
+           "INT 10h AH=0Ah handles a run ending on the last cell");
+    TCHECK(be->get_cell(st, BACKEND_TEXT_ROWS - 1, BACKEND_TEXT_COLS - 2,
+                        &ch, &attr) == 0 && ch == 'E' &&
+               be->get_cell(st, BACKEND_TEXT_ROWS - 1, BACKEND_TEXT_COLS - 1,
+                            &ch, &attr) == 0 && ch == 'E',
+           "INT 10h AH=0Ah writes both cells of the boundary run");
+
+    regs.ax = 0x0f00;
+    TCHECK(native_int_dispatch(ctx, &regs, 0x10, be, st) == 0,
+           "INT 10h AH=0Fh handled");
+    TCHECK(regs.ax == 0x5003 && (regs.bx >> 8) == 0,
+           "INT 10h AH=0Fh returns mode 03h and 80 columns");
+
+    TCHECK(be->set_video_mode(st, 0x01) == 0, "INT 10h text: reset to 40x25");
+    regs.ax = 0x0f00;
+    native_int_dispatch(ctx, &regs, 0x10, be, st);
+    TCHECK(regs.ax == 0x2801, "INT 10h AH=0Fh reports 40 columns in mode 01h");
+    TCHECK(be->set_video_mode(st, 0x03) == 0, "INT 10h text: back to 80x25");
+
+    /* Scroll up: rows 1..3 hold a..i; one line moves d..f into row 1 and the
+     * last row is blanked with BH. Cells outside the window keep their bytes,
+     * and the cursor does not move. */
+    seed_scroll_window(be, st);
+    regs.ax = 0x0601;               /* AH=06h, AL=1 line */
+    regs.bx = 0x1f00;               /* BH=1Fh blank attribute */
+    regs.cx = 0x0101;               /* top 1, left 1 */
+    regs.dx = 0x0303;               /* bottom 3, right 3 */
+    TCHECK(native_int_dispatch(ctx, &regs, 0x10, be, st) == 0,
+           "INT 10h AH=06h handled");
+    TCHECK(be->get_cell(st, 1, 1, &ch, &attr) == 0 && ch == 'd' && attr == 0x07,
+           "INT 10h AH=06h moves the second row into the first");
+    TCHECK(be->get_cell(st, 1, 3, &ch, &attr) == 0 && ch == 'f',
+           "INT 10h AH=06h moves the whole row");
+    TCHECK(be->get_cell(st, 2, 1, &ch, &attr) == 0 && ch == 'g',
+           "INT 10h AH=06h moves the third row up");
+    TCHECK(be->get_cell(st, 3, 1, &ch, &attr) == 0 && ch == ' ' && attr == 0x1f,
+           "INT 10h AH=06h blanks the bottom row with BH");
+    TCHECK(be->get_cell(st, 0, 0, &ch, &attr) == 0 && ch == 'Z',
+           "INT 10h AH=06h leaves cells outside the window alone");
+    TCHECK(be->get_cell(st, 4, 1, &ch, &attr) == 0 && ch == 'Q',
+           "INT 10h AH=06h leaves rows below the window alone");
+    TCHECK(be->get_cursor(st, &row, &col) == 0 && row == 10 && col == 20,
+           "INT 10h AH=06h leaves the cursor alone");
+
+    /* Scroll down: the mirror image, with the blank row at the top. */
+    seed_scroll_window(be, st);
+    regs.ax = 0x0701;               /* AH=07h, AL=1 line */
+    regs.bx = 0x2e00;               /* BH=2Eh blank attribute */
+    TCHECK(native_int_dispatch(ctx, &regs, 0x10, be, st) == 0,
+           "INT 10h AH=07h handled");
+    TCHECK(be->get_cell(st, 1, 1, &ch, &attr) == 0 && ch == ' ' && attr == 0x2e,
+           "INT 10h AH=07h blanks the top row with BH");
+    TCHECK(be->get_cell(st, 2, 1, &ch, &attr) == 0 && ch == 'a',
+           "INT 10h AH=07h moves the first row down");
+    TCHECK(be->get_cell(st, 3, 3, &ch, &attr) == 0 && ch == 'f',
+           "INT 10h AH=07h moves the second row down and clips the window");
+    TCHECK(be->get_cell(st, 0, 0, &ch, &attr) == 0 && ch == 'Z',
+           "INT 10h AH=07h leaves cells outside the window alone");
+    TCHECK(be->get_cursor(st, &row, &col) == 0 && row == 10 && col == 20,
+           "INT 10h AH=07h leaves the cursor alone");
+
+    /* AL=0 clears the window instead of shifting it. */
+    seed_scroll_window(be, st);
+    regs.ax = 0x0600;               /* AH=06h, AL=0: clear */
+    regs.bx = 0x7000;               /* BH=70h blank attribute */
+    TCHECK(native_int_dispatch(ctx, &regs, 0x10, be, st) == 0,
+           "INT 10h AH=06h with AL=0 handled");
+    TCHECK(be->get_cell(st, 1, 1, &ch, &attr) == 0 && ch == ' ' && attr == 0x70 &&
+               be->get_cell(st, 3, 3, &ch, &attr) == 0 && ch == ' ' && attr == 0x70,
+           "INT 10h AH=06h with AL=0 clears the whole window");
+    TCHECK(be->get_cell(st, 0, 0, &ch, &attr) == 0 && ch == 'Z' &&
+               be->get_cell(st, 4, 1, &ch, &attr) == 0 && ch == 'Q',
+           "INT 10h AH=06h with AL=0 leaves cells outside the window alone");
+    TCHECK(be->get_cursor(st, &row, &col) == 0 && row == 10 && col == 20,
+           "INT 10h AH=06h with AL=0 leaves the cursor alone");
+
+    /* Scrolling by at least the window height also clears it. */
+    seed_scroll_window(be, st);
+    regs.ax = 0x0605;               /* AL=5, more than the 3-row window */
+    regs.bx = 0x6000;               /* BH=60h blank attribute */
+    TCHECK(native_int_dispatch(ctx, &regs, 0x10, be, st) == 0,
+           "INT 10h AH=06h with AL >= window height handled");
+    TCHECK(be->get_cell(st, 1, 1, &ch, &attr) == 0 && ch == ' ' && attr == 0x60,
+           "INT 10h AH=06h with AL >= window height clears the window");
+  }
+
   /* INT 1Ah AH=00h: tick count in CX:DX. */
   {
     hydra_machine_registers_t regs = { 0 };
@@ -644,7 +917,27 @@ int hydra_backend_selftest(void)
     free(cursor);
   }
 
+  /* --- INT 10h AH=02h: a cursor move reaches present() ----------------- */
+  {
+    char *cursor = NULL;
+    size_t cursor_len = 0;
+
+    be->set_video_mode(st, 0x03);
+    g_probe_ctx = ctx;
+    g_probe_be = be;
+    g_probe_st = st;
+
+    TCHECK(capture_stdout(1, probe_cursor_int_present, &cursor, &cursor_len),
+           "INT 10h AH=02h: capture of a cursor move");
+    TCHECK(cursor && count_substr(cursor, "\033[H\033[2J") == 1,
+           "INT 10h AH=02h: a cursor move does not repaint the cells");
+    TCHECK(cursor && strstr(cursor, "\033[4;6H") != NULL,
+           "INT 10h AH=02h: the moved cursor reaches the terminal");
+    free(cursor);
+  }
+
   /* --- fail-loud: both classes of missing service must abort ------------ */
+  be->set_video_mode(st, 0x03);
   g_probe_ctx = ctx;
   g_probe_be = be;
   g_probe_st = st;
@@ -655,6 +948,20 @@ int hydra_backend_selftest(void)
          "unhandled AH inside a registered vector aborts (fail loud)");
   TCHECK(probe_aborts(probe_graphics_mode),
          "graphics mode on the terminal backend aborts (fail closed)");
+  TCHECK(probe_aborts(probe_cursor_page_one),
+         "INT 10h AH=02h rejects page 1 (fail loud)");
+  TCHECK(probe_aborts(probe_cursor_out_of_range),
+         "INT 10h AH=02h rejects a row outside the window (fail loud)");
+  TCHECK(probe_aborts(probe_scroll_window_out_of_range),
+         "INT 10h AH=06h rejects a window outside the screen (fail loud)");
+  TCHECK(probe_aborts(probe_write_page_one),
+         "INT 10h AH=09h rejects page 1 (fail loud)");
+  TCHECK(probe_aborts(probe_write_run_out_of_range),
+         "INT 10h AH=09h rejects a run past the last cell (fail loud)");
+  TCHECK(probe_aborts(probe_write_char_run_out_of_range),
+         "INT 10h AH=0Ah rejects a run past the last cell (fail loud)");
+  TCHECK(probe_aborts(probe_teletype_page_one),
+         "INT 10h AH=0Eh rejects page 1 (fail loud)");
 
   free(ctx);
   be->shutdown(st);
@@ -1234,6 +1541,7 @@ int hydra_backend_linktest(hydra_machine_t *m)
     goto done;
 
   /* Registers are read from the execution context's copy of the machine. */
+  exec.machine.registers->bx = 0x0000;     /* BH=0: page 0 */
   exec.machine.registers->ax = 0x0e41;     /* INT 10h AH=0Eh, AL='A' */
   hydra_impl_int(0x10);
   TCHECK(buf[0] == 'A',

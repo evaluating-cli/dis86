@@ -23,10 +23,30 @@ with a diagnostic instead of inventing a plausible value.
 Text output reaches the terminal by two routes, and both are required: most
 DOS programs use the BIOS, and plenty of them write the text window directly.
 
-- **BIOS services.** `INT 10h AH=00h` (set mode) and `AH=0Eh` (teletype);
-  `INT 21h AH=02h`, `AH=09h`, `AH=4Ch`. Graphics modes are refused by the
-  backend, so `AH=00h` fails closed with a diagnostic rather than rendering
-  garbage.
+- **BIOS services.** `INT 10h` text mode: `AH=00h` (set mode), `AH=02h`/`03h`
+  (set/get cursor), `AH=06h`/`07h` (scroll up/down), `AH=08h` (read character
+  and attribute), `AH=09h`/`0Ah` (write character with/without attribute),
+  `AH=0Eh` (teletype), and `AH=0Fh` (video state); `INT 21h` `AH=02h`,
+  `AH=09h`, `AH=4Ch`. Graphics modes are refused by the backend, so `AH=00h`
+  fails closed with a diagnostic rather than rendering garbage.
+
+  All of these address the active video page, which is page 0; a call naming
+  another page fails loud instead of drawing somewhere the guest cannot see.
+  Cursor positions are zero-based cells of the current geometry, and a move is
+  a `present()` change. A cursor position or scroll window outside the
+  geometry fails loud instead of being clipped. Scrolling takes an inclusive
+  window, treats `AL=0` (or at least the window height) as "clear", uses `BH`
+  as the blank attribute, and leaves the cursor where it was. The character
+  services write `CX` cells starting at the cursor, wrapping at the screen
+  width without moving the cursor; `AH=0Ah` keeps each target cell's own
+  attribute, and a run that would leave the window fails loud.
+
+  These services draw into the backend's shadow frame, not into guest video
+  memory. Direct stores remain the authoritative path for guest read-back;
+  BIOS output is only what is rendered. Keeping BIOS output in guest memory —
+  so a `state_save`/`state_restore` after a BIOS-only screen is faithful — is a
+  separate architectural change.
+
 - **Direct video memory.** Stores into the text window are mirrored into the
   backend's shadow buffer: `B8000h` for modes `00h`-`03h`, `B0000h` for MDA
   mode `07h`. Guest memory stays authoritative — the mirror is a projection,
@@ -64,10 +84,11 @@ forcing a repaint. Two things drive it:
   screen on the terminal while it waits;
 - the port driver, through `hydra_native_backend_present()`, once per frame.
 
-A snapshot restores the display too. `state_restore()` loads the whole image
-with a single read that never passes through the per-store mirror, so it
-re-projects the text window afterwards; without that the screen would keep
-showing the pre-restore frame while the guest reads the restored bytes.
+A snapshot restores the display too, for text the guest wrote directly.
+`state_restore()` loads the whole image with a single read that never passes
+through the per-store mirror, so it re-projects the text window afterwards;
+without that the screen would keep showing the pre-restore frame while the
+guest reads the restored bytes.
 
 ## SDL2: a new dependency, not a reuse
 
