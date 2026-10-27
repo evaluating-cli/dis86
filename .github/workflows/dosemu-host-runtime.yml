@@ -31,11 +31,36 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Set cache week
+        id: cache-week
+        run: |
+          echo "week=$(date +%Y-%W)" >> "$GITHUB_OUTPUT"
+          mkdir -p "$HOME/.cache/apt-archives/partial" "$HOME/.cache/dosemu"
+
+      - name: Cache dosemu packages and FreeDOS downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/apt-archives
+            ~/.cache/dosemu
+          key: ${{ runner.os }}-dosemu-cache-v1-${{ steps.cache-week.outputs.week }}-${{ hashFiles('.github/workflows/dosemu-host-runtime.yml', '.github/workflows/parity-fixture.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-dosemu-cache-v1-
+
       - name: Install stock dosemu2 runtime
         run: |
           set -euo pipefail
-          sudo apt-get update -q
-          sudo apt-get install -y software-properties-common
+          APT_CACHE="$HOME/.cache/apt-archives"
+          APT_OPTS=(
+            -o Acquire::Retries=5
+            -o Acquire::http::Timeout=20
+            -o Acquire::https::Timeout=20
+            -o Dir::Cache::archives="$APT_CACHE"
+            -o APT::Sandbox::User=root
+          )
+
+          sudo apt-get "${APT_OPTS[@]}" update -q
+          sudo apt-get "${APT_OPTS[@]}" install -y --no-install-recommends software-properties-common
 
           # Launchpad occasionally returns a transient signing-key 500 while
           # resolving the PPA. Retry the repository setup so an infrastructure
@@ -54,9 +79,8 @@ jobs:
             exit 1
           fi
 
-          sudo apt-get update -q
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y \
-            dosemu2 fdpp nasm meson ninja-build
+          sudo DEBIAN_FRONTEND=noninteractive apt-get "${APT_OPTS[@]}" install -y \
+            --no-install-recommends dosemu2 fdpp nasm meson ninja-build
 
           echo "### Runtime package identity" >> "$GITHUB_STEP_SUMMARY"
           echo '```text' >> "$GITHUB_STEP_SUMMARY"
@@ -64,6 +88,13 @@ jobs:
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           command -v dosemu
           dosemu --version || true
+
+      - name: Trim cached apt archives
+        if: always()
+        run: |
+          rm -rf "$HOME/.cache/apt-archives/partial"
+          rm -f "$HOME/.cache/apt-archives/lock"
+          mkdir -p "$HOME/.cache/apt-archives/partial"
 
       - name: Build Hydra host tests
         run: |
