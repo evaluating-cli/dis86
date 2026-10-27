@@ -30,6 +30,22 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Set cache week
+        id: cache-week
+        run: |
+          echo "week=$(date +%Y-%W)" >> "$GITHUB_OUTPUT"
+          mkdir -p "$HOME/.cache/apt-archives/partial" "$HOME/.cache/dosemu"
+
+      - name: Cache dosemu packages and FreeDOS downloads
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/apt-archives
+            ~/.cache/dosemu
+          key: ${{ runner.os }}-dosemu-cache-v1-${{ steps.cache-week.outputs.week }}-${{ hashFiles('.github/workflows/dosemu-host-runtime.yml', '.github/workflows/parity-fixture.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-dosemu-cache-v1-
+
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
@@ -39,7 +55,7 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update -q
-          sudo apt-get install -y nasm
+          sudo apt-get install -y --no-install-recommends nasm
 
       - name: Gate 1 + native lane (dosemu2-free)
         run: bash parity/build.sh
@@ -49,6 +65,14 @@ jobs:
         run: |
           set -euo pipefail
           . /etc/os-release
+          APT_CACHE="$HOME/.cache/apt-archives"
+          APT_OPTS=(
+            -o Acquire::Retries=5
+            -o Acquire::http::Timeout=20
+            -o Acquire::https::Timeout=20
+            -o Dir::Cache::archives="$APT_CACHE"
+            -o APT::Sandbox::User=root
+          )
 
           # Launchpad's PPA archive can be down for hours, taking every index
           # and pool path with it (2026-10-21: ppa.launchpadcontent.net
@@ -74,7 +98,7 @@ jobs:
             exit 0
           fi
 
-          sudo apt-get install -y software-properties-common
+          sudo apt-get "${APT_OPTS[@]}" install -y --no-install-recommends software-properties-common
 
           added=0
           for attempt in 1 2 3; do
@@ -90,8 +114,8 @@ jobs:
             exit 1
           fi
 
-          sudo apt-get update -q
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y dosemu2 fdpp
+          sudo DEBIAN_FRONTEND=noninteractive apt-get "${APT_OPTS[@]}" install -y \
+            --no-install-recommends dosemu2 fdpp
 
           echo "### Runtime package identity" >> "$GITHUB_STEP_SUMMARY"
           echo '```text' >> "$GITHUB_STEP_SUMMARY"
@@ -99,6 +123,13 @@ jobs:
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           command -v dosemu
           dosemu --version || true
+
+      - name: Trim cached apt archives
+        if: always()
+        run: |
+          rm -rf "$HOME/.cache/apt-archives/partial"
+          rm -f "$HOME/.cache/apt-archives/lock"
+          mkdir -p "$HOME/.cache/apt-archives/partial"
 
       - name: Golden lane + byte comparison
         if: steps.runtime.outputs.golden != 'skip'
