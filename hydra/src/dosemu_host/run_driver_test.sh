@@ -2,12 +2,14 @@
 # Run the Hydra-on-dosemu2 driver integration tests against fresh headless
 # dosemu2 instances:
 #   - .exe: Phase 7 Item C MZ test (once)
-#   - .com: Phase 4/5/6 integration test (twice consecutively)
+#   - .com: Phase 4/5/6 integration test (twice consecutively by default;
+#           TEST_COM_CASE=1|2 runs one half for the split CI matrix)
 #   - cap:  Phase 7 Item D HYDSNAP capture once, then restore the same
 #           snapshot on two fresh instances
 #   - ovl:  Option E normal page-in plus unpaged/paged HYDSNAP round-trips
 #   - mz-ovl: focused MZ/FBOV metadata-generated live overlay dispatch smoke
 # TESTPROG_FLAVOR=com|exe|cap|ovl|mz-ovl|both selects the run(s); default both (all).
+# TEST_COM_CASE=1|2|both selects the .com halves; default both.
 set -u
 
 SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
@@ -25,11 +27,22 @@ TEST_MZ_OVL="$BUILD/test_driver_mz_ovl"
 LOG=/tmp/opencode/driver_test.log
 CONF=/tmp/opencode/dosemu_mshm.conf
 FLAVOR="${TESTPROG_FLAVOR:-both}"
+COM_CASE="${TEST_COM_CASE:-both}"
+RUN_START=$SECONDS
 
 case "$FLAVOR" in
     com|exe|cap|ovl|mz-ovl|both) ;;
     *) echo "FAIL: TESTPROG_FLAVOR must be com|exe|cap|ovl|mz-ovl|both (got '$FLAVOR')" >&2; exit 2 ;;
 esac
+
+case "$COM_CASE" in
+    1|2|both) ;;
+    *) echo "FAIL: TEST_COM_CASE must be 1|2|both (got '$COM_CASE')" >&2; exit 2 ;;
+esac
+
+timestamp() {
+    date -u +%H:%M:%S
+}
 
 for artifact in "$COM" "$EXE" "$OVL" "$MZOVL" "$LAUNCH" "$TEST_COM" "$TEST_EXE" "$TEST_CAP" "$TEST_OVL" "$TEST_MZ_OVL"; do
     if [ ! -e "$artifact" ]; then
@@ -86,14 +99,16 @@ trap cleanup EXIT
 run_flavor() {
     local guest="$1" testbin="$2"; shift 2
     local launch_args=("$@")
+    local run_start=$SECONDS
+    local gname
+    gname=$(basename "$guest")
 
+    echo "[$(timestamp)] $gname: start"
     cleanup
     sleep 1
     rm -f "$XDG_RUNTIME_DIR"/dosemu2/dosemu.dbgin.* \
           "$XDG_RUNTIME_DIR"/dosemu2/dosemu.dbgout.* 2>/dev/null || true
 
-    local gname
-    gname=$(basename "$guest")
     cp "$guest" "/tmp/opencode/$gname"
     if [ "$testbin" = "$TEST_MZ_OVL" ]; then
         # launch.com requests TESTPROG.EXE; normalize case/name so a stale
@@ -137,6 +152,7 @@ run_flavor() {
     local run_rc=$?
 
     cleanup
+    echo "[$(timestamp)] $gname: done rc=$run_rc elapsed=$((SECONDS - run_start))s"
     return "$run_rc"
 }
 
@@ -146,6 +162,13 @@ record_rc() {
     if [ "$got" -ne 0 ] && [ "$rc" -eq 0 ]; then
         rc="$got"
     fi
+}
+
+run_com_case() {
+    local part="$1"
+    echo "===== .com flavor ($part/2) ====="
+    run_flavor "$COM" "$TEST_COM" -E testprog.com
+    record_rc $?
 }
 
 case "$FLAVOR" in
@@ -166,13 +189,15 @@ esac
 
 case "$FLAVOR" in
 com|both)
-    echo "===== .com flavor (1/2) ====="
-    run_flavor "$COM" "$TEST_COM" -E testprog.com
-    record_rc $?
-
-    echo "===== .com flavor (2/2) ====="
-    run_flavor "$COM" "$TEST_COM" -E testprog.com
-    record_rc $?
+    case "$COM_CASE" in
+    1|2)
+        run_com_case "$COM_CASE"
+        ;;
+    both)
+        run_com_case 1
+        run_com_case 2
+        ;;
+    esac
     ;;
 esac
 
@@ -240,4 +265,5 @@ ovl|both)
     ;;
 esac
 
+echo "[$(timestamp)] total elapsed: $((SECONDS - RUN_START))s"
 exit "$rc"
