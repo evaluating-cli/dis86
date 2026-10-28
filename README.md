@@ -96,6 +96,22 @@ See [`docs/emu86/sst.md`](docs/emu86/sst.md) for the frozen emu86/SST offline to
 
 Input binaries are either an MZ executable (`--binary-exe`) or a raw flat text region (`--binary-raw`); exactly one is required:
 
+Validate the configuration before decompiling:
+
+```
+./target/debug/dis86 --config <your_config.bsl> --binary-exe <program.exe> --validate-config
+./target/debug/dis86 --config <your_config.bsl> --binary-exe <program.exe> --validate-config --name <function_name>
+./target/debug/dis86 --config <your_config.bsl> --binary-exe <program.exe> --validate-config --codeseg-name <segment_name>
+```
+
+`--validate-config` checks structural ranges, linear decode, and direct
+call/return modes; unresolved targets and indirect calls are warnings by
+default and fail with `--strict`. `--name` and `--codeseg-name` also run a
+preflight automatically. Configuration addresses are **load-relative**: for an
+MZ file, `mzfile info` prints both the file-offset `Exe Region` and the
+load-relative `Config Address Space`; do not add the MZ header size to a
+configuration address.
+
 Emit disassembly:
 
 ```
@@ -140,7 +156,7 @@ Emit C code:
 ./target/debug/dis86 --config <your_config.bsl> --binary-exe <program.exe> --name <function_name> --emit-code <output-file>
 ```
 
-Other modes: `--analyze` (config-driven analysis), `--trace-analyze --trace <file>` (analysis of a recorded Hydra execution trace, issue #97), `--start-addr`/`--end-addr` (address-range slices), `--codeseg-name` (decompile a whole configured code segment), `--codegen-hydra` (Hydra-flavored codegen), and `--codegen-hydra --relocatable-seg HEX[,HEX...]` (emit listed absolute link-time segment values as `(CODE_START_SEG + seg)` for relocated Hydra execution). Run `dis86 --help` for the full list. The `mzfile` companion binary inspects and extracts MZ executables via subcommands (`mzfile info <program.exe>`, plus `extract`, `map`, and `dis`).
+Other modes: `--analyze` (config-driven analysis), `--validate-config` (config preflight; add `--strict` to make warnings fatal), `--trace-analyze --trace <file>` (analysis of a recorded Hydra execution trace, issue #97), `--start-addr`/`--end-addr` (address-range slices), `--codeseg-name` (decompile a whole configured code segment), `--codegen-hydra` (Hydra-flavored codegen), and `--codegen-hydra --relocatable-seg HEX[,HEX...]` (emit listed absolute link-time segment values as `(CODE_START_SEG + seg)` for relocated Hydra execution). Run `dis86 --help` for the full list. The `mzfile` companion binary inspects and extracts MZ executables via subcommands (`mzfile info <program.exe>`, plus `extract`, `map`, and `dis`).
 
 The end-to-end, from-zero walkthrough — MZ forensics to a working native binary, including the stock-dosemu2 oracle — is the operator's local recompile prompt, kept out of this tree; the in-repo end-to-end lane is [`parity/`](parity/README.md).
 

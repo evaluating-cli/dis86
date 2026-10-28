@@ -40,6 +40,16 @@ impl Exe {
     println!("  start     0x{:08x}", self.exe_start);
     println!("  end       0x{:08x}", self.exe_end);
     println!("");
+    println!("Config Address Space (load-relative):");
+    println!("  start     0000:0000");
+    let load_len = self.load_image_len();
+    if load_len <= u16::MAX as usize {
+      println!("  end       0000:{:04x} ({} bytes)", load_len, load_len);
+    } else {
+      println!("  end       {} bytes (does not fit one 16-bit segment)", load_len);
+    }
+    println!("  note      --config uses these addresses; Exe Region above is file offsets");
+    println!("");
   }
 
   pub fn print_relocs(relocs: &[Reloc]) {

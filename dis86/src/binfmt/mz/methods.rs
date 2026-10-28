@@ -6,6 +6,11 @@ impl Exe {
     &self.rawdata[self.exe_start as usize..self.exe_end as usize]
   }
 
+  /// Length of the load image in bytes (the file bytes after the MZ header).
+  pub fn load_image_len(&self) -> usize {
+    self.exe_data().len()
+  }
+
   pub fn overlay_data(&self, id: usize) -> &[u8] {
     let ovr = self.ovr.as_ref().unwrap();
     let seg = &ovr.segs[id];

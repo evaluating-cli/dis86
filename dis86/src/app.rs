@@ -13,6 +13,7 @@ use crate::decompile::opt;
 use crate::decompile::fuse;
 use crate::decompile::control_flow;
 use crate::spec::{self, Spec};
+use crate::validate::{self, ValidationScope};
 use std::fs::File;
 use std::io::Write;
 
@@ -27,6 +28,11 @@ fn print_help() {
   println!("");
   println!("MODE: ANALYZE");
   println!("  --analyze         analyze the binary using the configuration annotations");
+  println!("");
+  println!("MODE: VALIDATE CONFIG");
+  println!("  --validate-config validate config ranges, decode, and call modes; then exit");
+  println!("                    (also runs automatically before --name and --codeseg-name)");
+  println!("  --strict          make validation warnings fatal (with --validate-config or auto preflight)");
   println!("");
   println!("MODE: TRACE");
   println!("  --trace-analyze   analyze a recorded Hydra trace (issue #97)");
@@ -69,6 +75,29 @@ fn print_help() {
   println!("                    with --codegen-hydra; comma- or whitespace-separated)");
 }
 
+fn validation_scope(args: &Args) -> Result<ValidationScope, String> {
+  match (&args.name, &args.codeseg_name) {
+    (Some(_), Some(_)) => Err("choose only one of --name or --codeseg-name".to_string()),
+    (Some(name), None) => Ok(ValidationScope::Function(name.clone())),
+    (None, Some(name)) => Ok(ValidationScope::CodeSegment(name.clone())),
+    (None, None) => Ok(ValidationScope::All),
+  }
+}
+
+fn has_emit_flags(args: &Args) -> bool {
+  args.emit_dis.is_some() ||
+    args.emit_ir_initial.is_some() ||
+    args.emit_ir_presym.is_some() ||
+    args.emit_ir_sym.is_some() ||
+    args.emit_ir_fwd.is_some() ||
+    args.emit_ir_opt.is_some() ||
+    args.emit_ir_final.is_some() ||
+    args.emit_graph.is_some() ||
+    args.emit_ctrlflow.is_some() ||
+    args.emit_ast.is_some() ||
+    args.emit_code.is_some()
+}
+
 fn write_to_path(path: &str, data: &str) {
   if path.starts_with('-') {
     println!("{}", data);
@@ -89,6 +118,8 @@ struct Args {
   codeseg_name: Option<String>,
 
   analyze: bool,
+  validate_config: bool,
+  strict: bool,
   trace_analyze: bool,
   trace: Option<String>,
 
@@ -182,6 +213,8 @@ fn parse_args() -> Result<Args, pico_args::Error> {
     config:          pargs.opt_value_from_str("--config")?,
     binary:          parse_binary_fmt(&mut pargs, !trace_analyze)?,
     analyze:         false,
+    validate_config: false,
+    strict:          false,
     trace_analyze:   trace_analyze,
     trace:           pargs.opt_value_from_str("--trace")?,
     start_addr:      pargs.opt_value_from_str("--start-addr")?,
@@ -205,9 +238,11 @@ fn parse_args() -> Result<Args, pico_args::Error> {
   };
 
   let mut remaining = pargs.finish();
-  args.analyze       = match_flag(&mut remaining, "--analyze");
-  args.build_pin_all = match_flag(&mut remaining, "--build-pin-all");
-  args.codegen_hydra = match_flag(&mut remaining, "--codegen-hydra");
+  args.analyze         = match_flag(&mut remaining, "--analyze");
+  args.validate_config = match_flag(&mut remaining, "--validate-config");
+  args.strict          = match_flag(&mut remaining, "--strict");
+  args.build_pin_all   = match_flag(&mut remaining, "--build-pin-all");
+  args.codegen_hydra   = match_flag(&mut remaining, "--codegen-hydra");
 
   // It's up to the caller what to do with the remaining arguments.
   if remaining.len() != 0 {
@@ -227,6 +262,25 @@ pub fn run() -> i32 {
     }
   };
 
+  if args.validate_config {
+    if args.analyze {
+      eprintln!("Error: --validate-config cannot be combined with --analyze.");
+      return 1;
+    }
+    if args.trace_analyze {
+      eprintln!("Error: --validate-config cannot be combined with --trace-analyze.");
+      return 1;
+    }
+    if has_emit_flags(&args) {
+      eprintln!("Error: --validate-config cannot be combined with an --emit-* mode.");
+      return 1;
+    }
+    if args.start_addr.is_some() || args.end_addr.is_some() {
+      eprintln!("Error: --validate-config takes --name or --codeseg-name, not --start-addr/--end-addr.");
+      return 1;
+    }
+  }
+
   // The trace mode needs neither a configuration nor a binary: a trace
   // carries the addresses it saw. The configuration is still useful (it
   // names the functions the run did not discover), so it is read when it
@@ -237,7 +291,13 @@ pub fn run() -> i32 {
       return 1;
     };
     let cfg = match &args.config {
-      Some(path) => Some(Config::from_path(path).unwrap()),
+      Some(path) => match Config::from_path(path) {
+        Ok(cfg) => Some(cfg),
+        Err(err) => {
+          eprintln!("Error: {}", err);
+          return 1;
+        }
+      },
       None => None,
     };
     return crate::app_trace::run(cfg.as_ref(), trace_path);
@@ -247,7 +307,13 @@ pub fn run() -> i32 {
     eprintln!("Error: --config is required.");
     return 1;
   };
-  let cfg = Config::from_path(config_path).unwrap();
+  let cfg = match Config::from_path(config_path) {
+    Ok(cfg) => cfg,
+    Err(err) => {
+      eprintln!("Error: {}", err);
+      return 1;
+    }
+  };
 
   // Parse the relocation table once per run (not per function): a bad
   // value is a single upfront error, even without --codegen-hydra, and
@@ -276,12 +342,50 @@ pub fn run() -> i32 {
   }
 
   if args.analyze {
-    let Some(binary::Fmt::Exe(path)) = &args.binary else { panic!("expected --binary-exe in --analyze mode") };
+    let Some(binary::Fmt::Exe(path)) = &args.binary else {
+      eprintln!("Error: --analyze requires --binary-exe.");
+      return 1;
+    };
     return crate::app_analyze::run(&cfg, path);
   }
 
-  let Some(binary_fmt) = &args.binary else { panic!("expected a binary") };
-  let binary = Binary::from_fmt(binary_fmt, Some(&cfg)).unwrap();
+  let Some(binary_fmt) = &args.binary else {
+    eprintln!("Error: a binary is required.");
+    return 1;
+  };
+  let binary = match Binary::from_fmt(binary_fmt, Some(&cfg)) {
+    Ok(binary) => binary,
+    Err(err) => {
+      eprintln!("Error: {}", err);
+      return 1;
+    }
+  };
+
+  let scope = match validation_scope(&args) {
+    Ok(scope) => scope,
+    Err(err) => {
+      eprintln!("Error: {}", err);
+      return 1;
+    }
+  };
+  if args.validate_config {
+    let report = validate::validate_config(&cfg, &binary, &scope);
+    report.print();
+    return if report.should_fail(args.strict) { 1 } else { 0 };
+  }
+
+  // Batch modes get an automatic preflight: errors abort, warnings are
+  // reported but do not block unless --strict is set.
+  if args.name.is_some() || args.codeseg_name.is_some() {
+    let report = validate::validate_config(&cfg, &binary, &scope);
+    if report.should_fail(args.strict) {
+      report.print();
+      return 1;
+    }
+    if report.warnings() != 0 {
+      report.print();
+    }
+  }
 
   let specs =
     if let Some(name) = &args.name {
@@ -295,7 +399,23 @@ pub fn run() -> i32 {
     } else if let Some(name) = &args.codeseg_name {
       spec::specs_from_codeseg_name(&cfg, name)
     } else {
-      vec![spec::Spec::from_start_and_end(args.start_addr, args.end_addr)]
+      match (args.start_addr, args.end_addr) {
+        (Some(start), Some(end)) => {
+          if !binary.contains_region(start, end) {
+            eprintln!("Error: address range {}..{} is invalid or outside the loaded image", start, end);
+            return 1;
+          }
+          vec![spec::Spec::from_start_and_end(Some(start), Some(end))]
+        }
+        (None, None) => {
+          eprintln!("Error: one of --name, --codeseg-name, or --start-addr/--end-addr is required.");
+          return 1;
+        }
+        _ => {
+          eprintln!("Error: --start-addr and --end-addr must be provided together.");
+          return 1;
+        }
+      }
     };
 
   let mut all_code = String::new();
