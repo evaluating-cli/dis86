@@ -57,7 +57,8 @@ The dosemu-dependent executables are built under
 
 ### Reference dosemu2 configuration
 Integration suite (`run_driver_test.sh`, `TESTPROG_FLAVOR=com|exe|cap|ovl|mz-ovl|both`,
-default = all) launches fresh headless dosemu2 instances per stage:
+default = both; `TEST_COM_CASE=1|2|both`, default = both) launches fresh headless
+dosemu2 instances per stage:
 
 | Stage | What it proves | Guest / driver |
 |---|---|---|
@@ -213,11 +214,12 @@ not built by the default lane (enable with `--features emu86`); see
 ## CI job profile and cost
 
 The `dosemu-host-runtime.yml` lane runs the stock-dosemu2 acceptance matrix as
-**one job per flavour** (`fail-fast: false`, `flavor: [mz-ovl, exe, com, cap,
-ovl]`), so the wall-clock is the slowest flavour, not the sum of all twelve
-boots.
+**parallel jobs** (`fail-fast: false`), one per flavour except `.com`, which is
+split into `com 1/2` and `com 2/2`. The wall-clock is the slowest job, not the
+sum of all twelve boots.
 
-Measured on `main` at `2a1176b` (run 39379043523, `ubuntu-24.04`):
+Measured on `main` at `2a1176b` (run 39379043523, `ubuntu-24.04`; pre-split
+baseline):
 
 | Flavour | Phase 7 | Job total | Guest boots |
 |---|---|---|---|
@@ -227,17 +229,25 @@ Measured on `main` at `2a1176b` (run 39379043523, `ubuntu-24.04`):
 | cap | 1m47s | 3m03s | 3 |
 | **com** | **2m07s** | **3m23s** | 2 |
 
-The **critical path is `com`**, not `ovl`: `ovl` boots the guest five times and
-still finishes Phase 7 in 43s, while `com` runs twice and takes 2m07s. The
-per-boot cost varies about 7× across flavours and does not track the boot
+The **pre-split critical path is `com`**, not `ovl`: `ovl` boots the guest five
+times and still finishes Phase 7 in 43s, while `com` runs twice and takes 2m07s.
+The per-boot cost varies about 7× across flavours and does not track the boot
 count, because the flavours do different work per boot (`exe`/`com` drive the
 function-hook driver, `ovl` does overlay page-in/restore round-trips). These
 numbers therefore do not isolate the cost of the emulated boot itself.
 
-Each job pays a fixed overhead of about **1m15s** before Phase 7 starts
-(checkout, installing the stock dosemu2 runtime, building Hydra, the host
-state/transport test). Across the matrix, `run_driver_test.sh` boots dosemu2 12
-times in total: mz-ovl 1, exe 1, com 2, cap 3, ovl 5.
+Each job pays a fixed overhead before Phase 7 starts (checkout, installing the
+stock dosemu2 runtime, building Hydra). On the pre-split baseline above that
+overhead was about **1m15s** because every job also ran the host
+state/transport test; current CI gates the host state/transport and trace tool
+steps to `mz-ovl`, so the other jobs avoid that duplicated work. Measured on
+the warm `com 1/2` job of PR #139, the remaining overhead was about **53s**
+(job total 1m57s minus Phase 7's 64s). Across the matrix,
+`run_driver_test.sh` boots dosemu2 12 times in total: mz-ovl 1, exe 1, com 2,
+cap 3, ovl 5.
+
+Current CI layout: six jobs — `mz-ovl`, `exe`, `com 1/2`, `com 2/2`, `cap`,
+`ovl` — with `TEST_COM_CASE=1` or `2` selecting each `.com` half.
 
 The per-launch `sleep` calls are *not* the cost — they total only ~25–40s across
 the whole matrix.
@@ -246,17 +256,20 @@ The repository is public, so `ubuntu-24.04` provides 4 vCPU / 16 GB.
 
 ### Cost of the per-flavour split
 
-The split replaced a single serial job (~6m40s, one VM) with five parallel
-jobs — the slowest ~3m23s, at roughly 5× the runner-minutes. Free for a public
-repository, but more resource overall.
+The split replaced a single serial job (~6m40s, one VM) with six parallel
+jobs — the slowest ~3m23s. Free for a public repository, but more total
+runner-minutes and VMs. The `.com` case is split across two runners so each
+pays one boot instead of serializing both boots in one job.
 
 Each flavour gets its own VM, so there are **no shared-state races** — the real
 advantage over parallelising inside the script, where all flavours share
 `/tmp/opencode` and `$XDG_RUNTIME_DIR` and each would need its own working
-directory. Intra-flavour ordering is preserved: `com` still runs twice inside
-its job, and `cap`/`ovl` keep capture-before-restore.
+directory. `cap`/`ovl` keep capture-before-restore. The two `.com` cases still
+both run in CI, but on separate runners; the default local
+`TEST_COM_CASE=both` runs them consecutively in one invocation, preserving the
+same-job consecutive-run idempotency check.
 
-**Do not drop the repeated runs.** The `.com` flavour running twice, and `cap`'s
+**Do not collapse the repeated runs to one.** The two `.com` cases, and `cap`'s
 two restores, are deliberate idempotency and determinism checks.
 
 **Do not touch `$_cpuemu = (1)`.** It is *assumed* to be required for

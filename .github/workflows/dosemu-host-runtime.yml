@@ -20,13 +20,30 @@ permissions:
 
 jobs:
   runtime:
-    name: Stock dosemu2 host integration (${{ matrix.flavor }})
+    name: Stock dosemu2 host integration (${{ matrix.label }})
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
+      # .com is split across two runners so each pays one boot. The old
+      # same-job consecutive-run check is still available locally with
+      # TEST_COM_CASE=both (the script default).
       matrix:
-        flavor: [mz-ovl, exe, com, cap, ovl]
+        include:
+          - label: mz-ovl
+            flavor: mz-ovl
+          - label: exe
+            flavor: exe
+          - label: com 1/2
+            flavor: com
+            com_case: 1
+          - label: com 2/2
+            flavor: com
+            com_case: 2
+          - label: cap
+            flavor: cap
+          - label: ovl
+            flavor: ovl
 
     steps:
       - uses: actions/checkout@v4
@@ -35,17 +52,39 @@ jobs:
         id: cache-week
         run: |
           echo "week=$(date +%Y-%W)" >> "$GITHUB_OUTPUT"
-          mkdir -p "$HOME/.cache/apt-archives/partial" "$HOME/.cache/dosemu"
+          mkdir -p "$HOME/.cache/apt-archives/partial"
 
-      - name: Cache dosemu packages and FreeDOS downloads
+      - name: Cache apt package archives
         uses: actions/cache@v4
         with:
-          path: |
-            ~/.cache/apt-archives
-            ~/.cache/dosemu
-          key: ${{ runner.os }}-dosemu-cache-v1-${{ steps.cache-week.outputs.week }}-${{ hashFiles('.github/workflows/dosemu-host-runtime.yml', '.github/workflows/parity-fixture.yml') }}
+          path: ~/.cache/apt-archives
+          # All matrix legs deliberately share this key, which is safe only
+          # while every leg installs the identical package set below. Do not
+          # make that install flavour-dependent: a losing leg would then
+          # restore a cache without its packages and could not re-save it.
+          key: ${{ runner.os }}-dosemu-runtime-v2-${{ steps.cache-week.outputs.week }}-${{ hashFiles('.github/workflows/dosemu-host-runtime.yml') }}
           restore-keys: |
-            ${{ runner.os }}-dosemu-cache-v1-
+            ${{ runner.os }}-dosemu-runtime-v2-
+
+      - name: Prepare cached apt archives for _apt
+        run: |
+          set -euo pipefail
+          APT_CACHE="$HOME/.cache/apt-archives"
+          # apt downloads as _apt, not the runner. Mirror the distro archive
+          # tree (archives root:root, partial _apt:root 700) and hand the
+          # cached .debs to _apt too; Trim chowns them back before the cache
+          # is saved. _apt must traverse every path component, so keep this
+          # under a world-traversable directory (not a 700 home).
+          sudo mkdir -p "$APT_CACHE/partial"
+          sudo chown -R _apt:root "$APT_CACHE"
+          sudo chmod 700 "$APT_CACHE/partial"
+
+      - name: Stop background apt activity
+        run: |
+          sudo systemctl stop apt-daily.timer apt-daily-upgrade.timer \
+            2>/dev/null || true
+          sudo systemctl stop unattended-upgrades.service \
+            apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
 
       - name: Install stock dosemu2 runtime
         run: |
@@ -56,18 +95,24 @@ jobs:
             -o Acquire::http::Timeout=20
             -o Acquire::https::Timeout=20
             -o Dir::Cache::archives="$APT_CACHE"
-            -o APT::Sandbox::User=root
           )
 
-          sudo apt-get "${APT_OPTS[@]}" update -q
-          sudo apt-get "${APT_OPTS[@]}" install -y --no-install-recommends software-properties-common
+          # The runner image normally ships add-apt-repository, but keep the
+          # fallback for older images. Do not update twice when it is present.
+          if ! command -v add-apt-repository >/dev/null 2>&1; then
+            sudo apt-get "${APT_OPTS[@]}" update -q
+            sudo apt-get "${APT_OPTS[@]}" install -y \
+              --no-install-recommends software-properties-common
+          fi
 
           # Launchpad occasionally returns a transient signing-key 500 while
           # resolving the PPA. Retry the repository setup so an infrastructure
-          # blip does not masquerade as a Hydra runtime failure.
+          # blip does not masquerade as a Hydra runtime failure. -n keeps the
+          # update explicit so it runs under APT_OPTS and the archived .debs
+          # are reused.
           added=0
           for attempt in 1 2 3; do
-            if sudo add-apt-repository -y ppa:dosemu2/ppa; then
+            if timeout 60 sudo add-apt-repository -n -y ppa:dosemu2/ppa; then
               added=1
               break
             fi
@@ -79,6 +124,7 @@ jobs:
             exit 1
           fi
 
+          sudo DEBIAN_FRONTEND=noninteractive apt-get "${APT_OPTS[@]}" update -q
           sudo DEBIAN_FRONTEND=noninteractive apt-get "${APT_OPTS[@]}" install -y \
             --no-install-recommends dosemu2 fdpp nasm meson ninja-build
 
@@ -92,9 +138,14 @@ jobs:
       - name: Trim cached apt archives
         if: always()
         run: |
-          rm -rf "$HOME/.cache/apt-archives/partial"
-          rm -f "$HOME/.cache/apt-archives/lock"
-          mkdir -p "$HOME/.cache/apt-archives/partial"
+          set -euo pipefail
+          APT_CACHE="$HOME/.cache/apt-archives"
+          sudo rm -rf "$APT_CACHE/partial"
+          sudo rm -f "$APT_CACHE/lock"
+          sudo mkdir -p "$APT_CACHE/partial"
+          # actions/cache saves as the runner user; hand the archive tree back
+          # after apt's _apt downloads.
+          sudo chown -R "$(id -u):$(id -g)" "$APT_CACHE"
 
       - name: Build Hydra host tests
         run: |
@@ -124,7 +175,10 @@ jobs:
           hydra/build/src/native_host/test_native_host
           echo "test_native_host: PASS" >> "$GITHUB_STEP_SUMMARY"
 
+      # mz-ovl is the only job that runs test_host + hydra_trace; if this leg
+      # is renamed or dropped these gates disappear. Move them deliberately.
       - name: Run host state/transport test
+        if: matrix.flavor == 'mz-ovl'
         run: |
           set -euo pipefail
 
@@ -184,6 +238,7 @@ jobs:
           echo "test_host: PASS" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Run the instrumented-execution trace tool
+        if: matrix.flavor == 'mz-ovl'
         run: |
           set -euo pipefail
 
@@ -254,21 +309,27 @@ jobs:
           echo "hydra_trace: PASS" >> "$GITHUB_STEP_SUMMARY"
           cat "$TRACE" >> "$GITHUB_STEP_SUMMARY"
 
-      - name: Run Phase 7 acceptance matrix (${{ matrix.flavor }})
+      - name: Run Phase 7 acceptance matrix (${{ matrix.label }})
+        env:
+          TEST_COM_CASE: ${{ matrix.com_case }}
         run: |
           set -euo pipefail
           export DOSDEBUG_STREAM_LOG=/tmp/opencode/dosdebug_driver_stream.log
           rm -f "$DOSDEBUG_STREAM_LOG"
           TESTPROG_FLAVOR=${{ matrix.flavor }} timeout 600 \
             bash hydra/src/dosemu_host/run_driver_test.sh
-          echo "Phase 7 flavour ${{ matrix.flavor }}: PASS" \
+          echo "Phase 7 flavour ${{ matrix.label }}: PASS" \
             >> "$GITHUB_STEP_SUMMARY"
 
       - name: Show dosemu log on failure
         if: failure()
         run: |
-          echo "--- /tmp/opencode/host_test_dosemu.log ---"
-          tail -200 /tmp/opencode/host_test_dosemu.log 2>/dev/null || true
+          if [ "${{ matrix.flavor }}" = "mz-ovl" ]; then
+            echo "--- /tmp/opencode/host_test_dosemu.log ---"
+            tail -200 /tmp/opencode/host_test_dosemu.log 2>/dev/null || true
+            echo "--- /tmp/opencode/trace_tool_dosemu.log ---"
+            tail -200 /tmp/opencode/trace_tool_dosemu.log 2>/dev/null || true
+          fi
           echo "--- /tmp/opencode/driver_test.log ---"
           tail -200 /tmp/opencode/driver_test.log 2>/dev/null || true
           echo "--- /tmp/opencode/dosdebug_driver_stream.log ---"

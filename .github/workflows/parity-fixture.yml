@@ -34,17 +34,35 @@ jobs:
         id: cache-week
         run: |
           echo "week=$(date +%Y-%W)" >> "$GITHUB_OUTPUT"
-          mkdir -p "$HOME/.cache/apt-archives/partial" "$HOME/.cache/dosemu"
+          mkdir -p "$HOME/.cache/apt-archives/partial"
 
-      - name: Cache dosemu packages and FreeDOS downloads
+      - name: Cache apt package archives
         uses: actions/cache@v4
         with:
-          path: |
-            ~/.cache/apt-archives
-            ~/.cache/dosemu
-          key: ${{ runner.os }}-dosemu-cache-v1-${{ steps.cache-week.outputs.week }}-${{ hashFiles('.github/workflows/dosemu-host-runtime.yml', '.github/workflows/parity-fixture.yml') }}
+          path: ~/.cache/apt-archives
+          key: ${{ runner.os }}-dosemu-parity-v2-${{ steps.cache-week.outputs.week }}-${{ hashFiles('.github/workflows/parity-fixture.yml') }}
           restore-keys: |
-            ${{ runner.os }}-dosemu-cache-v1-
+            ${{ runner.os }}-dosemu-parity-v2-
+
+      - name: Prepare cached apt archives for _apt
+        run: |
+          set -euo pipefail
+          APT_CACHE="$HOME/.cache/apt-archives"
+          # apt downloads as _apt, not the runner. Mirror the distro archive
+          # tree (archives root:root, partial _apt:root 700) and hand the
+          # cached .debs to _apt too; Trim chowns them back before the cache
+          # is saved. _apt must traverse every path component, so keep this
+          # under a world-traversable directory (not a 700 home).
+          sudo mkdir -p "$APT_CACHE/partial"
+          sudo chown -R _apt:root "$APT_CACHE"
+          sudo chmod 700 "$APT_CACHE/partial"
+
+      - name: Stop background apt activity
+        run: |
+          sudo systemctl stop apt-daily.timer apt-daily-upgrade.timer \
+            2>/dev/null || true
+          sudo systemctl stop unattended-upgrades.service \
+            apt-daily.service apt-daily-upgrade.service 2>/dev/null || true
 
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -54,8 +72,15 @@ jobs:
       - name: Install fixture toolchain
         run: |
           set -euo pipefail
-          sudo apt-get update -q
-          sudo apt-get install -y --no-install-recommends nasm
+          APT_CACHE="$HOME/.cache/apt-archives"
+          APT_OPTS=(
+            -o Acquire::Retries=5
+            -o Acquire::http::Timeout=20
+            -o Acquire::https::Timeout=20
+            -o Dir::Cache::archives="$APT_CACHE"
+          )
+          sudo apt-get "${APT_OPTS[@]}" update -q
+          sudo apt-get "${APT_OPTS[@]}" install -y --no-install-recommends nasm
 
       - name: Gate 1 + native lane (dosemu2-free)
         run: bash parity/build.sh
@@ -71,7 +96,6 @@ jobs:
             -o Acquire::http::Timeout=20
             -o Acquire::https::Timeout=20
             -o Dir::Cache::archives="$APT_CACHE"
-            -o APT::Sandbox::User=root
           )
 
           # Launchpad's PPA archive can be down for hours, taking every index
@@ -98,11 +122,14 @@ jobs:
             exit 0
           fi
 
-          sudo apt-get "${APT_OPTS[@]}" install -y --no-install-recommends software-properties-common
+          if ! command -v add-apt-repository >/dev/null 2>&1; then
+            sudo apt-get "${APT_OPTS[@]}" install -y \
+              --no-install-recommends software-properties-common
+          fi
 
           added=0
           for attempt in 1 2 3; do
-            if sudo add-apt-repository -y ppa:dosemu2/ppa; then
+            if timeout 60 sudo add-apt-repository -n -y ppa:dosemu2/ppa; then
               added=1
               break
             fi
@@ -114,6 +141,7 @@ jobs:
             exit 1
           fi
 
+          sudo DEBIAN_FRONTEND=noninteractive apt-get "${APT_OPTS[@]}" update -q
           sudo DEBIAN_FRONTEND=noninteractive apt-get "${APT_OPTS[@]}" install -y \
             --no-install-recommends dosemu2 fdpp
 
@@ -127,9 +155,14 @@ jobs:
       - name: Trim cached apt archives
         if: always()
         run: |
-          rm -rf "$HOME/.cache/apt-archives/partial"
-          rm -f "$HOME/.cache/apt-archives/lock"
-          mkdir -p "$HOME/.cache/apt-archives/partial"
+          set -euo pipefail
+          APT_CACHE="$HOME/.cache/apt-archives"
+          sudo rm -rf "$APT_CACHE/partial"
+          sudo rm -f "$APT_CACHE/lock"
+          sudo mkdir -p "$APT_CACHE/partial"
+          # actions/cache saves as the runner user; hand the archive tree back
+          # after apt's _apt downloads.
+          sudo chown -R "$(id -u):$(id -g)" "$APT_CACHE"
 
       - name: Golden lane + byte comparison
         if: steps.runtime.outputs.golden != 'skip'

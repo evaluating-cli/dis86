@@ -235,6 +235,8 @@ static size_t find_sig(const uint8_t *file, size_t file_len,
 
 int main(int argc, char **argv)
 {
+  setvbuf(stdout, NULL, _IOLBF, 0);
+
   pid_t pid = 0;
   if (argc > 1) pid = (pid_t)strtol(argv[1], NULL, 0);
   const char *exe_path = (argc > 2) ? argv[2] : TESTPROG_EXE_PATH;

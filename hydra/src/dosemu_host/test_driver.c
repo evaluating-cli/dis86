@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "hydra_machine.h"
@@ -167,6 +168,20 @@ static int read_file(const char *path, uint8_t **out, size_t *out_len)
   return 0;
 }
 
+static long long monotonic_ms(void)
+{
+  struct timespec ts;
+  if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return -1;
+  return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static void print_elapsed(const char *label, long long start_ms)
+{
+  long long end_ms = monotonic_ms();
+  if (start_ms >= 0 && end_ms >= start_ms)
+    printf("%s: %lld ms\n", label, end_ms - start_ms);
+}
+
 static int go_sleep_stop(host_ctx_t *ctx, int ms)
 {
   if (dosdebug_go(ctx->db) != 0) return -1;
@@ -314,6 +329,8 @@ static void metadata_probe(void)
 
 int main(int argc, char **argv)
 {
+  setvbuf(stdout, NULL, _IOLBF, 0);
+
   pid_t pid = 0;
   if (argc > 1) pid = (pid_t)strtol(argv[1], NULL, 0);
   const char *com_path = (argc > 2) ? argv[2] : TESTPROG_COM_PATH;
@@ -339,7 +356,9 @@ int main(int argc, char **argv)
   hydra_machine_init(m.hardware, &audio, conf);
   host_ctx_t *ctx = (host_ctx_t *)m.hardware->ctx;
 
+  const long long load_start_ms = monotonic_ms();
   uint16_t com_seg = wait_for_com(ctx, file, file_len);
+  print_elapsed("guest load wait", load_start_ms);
   CHECK(com_seg != 0, "guest program loaded (segment %04x)", com_seg);
   if (!com_seg) { host_disconnect(ctx); free(file); return 1; }
 uint32_t com_phys = (uint32_t)com_seg << 4;
@@ -462,7 +481,9 @@ uint32_t com_phys = (uint32_t)com_seg << 4;
   opts.stop_user = &target;
   opts.verbose = 1;
 
+  const long long run_start_ms = monotonic_ms();
   host_run_stop_reason_t reason = host_run(ctx, &m, &opts, &stats);
+  print_elapsed("host_run elapsed", run_start_ms);
   printf("host_run ended: %s\n", reason_name(reason));
 
   uint16_t hookcnt  = lowmem_read16(ctx->lm, g_hookcnt_phys);
