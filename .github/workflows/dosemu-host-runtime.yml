@@ -58,6 +58,10 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.cache/apt-archives
+          # All matrix legs deliberately share this key, which is safe only
+          # while every leg installs the identical package set below. Do not
+          # make that install flavour-dependent: a losing leg would then
+          # restore a cache without its packages and could not re-save it.
           key: ${{ runner.os }}-dosemu-runtime-v2-${{ steps.cache-week.outputs.week }}-${{ hashFiles('.github/workflows/dosemu-host-runtime.yml') }}
           restore-keys: |
             ${{ runner.os }}-dosemu-runtime-v2-
@@ -66,6 +70,11 @@ jobs:
         run: |
           set -euo pipefail
           APT_CACHE="$HOME/.cache/apt-archives"
+          # apt downloads as _apt, not the runner. Mirror the distro archive
+          # tree (archives root:root, partial _apt:root 700) and hand the
+          # cached .debs to _apt too; Trim chowns them back before the cache
+          # is saved. _apt must traverse every path component, so keep this
+          # under a world-traversable directory (not a 700 home).
           sudo mkdir -p "$APT_CACHE/partial"
           sudo chown -R _apt:root "$APT_CACHE"
           sudo chmod 700 "$APT_CACHE/partial"
@@ -166,6 +175,8 @@ jobs:
           hydra/build/src/native_host/test_native_host
           echo "test_native_host: PASS" >> "$GITHUB_STEP_SUMMARY"
 
+      # mz-ovl is the only job that runs test_host + hydra_trace; if this leg
+      # is renamed or dropped these gates disappear. Move them deliberately.
       - name: Run host state/transport test
         if: matrix.flavor == 'mz-ovl'
         run: |
@@ -313,8 +324,12 @@ jobs:
       - name: Show dosemu log on failure
         if: failure()
         run: |
-          echo "--- /tmp/opencode/host_test_dosemu.log ---"
-          tail -200 /tmp/opencode/host_test_dosemu.log 2>/dev/null || true
+          if [ "${{ matrix.flavor }}" = "mz-ovl" ]; then
+            echo "--- /tmp/opencode/host_test_dosemu.log ---"
+            tail -200 /tmp/opencode/host_test_dosemu.log 2>/dev/null || true
+            echo "--- /tmp/opencode/trace_tool_dosemu.log ---"
+            tail -200 /tmp/opencode/trace_tool_dosemu.log 2>/dev/null || true
+          fi
           echo "--- /tmp/opencode/driver_test.log ---"
           tail -200 /tmp/opencode/driver_test.log 2>/dev/null || true
           echo "--- /tmp/opencode/dosdebug_driver_stream.log ---"

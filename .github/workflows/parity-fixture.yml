@@ -48,6 +48,11 @@ jobs:
         run: |
           set -euo pipefail
           APT_CACHE="$HOME/.cache/apt-archives"
+          # apt downloads as _apt, not the runner. Mirror the distro archive
+          # tree (archives root:root, partial _apt:root 700) and hand the
+          # cached .debs to _apt too; Trim chowns them back before the cache
+          # is saved. _apt must traverse every path component, so keep this
+          # under a world-traversable directory (not a 700 home).
           sudo mkdir -p "$APT_CACHE/partial"
           sudo chown -R _apt:root "$APT_CACHE"
           sudo chmod 700 "$APT_CACHE/partial"

@@ -57,7 +57,7 @@ The dosemu-dependent executables are built under
 
 ### Reference dosemu2 configuration
 Integration suite (`run_driver_test.sh`, `TESTPROG_FLAVOR=com|exe|cap|ovl|mz-ovl|both`,
-default = all; `TEST_COM_CASE=1|2|both`, default = both) launches fresh headless
+default = both; `TEST_COM_CASE=1|2|both`, default = both) launches fresh headless
 dosemu2 instances per stage:
 
 | Stage | What it proves | Guest / driver |
@@ -236,12 +236,15 @@ count, because the flavours do different work per boot (`exe`/`com` drive the
 function-hook driver, `ovl` does overlay page-in/restore round-trips). These
 numbers therefore do not isolate the cost of the emulated boot itself.
 
-Each job pays a fixed overhead of about **1m15s** before Phase 7 starts
-(checkout, installing the stock dosemu2 runtime, building Hydra, the host
-state/transport test). Current CI gates the host state/transport and trace
-tool steps to `mz-ovl`, so the other jobs avoid that duplicated work. Across
-the matrix, `run_driver_test.sh` boots dosemu2 12 times in total: mz-ovl 1,
-exe 1, com 2, cap 3, ovl 5.
+Each job pays a fixed overhead before Phase 7 starts (checkout, installing the
+stock dosemu2 runtime, building Hydra). On the pre-split baseline above that
+overhead was about **1m15s** because every job also ran the host
+state/transport test; current CI gates the host state/transport and trace tool
+steps to `mz-ovl`, so the other jobs avoid that duplicated work. Measured on
+the warm `com 1/2` job of PR #139, the remaining overhead was about **53s**
+(job total 1m57s minus Phase 7's 64s). Across the matrix,
+`run_driver_test.sh` boots dosemu2 12 times in total: mz-ovl 1, exe 1, com 2,
+cap 3, ovl 5.
 
 Current CI layout: six jobs — `mz-ovl`, `exe`, `com 1/2`, `com 2/2`, `cap`,
 `ovl` — with `TEST_COM_CASE=1` or `2` selecting each `.com` half.
