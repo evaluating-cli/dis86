@@ -1127,7 +1127,8 @@ impl IRBuilder<'_> {
     self.ir.set_var(instr::Reg::SP, self.cur, sp);
 
     // store to SS:SP
-    self.append_instr(Type::Void, Opcode::Store16, vec![ss, sp, vref]);
+    self.append_instr_with_attrs(Type::Void, Attribute::STACK_SAVE, Opcode::Store16,
+                                 vec![ss, sp, vref]);
   }
 
   fn append_pop(&mut self) -> Ref {
@@ -1341,8 +1342,8 @@ impl IRBuilder<'_> {
   fn write_guest_register_before(&mut self, blk: BlockRef, before: Ref,
                                  reg: instr::Reg, vref: Ref) -> Ref {
     let sym = self.ir.symbols.find_ref_by_name(sym::Table::Register, reg.info().name).unwrap();
-    self.insert_instr_before(blk, before, Type::U16, Attribute::PIN, Opcode::WriteVar16,
-                             vec![Ref::Symbol(sym), vref])
+    self.insert_instr_before(blk, before, Type::U16, Attribute::PIN | Attribute::EXIT_STATE,
+                             Opcode::WriteVar16, vec![Ref::Symbol(sym), vref])
   }
 
   /// Materialise the function's exit register state at a `ret`.

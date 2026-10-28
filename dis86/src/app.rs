@@ -29,6 +29,10 @@ fn print_help() {
   println!("MODE: ANALYZE");
   println!("  --analyze         analyze the binary using the configuration annotations");
   println!("");
+  println!("MODE: INFER ABI");
+  println!("  --infer-abi       report inferred args, register inputs, and return width for the");
+  println!("                    selected functions (uses --name, --codeseg-name, or a range)");
+  println!("");
   println!("MODE: VALIDATE CONFIG");
   println!("  --validate-config validate config ranges, decode, and call modes; then exit");
   println!("                    (also runs automatically before --name and --codeseg-name)");
@@ -118,6 +122,7 @@ struct Args {
   codeseg_name: Option<String>,
 
   analyze: bool,
+  infer_abi: bool,
   validate_config: bool,
   strict: bool,
   trace_analyze: bool,
@@ -213,6 +218,7 @@ fn parse_args() -> Result<Args, pico_args::Error> {
     config:          pargs.opt_value_from_str("--config")?,
     binary:          parse_binary_fmt(&mut pargs, !trace_analyze)?,
     analyze:         false,
+    infer_abi:       false,
     validate_config: false,
     strict:          false,
     trace_analyze:   trace_analyze,
@@ -239,6 +245,7 @@ fn parse_args() -> Result<Args, pico_args::Error> {
 
   let mut remaining = pargs.finish();
   args.analyze         = match_flag(&mut remaining, "--analyze");
+  args.infer_abi       = match_flag(&mut remaining, "--infer-abi");
   args.validate_config = match_flag(&mut remaining, "--validate-config");
   args.strict          = match_flag(&mut remaining, "--strict");
   args.build_pin_all   = match_flag(&mut remaining, "--build-pin-all");
@@ -277,6 +284,21 @@ pub fn run() -> i32 {
     }
     if args.start_addr.is_some() || args.end_addr.is_some() {
       eprintln!("Error: --validate-config takes --name or --codeseg-name, not --start-addr/--end-addr.");
+      return 1;
+    }
+  }
+
+  if args.infer_abi {
+    if args.analyze {
+      eprintln!("Error: --infer-abi cannot be combined with --analyze.");
+      return 1;
+    }
+    if args.validate_config {
+      eprintln!("Error: --infer-abi cannot be combined with --validate-config.");
+      return 1;
+    }
+    if has_emit_flags(&args) {
+      eprintln!("Error: --infer-abi cannot be combined with an --emit-* mode.");
       return 1;
     }
   }
@@ -417,6 +439,10 @@ pub fn run() -> i32 {
         }
       }
     };
+
+  if args.infer_abi {
+    return crate::app_infer::run(&cfg, &binary, specs);
+  }
 
   let mut all_code = String::new();
   let mut failures = 0;

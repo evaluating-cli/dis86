@@ -173,6 +173,45 @@ class RetUnknownFlagTests(unittest.TestCase):
         self.assertNotIn('RET_UNKNOWN', stub_line)
         self.assertIn('TODO: return kind unknown', stub_line)
 
+    def test_dont_pop_args_combines_with_near_mode(self):
+        func = Function(reimpl=True, name='near_ret_imm', ret='u16', args=2,
+                        start_addr='0000:1234', end_addr='0000:1300',
+                        flags='NEAR', dont_pop_args=True)
+        line = next(l for l in self._gen_functions_text([func]).splitlines() if 'near_ret_imm' in l)
+        self.assertIn('mode near', line)
+        self.assertIn('args 2', line)
+        self.assertIn('dont_pop_args 1', line)
+
+        dat = build_func_data([func])
+        self.assertEqual(dat[0].flags, 'NEAR | DONT_POP_ARGS')
+        output = io.StringIO()
+        gen_hdr({
+            'functions': [func],
+            'structures': [], 'data_section': [], 'callstack': [],
+        }, out=output)
+        stub_line = next(l for l in output.getvalue().splitlines() if 'near_ret_imm' in l and 'CALLSTUB' in l)
+        self.assertIn('NEAR | DONT_POP_ARGS', stub_line)
+
+    def test_legacy_dont_pop_args_flag_still_works(self):
+        func = Function(reimpl=True, name='legacy_ret_imm', ret='u16', args=2,
+                        start_addr='0000:1234', end_addr='0000:1300',
+                        flags='DONT_POP_ARGS')
+        line = next(l for l in self._gen_functions_text([func]).splitlines() if 'legacy_ret_imm' in l)
+        self.assertIn('mode far', line)
+        self.assertIn('dont_pop_args 1', line)
+        dat = build_func_data([func])
+        self.assertEqual(dat[0].flags, 'DONT_POP_ARGS')
+
+    def test_dont_pop_args_defaults_off(self):
+        func = Function(reimpl=True, name='near_plain_ret', ret='u16', args=2,
+                        start_addr='0000:1234', end_addr='0000:1300',
+                        flags='NEAR')
+        line = next(l for l in self._gen_functions_text([func]).splitlines() if 'near_plain_ret' in l)
+        self.assertIn('mode near', line)
+        self.assertNotIn('dont_pop_args', line)
+        dat = build_func_data([func])
+        self.assertEqual(dat[0].flags, 'NEAR')
+
 
 if __name__ == '__main__':
     unittest.main()

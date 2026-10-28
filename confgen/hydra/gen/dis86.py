@@ -16,7 +16,7 @@ def gen_functions(functions):
     emit("  functions {");
     for func in functions:
         extra = ''
-        if func.flags == 'DONT_POP_ARGS':
+        if func.dont_pop_args:
             extra += 'dont_pop_args 1 '
         if func.flags == 'INDIRECT_CALL_LOCATION':
             extra += 'indirect_call_location 1 '

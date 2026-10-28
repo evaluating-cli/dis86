@@ -162,7 +162,7 @@ def _verify_unique(name):
     FUNCTION_ALL_NAMES.add(name)
 
 class Function:
-    def __init__(self, reimpl, name, ret, args, start_addr, end_addr, flags=0, regargs=None, entry=None):
+    def __init__(self, reimpl, name, ret, args, start_addr, end_addr, flags=0, regargs=None, entry=None, dont_pop_args=False):
         _verify_unique(name);
         self.name = name
         self.ret = ret
@@ -173,6 +173,11 @@ class Function:
         self.is_overlay_entry = self.start_addr.overlay and self.entry_stub is not None
         self.regargs = ','.join(regargs) if regargs else None
         self.flags = flags
+        # `ret imm` callees pop their own arguments. Keep this separate from
+        # the call-mode/return-kind flag so a near function can carry both
+        # (`flags='NEAR'`, `dont_pop_args=True`). The legacy flag spelling is
+        # still accepted for existing annotations.
+        self.dont_pop_args = bool(dont_pop_args or flags == 'DONT_POP_ARGS')
         self.reimpl = reimpl
 
 class Global:

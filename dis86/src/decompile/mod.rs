@@ -1,5 +1,6 @@
 pub mod ir;
 pub mod ir_build;
+pub mod abi;
 pub mod sym;
 pub mod opt;
 pub mod fuse;
