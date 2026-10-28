@@ -122,6 +122,7 @@ mod tests {
     let exe = Exe::decode(&synthetic_fbov_exe()).expect("valid synthetic MZ/FBOV fixture");
     assert_eq!(exe.exe_start, 32);
     assert_eq!(exe.exe_end, 96);
+    assert_eq!(exe.load_image_len(), 64);
     assert_eq!(exe.num_overlay_segments(), 1);
     assert_eq!(exe.overlay_data(0), &[0xb8, 0x77, 0x0a, 0xcb]);
 

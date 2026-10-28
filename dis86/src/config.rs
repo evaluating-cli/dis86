@@ -30,7 +30,7 @@ pub struct Indirect {
   pub args: u16,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum CallMode {
   Near,
   Far,
@@ -285,7 +285,7 @@ impl Config {
       let mode = match mode_str {
         "near" => CallMode::Near,
         "far" => CallMode::Far,
-        _ => panic!("Unsupported mode '{}'", mode_str)
+        _ => return Err(format!("Unsupported mode '{}' for function '{}' (expected 'near' or 'far')", mode_str, key)),
       };
       let mut args: i16 = -1;
       if args_str != "None" {
@@ -325,11 +325,17 @@ impl Config {
         });
       } else {
         if mode != CallMode::Far {
-          panic!("Cannot have an indirect near call: {}", key);
+          return Err(format!("Indirect call '{}' must use 'mode far'", key));
+        }
+        let Some(ret) = ret else {
+          return Err(format!("Indirect call '{}' must declare a return type", key));
+        };
+        if args < 0 {
+          return Err(format!("Indirect call '{}' must declare its argument count", key));
         }
         self.indirects.push(Indirect {
           addr: start,
-          ret: ret.unwrap(), // FIXME IS THIS OKAY?
+          ret,
           args: args as u16,
         });
       }
@@ -582,5 +588,47 @@ dis86 {
     assert_eq!(cfg.funcs.len(), 2);
     assert_eq!(cfg.funcs[0].mode, CallMode::Near);
     assert_eq!(cfg.funcs[1].mode, CallMode::Far);
+  }
+
+  #[test]
+  fn unsupported_mode_is_an_error_not_a_panic() {
+    let tmp = TempConfig::write("dis86_bad_mode_test.bsl", r#"
+dis86 {
+  code_segments {
+  }
+  functions {
+    F1 { start 0000:0100 end "" mode sideways ret None args None }
+  }
+  structures {
+  }
+  globals {
+  }
+  text_section {
+  }
+}
+"#);
+    let err = Config::from_path(tmp.path().to_str().unwrap()).unwrap_err();
+    assert!(err.contains("Unsupported mode"), "unexpected error: {}", err);
+  }
+
+  #[test]
+  fn indirect_near_call_is_an_error_not_a_panic() {
+    let tmp = TempConfig::write("dis86_indirect_near_test.bsl", r#"
+dis86 {
+  code_segments {
+  }
+  functions {
+    F1 { start 0000:0100 end "" mode near ret u16 args 0 indirect_call_location 1 }
+  }
+  structures {
+  }
+  globals {
+  }
+  text_section {
+  }
+}
+"#);
+    let err = Config::from_path(tmp.path().to_str().unwrap()).unwrap_err();
+    assert!(err.contains("must use 'mode far'"), "unexpected error: {}", err);
   }
 }

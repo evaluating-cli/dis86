@@ -49,7 +49,8 @@ impl Binary {
         Binary::from_raw(&data, config)
       }
       Fmt::Exe(_) => {
-        let exe = binfmt::mz::Exe::decode(&data).unwrap();
+        let exe = binfmt::mz::Exe::decode(&data)
+          .map_err(|err| format!("Failed to decode MZ executable '{}': {}", path, err))?;
         Self::from_exe(&exe, config)
       }
     };
@@ -76,6 +77,39 @@ impl Binary {
     match start.seg {
       Seg::Normal(_) => &self.main.0[start.abs_normal() .. end.abs_normal()],
       Seg::Overlay(seg) => &self.overlays[seg as usize].0[start.off.0 as usize .. end.off.0 as usize],
+    }
+  }
+
+  /// Length of the normal load image in bytes. For an MZ executable this
+  /// excludes the header; for a raw binary it is the whole file.
+  pub fn image_len(&self) -> usize {
+    self.main.0.len()
+  }
+
+  /// Whether `addr` names a byte present in the loaded image.
+  pub fn contains_addr(&self, addr: SegOff) -> bool {
+    match addr.seg {
+      Seg::Normal(_) => addr.abs_normal() < self.main.0.len(),
+      Seg::Overlay(seg) => {
+        let Some(data) = self.overlays.get(seg as usize) else { return false };
+        (addr.off.0 as usize) < data.0.len()
+      }
+    }
+  }
+
+  /// Whether every address in the half-open range `[start, end)` is present
+  /// in the loaded image. This is the bounds-safe counterpart to `region`,
+  /// which deliberately asserts on malformed ranges.
+  pub fn contains_region(&self, start: SegOff, end: SegOff) -> bool {
+    if start.seg != end.seg || end < start {
+      return false;
+    }
+    match start.seg {
+      Seg::Normal(_) => end.abs_normal() <= self.main.0.len(),
+      Seg::Overlay(seg) => {
+        let Some(data) = self.overlays.get(seg as usize) else { return false };
+        (end.off.0 as usize) <= data.0.len()
+      }
     }
   }
 

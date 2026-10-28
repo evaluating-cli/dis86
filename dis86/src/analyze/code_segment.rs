@@ -10,7 +10,7 @@ pub struct Region {
   pub size: u32,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CodeSegment {
   pub primary: Region,
   pub stub: Option<Region>,

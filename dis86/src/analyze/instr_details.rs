@@ -256,7 +256,7 @@ pub fn instr_details(ins: &Instr, binary: &Binary, analyzed_seg: Seg) -> Result<
     Opcode::OP_XLAT       => (),
     Opcode::OP_XOR        => (),
 
-    _ => panic!("UNIMPL Opcode for {}", instr_str(ins)),
+    _ => return Err(format!("Unsupported instruction for analysis: {}", instr_str(ins))),
   };
 
   if let Some(ret) = ret {
@@ -310,6 +310,22 @@ mod tests {
     // `call +1` (E8 01 00) targets the `ret` at offset 3.
     let d = details_for(&[0xE8, 0x01, 0x00, 0xC3]);
     assert!(matches!(d.call, Some(Call::Direct(_))));
+  }
+
+  #[test]
+  fn unsupported_opcode_is_a_result_error_not_a_panic() {
+    // HLT decodes, but the conservative analyzer table does not model it.
+    // It must return an error so preflight can report it instead of unwinding.
+    let binary = Binary::from_raw(&[0xF4], None);
+    let start = SegOff { seg: Seg::Normal(0), off: Off(0) };
+    let end = SegOff { seg: Seg::Normal(0), off: Off(1) };
+    let mut decoder = Decoder::new(binary.region_iter(start, end));
+    let (instr, _raw) = decoder.try_next().unwrap().unwrap();
+    let err = match instr_details(&instr, &binary, Seg::Normal(0)) {
+      Err(err) => err,
+      Ok(_) => panic!("unsupported opcode must return an error"),
+    };
+    assert!(err.contains("Unsupported instruction"), "unexpected error: {}", err);
   }
 
   #[test]
