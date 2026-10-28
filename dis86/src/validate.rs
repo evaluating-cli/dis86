@@ -108,10 +108,6 @@ pub enum ValidationScope {
 pub fn validate_config(cfg: &Config, binary: &Binary, scope: &ValidationScope) -> Report {
   let mut report = Report::default();
 
-  validate_code_segments(cfg, &mut report);
-  validate_text_sections(cfg, binary, &mut report);
-  validate_indirects(cfg, binary, &mut report);
-
   let selected: Vec<&Func> = match scope {
     ValidationScope::All => cfg.funcs.iter().collect(),
     ValidationScope::Function(name) => match cfg.func_lookup_by_name(name) {
@@ -136,18 +132,23 @@ pub fn validate_config(cfg: &Config, binary: &Binary, scope: &ValidationScope) -
     }
   }
 
-  let mz_segments = if binary.exe().is_some() {
-    match CodeSegments::from_binary(binary) {
-      Ok(segments) => Some(segments),
-      Err(err) => {
-        report.error(None, format!("cannot determine code segments: {}", err));
-        return report;
+  match scope {
+    ValidationScope::All => {
+      validate_code_segments(cfg, scope, &mut report);
+      validate_text_sections(cfg, binary, None, &mut report);
+      validate_indirects(cfg, binary, None, &mut report);
+    }
+    ValidationScope::CodeSegment(name) => {
+      validate_code_segments(cfg, scope, &mut report);
+      if let Some(code_seg) = cfg.code_seg_lookup_by_name(name) {
+        validate_text_sections(cfg, binary, Some(code_seg.seg), &mut report);
+        validate_indirects(cfg, binary, Some(code_seg.seg), &mut report);
       }
     }
-  } else {
-    None
-  };
+    ValidationScope::Function(_) => {}
+  }
 
+  let validate_local_indirects = matches!(scope, ValidationScope::Function(_));
   let mut seen_names: HashSet<&str> = HashSet::new();
   let mut seen_starts: BTreeMap<SegOff, &str> = BTreeMap::new();
 
@@ -160,16 +161,23 @@ pub fn validate_config(cfg: &Config, binary: &Binary, scope: &ValidationScope) -
         "functions '{}' and '{}' share start address {}", other, func.name, func.start));
     }
 
-    validate_function(cfg, binary, mz_segments.as_ref(), func, &mut report);
+    validate_function(cfg, binary, func, validate_local_indirects, &mut report);
   }
 
   report
 }
 
-fn validate_code_segments(cfg: &Config, report: &mut Report) {
+fn validate_code_segments(cfg: &Config, scope: &ValidationScope, report: &mut Report) {
+  let only_name = match scope {
+    ValidationScope::CodeSegment(name) => Some(name.as_str()),
+    _ => None,
+  };
   let mut names = HashSet::new();
   let mut segs = HashSet::new();
   for code_seg in &cfg.code_segs {
+    if only_name.is_some_and(|name| code_seg.name != name) {
+      continue;
+    }
     if !names.insert(code_seg.name.as_str()) {
       report.error(None, format!("duplicate code segment name '{}'", code_seg.name));
     }
@@ -179,9 +187,17 @@ fn validate_code_segments(cfg: &Config, report: &mut Report) {
   }
 }
 
-fn validate_text_sections(cfg: &Config, binary: &Binary, report: &mut Report) {
+fn validate_text_sections(
+  cfg: &Config,
+  binary: &Binary,
+  only_seg: Option<Seg>,
+  report: &mut Report,
+) {
   let mut names = HashSet::new();
   for text in &cfg.text_section {
+    if only_seg.is_some_and(|seg| text.start.seg != seg) {
+      continue;
+    }
     if !names.insert(text.name.as_str()) {
       report.error(Some(text.start), format!("duplicate text section name '{}'", text.name));
     }
@@ -208,9 +224,17 @@ fn validate_text_sections(cfg: &Config, binary: &Binary, report: &mut Report) {
   }
 }
 
-fn validate_indirects(cfg: &Config, binary: &Binary, report: &mut Report) {
+fn validate_indirects(
+  cfg: &Config,
+  binary: &Binary,
+  only_seg: Option<Seg>,
+  report: &mut Report,
+) {
   let mut seen = HashSet::new();
   for indirect in &cfg.indirects {
+    if only_seg.is_some_and(|seg| indirect.addr.seg != seg) {
+      continue;
+    }
     if !seen.insert(indirect.addr) {
       report.error(Some(indirect.addr), format!(
         "duplicate indirect call entry at {}", indirect.addr));
@@ -225,8 +249,8 @@ fn validate_indirects(cfg: &Config, binary: &Binary, report: &mut Report) {
 fn validate_function(
   cfg: &Config,
   binary: &Binary,
-  mz_segments: Option<&CodeSegments>,
   func: &Func,
+  validate_local_indirects: bool,
   report: &mut Report,
 ) {
   let Some(end) = func.end else {
@@ -246,28 +270,21 @@ fn validate_function(
     return;
   }
 
-  if cfg.code_seg_lookup(start.seg).is_none() {
+  // Config code segments have no overlay representation (confgen emits the
+  // normal entry/stub segment), so the declaration check only applies to
+  // normal code. Overlay functions still resolve through the binary metadata.
+  if start.seg.is_normal() && cfg.code_seg_lookup(start.seg).is_none() {
     report.error(Some(func.start), format!(
       "function '{}' is in segment {}, which is not declared in dis86.code_segments", func.name, start.seg));
   }
 
-  let code_seg = match mz_segments {
-    Some(segments) => match segments.find_by_segment(start.seg) {
-      Some(code_seg) => (*code_seg).clone(),
-      None => {
-        report.error(Some(func.start), format!(
-          "function '{}' is in segment {}, which is not a code segment in the binary", func.name, start.seg));
-        return;
-      }
-    },
-    None => match raw_code_segment(binary, start.seg) {
-      Ok(code_seg) => code_seg,
-      Err(err) => {
-        report.error(Some(func.start), format!(
-          "function '{}' cannot be analyzed: {}", func.name, err));
-        return;
-      }
-    },
+  let code_seg = match code_segment_for_function(binary, start, end) {
+    Ok(code_seg) => code_seg,
+    Err(err) => {
+      report.error(Some(func.start), format!(
+        "function '{}' cannot be analyzed: {}", func.name, err));
+      return;
+    }
   };
 
   if !binary.contains_region(start, end) {
@@ -294,7 +311,14 @@ fn validate_function(
   }
 
   if let Some(entry) = func.entry {
-    if entry.seg != start.seg || entry < start || entry >= end {
+    let in_primary = entry.seg == start.seg && entry >= start && entry < end;
+    // An overlay entry is a normal-segment stub that launchers call into.
+    let in_stub = code_seg.stub.as_ref().is_some_and(|stub| {
+      entry.seg == stub.seg
+        && (entry.off.0 as u32) >= stub.skip_off
+        && (entry.off.0 as u32) < stub.skip_off + stub.size
+    });
+    if !in_primary && !in_stub {
       report.error(Some(entry), format!(
         "function '{}' entry {} is outside its configured range", func.name, entry));
     }
@@ -305,6 +329,19 @@ fn validate_function(
       report.error(Some(text.start), format!(
         "text section '{}' [{}..{}) overlaps function '{}' range [{}, {})",
         text.name, text.start, text.end, func.name, start, end));
+    }
+  }
+
+  if validate_local_indirects {
+    for indirect in &cfg.indirects {
+      if indirect.addr.seg == start.seg
+        && indirect.addr >= start
+        && indirect.addr < end
+        && !binary.contains_addr(indirect.addr)
+      {
+        report.error(Some(indirect.addr), format!(
+          "indirect call location {} is outside the loaded image", indirect.addr));
+      }
     }
   }
 
@@ -320,8 +357,13 @@ fn validate_function(
   let details = match FuncDetails::build(start, Some(end), &code_seg, binary) {
     Ok(details) => details,
     Err(err) => {
-      report.error(Some(start), format!(
-        "function '{}' analysis failed for [{}, {}): {}", func.name, start, end, err));
+      // The decompiler emits a non-fatal UNIMPL marker for opcodes the
+      // conservative analyzer table does not model (for example HLT), so a
+      // preflight must not turn that into a fatal error. Linear-decode
+      // failures were already reported above.
+      report.warning(Some(start), format!(
+        "function '{}' analysis could not validate call/return modes for [{}, {}): {}",
+        func.name, start, end, err));
       return;
     }
   };
@@ -445,23 +487,27 @@ fn validate_branch_targets(
   }
 }
 
-fn raw_code_segment(binary: &Binary, seg: Seg) -> Result<CodeSegment, String> {
-  let Seg::Normal(_) = seg else {
-    return Err("a raw binary has no overlay segments".to_string());
-  };
-  let base = seg.abs_normal();
-  let image_len = binary.image_len();
-  if base > image_len {
-    return Err(format!(
-      "segment {} starts at image byte {:#x}, past the {}-byte raw image", seg, base, image_len));
+fn code_segment_for_function(
+  binary: &Binary,
+  start: SegOff,
+  end: SegOff,
+) -> Result<CodeSegment, String> {
+  let has_overlay_metadata = binary.exe().is_some_and(|exe| {
+    exe.seginfo.is_some() && exe.ovr.is_some()
+  });
+  if start.seg.is_overlay() || has_overlay_metadata {
+    let segments = CodeSegments::from_binary(binary)?;
+    return segments.find_by_segment(start.seg).cloned().ok_or_else(|| {
+      format!("segment {} is not a code segment in the binary", start.seg)
+    });
   }
-  let size = image_len - base;
-  if size > u16::MAX as usize {
-    return Err(format!(
-      "raw image segment {} is {} bytes; segment offsets are u16 and cannot cover it", seg, size));
-  }
+
+  // Plain MZ and raw images have no segment table. A per-function segment is
+  // enough for validation; sizing it to the function end keeps images larger
+  // than 64 KiB valid when the selected function fits in one segment.
+  let size = end.off.0 as u32;
   Ok(CodeSegment {
-    primary: Region { seg, skip_off: 0, size: size as u32 },
+    primary: Region { seg: start.seg, skip_off: 0, size },
     stub: None,
   })
 }
@@ -549,6 +595,43 @@ mod tests {
     data[8..10].copy_from_slice(&32u16.to_le_bytes());
     data[24..26].copy_from_slice(&0x40u16.to_le_bytes());
     data
+  }
+
+  fn synthetic_fbov_exe() -> Vec<u8> {
+    let mut data = vec![0u8; 116];
+    // 32-byte MZ header followed by a 64-byte load image.
+    data[0..2].copy_from_slice(b"MZ");
+    data[2..4].copy_from_slice(&96u16.to_le_bytes());
+    data[4..6].copy_from_slice(&1u16.to_le_bytes());
+    data[8..10].copy_from_slice(&2u16.to_le_bytes());
+    data[24..26].copy_from_slice(&28u16.to_le_bytes());
+
+    // FBOV record follows the MZ image; its seginfo points inside the image.
+    data[96..100].copy_from_slice(b"FBOV");
+    data[100..104].copy_from_slice(&4u32.to_le_bytes());
+    data[104..108].copy_from_slice(&88u32.to_le_bytes());
+    data[108..112].copy_from_slice(&1i32.to_le_bytes());
+
+    // Overlay stub-segment header and one five-byte dispatch stub.
+    data[32..36].copy_from_slice(&[0xcd, 0x3f, 0, 0]);
+    data[36..40].copy_from_slice(&0u32.to_le_bytes());
+    data[40..42].copy_from_slice(&4u16.to_le_bytes());
+    data[88..90].copy_from_slice(&0u16.to_le_bytes());
+    data[90..92].copy_from_slice(&37u16.to_le_bytes());
+    data[92..94].copy_from_slice(&mz::SegInfoType::STUB.to_le_bytes());
+    data[94..96].copy_from_slice(&0u16.to_le_bytes());
+    data[64..66].copy_from_slice(&[0xcd, 0x3f]);
+    data[66..68].copy_from_slice(&0u16.to_le_bytes());
+    data[112..116].copy_from_slice(&[0xb8, 0x77, 0x0a, 0xcb]);
+    data
+  }
+
+  fn overlay_func() -> Func {
+    let mut f = func("F_mz_ovlhook", 0, 4, CallMode::Far);
+    f.start = SegOff { seg: Seg::Overlay(0), off: Off(0) };
+    f.end = Some(SegOff { seg: Seg::Overlay(0), off: Off(4) });
+    f.entry = Some(SegOff { seg: Seg::Normal(0), off: Off(0x20) });
+    f
   }
 
   #[test]
@@ -656,5 +739,89 @@ mod tests {
     assert!(report.warnings() > 0);
     assert!(!report.should_fail(false));
     assert!(report.should_fail(true));
+  }
+
+  #[test]
+  fn overlay_function_with_stub_entry_passes() {
+    let exe = mz::Exe::decode(&synthetic_fbov_exe()).expect("valid synthetic MZ/FBOV fixture");
+    let binary = Binary::from_exe(&exe, None);
+    let cfg = config(vec![overlay_func()], vec![], vec![]);
+
+    for scope in [ValidationScope::All, ValidationScope::Function("F_mz_ovlhook".to_string())] {
+      let report = validate_config(&cfg, &binary, &scope);
+      assert_eq!(report.errors(), 0, "overlay function must pass: {:?}", report.diagnostics);
+    }
+  }
+
+  #[test]
+  fn push_cs_call_to_far_target_is_not_a_mode_error() {
+    // `push cs; call +0; retf`: target 4 is configured far.
+    let binary = Binary::from_raw(&[0x0E, 0xE8, 0x00, 0x00, 0xCB], None);
+    let cfg = config(vec![
+      func("caller", 0, 4, CallMode::Near),
+      func("callee", 4, 5, CallMode::Far),
+    ], vec![], vec![]);
+    let report = validate_config(&cfg, &binary, &ValidationScope::All);
+    assert_eq!(report.errors(), 0, "push cs; call must be classified far: {:?}", report.diagnostics);
+  }
+
+  #[test]
+  fn unmodeled_opcode_warns_instead_of_failing() {
+    // HLT decodes but is not in the conservative analysis table; the
+    // decompiler emits a non-fatal UNIMPL marker, so preflight must warn.
+    let binary = Binary::from_raw(&[0xF4], None);
+    let cfg = config(vec![func("f", 0, 1, CallMode::Near)], vec![], vec![]);
+    let report = validate_config(&cfg, &binary, &ValidationScope::All);
+    assert_eq!(report.errors(), 0);
+    assert!(report.diagnostics.iter().any(|d| d.message.contains("could not validate")));
+  }
+
+  #[test]
+  fn raw_image_larger_than_64k_validates_a_low_function() {
+    let mut data = vec![0x90; 0x10000 + 16];
+    data[0] = 0xC3;
+    let binary = Binary::from_raw(&data, None);
+    let cfg = config(vec![func("f", 0, 1, CallMode::Near)], vec![], vec![]);
+    let report = validate_config(&cfg, &binary, &ValidationScope::All);
+    assert_eq!(report.errors(), 0, "large raw image must not fail: {:?}", report.diagnostics);
+  }
+
+  #[test]
+  fn plain_mz_larger_than_64k_validates_a_low_function() {
+    let mut data = synthetic_mz(0x10010);
+    data[512] = 0xC3;
+    let exe = mz::Exe::decode(&data).expect("valid large synthetic MZ");
+    let binary = Binary::from_exe(&exe, None);
+    let cfg = config(vec![func("f", 0, 1, CallMode::Near)], vec![], vec![]);
+    let report = validate_config(&cfg, &binary, &ValidationScope::All);
+    assert_eq!(report.errors(), 0, "large plain MZ must not fail: {:?}", report.diagnostics);
+  }
+
+  #[test]
+  fn function_scope_ignores_unrelated_bad_tables() {
+    let binary = Binary::from_raw(&[0xC3, 0xC3], None);
+    let bad_text = TextSectionRegion {
+      name: "unrelated".to_string(),
+      start: segoff(100),
+      end: segoff(101),
+      typ: Type::U16,
+      access: None,
+    };
+    let bad_indirect = Indirect {
+      addr: segoff(100),
+      ret: Type::U16,
+      args: 0,
+    };
+    let cfg = config(
+      vec![func("good", 0, 1, CallMode::Near)],
+      vec![bad_text],
+      vec![bad_indirect],
+    );
+
+    let scoped = validate_config(&cfg, &binary, &ValidationScope::Function("good".to_string()));
+    assert_eq!(scoped.errors(), 0, "unrelated defects must not block --name: {:?}", scoped.diagnostics);
+
+    let all = validate_config(&cfg, &binary, &ValidationScope::All);
+    assert!(all.has_errors(), "unrelated defects must still fail the full validation");
   }
 }

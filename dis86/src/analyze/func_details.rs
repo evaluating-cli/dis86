@@ -2,7 +2,7 @@ use super::code_segment::CodeSegment;
 use super::workqueue::WorkQueue;
 use crate::segoff::SegOff;
 use crate::binary::Binary;
-use crate::asm::instr::{Instr, Opcode};
+use crate::asm::instr::{Instr, Opcode, Operand, OperandReg, Reg};
 use crate::asm::decode::Decoder;
 use crate::asm::intel_syntax::instr_str;
 use crate::config::CallMode;
@@ -114,6 +114,10 @@ impl FuncDetails {
       };
 
       let mut addr = loc;
+      // The `push cs; call near` idiom is a far call in disguise. Mirror
+      // ir_build's SpecialState::PushCS: the marker applies only to the
+      // immediately following instruction.
+      let mut push_cs_pending = false;
 
       // Iterate over instructions in the block (until we reach a terminator)
       let mut block_complete = false;
@@ -136,7 +140,9 @@ impl FuncDetails {
           Some(Call::Direct(addr)) => {
             if DEBUG { println!("Call to {}", addr); }
             direct_calls.insert(*addr);
-            let mode = if instr.opcode == Opcode::OP_CALLF {
+            let mode = if instr.opcode == Opcode::OP_CALLF
+              || (instr.opcode == Opcode::OP_CALL && push_cs_pending)
+            {
               CallMode::Far
             } else {
               CallMode::Near
@@ -149,6 +155,8 @@ impl FuncDetails {
           }
           None => (),
         }
+
+        push_cs_pending = pushes_cs(&instr);
 
         // Figure out what to do next
         match details.next {
@@ -297,6 +305,17 @@ mod tests {
     let binary = Binary::from_raw(&[0x9A, 0x03, 0x00, 0x00, 0x00, 0xC3], None);
     let details = FuncDetails::build(segoff(0), Some(segoff(6)), &test_seg(6), &binary).unwrap();
     let kinds = details.direct_call_kinds.get(&segoff(3)).expect("direct call recorded");
+    assert!(kinds.contains(&CallMode::Far));
+    assert!(!kinds.contains(&CallMode::Near));
+  }
+
+  #[test]
+  fn push_cs_then_near_call_records_far_kind() {
+    // `push cs; call +0; ret`: the pushed CS makes the callee return via
+    // retf, so ir_build treats the call as far. The analyzer must agree.
+    let binary = Binary::from_raw(&[0x0E, 0xE8, 0x00, 0x00, 0xC3], None);
+    let details = FuncDetails::build(segoff(0), Some(segoff(5)), &test_seg(5), &binary).unwrap();
+    let kinds = details.direct_call_kinds.get(&segoff(4)).expect("direct call recorded");
     assert!(kinds.contains(&CallMode::Far));
     assert!(!kinds.contains(&CallMode::Near));
   }
@@ -451,6 +470,11 @@ mod tests {
     assert_eq!(details.end_addr_inferred, segoff(2));
     assert_eq!(details.return_kind, None, "the jump leaves the function");
   }
+}
+
+fn pushes_cs(instr: &Instr) -> bool {
+  instr.opcode == Opcode::OP_PUSH
+    && matches!(instr.operands.as_slice().first(), Some(Operand::Reg(OperandReg(Reg::CS))))
 }
 
 // FIXME: THIS FUNCTION IS WAY TOO COMPLICATED FOR ITS SIMPLE TASK: APIs NEED IMPROVEMENT
