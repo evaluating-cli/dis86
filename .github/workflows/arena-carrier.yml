@@ -1,0 +1,37 @@
+name: arena-carrier
+on:
+  push:
+    branches: ['arena/**']
+permissions:
+  issues: write
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Post correction on #146
+        env:
+          GH_TOKEN: '${{ github.token }}'
+        run: |
+          cat > /tmp/body.md <<'BODYEOF'
+          **Correction: the race is not `.com`-specific, and the check annotation hides the signature.**
+
+          **1. `cap` is affected.** `dosemu host runtime` run #170 (PR #143, head `960359162`, 2026-10-29 13:38 UTC) failed exactly one flavor — `Stock dosemu2 host integration (cap)` — in the HYDSNAP capture stage:
+
+          ```
+          === dosemu2 pid: 3798 ===
+          === Phase 7 Item D integration test (HYDSNAP cap) ===
+          FAIL: dosemu host: failed to connect to dosemu2 (pid=3798)
+          hydra/src/dosemu_host/run_driver_test.sh: line 99:  3817 Aborted (core dumped) "$testbin" ...
+          [13:39:09] testprog.exe: done rc=134 elapsed=1s
+          FAIL: no snapshot written
+          ```
+
+          So the framing above — `.com` shards hit hardest, `ovl`/`mz-ovl`/`cap` never failing — is wrong. Every flavor that launches dosemu2 and then connects is exposed, including the capture stage that runs `testprog.exe`. The fix belongs in the shared launcher / `dosdebug_connect` path, not in anything `.com`-specific.
+
+          **2. Do not classify this failure from the annotation.** The driver aborts with `rc=134` (SIGABRT), but `run_driver_test.sh` turns that into `FAIL: no snapshot written` and the step exits **1** — so the check-run annotation reads `Process completed with exit code 1` and the job looks like an ordinary 2-second test failure rather than a connection race. Grep the log tail for `failed to connect to dosemu2`, plus dosemu2's own `removing stale files: .../dosemu.dbgin.<pid>`; that pair is the reliable signature.
+
+          **3. Streak, per-flavor.** 6 flavors per run, 7 failed flavor-jobs across the 4 runs since 2026-10-28 20:17 (`#167` `main` `c4d20e7` → exe, com 2/2 · `#168` → exe, com 1/2 · `#169`, a re-trigger of `#168`'s head → com 1/2, com 2/2 · `#170` → cap): `exe` 2, `com 1/2` 2, `com 2/2` 2, `cap` 1, `ovl` 0, `mz-ovl` 0. No two runs failed with the same pair, and `#166` (2026-10-28 20:05) is the last fully green run. Rotating failures across three unrelated flavors is much more consistent with the FIFO race than with a flavor-bound regression, and it strengthens the case that `exe`-vs-`.com` differences in the original evidence were noise rather than signal.
+
+          Still unexplained: what changed at ~2026-10-28 20:17. Nothing in the repo moved between `#166` and `#167` that touches this path.
+          BODYEOF
+          gh api -X POST "repos/$GITHUB_REPOSITORY/issues/146/comments" --field body="$(cat /tmp/body.md)"
