@@ -42,8 +42,15 @@
  * The handshake is deliberately NOT retried: once the pair is open, a failure
  * is a protocol error rather than a missing endpoint, and replaying stop/r0
  * against a live machine would perturb the sequence the protocol relies on. */
-#define CONNECT_POLL_TRIES 20          /* bounded: 20 x 100 ms ~= 2 s */
+#define CONNECT_POLL_TRIES 20
 #define CONNECT_POLL_INTERVAL_MS 100
+/* The sleep only runs *between* attempts, so the endpoint is looked at
+ * CONNECT_POLL_TRIES times inside a window of (TRIES - 1) * INTERVAL =
+ * 1900 ms, not 2000 ms: a peer that publishes its fifo pair at t=1950 ms
+ * is already past the budget. Everything that quotes the budget must use
+ * this macro rather than TRIES * INTERVAL, or it overstates the guarantee
+ * by one interval. */
+#define CONNECT_POLL_WINDOW_MS ((CONNECT_POLL_TRIES - 1) * CONNECT_POLL_INTERVAL_MS)
 
 /* Fallback when XDG_RUNTIME_DIR is not set (Phase 0 default). */
 #define DEFAULT_XDG_RUNTIME "/tmp/opencode/runtime"
@@ -658,7 +665,9 @@ static dosdebug_t *connect_once(pid_t pid, connect_status_t *status,
     /* O_NONBLOCK so open() never blocks; cleared right after. */
     db->out_fd = open(out_path, O_RDONLY | O_NONBLOCK);
     if (db->out_fd < 0) {
-        /* ENOENT: the pair was unlinked and not yet recreated. */
+        /* ENOENT: the pair was unlinked and not yet recreated.
+         * No EAGAIN here, unlike the dbgin open below: O_RDONLY | O_NONBLOCK
+         * on a fifo never waits for a writer, so that errno cannot arise. */
         *reason = "dbgout open failed";
         if (errno != ENOENT && errno != ENXIO)
             *status = CONNECT_FATAL;
@@ -702,29 +711,73 @@ fail:
     return NULL;
 }
 
+/*
+ * A vanished peer must reach us as an errno, not as a signal. Commands go out
+ * with write() on a fifo, and the default disposition of SIGPIPE kills the
+ * process when its read end is gone - which happens precisely when dosemu2
+ * removes and recreates the pair under a connector that has already opened it
+ * (#146). Dead that fast, neither the retry loop nor the diagnostics below can
+ * run, and the failure looks like a crash rather than a message. Ignoring the
+ * signal turns it into EPIPE at the send_cmd() error branch.
+ *
+ * Process-wide on purpose: this translation unit is compiled into the host
+ * library and into every binary that connects (test_dosdebug, xcheck_lowmem,
+ * the Phase 7 driver), and none of them wants the default disposition - they
+ * all treat a dead peer as a hard failure anyway. test_driver_ovl.c:174 sets
+ * the same disposition at its own entry point.
+ */
+static void ignore_sigpipe(void)
+{
+    static bool installed;
+    if (!installed) {
+        signal(SIGPIPE, SIG_IGN);
+        installed = true;
+    }
+}
+
 dosdebug_t *dosdebug_connect(pid_t pid)
 {
+    ignore_sigpipe();
     const char *reason = "unknown";
+    int attempted = 0;
 
     for (int attempt = 1; attempt <= CONNECT_POLL_TRIES; attempt++) {
+        attempted = attempt;
         connect_status_t status;
         dosdebug_t *db = connect_once(pid, &status, &reason);
-        if (db)
+        if (db) {
+            /* #147 review E: the attempt count on *success* is the only way to
+             * size this window from CI instead of guessing - a lane that is green
+             * at attempt 19 is one runner hiccup from red, and nothing said so. */
+            if (attempt > 1)
+                fprintf(stderr,
+                        "dosdebug: dosemu2 (pid=%ld) endpoint appeared after %d "
+                        "attempt(s), ~%d ms in\n",
+                        (long)pid, attempt, (attempt - 1) * CONNECT_POLL_INTERVAL_MS);
             return db;
+        }
         if (status == CONNECT_FATAL) {
             fprintf(stderr, "dosdebug: connect to dosemu2 (pid=%ld) failed: %s\n",
                     (long)pid, reason);
             return NULL;
+        }
+        /* Polling pays off only while the instance we were pointed at is alive:
+         * once it is gone no look can succeed, so stop rather than spend the
+         * window on a dead process. That is also what makes the window safe to
+         * raise for a live-but-slow startup (#147 review E). */
+        if (pid != 0 && kill(pid, 0) != 0) {
+            reason = "dosemu2 exited before publishing the endpoint";
+            break;
         }
         if (attempt < CONNECT_POLL_TRIES)
             sleep_ms(CONNECT_POLL_INTERVAL_MS);
     }
 
     fprintf(stderr,
-            "dosdebug: gave up connecting to dosemu2 (pid=%ld) after %d attempts "
-            "over ~%d ms (last failure: %s)\n",
-            (long)pid, CONNECT_POLL_TRIES,
-            CONNECT_POLL_TRIES * CONNECT_POLL_INTERVAL_MS, reason);
+            "dosdebug: gave up connecting to dosemu2 (pid=%ld) after %d attempt(s), "
+            "~%d ms of a ~%d ms window (last failure: %s)\n",
+            (long)pid, attempted, (attempted - 1) * CONNECT_POLL_INTERVAL_MS,
+            CONNECT_POLL_WINDOW_MS, reason);
     report_runtime_dir();
     return NULL;
 }

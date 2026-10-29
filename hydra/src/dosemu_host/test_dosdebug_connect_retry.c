@@ -24,6 +24,8 @@
  *   2. reader lag (ENXIO) - the pair exists but dbgin has no reader yet
  *   3. never published    - connect must be bounded, not instant and not hang
  *   4. silent peer        - a handshake failure stays terminal (not retried)
+ *   5. peer vanishes      - a dead peer is an errno, never a SIGPIPE death
+ *   6. dead pid           - a pid already gone is not worth the retry window
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -56,6 +58,18 @@ static int g_failures;
     } while (0)
 
 static char g_dir[1024];   /* <XDG_RUNTIME_DIR>/dosemu2 */
+
+/* Path of a one-byte-per-command tally the fake peer appends to (O_APPEND, so a
+ * single write is atomic and survives the peer being killed). Counting what the
+ * peer actually received is what makes "the handshake is not retried"
+ * observable: a timing bound alone is blind to it - see test_silent_peer. */
+static char g_count_path[2048];
+
+static int count_bytes(void)
+{
+    struct stat st;
+    return stat(g_count_path, &st) == 0 ? (int)st.st_size : -1;
+}
 
 static long now_ms(void)
 {
@@ -146,6 +160,13 @@ static void peer_serve(int rfd, int wfd, int silent)
             if (chunk[i] == '\n') {
                 line[len] = '\0';
                 len = 0;
+                /* Tally before the silent short-circuit: in silent mode the reply
+                 * branch below is never reached, so counting there would be blind
+                 * to exactly the case this pin exists to observe. */
+                if (strcmp(line, "stop") == 0 && g_count_path[0]) {
+                    int cfd = open(g_count_path, O_WRONLY | O_APPEND | O_CREAT, 0600);
+                    if (cfd >= 0) { (void)!write(cfd, "s", 1); close(cfd); }
+                }
                 if (silent)
                     continue;
                 if (strcmp(line, "stop") == 0) {
@@ -206,7 +227,31 @@ static void peer_run(pid_t me, const peer_opts_t *o)
         _exit(24);
     (void)fcntl(wfd, F_SETFL, 0);
 
-    peer_serve(rfd, wfd, o->silent);
+    /* dosemu2 outlives one connector, so the fake peer must too. A peer that
+     * exits on EOF makes every retry after the first fail fast on ENXIO, which
+     * hides a retry-the-handshake regression behind the timing bounds. */
+    long accept_until = now_ms() + 20000;
+    while (now_ms() < accept_until) {
+        peer_serve(rfd, wfd, o->silent);
+        close(rfd);
+        close(wfd);
+        rfd = open(in_path, O_RDONLY);          /* wait for the next connector */
+        if (rfd < 0)
+            break;
+        wfd = -1;
+        long dl = now_ms() + 1000;
+        while (now_ms() < dl) {
+            wfd = open(out_path, O_WRONLY | O_NONBLOCK);
+            if (wfd >= 0)
+                break;
+            if (errno != ENXIO && errno != ENOENT && errno != EINTR)
+                _exit(25);
+            sleep_ms(5);
+        }
+        if (wfd < 0)
+            break;
+        (void)fcntl(wfd, F_SETFL, 0);
+    }
     _exit(0);
 }
 
@@ -312,6 +357,8 @@ static void test_silent_peer(void)
     int sync[2];
     CHECK(pipe(sync) == 0, "silent peer: sync pipe");
 
+    snprintf(g_count_path, sizeof(g_count_path), "%s/silent-peer.tally", g_dir);
+    unlink(g_count_path);
     peer_opts_t o = { 0, 0, 0, 1, sync[1] };
     pid_t peer = peer_start(&o);
     close(sync[1]);
@@ -322,11 +369,60 @@ static void test_silent_peer(void)
     long dt = now_ms() - t0;
 
     CHECK(db == NULL, "silent peer: a failed handshake is terminal");
-    /* stop-drain (800 ms) + dump timeout (2000 ms) once; a retried handshake
-     * would cost that twenty times over. */
+    /* Timing alone cannot see this: with a peer that survives a disconnect the
+     * retries still cost ~2.8 s each, but a bound loose enough to tolerate
+     * runner noise (15 s) also tolerates five of them. Count what the peer was
+     * actually asked to do - one 'stop', because a handshake failure is
+     * terminal. The bound stays as a wall-clock guard at two handshakes' worth
+     * (measured: 2803 ms for one). */
+    int stops = count_bytes();
+    printf("MEASURE silent peer: dt=%ld ms, peer received %d 'stop' command(s)\n", dt, stops);
+    CHECK(stops == 1, "silent peer: stop/r0 ran exactly once");
     CHECK(dt >= 2000, "silent peer: waited out the handshake timeouts");
-    CHECK(dt <= 15000, "silent peer: handshake was not retried");
+    CHECK(dt <= 6000, "silent peer: handshake was not retried");
     peer_stop(peer);
+}
+
+/* 5. A peer that disappears mid-session must surface as an error, not a signal:
+ *    commands go out with write() on a fifo, whose default disposition when the
+ *    reader has gone is SIGPIPE - that kills the run before any CHECK can
+ *    report. */
+static void test_peer_vanishes_mid_session(void)
+{
+    peer_opts_t o = { 0, 0, 0, 0, -1 };
+    pid_t peer = peer_start(&o);
+    dosdebug_t *db = dosdebug_connect(peer);
+    CHECK(db != NULL, "peer vanishes: connected first");
+    if (!db) {
+        peer_stop(peer);
+        return;
+    }
+    peer_stop(peer);                 /* read end gone: dosemu2 vanished */
+    dosdebug_regs_t r;
+    CHECK(dosdebug_read_regs(db, &r) != 0,
+          "peer vanishes: a dead peer is an errno, not SIGPIPE");
+    dosdebug_disconnect(db);
+}
+
+/* 6. A pid that is already gone must not cost the retry window: the polling
+ *    exists for a *live* dosemu2 that has not published yet, and discovering
+ *    instantly that it died is what lets that window be raised without slowing
+ *    the genuinely-broken case down. */
+static void test_dead_pid_fails_fast(void)
+{
+    pid_t kid = fork();
+    if (kid == 0)
+        _exit(0);
+    int st;
+    while (waitpid(kid, &st, 0) < 0 && errno == EINTR)
+        continue;   /* reaped: the pid is gone (barring reuse) */
+
+    long t0 = now_ms();
+    dosdebug_t *db = dosdebug_connect(kid);
+    long dt = now_ms() - t0;
+    printf("MEASURE dead pid: dt=%ld ms (retry window is 1900 ms)\n", dt);
+    CHECK(db == NULL, "dead pid: connect fails");
+    CHECK(dt < 1000, "dead pid: no retry window paid for a dead process");
 }
 
 int main(void)
@@ -347,12 +443,15 @@ int main(void)
         perror("setenv");
         return 2;
     }
+    g_count_path[0] = '\0';
     printf("runtime dir: %s\n", g_dir);
 
     test_late_publication();
     test_reader_lag();
     test_never_published();
     test_silent_peer();
+    test_peer_vanishes_mid_session();
+    test_dead_pid_fails_fast();
 
     rmdir(g_dir);
     rmdir(root);
