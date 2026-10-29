@@ -307,9 +307,10 @@ fn dx_read_after_conditional_branch_is_evidence() {
 }
 
 #[test]
-fn out_of_range_branch_still_reports_ret_and_inputs() {
-  // #73/#140 shape: the explicit target is dropped as an empty block, but the
-  // fallthrough path still reaches the ret and reads BX.
+fn out_of_range_branch_keeps_the_fallthrough_ret_and_inputs() {
+  // Characterisation of the #73/#140 shape: the explicit target is dropped as
+  // an empty block, and the ret/input stay reachable through the branch's
+  // fallthrough block. This does not exercise the empty-block rule itself.
   let code = [
     0x74, 0x04, // jz +4 -> target 0x0006, outside [0, 5)
     0x89, 0xD8, // mov ax,bx
@@ -398,4 +399,19 @@ fn u32_return_dead_dx_move_is_not_evidence() {
   let ir = build_ir(&code, &caller, &cfg);
   let live = abi::semantic_live(&ir);
   assert!(!abi::caller_reads_dx_after_call(&ir, &live, first_call(&ir)));
+}
+
+#[test]
+fn mid_instruction_target_keeps_fallthrough_ret() {
+  let code = [
+    0x74, 0x02,       // jz +2 -> target 0x0004 (inside mov ax,0x9090)
+    0xB8, 0x90, 0x90, // mov ax,0x9090 (0x0002..0x0005)
+    0xC3,             // ret at 0x0005
+  ];
+  let f = func("mid_target", 0, 6, Some(Type::U16), None);
+  let cfg = config(vec![f.clone()]);
+  let ir = build_ir(&code, &f, &cfg);
+  // The mid-instruction target becomes an empty leaf block; the ret is in the
+  // branch fallthrough, so block_exits still reaches it.
+  assert!(abi::has_reachable_ret(&ir), "fallthrough ret must stay reachable");
 }

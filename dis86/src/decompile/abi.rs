@@ -111,6 +111,10 @@ pub fn has_reachable_ret(ir: &IR) -> bool {
 /// `DX = Upper16(call)`, so a read often uses that derived ref rather than
 /// `Init(DX)`. Both forms count.
 pub fn caller_reads_dx_after_call(ir: &IR, live: &HashSet<Ref>, call: Ref) -> bool {
+  // A call in an unreachable block is not a live root, but its fallthrough can
+  // join a block that is reachable another way; do not attribute that block's
+  // DX read to this dead call.
+  if !live.contains(&call) { return false; }
   let Ref::Instr(blk, idx) = call else { return false; };
   let dx_result = dx_result_of_call(ir, call);
   let mut seen = HashSet::new();

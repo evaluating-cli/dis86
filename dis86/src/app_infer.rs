@@ -112,19 +112,22 @@ pub fn run(cfg: &Config, binary: &Binary, specs: Vec<Spec<'_>>,
   let args = infer_args(cfg, &built);
   println!("name\tstart\tend\targs\tdont_pop_args\tret\tregargs\tnote");
   for f in built {
-    let ret = if !abi::has_reachable_ret(&f.ir)
-      || matches!(f.annotated_ret, Some(Type::Void)) {
-      "void"
-    } else if matches!(f.annotated_ret, Some(Type::U32)) {
-      if dx_reads.contains(&f.name) {
-        "u32"
-      } else {
-        "u32 (annotated; no caller DX read observed)"
+    let reachable_ret = abi::has_reachable_ret(&f.ir);
+    let dx = dx_reads.contains(&f.name);
+    // An explicit annotation outranks reachability: the report must not
+    // propose replacing a deliberate `ret u16` with `void` just because the
+    // configured range ends before the ret. Reachability only qualifies the
+    // annotation in that case.
+    let ret = match &f.annotated_ret {
+      Some(Type::Void) => "void".to_string(),
+      Some(t) if !reachable_ret =>
+        format!("{} (annotated; ret outside the reachable range)", t),
+      Some(Type::U32) => {
+        if dx { "u32".to_string() } else { "u32 (annotated; no caller DX read observed)".to_string() }
       }
-    } else if dx_reads.contains(&f.name) {
-      "u32"
-    } else {
-      "u16"
+      Some(t) => if dx { "u32".to_string() } else { format!("{}", t) },
+      None if !reachable_ret => "void".to_string(),
+      None => if dx { "u32".to_string() } else { "u16".to_string() },
     };
     let regs: Vec<&str> = abi::infer_register_inputs(&f.ir)
       .iter().map(|reg| reg.info().name).collect();

@@ -187,3 +187,23 @@ fn infer_abi_reports_an_out_of_image_name_without_panicking() {
   assert!(!stderr.contains("panicked"), "stderr: {}", stderr);
   let _ = fs::remove_dir_all(dir);
 }
+
+#[test]
+fn infer_abi_keeps_annotated_ret_when_the_range_truncates() {
+  for (ret, expected) in [
+    ("u16", "u16 (annotated; ret outside the reachable range)"),
+    ("u32", "u32 (annotated; ret outside the reachable range)"),
+  ] {
+    let dir = temp_dir();
+    let functions = format!(
+      "f {{ start 0000:0000 end 0000:0001 mode near ret {} args 0 }}", ret);
+    // The range ends before the ret at 0x0001.
+    let out = run(&dir, &[0x90, 0xC3], &functions, &["--infer-abi", "--name", "f"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "stderr: {}", stderr);
+    assert!(stdout.contains(expected), "ret {}: stdout: {}", ret, stdout);
+    assert!(!stdout.contains("\tvoid\t"), "ret {}: stdout: {}", ret, stdout);
+    let _ = fs::remove_dir_all(dir);
+  }
+}
