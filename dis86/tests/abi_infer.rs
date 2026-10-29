@@ -1,8 +1,6 @@
-use dis86::asm::decode::Decoder;
 use dis86::asm::instr::Reg;
 use dis86::config::{CallMode, Config, Func};
-use dis86::decompile::ir_build;
-use dis86::decompile::{abi, opt, sym};
+use dis86::decompile::abi;
 use dis86::segoff::{Off, Seg, SegOff};
 use dis86::spec::Spec;
 use dis86::types::{Type, TypeDatabase};
@@ -36,19 +34,8 @@ fn config(funcs: Vec<Func>) -> Config {
 fn build_ir(code: &[u8], func: &Func, cfg: &Config) -> dis86::decompile::ir::IR {
   let binary = dis86::binary::Binary::from_raw(code, None);
   let spec = Spec::from_func(func);
-  let mut decoder = Decoder::new(binary.region_iter(spec.start, spec.end));
-  let mut instrs = vec![];
-  while let Some((ins, _raw)) = decoder.try_next().expect("decode") {
-    instrs.push(ins);
-  }
-  let mut ir = ir_build::build_from_instrs(&instrs, cfg, &spec, &binary, false, false);
-  opt::optimize(&mut ir);
-  sym::symbolize(&mut ir, cfg);
-  opt::forward_store_to_load(&mut ir);
-  opt::optimize(&mut ir);
-  opt::mem_symbol_to_ref(&mut ir);
-  opt::optimize(&mut ir);
-  ir
+  dis86::app_infer::build_ir_for_analysis(cfg, &binary, &spec, false)
+    .expect("build analysis IR").0
 }
 
 fn infer(code: &[u8], func: &Func, cfg: &Config) -> Vec<Reg> {
@@ -278,4 +265,137 @@ fn function_without_reachable_ret_has_no_return() {
   let cfg = config(vec![f.clone()]);
   let ir = build_ir(&code, &f, &cfg);
   assert!(!abi::has_reachable_ret(&ir));
+}
+
+#[test]
+fn dead_dx_move_is_not_return_evidence() {
+  let code = [
+    0xE8, 0x0D, 0x00, // call callee at 0x0010; next IP is 0x0003
+    0x89, 0xD3,       // mov bx,dx (dead: bx is never used)
+    0xC3,             // ret
+    0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, // padding to 0x0010
+    0xBA, 0x07, 0x00, // callee: mov dx,7
+    0xB8, 0x03, 0x00, // callee: mov ax,3
+    0xC3,             // callee: ret
+  ];
+  let caller = func("dead_dx_caller", 0, 6, Some(Type::U16), None);
+  let callee = func("dead_dx_callee", 0x10, 0x19, Some(Type::U16), None);
+  let cfg = config(vec![caller.clone(), callee]);
+  let ir = build_ir(&code, &caller, &cfg);
+  let live = abi::semantic_live(&ir);
+  assert!(!abi::caller_reads_dx_after_call(&ir, &live, first_call(&ir)));
+}
+
+#[test]
+fn dx_read_after_conditional_branch_is_evidence() {
+  let code = [
+    0xE8, 0x0D, 0x00, // call callee at 0x0010; next IP is 0x0003
+    0x74, 0x02,       // jz +2 -> 0x0007 (the ret)
+    0x89, 0xD0,       // mov ax,dx
+    0xC3,             // ret
+    0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, // padding to 0x0010
+    0xBA, 0x07, 0x00, // callee: mov dx,7
+    0xB8, 0x03, 0x00, // callee: mov ax,3
+    0xC3,             // callee: ret
+  ];
+  let caller = func("branch_dx_caller", 0, 8, Some(Type::U16), None);
+  let callee = func("branch_dx_callee", 0x10, 0x19, Some(Type::U16), None);
+  let cfg = config(vec![caller.clone(), callee]);
+  let ir = build_ir(&code, &caller, &cfg);
+  let live = abi::semantic_live(&ir);
+  assert!(abi::caller_reads_dx_after_call(&ir, &live, first_call(&ir)));
+}
+
+#[test]
+fn out_of_range_branch_still_reports_ret_and_inputs() {
+  // #73/#140 shape: the explicit target is dropped as an empty block, but the
+  // fallthrough path still reaches the ret and reads BX.
+  let code = [
+    0x74, 0x04, // jz +4 -> target 0x0006, outside [0, 5)
+    0x89, 0xD8, // mov ax,bx
+    0xC3,       // ret
+  ];
+  let f = func("out_of_range", 0, 5, Some(Type::U16), None);
+  let cfg = config(vec![f.clone()]);
+  assert_eq!(infer(&code, &f, &cfg), vec![Reg::BX]);
+  let ir = build_ir(&code, &f, &cfg);
+  assert!(abi::has_reachable_ret(&ir), "the fallthrough ret must stay reachable");
+}
+
+#[test]
+fn segment_register_read_is_an_input() {
+  let code = [
+    0x8C, 0xD8, // mov ax,ds
+    0xC3,       // ret
+  ];
+  let f = func("reads_ds", 0, 3, Some(Type::U16), None);
+  let cfg = config(vec![f.clone()]);
+  assert_eq!(infer(&code, &f, &cfg), vec![Reg::DS]);
+}
+
+#[test]
+fn unannotated_ret_does_not_report_return_registers_as_inputs() {
+  // With no return annotation the IR models DX:AX as the return value. Those
+  // entry values are the caller's exit state, not regargs.
+  let code = [0xC3];
+  let f = func("unannotated", 0, 1, None, None);
+  let cfg = config(vec![f.clone()]);
+  assert!(infer(&code, &f, &cfg).is_empty());
+}
+
+#[test]
+fn u32_return_caller_dx_read_is_evidence() {
+  let code = [
+    0xE8, 0x0D, 0x00, // call callee at 0x0010; next IP is 0x0003
+    0x89, 0xD0,       // mov ax,dx
+    0xC3,             // ret
+    0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, // padding to 0x0010
+    0xBA, 0x07, 0x00, // callee: mov dx,7
+    0xB8, 0x03, 0x00, // callee: mov ax,3
+    0xC3,             // callee: ret
+  ];
+  let caller = func("u32_dx_caller", 0, 6, Some(Type::U16), None);
+  let callee = func("u32_dx_callee", 0x10, 0x19, Some(Type::U32), None);
+  let cfg = config(vec![caller.clone(), callee]);
+  let ir = build_ir(&code, &caller, &cfg);
+  let live = abi::semantic_live(&ir);
+  assert!(abi::caller_reads_dx_after_call(&ir, &live, first_call(&ir)));
+}
+
+#[test]
+fn unannotated_return_caller_dx_read_is_evidence() {
+  let code = [
+    0xE8, 0x0D, 0x00, // call callee at 0x0010; next IP is 0x0003
+    0x89, 0xD0,       // mov ax,dx
+    0xC3,             // ret
+    0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, // padding to 0x0010
+    0xBA, 0x07, 0x00, // callee: mov dx,7
+    0xB8, 0x03, 0x00, // callee: mov ax,3
+    0xC3,             // callee: ret
+  ];
+  let caller = func("unknown_dx_caller", 0, 6, Some(Type::U16), None);
+  let callee = func("unknown_dx_callee", 0x10, 0x19, None, None);
+  let cfg = config(vec![caller.clone(), callee]);
+  let ir = build_ir(&code, &caller, &cfg);
+  let live = abi::semantic_live(&ir);
+  assert!(abi::caller_reads_dx_after_call(&ir, &live, first_call(&ir)));
+}
+
+#[test]
+fn u32_return_dead_dx_move_is_not_evidence() {
+  let code = [
+    0xE8, 0x0D, 0x00, // call callee at 0x0010; next IP is 0x0003
+    0x89, 0xD3,       // mov bx,dx (dead)
+    0xC3,             // ret
+    0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, // padding to 0x0010
+    0xBA, 0x07, 0x00, // callee: mov dx,7
+    0xB8, 0x03, 0x00, // callee: mov ax,3
+    0xC3,             // callee: ret
+  ];
+  let caller = func("u32_dead_caller", 0, 6, Some(Type::U16), None);
+  let callee = func("u32_dead_callee", 0x10, 0x19, Some(Type::U32), None);
+  let cfg = config(vec![caller.clone(), callee]);
+  let ir = build_ir(&code, &caller, &cfg);
+  let live = abi::semantic_live(&ir);
+  assert!(!abi::caller_reads_dx_after_call(&ir, &live, first_call(&ir)));
 }

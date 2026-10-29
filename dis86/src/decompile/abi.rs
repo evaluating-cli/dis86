@@ -16,6 +16,10 @@ use crate::decompile::ir::{Attribute, BlockRef, Instr, IR, Opcode, Ref};
 /// Registers that can carry a function argument in the configurations this
 /// analysis supports. Frame/segment state (`SP`, `BP`, `SS`, `CS`) is not an
 /// argument; `IP`/`FLAGS` are never pinned as `regargs`.
+///
+/// `DS`/`ES` are inputs only: this PR has no segment output model, so a
+/// callee that changes them still drops the change at `ret` (issue #144).
+/// Keep that asymmetry in mind when reading a `regargs` row.
 const CANDIDATES: [instr::Reg; 8] = [
   instr::Reg::AX,
   instr::Reg::BX,
@@ -37,8 +41,14 @@ pub fn infer_register_inputs(ir: &IR) -> Vec<instr::Reg> {
   let mut found = HashSet::new();
   for r in live {
     let Some(instr) = ir.instr(r) else { continue; };
+    let is_ret = matches!(instr.opcode, Opcode::RetNear | Opcode::RetFar);
     for operand in &instr.operands {
       if let Ref::Init(reg) = operand {
+        // A `ret`'s AX/DX operands are the return expression, not caller
+        // setup. An unannotated function returns DX:AX by default, and
+        // counting those entry values would report the return registers as
+        // `regargs`.
+        if is_ret && matches!(reg, instr::Reg::AX | instr::Reg::DX) { continue; }
         let reg = storage_parent(*reg);
         if CANDIDATES.contains(&reg) { found.insert(reg); }
       }
@@ -96,34 +106,86 @@ pub fn has_reachable_ret(ir: &IR) -> bool {
 /// or another call. This is the caller-observed half of return inference: a
 /// 16-bit return leaves `DX` unknown, so only a caller that actually consumes
 /// the high half justifies `u32`.
+///
+/// A `U32`/`Unknown` return is represented in the caller as
+/// `DX = Upper16(call)`, so a read often uses that derived ref rather than
+/// `Init(DX)`. Both forms count.
 pub fn caller_reads_dx_after_call(ir: &IR, live: &HashSet<Ref>, call: Ref) -> bool {
   let Ref::Instr(blk, idx) = call else { return false; };
+  let dx_result = dx_result_of_call(ir, call);
   let mut seen = HashSet::new();
-  reads_dx_from(ir, live, blk, Some(idx + 1), &mut seen)
+  reads_dx_from(ir, live, blk, Some(idx + 1), dx_result, &mut seen)
+}
+
+/// The high half of a `U32`/`Unknown` call result, created by
+/// `save_return_value` as `Upper16(call)`.
+fn dx_result_of_call(ir: &IR, call: Ref) -> Option<Ref> {
+  for blk in ir.iter_blocks() {
+    for r in ir.iter_instrs(blk) {
+      let Some(instr) = ir.instr(r) else { continue; };
+      if instr.opcode == Opcode::Upper16 && instr.operands.first() == Some(&call) {
+        return Some(r);
+      }
+    }
+  }
+  None
 }
 
 fn reads_dx_from(ir: &IR, live: &HashSet<Ref>, blk: BlockRef,
-                 after: Option<usize>, seen: &mut HashSet<BlockRef>) -> bool {
+                 after: Option<usize>, dx_result: Option<Ref>,
+                 seen: &mut HashSet<BlockRef>) -> bool {
   if !seen.insert(blk) { return false; }
   let start = after.unwrap_or(0);
   for (i, r) in ir.iter_instrs(blk).enumerate() {
     if i < start { continue; }
     let Some(instr) = ir.instr(r) else { continue; };
     if writes_dx(ir, instr) { return false; }
-    if live.contains(&r) && instr.operands.iter().any(|o| *o == Ref::Init(instr::Reg::DX)) {
-      return true;
+    if live.contains(&r) {
+      if instr.operands.iter().any(|o| *o == Ref::Init(instr::Reg::DX)) {
+        return true;
+      }
+      if let Some(result) = dx_result {
+        if instr.operands.iter().any(|o| derives_from(ir, *o, result)) {
+          return true;
+        }
+      }
     }
   }
   for succ in successors(ir, blk) {
-    if reads_dx_from(ir, live, succ, None, seen) { return true; }
+    if reads_dx_from(ir, live, succ, None, dx_result, seen) { return true; }
   }
   false
 }
 
+/// Whether `value` is `target` or a pure projection of it (the byte splits
+/// and copies `save_return_value` emits around a call result).
+fn derives_from(ir: &IR, value: Ref, target: Ref) -> bool {
+  let mut seen = HashSet::new();
+  derives_from_inner(ir, value, target, &mut seen)
+}
+
+fn derives_from_inner(ir: &IR, value: Ref, target: Ref,
+                      seen: &mut HashSet<Ref>) -> bool {
+  if value == target { return true; }
+  if !seen.insert(value) { return false; }
+  let Some(instr) = ir.instr(value) else { return false; };
+  if !matches!(instr.opcode,
+    Opcode::Ref | Opcode::Upper16 | Opcode::Lower16
+      | Opcode::And | Opcode::Or | Opcode::UShr | Opcode::Shl) {
+    return false;
+  }
+  instr.operands.iter().any(|o| derives_from_inner(ir, *o, target, seen))
+}
+
 fn writes_dx(ir: &IR, instr: &Instr) -> bool {
   match instr.opcode {
+    // `CallPtr` is one arm until issue #145 splits it into near/far indirect
+    // calls; that split must update this list too.
     Opcode::CallArgs | Opcode::CallNear | Opcode::CallFar | Opcode::CallPtr | Opcode::Int => true,
     Opcode::WriteVar16 => {
+      // Exit-state write-backs preserve the callee's DX value for its caller;
+      // they do not clobber the value this function is still using.
+      if (instr.attrs & Attribute::EXIT_STATE) != 0 { return false; }
       match instr.operands.first() {
         Some(Ref::Symbol(sym)) => {
           sym.table() == crate::decompile::sym::Table::Register

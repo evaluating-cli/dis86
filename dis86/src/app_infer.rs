@@ -1,13 +1,13 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crate::asm::decode::Decoder;
 use crate::asm::instr::{self, Instr as RawInstr, Operand, Reg};
 use crate::asm::instr::Opcode::*;
 use crate::binary::Binary;
 use crate::config::Config;
-use crate::decompile::ir::IR;
+use crate::decompile::ir::{Opcode as IrOpcode, Ref, IR};
 use crate::decompile::{abi, ir_build, opt, sym};
-use crate::segoff::SegOff;
+use crate::segoff::{Off, Seg, SegOff};
 use crate::spec::Spec;
 use crate::types::Type;
 
@@ -27,7 +27,26 @@ struct SpecSeed {
   end: SegOff,
 }
 
-pub fn run(cfg: &Config, binary: &Binary, specs: Vec<Spec<'_>>) -> i32 {
+/// A selected function that could not be analyzed. Structural range failures
+/// and decode failures both become rows so one bad entry does not hide the
+/// rest of the report.
+pub struct FailedFunc {
+  pub name: String,
+  pub start: SegOff,
+  pub end: SegOff,
+  pub note: String,
+}
+
+impl FailedFunc {
+  pub fn new(name: String, start: SegOff, end: SegOff, note: String) -> Self {
+    FailedFunc { name, start, end, note }
+  }
+}
+
+const MAX_FIXPOINT_ITERS: usize = 8;
+
+pub fn run(cfg: &Config, binary: &Binary, specs: Vec<Spec<'_>>,
+           pre_failed: Vec<FailedFunc>) -> i32 {
   let seeds: Vec<SpecSeed> = specs.into_iter().map(|spec| SpecSeed {
     name: spec.name,
     func_name: spec.func.map(|f| f.name.clone()),
@@ -39,7 +58,9 @@ pub fn run(cfg: &Config, binary: &Binary, specs: Vec<Spec<'_>>) -> i32 {
   // inputs, so rebuilding with the inferred declarations reaches a fixpoint.
   let mut working = cfg.clone();
   let mut built = vec![];
-  for _ in 0..8 {
+  let mut failed = vec![];
+  let mut converged = false;
+  for _ in 0..MAX_FIXPOINT_ITERS {
     let specs: Vec<Spec<'_>> = seeds.iter().map(|seed| match &seed.func_name {
       Some(name) => Spec::from_config_name(&working, name).unwrap_or_else(|| Spec {
         func: None,
@@ -54,13 +75,7 @@ pub fn run(cfg: &Config, binary: &Binary, specs: Vec<Spec<'_>>) -> i32 {
         end: seed.end,
       },
     }).collect();
-    built = match build_all(&working, binary, specs) {
-      Ok(built) => built,
-      Err((name, err)) => {
-        eprintln!("Error: {}: {}", name, err);
-        return 1;
-      }
-    };
+    (built, failed) = build_all(&working, binary, specs);
 
     let mut changed = false;
     for f in &working.funcs {
@@ -72,7 +87,10 @@ pub fn run(cfg: &Config, binary: &Binary, specs: Vec<Spec<'_>>) -> i32 {
         break;
       }
     }
-    if !changed { break; }
+    if !changed {
+      converged = true;
+      break;
+    }
     for bf in &built {
       let regs = abi::infer_register_inputs(&bf.ir);
       let new = if regs.is_empty() { None } else { Some(regs) };
@@ -81,10 +99,14 @@ pub fn run(cfg: &Config, binary: &Binary, specs: Vec<Spec<'_>>) -> i32 {
       }
     }
   }
+  if !converged {
+    eprintln!("Warning: ABI inference did not converge after {} iterations; the report reflects the last pass.",
+              MAX_FIXPOINT_ITERS);
+  }
 
   let mut dx_reads = HashSet::new();
   for caller in &built {
-    raw_dx_reads(cfg, caller, &mut dx_reads);
+    ir_dx_reads(caller, &mut dx_reads);
   }
 
   let args = infer_args(cfg, &built);
@@ -93,6 +115,12 @@ pub fn run(cfg: &Config, binary: &Binary, specs: Vec<Spec<'_>>) -> i32 {
     let ret = if !abi::has_reachable_ret(&f.ir)
       || matches!(f.annotated_ret, Some(Type::Void)) {
       "void"
+    } else if matches!(f.annotated_ret, Some(Type::U32)) {
+      if dx_reads.contains(&f.name) {
+        "u32"
+      } else {
+        "u32 (annotated; no caller DX read observed)"
+      }
     } else if dx_reads.contains(&f.name) {
       "u32"
     } else {
@@ -108,7 +136,10 @@ pub fn run(cfg: &Config, binary: &Binary, specs: Vec<Spec<'_>>) -> i32 {
     println!("{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
              f.name, f.start, f.end, nargs, dont_pop, ret, regs, note);
   }
-  0
+  for f in failed.iter().chain(pre_failed.iter()) {
+    println!("{}\t{}\t{}\t?\t?\t?\t-\t{}", f.name, f.start, f.end, f.note);
+  }
+  if failed.is_empty() && pre_failed.is_empty() { 0 } else { 1 }
 }
 
 struct ArgsInfo {
@@ -121,7 +152,7 @@ fn infer_args(cfg: &Config, built: &[BuiltFunc]) -> std::collections::HashMap<St
   let mut cleanups: std::collections::HashMap<String, Vec<u16>> = std::collections::HashMap::new();
   for caller in built {
     for (i, ins) in caller.raw.iter().enumerate() {
-      if !matches!(ins.opcode, OP_CALL) { continue; }
+      if !matches!(ins.opcode, OP_CALL | OP_CALLF) { continue; }
       let Some(target) = direct_call_target(ins) else { continue; };
       let Some(callee) = cfg.func_lookup(target) else { continue; };
       let Some(bytes) = cleanup_bytes(&caller.raw, i + 1) else { continue; };
@@ -151,7 +182,7 @@ fn infer_args(cfg: &Config, built: &[BuiltFunc]) -> std::collections::HashMap<St
         });
       } else {
         out.insert(f.name.clone(), ArgsInfo {
-          args: Some(0),
+          args: None,
           dont_pop_args: false,
           note: format!("variadic/cleanup varies: {:?}", uniq),
         });
@@ -162,18 +193,75 @@ fn infer_args(cfg: &Config, built: &[BuiltFunc]) -> std::collections::HashMap<St
 }
 
 fn ret_imm_args(raw: &[RawInstr]) -> Option<u16> {
+  let reachable = reachable_raw(raw);
   let mut values = std::collections::BTreeSet::new();
-  for ins in raw {
+  let mut saw_ret = false;
+  for (i, ins) in raw.iter().enumerate() {
+    if !reachable[i] { continue; }
     if !matches!(ins.opcode, OP_RET | OP_RETF) { continue; }
+    saw_ret = true;
+    let mut imm = None;
     for op in &ins.operands {
-      if let Operand::Imm(imm) = op {
-        if imm.val % 2 == 0 { values.insert(imm.val / 2); }
+      if let Operand::Imm(i) = op {
+        if i.val % 2 == 0 { imm = Some(i.val / 2); }
       }
     }
+    // A reachable plain `ret` means the callee does not uniformly pop
+    // arguments, so a `ret imm` elsewhere is not evidence for the whole
+    // function.
+    match imm {
+      Some(n) => { values.insert(n); }
+      None => return None,
+    }
   }
-  if values.len() == 1 { values.into_iter().next() } else { None }
+  if saw_ret && values.len() == 1 { values.into_iter().next() } else { None }
 }
 
+/// Raw-instruction reachability, used to ignore bytes decoded after a
+/// terminator (padding, inline data). Follows fallthrough and direct
+/// `Rel`/`Far` targets.
+fn reachable_raw(raw: &[RawInstr]) -> Vec<bool> {
+  let mut reachable = vec![false; raw.len()];
+  if raw.is_empty() { return reachable; }
+  let index: HashMap<SegOff, usize> =
+    raw.iter().enumerate().map(|(i, ins)| (ins.addr, i)).collect();
+  let mut stack = vec![0usize];
+  while let Some(i) = stack.pop() {
+    if i >= raw.len() || reachable[i] { continue; }
+    reachable[i] = true;
+    let ins = &raw[i];
+    let fallthrough = !matches!(ins.opcode,
+      OP_RET | OP_RETF | OP_HLT | OP_IRET | OP_JMP | OP_JMPF);
+    if follows_target(ins.opcode) {
+      for op in &ins.operands {
+        let target = match op {
+          Operand::Rel(rel) => Some(ins.rel_addr(rel)),
+          Operand::Far(far) => Some(SegOff { seg: Seg::Normal(far.seg), off: Off(far.off) }),
+          _ => None,
+        };
+        if let Some(target) = target {
+          if let Some(&j) = index.get(&target) { stack.push(j); }
+        }
+      }
+    }
+    if fallthrough && i + 1 < raw.len() { stack.push(i + 1); }
+  }
+  reachable
+}
+
+/// Instructions whose `Rel`/`Far` operand is an intra-function control-flow
+/// edge. Calls also carry a target, but it is not part of this function.
+fn follows_target(opcode: instr::Opcode) -> bool {
+  matches!(opcode,
+    OP_JMP | OP_JMPF
+      | OP_JA | OP_JAE | OP_JB | OP_JBE | OP_JCXZ | OP_JE | OP_JG | OP_JGE
+      | OP_JL | OP_JLE | OP_JNE | OP_JNO | OP_JNP | OP_JNS | OP_JO | OP_JP
+      | OP_JS | OP_LOOP | OP_LOOPE | OP_LOOPNE)
+}
+
+/// Caller stack cleanup immediately after a call. Only the `add sp, imm`
+/// idiom is measured; cleanup done by `pop reg`, or cleanup behind a branch,
+/// yields no evidence rather than a guess.
 fn cleanup_bytes(raw: &[RawInstr], start: usize) -> Option<u16> {
   let mut j = start;
   while j < raw.len() {
@@ -198,8 +286,9 @@ fn first_is_sp(ins: &RawInstr) -> bool {
 }
 
 fn build_all(cfg: &Config, binary: &Binary, specs: Vec<Spec<'_>>)
-  -> Result<Vec<BuiltFunc>, (String, String)> {
+  -> (Vec<BuiltFunc>, Vec<FailedFunc>) {
   let mut built = vec![];
+  let mut failed = vec![];
   for spec in specs {
     match build(cfg, binary, &spec) {
       Ok((ir, raw)) => built.push(BuiltFunc {
@@ -210,15 +299,31 @@ fn build_all(cfg: &Config, binary: &Binary, specs: Vec<Spec<'_>>)
         ir,
         raw,
       }),
-      Err(err) => return Err((spec.name, err)),
+      Err(err) => failed.push(FailedFunc {
+        name: spec.name,
+        start: spec.start,
+        end: spec.end,
+        note: err,
+      }),
     }
   }
-  Ok(built)
+  (built, failed)
 }
 
 fn build(cfg: &Config, binary: &Binary, spec: &Spec<'_>) -> Result<(IR, Vec<RawInstr>), String> {
+  build_ir_for_analysis(cfg, binary, spec, false)
+}
+
+/// Build the same IR the decompiler emits for `spec`, so inference and
+/// codegen cannot silently diverge. Public so the ABI tests exercise this
+/// pipeline instead of copying it.
+pub fn build_ir_for_analysis(cfg: &Config, binary: &Binary, spec: &Spec<'_>, pin_all: bool)
+  -> Result<(IR, Vec<RawInstr>), String> {
   let start = spec.start;
   let end = spec.end;
+  if !binary.contains_region(start, end) {
+    return Err(format!("invalid range {}..{} (outside the loaded image)", start, end));
+  }
   let mut instrs = vec![];
   let mut decoder = Decoder::new(binary.region_iter(start, end));
   loop {
@@ -228,125 +333,52 @@ fn build(cfg: &Config, binary: &Binary, spec: &Spec<'_>) -> Result<(IR, Vec<RawI
       Err(err) => return Err(format!("decode failed at {}: {}", start, err)),
     }
   }
+  build_ir_from_instrs(cfg, binary, spec, instrs, pin_all)
+}
 
+fn build_ir_from_instrs(cfg: &Config, binary: &Binary, spec: &Spec<'_>,
+                        instrs: Vec<RawInstr>, pin_all: bool)
+  -> Result<(IR, Vec<RawInstr>), String> {
   let overlay = spec.start.is_overlay_addr();
-  let mut ir = ir_build::build_from_instrs(&instrs, cfg, spec, binary, overlay, false);
+  let mut ir = ir_build::build_from_instrs(&instrs, cfg, spec, binary, overlay, pin_all);
   opt::optimize(&mut ir);
   sym::symbolize(&mut ir, cfg);
   opt::forward_store_to_load(&mut ir);
   opt::optimize(&mut ir);
   opt::mem_symbol_to_ref(&mut ir);
   opt::optimize(&mut ir);
+  crate::decompile::finalize_for_emission(&mut ir);
   Ok((ir, instrs))
 }
 
-fn raw_dx_reads(cfg: &Config, caller: &BuiltFunc, out: &mut HashSet<String>) {
-  for (i, ins) in caller.raw.iter().enumerate() {
-    if !matches!(ins.opcode, OP_CALL) { continue; }
-    let Some(target) = direct_call_target(ins) else { continue; };
-    let Some(callee) = cfg.func_lookup(target) else { continue; };
-    let mut j = i + 1;
-    while j < caller.raw.len() {
-      match dx_effect(&caller.raw[j]) {
-        DxEffect::Read => {
-          out.insert(callee.name.clone());
-          break;
-        }
-        DxEffect::Write | DxEffect::Clobber => break,
-        DxEffect::None => j += 1,
+/// Collect callees whose callers consume the high half of the return value.
+/// Uses the same CFG-aware, liveness-checked analysis the tests exercise, so
+/// a dead `mov bx,dx` cannot mark a return as `u32` and a read after a branch
+/// still counts.
+fn ir_dx_reads(caller: &BuiltFunc, out: &mut HashSet<String>) {
+  let live = abi::semantic_live(&caller.ir);
+  for blk in caller.ir.iter_blocks() {
+    for r in caller.ir.iter_instrs(blk) {
+      let Some(instr) = caller.ir.instr(r) else { continue; };
+      if instr.opcode != IrOpcode::CallArgs { continue; }
+      let Some(Ref::Func(idx)) = instr.operands.first().copied() else { continue; };
+      let Some(name) = caller.ir.funcs.get(idx) else { continue; };
+      if abi::caller_reads_dx_after_call(&caller.ir, &live, r) {
+        out.insert(name.clone());
       }
     }
   }
 }
 
-fn direct_call_target(ins: &RawInstr) -> Option<crate::segoff::SegOff> {
+fn direct_call_target(ins: &RawInstr) -> Option<SegOff> {
   for op in &ins.operands {
-    if let Operand::Rel(rel) = op { return Some(ins.rel_addr(rel)); }
+    match op {
+      Operand::Rel(rel) => return Some(ins.rel_addr(rel)),
+      Operand::Far(far) => return Some(SegOff { seg: Seg::Normal(far.seg), off: Off(far.off) }),
+      _ => {}
+    }
   }
   None
-}
-
-#[derive(Debug, PartialEq, Eq)]
-enum DxEffect { None, Read, Write, Clobber }
-
-/// Whether a raw instruction reads or writes the full `DX` register. The scan
-/// stops at the first write (or clobbering call) after a call; a read before
-/// that is the caller consuming the high half.
-fn dx_effect(ins: &RawInstr) -> DxEffect {
-  match ins.opcode {
-    OP_CALL | OP_CALLF | OP_INT | OP_INTO | OP_IRET | OP_RET | OP_RETF
-      | OP_JMP | OP_JMPF | OP_HLT => DxEffect::Clobber,
-    OP_JA | OP_JAE | OP_JB | OP_JBE | OP_JCXZ | OP_JE | OP_JG | OP_JGE
-      | OP_JL | OP_JLE | OP_JNE | OP_JNO | OP_JNP | OP_JNS | OP_JO | OP_JP
-      | OP_JS | OP_LOOP | OP_LOOPE | OP_LOOPNE => DxEffect::Clobber,
-    OP_CWD => DxEffect::Write,
-    OP_MUL | OP_IMUL | OP_IMUL_TRUNC | OP_DIV | OP_IDIV => {
-      if any_reads_dx(ins) { DxEffect::Read } else { DxEffect::Write }
-    }
-    OP_POP => {
-      if first_is_dx(ins) { DxEffect::Write } else { DxEffect::None }
-    }
-    OP_PUSH => {
-      if any_reads_dx(ins) { DxEffect::Read } else { DxEffect::None }
-    }
-    OP_INC | OP_DEC | OP_NEG | OP_NOT | OP_RCL | OP_RCR
-      | OP_ROL | OP_ROR | OP_SHL | OP_SHR | OP_SAR => {
-      if any_reads_dx(ins) { DxEffect::Read } else { DxEffect::None }
-    }
-    OP_MOV | OP_LEA | OP_LDS | OP_LES => {
-      if first_is_dx(ins) {
-        if source_reads_dx(ins) { DxEffect::Read } else { DxEffect::Write }
-      } else if source_reads_dx(ins) {
-        DxEffect::Read
-      } else {
-        DxEffect::None
-      }
-    }
-    OP_XCHG => {
-      if any_reads_dx(ins) { DxEffect::Read } else { DxEffect::None }
-    }
-    OP_ADD | OP_ADC | OP_SUB | OP_SBB | OP_AND | OP_OR | OP_XOR => {
-      if first_is_dx(ins) {
-        if read_modify_zeroing(ins) { DxEffect::Write } else { DxEffect::Read }
-      } else if source_reads_dx(ins) {
-        DxEffect::Read
-      } else {
-        DxEffect::None
-      }
-    }
-    OP_CMP | OP_TEST => {
-      if any_reads_dx(ins) { DxEffect::Read } else { DxEffect::None }
-    }
-    _ => {
-      if source_reads_dx(ins) { DxEffect::Read } else { DxEffect::None }
-    }
-  }
-}
-
-fn first_is_dx(ins: &RawInstr) -> bool {
-  matches!(ins.operands.get(0), Some(Operand::Reg(instr::OperandReg(Reg::DX))))
-}
-
-fn source_reads_dx(ins: &RawInstr) -> bool {
-  ins.operands.as_slice().iter().skip(1).any(|op| operand_reads_dx(*op))
-}
-
-fn any_reads_dx(ins: &RawInstr) -> bool {
-  ins.operands.as_slice().iter().any(|op| operand_reads_dx(*op))
-}
-
-fn operand_reads_dx(op: Operand) -> bool {
-  match op {
-    Operand::Reg(instr::OperandReg(Reg::DX)) | Operand::Reg(instr::OperandReg(Reg::DH)) => true,
-    Operand::Mem(mem) => mem.reg1 == Some(Reg::DX) || mem.reg2 == Some(Reg::DX),
-    _ => false,
-  }
-}
-
-fn read_modify_zeroing(ins: &RawInstr) -> bool {
-  let mut ops = ins.operands.as_slice().iter();
-  let Some(Operand::Reg(instr::OperandReg(Reg::DX))) = ops.next() else { return false; };
-  matches!(ops.next(), Some(Operand::Reg(instr::OperandReg(Reg::DX))))
 }
 
 #[cfg(test)]
@@ -370,9 +402,17 @@ mod tests {
   }
 
   #[test]
-  fn mixed_ret_immediates_are_not_trusted() {
-    let code = [0xC2, 0x04, 0x00, 0xC2, 0x06, 0x00];
+  fn reachable_mixed_ret_immediates_are_not_trusted() {
+    // jz over the `ret 4` to a plain `ret`: both paths are reachable.
+    let code = [0x74, 0x03, 0xC2, 0x04, 0x00, 0xC3];
     assert_eq!(ret_imm_args(&decode(&code)), None);
+  }
+
+  #[test]
+  fn ret_imm_after_a_terminator_is_still_trusted() {
+    // Decoding continues past `ret`; the trailing bytes are unreachable.
+    let code = [0xC2, 0x04, 0x00, 0xC2, 0x06, 0x00];
+    assert_eq!(ret_imm_args(&decode(&code)), Some(2));
   }
 
   #[test]
@@ -382,12 +422,15 @@ mod tests {
   }
 
   #[test]
-  fn dx_effect_distinguishes_reads_writes_and_zeroing() {
-    assert_eq!(dx_effect(&decode(&[0x89, 0xD0])[0]), DxEffect::Read);  // mov ax,dx
-    assert_eq!(dx_effect(&decode(&[0x89, 0xD8])[0]), DxEffect::None);  // mov ax,bx
-    assert_eq!(dx_effect(&decode(&[0xBA, 0x04, 0x00])[0]), DxEffect::Write); // mov dx,4
-    assert_eq!(dx_effect(&decode(&[0x5A])[0]), DxEffect::Write);       // pop dx
-    assert_eq!(dx_effect(&decode(&[0x52])[0]), DxEffect::Read);        // push dx
-    assert_eq!(dx_effect(&decode(&[0x31, 0xD2])[0]), DxEffect::Write); // xor dx,dx
+  fn trailing_plain_ret_does_not_invalidate_ret_imm() {
+    let code = [0xC2, 0x04, 0x00, 0xC3];
+    assert_eq!(ret_imm_args(&decode(&code)), Some(2));
+  }
+
+  #[test]
+  fn far_call_target_is_resolved() {
+    let raw = decode(&[0x9A, 0x34, 0x12, 0x00, 0x00]);
+    assert_eq!(direct_call_target(&raw[0]),
+               Some(SegOff { seg: Seg::Normal(0), off: Off(0x1234) }));
   }
 }

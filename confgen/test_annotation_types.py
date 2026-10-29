@@ -173,6 +173,24 @@ class RetUnknownFlagTests(unittest.TestCase):
         self.assertNotIn('RET_UNKNOWN', stub_line)
         self.assertIn('TODO: return kind unknown', stub_line)
 
+    def test_dont_pop_args_combines_with_ret_unknown_interim_modes(self):
+        # Pins the interaction between the interim RET_UNKNOWN modes and the
+        # new boolean: the callstub keeps its interim mode and gains the
+        # DONT_POP_ARGS bit, and the BSL keeps mode + dont_pop_args.
+        from hydra.annotations import RET_UNKNOWN_MODES
+        for i, (flag, (mode, _cflags)) in enumerate(RET_UNKNOWN_MODES.items()):
+            name = f'ret_unknown_dpa_{i}'
+            func = Function(reimpl=False, name=name, ret=None, args=None,
+                            start_addr='0000:1234', end_addr='0000:1300',
+                            flags=flag, dont_pop_args=True)
+            line = next(l for l in self._gen_functions_text([func]).splitlines() if name in l)
+            self.assertIn(f'mode {mode}', line)
+            self.assertIn('dont_pop_args 1', line)
+            self.assertIn('ret_kind_unknown 1', line)
+            dat = build_func_data([func])
+            self.assertIn('DONT_POP_ARGS', dat[0].flags)
+            self.assertNotIn('RET_UNKNOWN', dat[0].flags)
+
     def test_dont_pop_args_combines_with_near_mode(self):
         func = Function(reimpl=True, name='near_ret_imm', ret='u16', args=2,
                         start_addr='0000:1234', end_addr='0000:1300',
