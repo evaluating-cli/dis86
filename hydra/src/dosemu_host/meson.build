@@ -71,6 +71,16 @@ test_trace = executable(
   link_with : libhydra,
 )
 
+## Connect-race regression (issue #146): dosemu2 publishes its debug FIFO pair
+## early and then removes/recreates it, so a connector can find no pair yet, or
+## a dbgin with no reader (ENXIO). A forked fake peer serves the endpoint, so
+## this needs no dosemu2 and no guest: it links the same concatenated
+## dosdebug translation unit the host library uses.
+test_dosdebug_connect_retry = executable(
+  'test_dosdebug_connect_retry',
+  ['test_dosdebug_connect_retry.c', dosdebug_combined],
+)
+
 ## Phase 4/5: guest program (nasm -> .COM) + driver integration test.
 
 testprog_com = custom_target(
