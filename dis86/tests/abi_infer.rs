@@ -402,6 +402,44 @@ fn u32_return_dead_dx_move_is_not_evidence() {
 }
 
 #[test]
+fn u16_call_byte_fragment_read_is_evidence() {
+  for read in [[0x88, 0xF0], [0x88, 0xD0]] { // mov al,dh / mov al,dl
+    let mut code = vec![0xE8, 0x0D, 0x00, read[0], read[1], 0xC3];
+    code.extend([0x90; 10]);
+    code.extend([0xBA, 0x07, 0x00, 0xB8, 0x03, 0x00, 0xC3]);
+    let caller = func("fragment_caller", 0, 6, Some(Type::U16), None);
+    let callee = func("fragment_callee", 0x10, 0x17, Some(Type::U16), None);
+    let cfg = config(vec![caller.clone(), callee]);
+    let ir = build_ir(&code, &caller, &cfg);
+    let live = abi::semantic_live(&ir);
+    assert!(abi::caller_reads_dx_after_call(&ir, &live, first_call(&ir)),
+            "read {:02X?}", read);
+  }
+}
+
+#[test]
+fn direct_ret_of_entry_ax_is_not_an_input() {
+  let code = [0xC3];
+  let f = func("direct_ax", 0, 1, Some(Type::U16), None);
+  let cfg = config(vec![f.clone()]);
+  assert!(infer(&code, &f, &cfg).is_empty());
+}
+
+#[test]
+fn phi_return_of_entry_ax_is_an_input() {
+  let code = [
+    0x85, 0xC0,       // test ax,ax
+    0x74, 0x03,       // jz +3 -> ret
+    0xB8, 0x01, 0x00, // mov ax,1
+    0xC3,             // ret
+  ];
+  let f = func("phi_ax", 0, 8, Some(Type::U16), None);
+  let cfg = config(vec![f.clone()]);
+  // AX is read by `test`; the merge into the return does not hide that.
+  assert_eq!(infer(&code, &f, &cfg), vec![Reg::AX]);
+}
+
+#[test]
 fn mid_instruction_target_keeps_fallthrough_ret() {
   let code = [
     0x74, 0x02,       // jz +2 -> target 0x0004 (inside mov ax,0x9090)

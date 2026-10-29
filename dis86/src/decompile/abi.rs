@@ -47,7 +47,9 @@ pub fn infer_register_inputs(ir: &IR) -> Vec<instr::Reg> {
         // A `ret`'s AX/DX operands are the return expression, not caller
         // setup. An unannotated function returns DX:AX by default, and
         // counting those entry values would report the return registers as
-        // `regargs`.
+        // `regargs`. The check is deliberately shallow: a value used by a
+        // non-ret instruction (including a `Phi` merge that also feeds the
+        // return) is still an input.
         if is_ret && matches!(reg, instr::Reg::AX | instr::Reg::DX) { continue; }
         let reg = storage_parent(*reg);
         if CANDIDATES.contains(&reg) { found.insert(reg); }
@@ -145,7 +147,7 @@ fn reads_dx_from(ir: &IR, live: &HashSet<Ref>, blk: BlockRef,
     let Some(instr) = ir.instr(r) else { continue; };
     if writes_dx(ir, instr) { return false; }
     if live.contains(&r) {
-      if instr.operands.iter().any(|o| *o == Ref::Init(instr::Reg::DX)) {
+      if instr.operands.iter().any(|o| derives_from_reg(ir, *o, instr::Reg::DX)) {
         return true;
       }
       if let Some(result) = dx_result {
@@ -173,12 +175,36 @@ fn derives_from_inner(ir: &IR, value: Ref, target: Ref,
   if value == target { return true; }
   if !seen.insert(value) { return false; }
   let Some(instr) = ir.instr(value) else { return false; };
-  if !matches!(instr.opcode,
-    Opcode::Ref | Opcode::Upper16 | Opcode::Lower16
-      | Opcode::And | Opcode::Or | Opcode::UShr | Opcode::Shl) {
-    return false;
-  }
+  if !is_projection(instr.opcode) { return false; }
   instr.operands.iter().any(|o| derives_from_inner(ir, *o, target, seen))
+}
+
+/// Whether `value` is a register or a pure projection of its byte fragments.
+/// `save_return_value` re-splits `DX` into `DL`/`DH` after a call, so a byte
+/// read is still a read of the parent register.
+fn derives_from_reg(ir: &IR, value: Ref, reg: instr::Reg) -> bool {
+  let mut seen = HashSet::new();
+  derives_from_reg_inner(ir, value, reg, &mut seen)
+}
+
+fn derives_from_reg_inner(ir: &IR, value: Ref, reg: instr::Reg,
+                          seen: &mut HashSet<Ref>) -> bool {
+  match value {
+    Ref::Init(r) => storage_parent(r) == reg,
+    Ref::Instr(_, _) => {
+      if !seen.insert(value) { return false; }
+      let Some(instr) = ir.instr(value) else { return false; };
+      if !is_projection(instr.opcode) { return false; }
+      instr.operands.iter().any(|o| derives_from_reg_inner(ir, *o, reg, seen))
+    }
+    _ => false,
+  }
+}
+
+fn is_projection(opcode: Opcode) -> bool {
+  matches!(opcode,
+    Opcode::Ref | Opcode::Upper16 | Opcode::Lower16
+      | Opcode::And | Opcode::Or | Opcode::UShr | Opcode::Shl)
 }
 
 fn writes_dx(ir: &IR, instr: &Instr) -> bool {

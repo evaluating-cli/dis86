@@ -33,6 +33,8 @@ fn print_help() {
   println!("  --infer-abi       report inferred args, register inputs, and return width for the");
   println!("                    selected functions (uses --name, --codeseg-name, or a range)");
   println!("                    register inputs are iterated to a fixpoint (at most 8 passes)");
+  println!("                    call-site columns need callers in the selection; --name builds");
+  println!("                    only the named function");
   println!("");
   println!("MODE: VALIDATE CONFIG");
   println!("  --validate-config validate config ranges, decode, and call modes; then exit");

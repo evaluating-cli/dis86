@@ -154,12 +154,19 @@ struct ArgsInfo {
 fn infer_args(cfg: &Config, built: &[BuiltFunc]) -> std::collections::HashMap<String, ArgsInfo> {
   let mut cleanups: std::collections::HashMap<String, Vec<u16>> = std::collections::HashMap::new();
   for caller in built {
+    let reachable = reachable_raw(&caller.raw);
     for (i, ins) in caller.raw.iter().enumerate() {
+      if !reachable[i] { continue; }
       if !matches!(ins.opcode, OP_CALL | OP_CALLF) { continue; }
       let Some(target) = direct_call_target(ins) else { continue; };
       let Some(callee) = cfg.func_lookup(target) else { continue; };
       let Some(bytes) = cleanup_bytes(&caller.raw, i + 1) else { continue; };
       if bytes % 2 != 0 { continue; }
+      // A post-call `add sp, imm` needs pushed argument slots to corroborate
+      // it. Without them the adjustment is more likely frame teardown, which
+      // would otherwise turn a no-arg callee into a false `args` suggestion.
+      let pushed = pushed_bytes_before(&caller.raw, i);
+      if pushed == 0 || bytes > pushed { continue; }
       cleanups.entry(callee.name.clone()).or_default().push(bytes / 2);
     }
   }
@@ -263,29 +270,68 @@ fn follows_target(opcode: instr::Opcode) -> bool {
 }
 
 /// Caller stack cleanup immediately after a call. Only the `add sp, imm`
-/// idiom is measured; cleanup done by `pop reg`, or cleanup behind a branch,
-/// yields no evidence rather than a guess.
+/// idiom is measured, and only within a short window that contains no other
+/// stack write or control transfer. Cleanup done by `pop reg`, behind a
+/// branch, or through a frame teardown yields no evidence rather than a guess.
 fn cleanup_bytes(raw: &[RawInstr], start: usize) -> Option<u16> {
-  let mut j = start;
-  while j < raw.len() {
-    let ins = &raw[j];
+  for ins in raw.iter().skip(start).take(CLEANUP_LOOKAHEAD) {
     if ins.opcode == OP_ADD && first_is_sp(ins) {
-      if let Some(Operand::Imm(imm)) = ins.operands.get(1) { return Some(imm.val); }
+      return match ins.operands.get(1) {
+        Some(Operand::Imm(imm)) => Some(imm.val),
+        _ => None,
+      };
     }
-    if matches!(ins.opcode, OP_PUSH | OP_POP | OP_CALL | OP_CALLF | OP_INT | OP_INTO
-      | OP_RET | OP_RETF | OP_JMP | OP_JMPF | OP_HLT
-      | OP_JA | OP_JAE | OP_JB | OP_JBE | OP_JCXZ | OP_JE | OP_JG | OP_JGE
-      | OP_JL | OP_JLE | OP_JNE | OP_JNO | OP_JNP | OP_JNS | OP_JO | OP_JP
-      | OP_JS | OP_LOOP | OP_LOOPE | OP_LOOPNE) {
-      return None;
-    }
-    j += 1;
+    if writes_sp(ins) || is_control_transfer(ins.opcode) { return None; }
   }
   None
 }
 
+const CLEANUP_LOOKAHEAD: usize = 4;
+
 fn first_is_sp(ins: &RawInstr) -> bool {
   matches!(ins.operands.get(0), Some(Operand::Reg(instr::OperandReg(Reg::SP))))
+}
+
+/// Contiguous `push` slots immediately before a call. Used to corroborate a
+/// post-call `add sp, imm`; mirrors the IR builder's call-argument heuristic.
+fn pushed_bytes_before(raw: &[RawInstr], call: usize) -> u16 {
+  let mut bytes = 0u16;
+  let mut j = call;
+  while j > 0 {
+    j -= 1;
+    if raw[j].opcode != OP_PUSH { break; }
+    bytes += 2;
+  }
+  bytes
+}
+
+fn is_control_transfer(opcode: instr::Opcode) -> bool {
+  matches!(opcode,
+    OP_RET | OP_RETF | OP_IRET | OP_JMP | OP_JMPF | OP_HLT
+      | OP_JA | OP_JAE | OP_JB | OP_JBE | OP_JCXZ | OP_JE | OP_JG | OP_JGE
+      | OP_JL | OP_JLE | OP_JNE | OP_JNO | OP_JNP | OP_JNS | OP_JO | OP_JP
+      | OP_JS | OP_LOOP | OP_LOOPE | OP_LOOPNE)
+}
+
+/// Whether an instruction can change `SP`. The scan stops at these so an
+/// unrelated later `add sp, imm` is never attributed to the call.
+fn writes_sp(ins: &RawInstr) -> bool {
+  if matches!(ins.opcode,
+    OP_PUSH | OP_POP | OP_PUSHA | OP_POPA | OP_PUSHF | OP_POPF
+      | OP_ENTER | OP_LEAVE | OP_CALL | OP_CALLF | OP_INT | OP_INTO
+      | OP_IRET | OP_RET | OP_RETF) {
+    return true;
+  }
+  let dst_is_sp = first_is_sp(ins);
+  if dst_is_sp && matches!(ins.opcode,
+    OP_MOV | OP_ADD | OP_ADC | OP_SUB | OP_SBB | OP_AND | OP_OR | OP_XOR
+      | OP_INC | OP_DEC | OP_NEG | OP_NOT | OP_SHL | OP_SHR | OP_SAR
+      | OP_ROL | OP_ROR | OP_RCL | OP_RCR | OP_LEA | OP_LDS | OP_LES) {
+    return true;
+  }
+  ins.opcode == OP_XCHG
+    && ins.operands.as_slice().iter().any(|op|
+      matches!(op, Operand::Reg(instr::OperandReg(Reg::SP))))
 }
 
 fn build_all(cfg: &Config, binary: &Binary, specs: Vec<Spec<'_>>)
@@ -422,6 +468,38 @@ mod tests {
   fn caller_stack_cleanup_is_measured() {
     let raw = decode(&[0xE8, 0x00, 0x00, 0x83, 0xC4, 0x04]);
     assert_eq!(cleanup_bytes(&raw, 1), Some(4));
+  }
+
+  #[test]
+  fn cleanup_scan_stops_at_stack_writes() {
+    // call; mov sp,bp; add sp,4
+    let raw = decode(&[0xE8, 0x00, 0x00, 0x89, 0xEC, 0x83, 0xC4, 0x04]);
+    assert_eq!(cleanup_bytes(&raw, 1), None);
+    // call; leave; add sp,4
+    let raw = decode(&[0xE8, 0x00, 0x00, 0xC9, 0x83, 0xC4, 0x04]);
+    assert_eq!(cleanup_bytes(&raw, 1), None);
+    // call; add sp,ax; add sp,4
+    let raw = decode(&[0xE8, 0x00, 0x00, 0x01, 0xC4, 0x83, 0xC4, 0x04]);
+    assert_eq!(cleanup_bytes(&raw, 1), None);
+    // call; pusha; add sp,4
+    let raw = decode(&[0xE8, 0x00, 0x00, 0x60, 0x83, 0xC4, 0x04]);
+    assert_eq!(cleanup_bytes(&raw, 1), None);
+  }
+
+  #[test]
+  fn cleanup_scan_is_bounded() {
+    let raw = decode(&[0xE8, 0x00, 0x00, 0x90, 0x90, 0x90, 0x90, 0x83, 0xC4, 0x04]);
+    assert_eq!(cleanup_bytes(&raw, 1), None);
+    let raw = decode(&[0xE8, 0x00, 0x00, 0x90, 0x90, 0x90, 0x83, 0xC4, 0x04]);
+    assert_eq!(cleanup_bytes(&raw, 1), Some(4));
+  }
+
+  #[test]
+  fn contiguous_pushes_before_call_are_counted() {
+    let raw = decode(&[0x50, 0x53, 0xE8, 0x00, 0x00]);
+    assert_eq!(pushed_bytes_before(&raw, 2), 4);
+    let raw = decode(&[0x50, 0x90, 0xE8, 0x00, 0x00]);
+    assert_eq!(pushed_bytes_before(&raw, 2), 0);
   }
 
   #[test]

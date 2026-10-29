@@ -158,6 +158,8 @@ Emit C code:
 
 Other modes: `--analyze` (config-driven analysis), `--infer-abi` (report inferred stack/register arguments and return width for selected functions; register inputs converge over at most 8 passes), `--validate-config` (config preflight; add `--strict` to make warnings fatal), `--trace-analyze --trace <file>` (analysis of a recorded Hydra execution trace, issue #97), `--start-addr`/`--end-addr` (address-range slices), `--codeseg-name` (decompile a whole configured code segment), `--codegen-hydra` (Hydra-flavored codegen), and `--codegen-hydra --relocatable-seg HEX[,HEX...]` (emit listed absolute link-time segment values as `(CODE_START_SEG + seg)` for relocated Hydra execution). Run `dis86 --help` for the full list. The `mzfile` companion binary inspects and extracts MZ executables via subcommands (`mzfile info <program.exe>`, plus `extract`, `map`, and `dis`).
 
+`--infer-abi` call-site columns (`args`, `dont_pop_args`, and caller-observed `u32` promotion) come only from functions included in the selection. `--name` builds just that function, so use `--codeseg-name` or a range that includes the callers when those columns matter.
+
 The end-to-end, from-zero walkthrough — MZ forensics to a working native binary, including the stock-dosemu2 oracle — is the operator's local recompile prompt, kept out of this tree; the in-repo end-to-end lane is [`parity/`](parity/README.md).
 
 ## Caveats & Limitations

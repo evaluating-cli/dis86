@@ -47,6 +47,16 @@ fn run(dir: &PathBuf, raw: &[u8], functions: &str, extra: &[&str]) -> std::proce
   cmd.output().expect("run dis86")
 }
 
+fn row<'a>(stdout: &'a str, name: &str) -> &'a str {
+  stdout.lines().find(|line| line.starts_with(&format!("{}\t", name)))
+    .unwrap_or_else(|| panic!("no {} row: {}", name, stdout))
+}
+
+fn field(row: &str, index: usize) -> &str {
+  row.split('\t').nth(index)
+    .unwrap_or_else(|| panic!("short row: {}", row))
+}
+
 const ONE_FUNC: &str = "f { start 0000:0000 end 0000:0001 mode near ret u16 args 0 }";
 
 #[test]
@@ -204,6 +214,102 @@ fn infer_abi_keeps_annotated_ret_when_the_range_truncates() {
     assert!(out.status.success(), "stderr: {}", stderr);
     assert!(stdout.contains(expected), "ret {}: stdout: {}", ret, stdout);
     assert!(!stdout.contains("\tvoid\t"), "ret {}: stdout: {}", ret, stdout);
+    let _ = fs::remove_dir_all(dir);
+  }
+}
+
+#[test]
+fn infer_abi_does_not_mistake_frame_teardown_for_arguments() {
+  let dir = temp_dir();
+  let code = [
+    0x83, 0xEC, 0x08, // sub sp,8
+    0xE8, 0x0A, 0x00, // call callee at 0x0010; next IP is 0x0006
+    0x83, 0xC4, 0x08, // add sp,8 (frame teardown, not argument cleanup)
+    0xC3,             // ret
+    0x90, 0x90, 0x90, 0x90, 0x90, 0x90, // padding to 0x0010
+    0xC3,             // callee: ret
+  ];
+  let functions = "\
+    caller { start 0000:0000 end 0000:000A mode near ret u16 args 0 } \
+    callee { start 0000:0010 end 0000:0011 mode near ret u16 args 0 }";
+  let out = run(&dir, &code, functions, &["--infer-abi", "--codeseg-name", "main"]);
+  let stdout = String::from_utf8_lossy(&out.stdout);
+  let stderr = String::from_utf8_lossy(&out.stderr);
+  assert!(out.status.success(), "stderr: {}", stderr);
+  let callee = row(&stdout, "callee");
+  assert_eq!(field(callee, 3), "?", "callee row: {}", callee);
+  assert!(field(callee, 7).contains("no call-site evidence"),
+          "callee row: {}", callee);
+  let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn infer_abi_uses_pushed_arguments_to_corroborate_cleanup() {
+  let dir = temp_dir();
+  let code = [
+    0x50,             // push ax
+    0xE8, 0x0C, 0x00, // call callee at 0x0010; next IP is 0x0004
+    0x83, 0xC4, 0x02, // add sp,2
+    0xC3,             // ret
+    0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, // padding to 0x0010
+    0xC3,             // callee: ret
+  ];
+  let functions = "\
+    caller { start 0000:0000 end 0000:0008 mode near ret u16 args 0 } \
+    callee { start 0000:0010 end 0000:0011 mode near ret u16 args 0 }";
+  let out = run(&dir, &code, functions, &["--infer-abi", "--codeseg-name", "main"]);
+  let stdout = String::from_utf8_lossy(&out.stdout);
+  let stderr = String::from_utf8_lossy(&out.stderr);
+  assert!(out.status.success(), "stderr: {}", stderr);
+  let callee = row(&stdout, "callee");
+  assert_eq!(field(callee, 3), "1", "callee row: {}", callee);
+  assert_eq!(field(callee, 4), "false", "callee row: {}", callee);
+  assert!(field(callee, 7).contains("caller cleans 2 byte(s)"),
+          "callee row: {}", callee);
+  let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn infer_abi_ignores_cleanup_from_an_unreachable_call() {
+  let dir = temp_dir();
+  let code = [
+    0xC3,             // ret: the following bytes are unreachable
+    0x50,             // push ax
+    0xE8, 0x0B, 0x00, // call callee at 0x0010; next IP is 0x0005
+    0x83, 0xC4, 0x02, // add sp,2
+    0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, // padding to 0x0010
+    0xC3,             // callee: ret
+  ];
+  let functions = "\
+    caller { start 0000:0000 end 0000:0008 mode near ret u16 args 0 } \
+    callee { start 0000:0010 end 0000:0011 mode near ret u16 args 0 }";
+  let out = run(&dir, &code, functions, &["--infer-abi", "--codeseg-name", "main"]);
+  let stdout = String::from_utf8_lossy(&out.stdout);
+  let stderr = String::from_utf8_lossy(&out.stderr);
+  assert!(out.status.success(), "stderr: {}", stderr);
+  let callee = row(&stdout, "callee");
+  assert_eq!(field(callee, 3), "?", "callee row: {}", callee);
+  assert!(field(callee, 7).contains("no call-site evidence"),
+          "callee row: {}", callee);
+  let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn infer_abi_marks_u32_return_from_a_high_byte_read() {
+  for read in [[0x88, 0xF0], [0x88, 0xD0]] { // mov al,dh / mov al,dl
+    let dir = temp_dir();
+    let mut code = vec![0xE8, 0x0D, 0x00, read[0], read[1], 0xC3];
+    code.extend([0x90; 10]);
+    code.extend([0xBA, 0x07, 0x00, 0xB8, 0x03, 0x00, 0xC3]);
+    let functions = "\
+      caller { start 0000:0000 end 0000:0006 mode near ret u16 args 0 } \
+      callee { start 0000:0010 end 0000:0017 mode near ret u16 args 0 }";
+    let out = run(&dir, &code, functions, &["--infer-abi", "--codeseg-name", "main"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "read {:02X?}, stderr: {}", read, stderr);
+    let callee = row(&stdout, "callee");
+    assert_eq!(field(callee, 5), "u32", "read {:02X?}, callee row: {}", read, callee);
     let _ = fs::remove_dir_all(dir);
   }
 }
