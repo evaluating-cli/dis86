@@ -169,6 +169,16 @@ jobs:
           hydra/build/src/dosemu_host/test_trace
           echo "test_trace: PASS" >> "$GITHUB_STEP_SUMMARY"
 
+      # #146: dosemu2 publishes the debug FIFO pair early and then removes and
+      # recreates it, so a single-shot connect can land in the gap. This uses a
+      # forked fake peer, so it costs ~6 s and needs no dosemu2 - but it is the
+      # only gate that covers the connect race at all.
+      - name: Verify dosdebug connect retry (dosemu2-free)
+        run: |
+          set -euo pipefail
+          hydra/build/src/dosemu_host/test_dosdebug_connect_retry
+          echo "test_dosdebug_connect_retry: PASS" >> "$GITHUB_STEP_SUMMARY"
+
       - name: Verify native host skeleton (dosemu2-free)
         run: |
           set -euo pipefail

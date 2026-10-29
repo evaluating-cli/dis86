@@ -32,6 +32,26 @@
 #define QUIET_MS 80          /* silence threshold: response considered done */
 #define DEFAULT_TIMEOUT_MS 5000
 
+/* #146: dosemu2 publishes the debug FIFO pair early in startup and then removes
+ * and recreates it (its log prints "removing stale files: .../dosemu.dbgin.<pid>"
+ * right after a connector has already looked). A connector that looks into that
+ * window sees either no pair at all (discover_pid's single readdir pass fails)
+ * or a dbgin with no reader yet (ENXIO on the writer open). Poll the endpoint
+ * instead of failing on the first look.
+ *
+ * The handshake is deliberately NOT retried: once the pair is open, a failure
+ * is a protocol error rather than a missing endpoint, and replaying stop/r0
+ * against a live machine would perturb the sequence the protocol relies on. */
+#define CONNECT_POLL_TRIES 20
+#define CONNECT_POLL_INTERVAL_MS 100
+/* The sleep only runs *between* attempts, so the endpoint is looked at
+ * CONNECT_POLL_TRIES times inside a window of (TRIES - 1) * INTERVAL =
+ * 1900 ms, not 2000 ms: a peer that publishes its fifo pair at t=1950 ms
+ * is already past the budget. Everything that quotes the budget must use
+ * this macro rather than TRIES * INTERVAL, or it overstates the guarantee
+ * by one interval. */
+#define CONNECT_POLL_WINDOW_MS ((CONNECT_POLL_TRIES - 1) * CONNECT_POLL_INTERVAL_MS)
+
 /* Fallback when XDG_RUNTIME_DIR is not set (Phase 0 default). */
 #define DEFAULT_XDG_RUNTIME "/tmp/opencode/runtime"
 
@@ -516,6 +536,47 @@ static const char *xdg_runtime_dir(void)
     return DEFAULT_XDG_RUNTIME;
 }
 
+/* Sleep in milliseconds. usleep() is not usable here: this translation unit
+ * sets _POSIX_C_SOURCE 200809L, where usleep() is no longer declared. */
+static void sleep_ms(int ms)
+{
+    struct timespec ts;
+    ts.tv_sec = ms / 1000;
+    ts.tv_nsec = (long)(ms % 1000) * 1000000L;
+    while (nanosleep(&ts, &ts) != 0 && errno == EINTR)
+        continue; /* ts now holds the unslept remainder */
+}
+
+/*
+ * #146 diagnostics: the runtime log alone cannot distinguish "no fifo at all"
+ * from "fifo exists but has no reader", which is what made the first diagnosis
+ * of this race expensive. On exhaustion, show what the endpoint dir held.
+ */
+static void report_runtime_dir(void)
+{
+    char dir[8192];
+    snprintf(dir, sizeof(dir), "%s/dosemu2", xdg_runtime_dir());
+    fprintf(stderr, "dosdebug: runtime dir: %s\n", dir);
+
+    DIR *d = opendir(dir);
+    if (!d) {
+        fprintf(stderr, "dosdebug:   (opendir failed: %s)\n", strerror(errno));
+        return;
+    }
+
+    int shown = 0;
+    struct dirent *ent;
+    while ((ent = readdir(d)) != NULL) {
+        if (strncmp(ent->d_name, "dosemu.dbg", 10) != 0)
+            continue;
+        fprintf(stderr, "dosdebug:   %s\n", ent->d_name);
+        shown++;
+    }
+    if (shown == 0)
+        fprintf(stderr, "dosdebug:   (no dosemu.dbg* entries)\n");
+    closedir(d);
+}
+
 /*
  * Locate a dosemu2 instance. If wanted != 0, require that exact pid.
  * Otherwise pick the first live instance found.
@@ -559,8 +620,23 @@ static pid_t discover_pid(pid_t wanted)
     return found;
 }
 
-dosdebug_t *dosdebug_connect(pid_t pid)
+typedef enum {
+    CONNECT_OK = 0,
+    CONNECT_AGAIN,   /* endpoint not serving yet: worth another look */
+    CONNECT_FATAL,   /* protocol/handshake error: retrying cannot help */
+} connect_status_t;
+
+/*
+ * One connection attempt: discover the endpoint, open both FIFOs and run the
+ * handshake. Returns a connected handle, or NULL with *status telling the
+ * caller whether another attempt could succeed and *reason naming the step.
+ */
+static dosdebug_t *connect_once(pid_t pid, connect_status_t *status,
+                                const char **reason)
 {
+    *status = CONNECT_AGAIN;
+    *reason = "debug fifo pair not published yet";
+
     pid_t p = discover_pid(pid);
     if (p < 0)
         return NULL;
@@ -572,8 +648,11 @@ dosdebug_t *dosdebug_connect(pid_t pid)
              xdg_runtime_dir(), (long)p);
 
     dosdebug_t *db = calloc(1, sizeof(*db));
-    if (!db)
+    if (!db) {
+        *status = CONNECT_FATAL;
+        *reason = "out of memory";
         return NULL;
+    }
     {
         const char *sl = getenv("DOSDEBUG_STREAM_LOG");
         if (sl && sl[0])
@@ -585,18 +664,33 @@ dosdebug_t *dosdebug_connect(pid_t pid)
 
     /* O_NONBLOCK so open() never blocks; cleared right after. */
     db->out_fd = open(out_path, O_RDONLY | O_NONBLOCK);
-    if (db->out_fd < 0)
+    if (db->out_fd < 0) {
+        /* ENOENT: the pair was unlinked and not yet recreated.
+         * No EAGAIN here, unlike the dbgin open below: O_RDONLY | O_NONBLOCK
+         * on a fifo never waits for a writer, so that errno cannot arise. */
+        *reason = "dbgout open failed";
+        if (errno != ENOENT && errno != ENXIO)
+            *status = CONNECT_FATAL;
         goto fail;
+    }
     db->in_fd = open(in_path, O_WRONLY | O_NONBLOCK);
-    if (db->in_fd < 0)
+    if (db->in_fd < 0) {
+        /* ENXIO: the fifo exists but dosemu2 has not opened its read end yet.
+         * ENOENT: it unlinked/recreated the pair between discovery and here.
+         * Both are the startup window, not a hard error. */
+        *reason = (errno == ENXIO) ? "dbgin has no reader yet (ENXIO)"
+                                   : "dbgin open failed";
+        if (errno != ENOENT && errno != ENXIO && errno != EAGAIN)
+            *status = CONNECT_FATAL;
         goto fail;
+    }
     fcntl(db->out_fd, F_SETFL, 0);
     fcntl(db->in_fd, F_SETFL, 0);
 
-    /* Handshake: make sure the machine is stopped, then grab a register dump.
-     * The 'stop' response (which may be a dump if the machine was running)
-     * is fully drained so the following 'r0' dump is a clean, parseable one.
-     */
+    /* The endpoint exists from here on: any failure is a protocol error and
+     * must not be retried (#146 non-goal: no change to handshake sequencing). */
+    *status = CONNECT_FATAL;
+    *reason = "handshake failed";
     if (send_cmd(db, "stop\n") != 0)
         goto fail;
     if (read_until_quiet(db, 800) != 0)
@@ -609,10 +703,82 @@ dosdebug_t *dosdebug_connect(pid_t pid)
         goto fail;
 
     db->connected = true;
+    *status = CONNECT_OK;
     return db;
 
 fail:
     dosdebug_disconnect(db);
+    return NULL;
+}
+
+/*
+ * A vanished peer must reach us as an errno, not as a signal. Commands go out
+ * with write() on a fifo, and the default disposition of SIGPIPE kills the
+ * process when its read end is gone - which happens precisely when dosemu2
+ * removes and recreates the pair under a connector that has already opened it
+ * (#146). Dead that fast, neither the retry loop nor the diagnostics below can
+ * run, and the failure looks like a crash rather than a message. Ignoring the
+ * signal turns it into EPIPE at the send_cmd() error branch.
+ *
+ * Process-wide on purpose: this translation unit is compiled into the host
+ * library and into every binary that connects (test_dosdebug, xcheck_lowmem,
+ * the Phase 7 driver), and none of them wants the default disposition - they
+ * all treat a dead peer as a hard failure anyway. test_driver_ovl.c:174 sets
+ * the same disposition at its own entry point.
+ */
+static void ignore_sigpipe(void)
+{
+    static bool installed;
+    if (!installed) {
+        signal(SIGPIPE, SIG_IGN);
+        installed = true;
+    }
+}
+
+dosdebug_t *dosdebug_connect(pid_t pid)
+{
+    ignore_sigpipe();
+    const char *reason = "unknown";
+    int attempted = 0;
+
+    for (int attempt = 1; attempt <= CONNECT_POLL_TRIES; attempt++) {
+        attempted = attempt;
+        connect_status_t status;
+        dosdebug_t *db = connect_once(pid, &status, &reason);
+        if (db) {
+            /* #147 review E: the attempt count on *success* is the only way to
+             * size this window from CI instead of guessing - a lane that is green
+             * at attempt 19 is one runner hiccup from red, and nothing said so. */
+            if (attempt > 1)
+                fprintf(stderr,
+                        "dosdebug: dosemu2 (pid=%ld) endpoint appeared after %d "
+                        "attempt(s), ~%d ms in\n",
+                        (long)pid, attempt, (attempt - 1) * CONNECT_POLL_INTERVAL_MS);
+            return db;
+        }
+        if (status == CONNECT_FATAL) {
+            fprintf(stderr, "dosdebug: connect to dosemu2 (pid=%ld) failed: %s\n",
+                    (long)pid, reason);
+            return NULL;
+        }
+        /* Polling pays off only while the instance we were pointed at is alive:
+         * once it is gone no look can succeed, so stop rather than spend the
+         * window on a dead process. That is also what makes the window safe to
+         * raise for a live-but-slow startup (#147 review E). */
+        if (pid != 0 && kill(pid, 0) != 0) {
+            reason = "dosemu2 exited before publishing the endpoint";
+            break;
+        }
+        if (attempt < CONNECT_POLL_TRIES)
+            sleep_ms(CONNECT_POLL_INTERVAL_MS);
+    }
+
+    fprintf(stderr,
+            "dosdebug: gave up connecting to dosemu2 (pid=%ld) after %d attempt(s), "
+            "~%d ms of a ~%d ms window (last failure: %s)\n",
+            (long)pid, attempted, (attempted - 1) * CONNECT_POLL_INTERVAL_MS,
+            CONNECT_POLL_WINDOW_MS, reason);
+    report_runtime_dir();
     return NULL;
 }
 
