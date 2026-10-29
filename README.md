@@ -112,6 +112,37 @@ MZ file, `mzfile info` prints both the file-offset `Exe Region` and the
 load-relative `Config Address Space`; do not add the MZ header size to a
 configuration address.
 
+### Discontiguous function bodies
+
+A function normally occupies the half-open range `[start, end)`. When its body
+is split by embedded data, or shares an epilogue outside that range, add a
+`regions` table. Each region is half-open, stays in the function's segment, and
+must not overlap another region; `start` must lie inside one region. With
+`regions` present, `end` is optional: omit it or use `end ""` to derive it from
+the highest region end, while a concrete `end` remains an upper bound that no
+region may exceed.
+
+```
+    F_split {
+      start 0000:0100 end ""
+      mode near ret u16 args 0
+      regions {
+        _0 { start 0000:0100 end 0000:0120 }
+        _1 { start 0000:0180 end 0000:01a0 }
+      }
+    }
+```
+
+Region starts are inclusive and ends exclusive. Bytes in the gaps are never
+decoded: ordinary fallthrough stops at a region end, and a branch into a gap is
+reported and not followed. A region may begin before `start` to model a shared
+epilogue; an explicit `entry` must still lie inside a region (or an overlay
+stub). Adjacent regions are normalized. A `regions` table must not be empty, and
+indirect-call entries cannot declare one. Different functions may claim
+overlapping regions (for example a shared epilogue); each function decodes its
+own set independently. Configurations without `regions` keep the original
+`[start, end)` behavior.
+
 Emit disassembly:
 
 ```

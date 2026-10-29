@@ -1,10 +1,9 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::asm::decode::Decoder;
 use crate::asm::instr::{self, Instr as RawInstr, Operand, Reg};
 use crate::asm::instr::Opcode::*;
 use crate::binary::Binary;
-use crate::config::Config;
+use crate::config::{Config, FuncRegion};
 use crate::decompile::ir::{Opcode as IrOpcode, Ref, IR};
 use crate::decompile::{abi, ir_build, opt, sym};
 use crate::segoff::{Off, Seg, SegOff};
@@ -25,6 +24,7 @@ struct SpecSeed {
   func_name: Option<String>,
   start: SegOff,
   end: SegOff,
+  regions: Vec<FuncRegion>,
 }
 
 /// A selected function that could not be analyzed. Structural range failures
@@ -52,6 +52,7 @@ pub fn run(cfg: &Config, binary: &Binary, specs: Vec<Spec<'_>>,
     func_name: spec.func.map(|f| f.name.clone()),
     start: spec.start,
     end: spec.end,
+    regions: spec.regions,
   }).collect();
 
   // Regargs propagate caller-ward: a caller pins a callee's declared register
@@ -67,12 +68,14 @@ pub fn run(cfg: &Config, binary: &Binary, specs: Vec<Spec<'_>>,
         name: seed.name.clone(),
         start: seed.start,
         end: seed.end,
+        regions: seed.regions.clone(),
       }),
       None => Spec {
         func: None,
         name: seed.name.clone(),
         start: seed.start,
         end: seed.end,
+        regions: seed.regions.clone(),
       },
     }).collect();
     (built, failed) = build_all(&working, binary, specs);
@@ -368,20 +371,13 @@ fn build(cfg: &Config, binary: &Binary, spec: &Spec<'_>) -> Result<(IR, Vec<RawI
 /// pipeline instead of copying it.
 pub fn build_ir_for_analysis(cfg: &Config, binary: &Binary, spec: &Spec<'_>, pin_all: bool)
   -> Result<(IR, Vec<RawInstr>), String> {
-  let start = spec.start;
-  let end = spec.end;
-  if !binary.contains_region(start, end) {
-    return Err(format!("invalid range {}..{} (outside the loaded image)", start, end));
-  }
-  let mut instrs = vec![];
-  let mut decoder = Decoder::new(binary.region_iter(start, end));
-  loop {
-    match decoder.try_next() {
-      Ok(Some((instr, _raw))) => instrs.push(instr),
-      Ok(None) => break,
-      Err(err) => return Err(format!("decode failed at {}: {}", start, err)),
+  for region in &spec.regions {
+    if !binary.contains_region(region.start, region.end) {
+      return Err(format!(
+        "invalid region {}..{} (outside the loaded image)", region.start, region.end));
     }
   }
+  let (instrs, _raw) = crate::spec::decode_regions(binary, spec)?;
   build_ir_from_instrs(cfg, binary, spec, instrs, pin_all)
 }
 
@@ -433,6 +429,7 @@ fn direct_call_target(ins: &RawInstr) -> Option<SegOff> {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::asm::decode::Decoder;
 
   fn decode(code: &[u8]) -> Vec<RawInstr> {
     let binary = crate::binary::Binary::from_raw(code, None);

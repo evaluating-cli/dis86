@@ -125,7 +125,7 @@ fn infer_abi_skips_structurally_invalid_functions() {
   assert!(!out.status.success(), "the invalid function must fail the run");
   assert!(stdout.contains("good"), "stdout: {}", stdout);
   assert!(stdout.contains("bad"), "stdout: {}", stdout);
-  assert!(stdout.contains("range outside the loaded image"), "stdout: {}", stdout);
+  assert!(stdout.contains("outside the loaded image"), "stdout: {}", stdout);
   assert!(!stderr.contains("panicked"), "stderr: {}", stderr);
   let _ = fs::remove_dir_all(dir);
 }
@@ -193,7 +193,7 @@ fn infer_abi_reports_an_out_of_image_name_without_panicking() {
   let stderr = String::from_utf8_lossy(&out.stderr);
   assert!(!out.status.success(), "the invalid range must fail the run");
   assert!(stdout.contains("f\t"), "stdout: {}", stdout);
-  assert!(stdout.contains("range outside the loaded image"), "stdout: {}", stdout);
+  assert!(stdout.contains("outside the loaded image"), "stdout: {}", stdout);
   assert!(!stderr.contains("panicked"), "stderr: {}", stderr);
   let _ = fs::remove_dir_all(dir);
 }
@@ -312,4 +312,20 @@ fn infer_abi_marks_u32_return_from_a_high_byte_read() {
     assert_eq!(field(callee, 5), "u32", "read {:02X?}, callee row: {}", read, callee);
     let _ = fs::remove_dir_all(dir);
   }
+}
+
+#[test]
+fn infer_abi_decodes_configured_regions_without_touching_gaps() {
+  let dir = temp_dir();
+  // `jmp 0x0008`; the gap contains invalid opcode bytes; `ret` at 8.
+  let code = [0xE9, 0x05, 0x00, 0x63, 0x63, 0x63, 0x63, 0x63, 0xC3];
+  let functions = "f { start 0000:0000 end \"\" mode near ret u16 args 0 regions { _0 { start 0000:0000 end 0000:0003 } _1 { start 0000:0008 end 0000:0009 } } }";
+  let out = run(&dir, &code, functions, &["--infer-abi", "--name", "f"]);
+  let stdout = String::from_utf8_lossy(&out.stdout);
+  let stderr = String::from_utf8_lossy(&out.stderr);
+  assert!(out.status.success(), "stderr: {}", stderr);
+  assert!(stdout.contains("f\t"), "stdout: {}", stdout);
+  assert!(!stdout.contains("decode failed"), "stdout: {}", stdout);
+  assert!(!stdout.contains("outside the loaded image"), "stdout: {}", stdout);
+  let _ = fs::remove_dir_all(dir);
 }

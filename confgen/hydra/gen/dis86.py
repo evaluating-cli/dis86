@@ -41,6 +41,12 @@ def gen_functions(functions):
             extra += 'ret_kind_unknown 1 '
         start = '""' if not func.start_addr else func.start_addr
         end = '""' if not func.end_addr else func.end_addr
+        if func.regions:
+            region_text = ' '.join(
+                f'_{i} {{ start {rstart} end {rend} }}'
+                for i, (rstart, rend) in enumerate(func.regions)
+            )
+            extra += f'regions {{ {region_text} }} '
         emit(f'    {func.name:30} {{ start {start} end {end} mode {mode} ret {func.ret} args {func.args} {extra}}} ')
     emit("  }");
 

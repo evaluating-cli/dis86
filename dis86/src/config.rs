@@ -10,6 +10,19 @@ pub struct CodeSeg {
   pub name: String,
 }
 
+/// A half-open, same-segment slice of a function body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub struct FuncRegion {
+  pub start: SegOff,
+  pub end: SegOff,
+}
+
+impl FuncRegion {
+  pub fn contains(&self, addr: SegOff) -> bool {
+    addr.seg == self.start.seg && addr.off >= self.start.off && addr.off < self.end.off
+  }
+}
+
 #[derive(Debug, Clone)]
 pub struct Func {
   pub name: String,
@@ -25,6 +38,9 @@ pub struct Func {
   /// Registers a caller must not assume this function preserves.
   pub clobbers: Option<Vec<Reg>>,
   pub dont_pop_args: bool,
+  /// Explicit discontiguous body regions. Empty means the legacy
+  /// `[start, end)` range.
+  pub regions: Vec<FuncRegion>,
 }
 
 #[derive(Debug, Clone)]
@@ -93,6 +109,50 @@ impl Func {
       Some(ret) => ret.clone(),
       None => Type::U32,  // when we don't have more information, we can pessimize and assume u32 might be returned
     }
+  }
+
+  /// Ranges the function body occupies, falling back to `[start, end)` when
+  /// no explicit regions are configured. Adjacent and overlapping regions are
+  /// merged; validation reports overlaps, but execution remains total.
+  pub fn effective_regions(&self) -> Vec<FuncRegion> {
+    if self.regions.is_empty() {
+      let Some(end) = self.end else { return vec![] };
+      return vec![FuncRegion { start: self.start, end }];
+    }
+
+    let mut regions = self.regions.clone();
+    regions.sort();
+
+    let mut merged: Vec<FuncRegion> = vec![];
+    for region in regions {
+      if let Some(last) = merged.last_mut() {
+        if last.start.seg == region.start.seg && region.start.off <= last.end.off {
+          if region.end.off > last.end.off {
+            last.end = region.end;
+          }
+          continue;
+        }
+      }
+      merged.push(region);
+    }
+    merged
+  }
+
+  /// Regions to use for control-flow analysis. Explicit regions are
+  /// normalized; legacy functions return none so analysis keeps the original
+  /// `[start, end)` behavior, including following branches outside `end`.
+  pub fn analysis_regions(&self) -> Vec<FuncRegion> {
+    if self.regions.is_empty() { vec![] } else { self.effective_regions() }
+  }
+
+  /// Exclusive upper bound for the function body. `end` wins when present;
+  /// otherwise the highest explicit region end supplies it.
+  pub fn outer_end(&self) -> Option<SegOff> {
+    self.end.or_else(|| self.effective_regions().last().map(|region| region.end))
+  }
+
+  pub fn region_containing(&self, addr: SegOff) -> Option<FuncRegion> {
+    self.effective_regions().into_iter().find(|region| region.contains(addr))
   }
 }
 
@@ -287,8 +347,12 @@ impl Config {
 
       let start_str = f.get_str("start")
         .ok_or_else(|| format!("No function 'start' property for '{}'", key))?;
-      let end_str = f.get_str("end")
-        .ok_or_else(|| format!("No function 'end' property for '{}'", key))?;
+      let regions = parse_regions(&f, key)?;
+      let end_str = match f.get_str("end") {
+        Some(end) => end,
+        None if !regions.is_empty() => "",
+        None => return Err(format!("No function 'end' property for '{}'", key)),
+      };
       let entry_str = f.get_str("entry").unwrap_or("");
       let mode_str = f.get_str("mode")
         .ok_or_else(|| format!("No function 'mode' property for '{}'", key))?;
@@ -356,8 +420,12 @@ impl Config {
           regouts,
           clobbers,
           dont_pop_args,
+          regions,
         });
       } else {
+        if !regions.is_empty() {
+          return Err(format!("Indirect call '{}' cannot declare 'regions'", key));
+        }
         if regouts.is_some() || clobbers.is_some() {
           return Err(format!(
             "Indirect call '{}' cannot declare 'regouts' or 'clobbers'", key));
@@ -557,6 +625,31 @@ fn parse_hex_u16(s: &str) -> Result<u16, &'static str> {
   }
 }
 
+fn parse_regions(func: &bsl::Node, func_key: &str) -> Result<Vec<FuncRegion>, String> {
+  let Some(regions) = func.get_node("regions") else { return Ok(vec![]) };
+
+  let mut parsed = vec![];
+  for (key, val) in regions.iter() {
+    let region = val.as_node()
+      .ok_or_else(|| format!("Expected region properties for '{}.regions.{}'", func_key, key))?;
+    let start_str = region.get_str("start")
+      .ok_or_else(|| format!("No region 'start' property for '{}.regions.{}'", func_key, key))?;
+    let end_str = region.get_str("end")
+      .ok_or_else(|| format!("No region 'end' property for '{}.regions.{}'", func_key, key))?;
+    let start: SegOff = start_str.parse()
+      .map_err(|_| format!("Expected segoff for '{}.regions.{}.start', got '{}'", func_key, key, start_str))?;
+    let end: SegOff = end_str.parse()
+      .map_err(|_| format!("Expected segoff for '{}.regions.{}.end', got '{}'", func_key, key, end_str))?;
+    parsed.push(FuncRegion { start, end });
+  }
+  if parsed.is_empty() {
+    return Err(format!(
+      "Function '{}' has an empty 'regions' node; omit it for a single range or declare at least one region",
+      func_key));
+  }
+  Ok(parsed)
+}
+
 // parse number: either decimal or hex
 fn parse_u16(s: &str) -> Result<u16, String> {
   if s.starts_with("0x") {
@@ -598,6 +691,134 @@ mod tests {
     fn drop(&mut self) {
       let _ = std::fs::remove_file(&self.0);
     }
+  }
+
+  #[test]
+  fn regions_parse_with_fallback_and_normalized_order() {
+    use crate::segoff::Off;
+
+    let tmp = TempConfig::write("dis86_regions_test.bsl", r#"
+dis86 {
+  code_segments {
+  }
+  functions {
+    F1 { start 0000:0100 end 0000:0300 mode near ret None args None
+         regions {
+           _0 { start 0000:0200 end 0000:0220 }
+           _1 { start 0000:0100 end 0000:0120 }
+         }
+    }
+    F2 { start 0000:0300 end 0000:0340 mode near ret None args None }
+    F3 { start 0000:0350 end "" mode near ret None args None }
+    F4 { start 0000:0400 mode near ret None args None
+         regions { _0 { start 0000:0400 end 0000:0410 } }
+    }
+  }
+  structures {
+  }
+  globals {
+  }
+  text_section {
+  }
+}
+"#);
+    let cfg = Config::from_path(tmp.path().to_str().unwrap()).unwrap();
+    let so = |off| SegOff { seg: Seg::Normal(0), off: Off(off) };
+
+    assert_eq!(cfg.funcs[0].regions, vec![
+      FuncRegion { start: so(0x200), end: so(0x220) },
+      FuncRegion { start: so(0x100), end: so(0x120) },
+    ]);
+    assert_eq!(cfg.funcs[0].effective_regions(), vec![
+      FuncRegion { start: so(0x100), end: so(0x120) },
+      FuncRegion { start: so(0x200), end: so(0x220) },
+    ]);
+    assert_eq!(cfg.funcs[0].analysis_regions(), cfg.funcs[0].effective_regions());
+    assert_eq!(cfg.funcs[0].outer_end(), Some(so(0x300)));
+
+    assert_eq!(cfg.funcs[1].effective_regions(),
+      vec![FuncRegion { start: so(0x300), end: so(0x340) }]);
+    assert_eq!(cfg.funcs[1].analysis_regions(), vec![]);
+    assert_eq!(cfg.funcs[2].effective_regions(), vec![]);
+    assert_eq!(cfg.funcs[2].outer_end(), None);
+    assert_eq!(cfg.funcs[3].end, None);
+    assert_eq!(cfg.funcs[3].effective_regions(),
+      vec![FuncRegion { start: so(0x400), end: so(0x410) }]);
+    assert_eq!(cfg.funcs[3].outer_end(), Some(so(0x410)));
+  }
+
+  #[test]
+  fn adjacent_regions_are_normalized_into_one() {
+    use crate::segoff::Off;
+
+    let tmp = TempConfig::write("dis86_adjacent_regions_test.bsl", r#"
+dis86 {
+  code_segments {
+  }
+  functions {
+    F1 { start 0000:0100 end 0000:0140 mode near ret None args None
+         regions {
+           _0 { start 0000:0100 end 0000:0120 }
+           _1 { start 0000:0120 end 0000:0140 }
+         }
+    }
+  }
+  structures {
+  }
+  globals {
+  }
+  text_section {
+  }
+}
+"#);
+    let cfg = Config::from_path(tmp.path().to_str().unwrap()).unwrap();
+    let so = |off| SegOff { seg: Seg::Normal(0), off: Off(off) };
+    assert_eq!(cfg.funcs[0].effective_regions(),
+      vec![FuncRegion { start: so(0x100), end: so(0x140) }]);
+  }
+
+  #[test]
+  fn missing_end_without_regions_is_still_an_error() {
+    let tmp = TempConfig::write("dis86_missing_end_test.bsl", r#"
+dis86 {
+  code_segments {
+  }
+  functions {
+    F1 { start 0000:0100 mode near ret None args None }
+  }
+  structures {
+  }
+  globals {
+  }
+  text_section {
+  }
+}
+"#);
+    let err = Config::from_path(tmp.path().to_str().unwrap()).unwrap_err();
+    assert!(err.contains("No function 'end' property"), "unexpected error: {}", err);
+  }
+
+  #[test]
+  fn region_requires_concrete_start_and_end() {
+    let tmp = TempConfig::write("dis86_bad_region_test.bsl", r#"
+dis86 {
+  code_segments {
+  }
+  functions {
+    F1 { start 0000:0100 end 0000:0300 mode near ret None args None
+         regions { _0 { start 0000:0100 } }
+    }
+  }
+  structures {
+  }
+  globals {
+  }
+  text_section {
+  }
+}
+"#);
+    let err = Config::from_path(tmp.path().to_str().unwrap()).unwrap_err();
+    assert!(err.contains("No region 'end' property"), "unexpected error: {}", err);
   }
 
   #[test]
@@ -647,6 +868,49 @@ dis86 {
 "#);
     let err = Config::from_path(tmp.path().to_str().unwrap()).unwrap_err();
     assert!(err.contains("Unsupported mode"), "unexpected error: {}", err);
+  }
+
+  #[test]
+  fn empty_regions_node_is_an_error_not_a_fallback() {
+    let tmp = TempConfig::write("dis86_empty_regions_test.bsl", r#"
+dis86 {
+  code_segments {
+  }
+  functions {
+    F1 { start 0000:0100 end 0000:0300 mode near ret None args None regions { } }
+  }
+  structures {
+  }
+  globals {
+  }
+  text_section {
+  }
+}
+"#);
+    let err = Config::from_path(tmp.path().to_str().unwrap()).unwrap_err();
+    assert!(err.contains("empty 'regions' node"), "unexpected error: {}", err);
+  }
+
+  #[test]
+  fn indirect_call_cannot_declare_regions() {
+    let tmp = TempConfig::write("dis86_indirect_regions_test.bsl", r#"
+dis86 {
+  code_segments {
+  }
+  functions {
+    F1 { start 0000:0100 end "" mode far ret u16 args 0 indirect_call_location 1
+         regions { _0 { start 0000:0100 end 0000:0110 } } }
+  }
+  structures {
+  }
+  globals {
+  }
+  text_section {
+  }
+}
+"#);
+    let err = Config::from_path(tmp.path().to_str().unwrap()).unwrap_err();
+    assert!(err.contains("cannot declare 'regions'"), "unexpected error: {}", err);
   }
 
   #[test]
