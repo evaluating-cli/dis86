@@ -10,6 +10,7 @@ use crate::analyze::code_segment::{CodeSegment, CodeSegments, Region};
 use crate::analyze::func_details::{first_undecodable_addr, FuncDetails, ReturnKind};
 use crate::asm::branch::{self, BranchTarget, UnresolvedTransfer};
 use crate::asm::decode::Decoder;
+use crate::asm::instr::has_fallthrough;
 use crate::binary::Binary;
 use crate::config::{CallMode, Config, Func, FuncRegion};
 use crate::segoff::{Seg, SegOff};
@@ -215,10 +216,37 @@ fn validate_text_sections(
       report.error(Some(text.start), format!(
         "text section '{}' range {}..{} is outside the loaded image", text.name, text.start, text.end));
     }
+    if text.start.seg.is_normal() && cfg.code_seg_lookup(text.start.seg).is_none() {
+      report.warning(Some(text.start), format!(
+        "text section '{}' is in segment {}, which is not declared in dis86.code_segments; it is inert",
+        text.name, text.start.seg));
+    }
+    if text.typ.is_none() && text.access.is_some() {
+      report.error(Some(text.start), format!(
+        "text section '{}' declares access without a type; an untyped region is a data hole, not a jump table",
+        text.name));
+    }
     if let Some(access) = text.access {
       if !binary.contains_addr(access) {
         report.error(Some(access), format!(
           "text section '{}' access address {} is outside the loaded image", text.name, access));
+      }
+    }
+  }
+
+  // Declared data regions may not overlap each other when a hole is involved:
+  // holes are subtractive claims, while typed tables are jump-table lookups.
+  for (i, a) in cfg.text_section.iter().enumerate() {
+    if only_seg.is_some_and(|seg| a.start.seg != seg) { continue; }
+    for b in cfg.text_section.iter().skip(i + 1) {
+      if only_seg.is_some_and(|seg| b.start.seg != seg) { continue; }
+      if a.start.seg == b.start.seg
+        && (a.is_data_hole() || b.is_data_hole())
+        && ranges_overlap(a.start, a.end, b.start, b.end)
+      {
+        report.error(Some(b.start), format!(
+          "text section '{}' [{}..{}) overlaps declared data '{}' [{}..{})",
+          b.name, b.start, b.end, a.name, a.start, a.end));
       }
     }
   }
@@ -295,7 +323,29 @@ fn validate_function(
   };
 
   let regions = func.effective_regions();
-  let analysis_regions = func.analysis_regions();
+  let code_regions = cfg.code_regions(&regions);
+  let mut data_errors = false;
+  for region in &regions {
+    if cfg.code_regions(&[*region]).is_empty() {
+      let data = cfg.data_region_containing(region.start)
+        .map(|data| format!("'{}' [{}, {})", data.name, data.start, data.end))
+        .unwrap_or_else(|| "declared data".to_string());
+      report.error(Some(region.start), format!(
+        "function '{}' region [{}, {}) is fully covered by {}",
+        func.name, region.start, region.end, data));
+      data_errors = true;
+    }
+  }
+  if cfg.data_region_containing(start).is_some() {
+    report.error(Some(start), format!(
+      "function '{}' start {} is inside a declared data region", func.name, start));
+    data_errors = true;
+  }
+  let analysis_regions = if func.regions.is_empty() && !cfg.has_data_in_regions(&regions) {
+    vec![]
+  } else {
+    code_regions.clone()
+  };
   let mut region_errors = false;
   if !func.regions.is_empty() {
     let mut sorted = func.regions.clone();
@@ -380,12 +430,12 @@ fn validate_function(
       func.name, end, code_seg.end(), code_seg.start(), code_seg.end()));
     return;
   }
-  if region_errors {
+  if region_errors || data_errors {
     return;
   }
 
   if let Some(entry) = func.entry {
-    let in_primary = regions.iter().any(|region| region.contains(entry));
+    let in_primary = code_regions.iter().any(|region| region.contains(entry));
     // An overlay entry is a normal-segment stub that launchers call into.
     let in_stub = code_seg.stub.as_ref().is_some_and(|stub| {
       entry.seg == stub.seg
@@ -395,16 +445,6 @@ fn validate_function(
     if !in_primary && !in_stub {
       report.error(Some(entry), format!(
         "function '{}' entry {} is outside its configured range", func.name, entry));
-    }
-  }
-
-  for text in &cfg.text_section {
-    for region in &regions {
-      if text.start.seg == region.start.seg && ranges_overlap(region.start, region.end, text.start, text.end) {
-        report.error(Some(text.start), format!(
-          "text section '{}' [{}..{}) overlaps function '{}' region [{}, {})",
-          text.name, text.start, text.end, func.name, region.start, region.end));
-      }
     }
   }
 
@@ -420,7 +460,7 @@ fn validate_function(
     }
   }
 
-  for region in &regions {
+  for region in &code_regions {
     if let Some(gap) = first_undecodable_addr(binary, region.start, region.end) {
       report.error(Some(gap), format!(
         "function '{}' linear decode of region [{}, {}) fails at {}; the region spans non-code bytes (split the region or declare the data in text_section)",
@@ -429,7 +469,16 @@ fn validate_function(
     }
   }
 
-  validate_branch_targets(func, &regions, binary, report);
+  if let Some((data_name, data_start, data_end, last_addr)) =
+    first_data_fallthrough(binary, cfg, &code_regions)
+  {
+    report.error(Some(last_addr), format!(
+      "function '{}' instruction at {} falls through into declared data '{}' [{}, {})",
+      func.name, last_addr, data_name, data_start, data_end));
+    return;
+  }
+
+  validate_branch_targets(func, &code_regions, cfg, binary, report);
 
   let details = match FuncDetails::build_with_regions(start, Some(end), &analysis_regions, &code_seg, binary) {
     Ok(details) => details,
@@ -501,6 +550,12 @@ fn validate_direct_calls(
   report: &mut Report,
 ) {
   for (target, modes) in direct_call_kinds {
+    if let Some(data) = cfg.data_region_containing(*target) {
+      report.error(Some(func.start), format!(
+        "function '{}' calls declared data '{}' [{}, {}) at {}",
+        func.name, data.name, data.start, data.end, target));
+      continue;
+    }
     if modes.contains(&CallMode::Near) && modes.contains(&CallMode::Far) {
       report.error(Some(func.start), format!(
         "function '{}' calls {} as both near and far", func.name, target));
@@ -525,9 +580,35 @@ fn validate_direct_calls(
   }
 }
 
+fn first_data_fallthrough(
+  binary: &Binary,
+  cfg: &Config,
+  code_regions: &[FuncRegion],
+) -> Option<(String, SegOff, SegOff, SegOff)> {
+  for region in code_regions {
+    let Some(data) = cfg.data_region_containing(region.end) else { continue; };
+    let mut decoder = Decoder::new(binary.region_iter(region.start, region.end));
+    let mut last = None;
+    loop {
+      match decoder.try_next() {
+        Ok(Some((instr, _raw))) => last = Some(instr),
+        Ok(None) => break,
+        Err(_) => { last = None; break; }
+      }
+    }
+    if let Some(instr) = last {
+      if has_fallthrough(instr.opcode) {
+        return Some((data.name.clone(), data.start, data.end, instr.addr));
+      }
+    }
+  }
+  None
+}
+
 fn validate_branch_targets(
   func: &Func,
   regions: &[FuncRegion],
+  cfg: &Config,
   binary: &Binary,
   report: &mut Report,
 ) {
@@ -545,7 +626,11 @@ fn validate_branch_targets(
       let Some(target) = branch::branch_target(&instr) else { continue };
       match target {
         BranchTarget::Relative { target, .. } => {
-          if !in_range(target) {
+          if let Some(data) = cfg.data_region_containing(target) {
+            report.error(Some(instr.addr), format!(
+              "function '{}' branch at {} targets declared data '{}' [{}, {})",
+              func.name, instr.addr, data.name, data.start, data.end));
+          } else if !in_range(target) {
             report.warning(Some(instr.addr), format!(
               "function '{}' branch at {} targets {}, outside its configured range",
               func.name, instr.addr, target));
@@ -553,7 +638,11 @@ fn validate_branch_targets(
         }
         BranchTarget::Unresolved(UnresolvedTransfer::FarDirect { seg, off }) => {
           let target = SegOff::new(seg, off);
-          if !in_range(target) {
+          if let Some(data) = cfg.data_region_containing(target) {
+            report.error(Some(instr.addr), format!(
+              "function '{}' far branch at {} targets declared data '{}' [{}, {})",
+              func.name, instr.addr, data.name, data.start, data.end));
+          } else if !in_range(target) {
             report.warning(Some(instr.addr), format!(
               "function '{}' far branch at {} targets {}, outside its configured range",
               func.name, instr.addr, target));
@@ -923,19 +1012,42 @@ mod tests {
   }
 
   #[test]
-  fn text_section_overlap_is_an_error() {
-    let binary = Binary::from_raw(&[0xC3], None);
+  fn text_section_inside_function_is_legal() {
+    let binary = Binary::from_raw(&[0xC3, 0x63], None);
     let text = TextSectionRegion {
-      name: "string".to_string(),
-      start: segoff(0),
-      end: segoff(1),
-      typ: Type::U16,
+      name: "table".to_string(),
+      start: segoff(1),
+      end: segoff(2),
+      typ: Some(Type::U8),
       access: None,
     };
-    let cfg = config(vec![func("f", 0, 1, CallMode::Near)], vec![text], vec![]);
+    let cfg = config(vec![func("f", 0, 2, CallMode::Near)], vec![text], vec![]);
+    let report = validate_config(&cfg, &binary, &ValidationScope::All);
+    assert_eq!(report.errors(), 0, "{:?}", report.diagnostics);
+  }
+
+  #[test]
+  fn overlapping_data_holes_are_an_error() {
+    let binary = Binary::from_raw(&[0xC3, 0xC3], None);
+    let a = TextSectionRegion {
+      name: "a".to_string(),
+      start: segoff(0),
+      end: segoff(1),
+      typ: None,
+      access: None,
+    };
+    let b = TextSectionRegion {
+      name: "b".to_string(),
+      start: segoff(0),
+      end: segoff(2),
+      typ: None,
+      access: None,
+    };
+    let cfg = config(vec![func("f", 1, 2, CallMode::Near)], vec![a, b], vec![]);
     let report = validate_config(&cfg, &binary, &ValidationScope::All);
     assert!(report.has_errors());
-    assert!(report.diagnostics.iter().any(|d| d.message.contains("overlaps function")));
+    assert!(report.diagnostics.iter().any(|d| d.message.contains("overlaps declared data")),
+      "{:?}", report.diagnostics);
   }
 
   #[test]
@@ -1031,7 +1143,7 @@ mod tests {
       name: "unrelated".to_string(),
       start: segoff(100),
       end: segoff(101),
-      typ: Type::U16,
+      typ: Some(Type::U16),
       access: None,
     };
     let bad_indirect = Indirect {

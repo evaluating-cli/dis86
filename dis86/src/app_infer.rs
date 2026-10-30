@@ -389,7 +389,7 @@ pub fn build_ir_for_analysis(cfg: &Config, binary: &Binary, spec: &Spec<'_>, pin
         "invalid region {}..{} (outside the loaded image)", region.start, region.end));
     }
   }
-  let (instrs, _raw) = crate::spec::decode_regions(binary, spec)?;
+  let (instrs, _raw) = crate::spec::decode_regions(binary, cfg, spec)?;
   build_ir_from_instrs(cfg, binary, spec, instrs, pin_all)
 }
 
