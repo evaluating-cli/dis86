@@ -26,7 +26,7 @@ trait FlavorImpl {
   fn func_sig(&self, g: &mut Gen<'_>, func: &Function) -> fmt::Result;
   fn frame_enter(&self, g: &mut Gen<'_>, frame_size: u16) -> fmt::Result;
   fn frame_leave(&self, g: &mut Gen<'_>) -> fmt::Result;
-  fn ret(&self, g: &mut Gen<'_>, ret: &Return) -> fmt::Result;
+  fn ret(&self, g: &mut Gen<'_>, ret: &Return, imp: &dyn FlavorImpl) -> fmt::Result;
   fn call(&self, g: &mut Gen<'_>, name: &Expr, args: &[Expr], level: usize) -> fmt::Result;
   fn relocatable_segs(&self) -> &[u16] { &[] }
 }
@@ -49,7 +49,10 @@ impl FlavorImpl for Standard {
     Ok(())
   }
 
-  fn ret(&self, g: &mut Gen<'_>, ret: &Return) -> fmt::Result {
+  fn ret(&self, g: &mut Gen<'_>, ret: &Return, imp: &dyn FlavorImpl) -> fmt::Result {
+    for assign in &ret.post_frame {
+      g.assign(assign, imp)?;
+    }
     g.text("return")?;
 
     match ret.vals.len() {
@@ -106,7 +109,7 @@ impl FlavorImpl for Hydra {
     g.endline()
   }
 
-  fn ret(&self, g: &mut Gen<'_>, ret: &Return) -> fmt::Result {
+  fn ret(&self, g: &mut Gen<'_>, ret: &Return, imp: &dyn FlavorImpl) -> fmt::Result {
     match ret.vals.len() {
       0 => (),
       1 => {
@@ -128,6 +131,9 @@ impl FlavorImpl for Hydra {
       _ => panic!("Unsupported return values"),
     }
     self.frame_leave(g)?;
+    for assign in &ret.post_frame {
+      g.assign(assign, imp)?;
+    }
     match &ret.rt {
       ReturnType::Far => g.text("RETURN_FAR();")?,
       ReturnType::Near => g.text("RETURN_NEAR();")?,
@@ -340,6 +346,29 @@ impl<'a> Gen<'a> {
     self.text(";")
   }
 
+  fn assign(&mut self, s: &Assign, imp: &dyn FlavorImpl) -> fmt::Result {
+    if let Expr::GuestMem(seg, off, width) = &s.lhs {
+      self.text(&format!("STORE_{}(", width * 8))?;
+      self.expr(seg, 0, imp)?;
+      self.text(", ")?;
+      self.expr_plain(off, 0, imp)?;
+      self.text(", ")?;
+      self.expr(&s.rhs, 0, imp)?;
+      self.text(");")?;
+      self.endline()?;
+      return Ok(());
+    }
+    if let Some(typ) = &s.decltype {
+      self.text(&format!("{} ", typ))?;
+    }
+    self.expr(&s.lhs, 0, imp)?;
+    self.text(" = ")?;
+    self.expr(&s.rhs, 0, imp)?;
+    self.text(";")?;
+    self.endline()?;
+    Ok(())
+  }
+
   fn stmt(&mut self, stmt: &Stmt, imp: &dyn FlavorImpl) -> fmt::Result {
     match stmt {
       Stmt::Label(l) => {
@@ -356,25 +385,7 @@ impl<'a> Gen<'a> {
         self.endline()?;
       }
       Stmt::Assign(s) => {
-        if let Expr::GuestMem(seg, off, width) = &s.lhs {
-          self.text(&format!("STORE_{}(", width * 8))?;
-          self.expr(seg, 0, imp)?;
-          self.text(", ")?;
-          self.expr_plain(off, 0, imp)?;
-          self.text(", ")?;
-          self.expr(&s.rhs, 0, imp)?;
-          self.text(");")?;
-          self.endline()?;
-          return Ok(());
-        }
-        if let Some(typ) = &s.decltype {
-          self.text(&format!("{} ", typ))?;
-        }
-        self.expr(&s.lhs, 0, imp)?;
-        self.text(" = ")?;
-        self.expr(&s.rhs, 0, imp)?;
-        self.text(";")?;
-        self.endline()?;
+        self.assign(s, imp)?;
       }
       Stmt::Goto(g) => {
         self.goto(&g.label)?;
@@ -391,7 +402,7 @@ impl<'a> Gen<'a> {
         self.endline()?;
       }
       Stmt::Return(r) => {
-        imp.ret(self, r)?;
+        imp.ret(self, r, imp)?;
         self.endline()?;
       }
       Stmt::Loop(lp) => {
