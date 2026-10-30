@@ -254,7 +254,8 @@ impl Config {
   /// Parse the register lists used by the caller/callee contract annotations.
   /// These describe full registers only: fragment aliases and the frame,
   /// instruction-pointer, and flags registers are not call-visible outputs or
-  /// clobbers.
+  /// clobbers. AX is the return value (see #134), so it is not a separate
+  /// contract register either.
   fn parse_contract_regs(key: &str, field: &str, value: Option<&str>)
       -> Result<Option<Vec<Reg>>, String> {
     let Some(value) = value else { return Ok(None) };
@@ -263,10 +264,10 @@ impl Config {
       let name = name.trim();
       let reg = Reg::from_str_upper(name)
         .ok_or_else(|| format!("Failed to parse '{}.{}' register name: {}", key, field, name))?;
-      if !matches!(reg, Reg::AX | Reg::CX | Reg::DX | Reg::BX | Reg::SI | Reg::DI
+      if !matches!(reg, Reg::CX | Reg::DX | Reg::BX | Reg::SI | Reg::DI
                         | Reg::ES | Reg::SS | Reg::DS) {
         return Err(format!(
-          "Unsupported register '{}' in '{}.{}' (expected AX, CX, DX, BX, SI, DI, ES, SS, or DS)",
+          "Unsupported register '{}' in '{}.{}' (expected CX, DX, BX, SI, DI, ES, SS, or DS; AX is the return value)",
           name, key, field));
       }
       if !regs.contains(&reg) {

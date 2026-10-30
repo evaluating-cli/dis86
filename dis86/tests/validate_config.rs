@@ -121,3 +121,15 @@ fn validate_config_rejects_a_frame_register_as_a_contract_register() {
   assert!(!stderr.contains("panicked"), "stderr: {}", stderr);
   let _ = fs::remove_dir_all(dir);
 }
+
+#[test]
+fn validate_config_rejects_ax_as_a_contract_register() {
+  let dir = temp_dir();
+  let bsl = config_with_annotations("0000:0001", "regouts AX");
+  let out = run_validate_config(&dir, &bsl, &["--validate-config"]);
+  assert!(!out.status.success(), "unexpected success");
+  let stderr = String::from_utf8_lossy(&out.stderr);
+  assert!(stderr.contains("Unsupported register"), "stderr: {}", stderr);
+  assert!(!stderr.contains("panicked"), "stderr: {}", stderr);
+  let _ = fs::remove_dir_all(dir);
+}
