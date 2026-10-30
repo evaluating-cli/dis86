@@ -122,6 +122,50 @@ fn shared_epilogue_before_entry_decodes_entry_first() {
 }
 
 #[test]
+fn infer_abi_does_not_use_an_unreachable_later_region() {
+  let dir = temp_dir();
+  let mut raw = vec![0x00, 0xE8, 0xFD, 0x0F]; // call 0000:1000
+  raw.resize(8, 0x63);                         // gap between the regions
+  raw.extend_from_slice(&[0xC2, 0x04, 0x00]);  // ret 4 in the second region
+  let out = run(
+    &dir,
+    &raw,
+    r#"f { start 0000:0000 end "" mode near ret u16 args 0 regions { _0 { start 0000:0000 end 0000:0003 } _1 { start 0000:0008 end 0000:000b } } }"#,
+    &["--infer-abi", "--name", "f"],
+  );
+  let stdout = String::from_utf8_lossy(&out.stdout);
+  let stderr = String::from_utf8_lossy(&out.stderr);
+  assert!(out.status.success(), "stderr: {}", stderr);
+  let row = stdout.lines().find(|line| line.starts_with("f\t"))
+    .unwrap_or_else(|| panic!("no f row: {}", stdout));
+  let fields: Vec<_> = row.split('\t').collect();
+  assert_eq!(fields[3], "?", "unreachable ret must not imply args: {}", row);
+  assert_eq!(fields[4], "false", "unreachable ret must not imply callee cleanup: {}", row);
+  assert!(!row.contains("ret 4"), "unreachable ret must not be evidence: {}", row);
+  let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn region_spanning_entry_links_the_prestart_fallthrough() {
+  let dir = temp_dir();
+  // Entry at 0x0003 jumps to the pre-start chunk at 0x0000, which sets AX
+  // and falls through back to the entry.
+  let raw = [0xB8, 0x01, 0x00, 0xE9, 0xFA, 0xFF];
+  let out = run(
+    &dir,
+    &raw,
+    r#"f { start 0000:0003 end 0000:0006 mode near ret u16 args 0 regions { _0 { start 0000:0000 end 0000:0006 } } }"#,
+    &["--name", "f", "--emit-code", "-"],
+  );
+  let stdout = String::from_utf8_lossy(&out.stdout);
+  let stderr = String::from_utf8_lossy(&out.stderr);
+  assert!(out.status.success(), "stderr: {}", stderr);
+  assert!(stdout.contains("u16 f(void)"), "stdout: {}", stdout);
+  assert!(stdout.contains("while (1)"), "the pre-start fallthrough must keep the loop: {}", stdout);
+  let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn branch_into_a_gap_stays_a_validation_warning() {
   let dir = temp_dir();
   let mut raw = vec![0xE9, 0x1D, 0x00]; // jmp 0x0020

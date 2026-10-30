@@ -509,6 +509,22 @@ impl<'a> IRBuilder<'a> {
     self.switch_blk(next_bref);
     assert!(self.ir.block_instr_count(self.cur) == 0);
   }
+
+  /// A region that spans `spec.start` is split so the entry chunk decodes
+  /// first. The pre-start chunk is emitted later even though execution can
+  /// fall through from it into the entry, so restore that contiguous edge
+  /// unless the chunk already ends in a control transfer.
+  fn link_prestart_fallthrough(&mut self, block: BlockRef) {
+    let has_transfer = matches!(
+      self.ir.block_last_instr(block).map(|ins| ins.opcode),
+      Some(Opcode::Jmp | Opcode::Jne | Opcode::JmpTbl | Opcode::RetFar | Opcode::RetNear));
+    if has_transfer { return; }
+    let target = self.addrmap.get(&self.spec.start).copied().unwrap_or(BlockRef(0));
+    if target == block { return; }
+    self.ir.block_mut(target).preds.push(block);
+    self.ir.block_instr_append(block,
+      Self::make_instr(Type::Void, Attribute::NONE, Opcode::Jmp, vec![Ref::Block(target)]));
+  }
 }
 
 /////////////////////////////////////////////////////////////////////////////////////
@@ -3181,6 +3197,10 @@ impl IRBuilder<'_> {
     }
 
     // Step 3: iterate each instruction, building each block
+    let entry_region = self.spec.regions.iter()
+      .find(|region| region.contains(self.spec.start))
+      .copied();
+    let mut prestart_last = None;
     for ins in self.instrs {
       if DEBUG { println!("DEBUG: {}", instr_str(ins)); }
       if block_start.get(&ins.addr).is_some() {
@@ -3190,7 +3210,20 @@ impl IRBuilder<'_> {
           self.start_next_blk(ins.addr);
         }
       }
+      if let Some(region) = entry_region {
+        if ins.addr.seg == region.start.seg
+          && ins.addr.off >= region.start.off
+          && ins.addr.off < self.spec.start.off
+        {
+          prestart_last = Some((ins.end_addr(), self.cur));
+        }
+      }
       self.append_asm_instr(ins);
+    }
+    if let Some((last_end, block)) = prestart_last {
+      if last_end == self.spec.start {
+        self.link_prestart_fallthrough(block);
+      }
     }
     // The last block is never switched away from; record its carry/DF exit.
     self.exit_known.insert(self.cur, self.carry_known);
@@ -3808,6 +3841,36 @@ mod tests {
     let second = *b.addrmap.get(&so(0x20)).expect("second region gets a block");
     assert!(b.ir.block_instr_count(second) > 0, "second region decoded into its own block");
     assert!(b.ir.block(second).preds.is_empty(), "no false fallthrough predecessor");
+  }
+
+  #[test]
+  fn prestart_chunk_falls_through_to_the_entry() {
+    let types = Rc::new(TypeDatabase::new());
+    let cfg = Config { types: types.clone(), structs: vec![], code_segs: vec![], funcs: vec![], indirects: vec![], globals: vec![], text_section: vec![] };
+    let binary = binary::Binary::from_raw(&[0x90; 6], None);
+    let so = |off| SegOff { seg: Seg::Normal(0), off: Off(off) };
+    let spec = spec::Spec {
+      func: None,
+      name: "split".to_string(),
+      start: so(3),
+      end: so(6),
+      regions: vec![config::FuncRegion { start: so(0), end: so(6) }],
+    };
+    // The entry is `jmp 0`; the pre-start chunk is `mov ax,1`, which must
+    // fall through to the entry at 0x0003.
+    let instrs = [
+      jmp_instr(instr::Opcode::OP_JMP, 3, 3, 0xFFFA),
+      located_instr(instr::Opcode::OP_MOV, 0, 3, vec![
+        instr::Operand::Reg(instr::OperandReg(instr::Reg::AX)),
+        instr::Operand::Imm(instr::OperandImm { sz: instr::Size::Size16, val: 1 }),
+      ]),
+    ];
+    let mut b = test_builder(&cfg, &instrs, &spec, &binary);
+    b.build();
+    let prestart = *b.addrmap.get(&so(0)).expect("pre-start block exists");
+    assert_eq!(b.ir.block_exits(prestart), vec![BlockRef(0)],
+      "the pre-start chunk must link to the entry block");
+    assert_eq!(b.ir.block(BlockRef(0)).name, "entry");
   }
 
   #[test]

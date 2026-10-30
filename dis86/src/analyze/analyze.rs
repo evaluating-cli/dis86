@@ -22,6 +22,14 @@ fn analysis_regions_for(func: &Func, start: SegOff) -> Vec<FuncRegion> {
   if func.start == start { func.analysis_regions() } else { vec![] }
 }
 
+/// Resolve a workqueue address for analysis. Calls target `Func::entry`, but
+/// overlay workqueues start at the body address; fall back to `start` so the
+/// body keeps its name and regions instead of becoming an unknown function.
+fn analysis_func_lookup<'a>(cfg: &'a Config, addr: SegOff) -> Option<&'a Func> {
+  cfg.func_lookup(addr)
+    .or_else(|| cfg.funcs.iter().find(|func| func.start == addr))
+}
+
 impl Analyze {
   pub fn new(cfg: &Config, exe_path: &str) -> Result<Self, String> {
     let fmt = Fmt::Exe(exe_path.to_string());
@@ -134,7 +142,7 @@ impl Analyze {
       return Err(format!("Failed to find code segement"));
     };
     assert!(start >= code_seg.start());
-    match self.cfg.func_lookup(start) {
+    match analysis_func_lookup(&self.cfg, start) {
       Some(func) => {
         let regions = analysis_regions_for(func, start);
         if regions.is_empty() {
@@ -193,7 +201,7 @@ fn dump_functions(functions: &BTreeMap<SegOff, Result<FuncDetails, String>>, cfg
       current_seg = Some(seg);
     }
 
-    let name = match cfg.func_lookup(*addr) {
+    let name = match analysis_func_lookup(cfg, *addr) {
       Some(func) => func.name.clone(),
       None => "UNKNOWN".to_string(),
     };
@@ -396,7 +404,7 @@ fn generate_annotations(functions: &BTreeMap<SegOff, Result<FuncDetails, String>
 
 
     let (name, ret, args, configured_mode, suggestion_regions, configured_end) =
-      match cfg.func_lookup(*addr) {
+      match analysis_func_lookup(cfg, *addr) {
         Some(func) => {
           let has_regions = func.start == *addr && !func.regions.is_empty();
           (
@@ -419,7 +427,7 @@ fn generate_annotations(functions: &BTreeMap<SegOff, Result<FuncDetails, String>
         // before the IGNORED line, which also carries the range).
         // Configured function regions are probed individually; their gaps
         // are intentional and must not produce a false diagnostic.
-        let configured_regions = cfg.func_lookup(*addr)
+        let configured_regions = analysis_func_lookup(cfg, *addr)
           .map(|func| analysis_regions_for(func, *addr))
           .filter(|regions| !regions.is_empty());
         match configured_regions {
@@ -570,6 +578,20 @@ mod tests {
     assert!(analysis_regions_for(&func, stub).is_empty(),
       "the stub address must not inherit the overlay body regions");
     assert_eq!(analysis_regions_for(&func, body_start),
+      vec![FuncRegion { start: body_start, end: body_end }]);
+
+    let cfg = Config {
+      types: std::rc::Rc::new(crate::types::TypeDatabase::new()),
+      structs: vec![],
+      code_segs: vec![],
+      funcs: vec![func],
+      indirects: vec![],
+      globals: vec![],
+      text_section: vec![],
+    };
+    assert_eq!(analysis_func_lookup(&cfg, stub).map(|f| f.name.as_str()), Some("ovl"));
+    let body = analysis_func_lookup(&cfg, body_start).expect("body start resolves");
+    assert_eq!(analysis_regions_for(body, body_start),
       vec![FuncRegion { start: body_start, end: body_end }]);
   }
 
