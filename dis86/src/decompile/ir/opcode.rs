@@ -83,12 +83,12 @@ pub enum Opcode {
 
   CallFar,
   CallNear,
-  // Indirect call with no statically known target: covers both near-indirect
-  // (`call ax`, `call [mem]`) and far-indirect (`callf [mem]`) sites as one
-  // explicit-imprecision marker. Always renders as CALL_FAR_INDIRECT in the
-  // C output regardless of which form produced it; a refined near/far split
-  // would need the target's segment to be resolvable at the call site.
-  CallPtr,
+  // Indirect calls with no statically known target. The instruction encoding
+  // already distinguishes the forms, so keep them separate: a near indirect
+  // call pushes only IP, while a far indirect call pushes CS:IP. They render
+  // as CALL_NEAR_INDIRECT and CALL_FAR_INDIRECT respectively.
+  CallNearPtr,
+  CallFarPtr,
   CallArgs,
   Int,
 
@@ -225,7 +225,8 @@ impl Opcode {
       Opcode::NotSign     => "notsign",
       Opcode::CallFar     => "callfar",
       Opcode::CallNear    => "callnear",
-      Opcode::CallPtr     => "callptr",
+      Opcode::CallNearPtr => "callnearptr",
+      Opcode::CallFarPtr  => "callfarptr",
       Opcode::CallArgs    => "callargs",
       Opcode::Int         => "int",
       Opcode::RepMovs     => "repmovs",
@@ -284,7 +285,8 @@ impl Opcode {
   /// value propagates.
   pub fn may_clobber_memory(&self) -> bool {
     match self {
-      Opcode::CallFar | Opcode::CallNear | Opcode::CallPtr | Opcode::CallArgs => true,
+      Opcode::CallFar | Opcode::CallNear | Opcode::CallNearPtr | Opcode::CallFarPtr
+        | Opcode::CallArgs => true,
       Opcode::Int => true,
       Opcode::RepMovs | Opcode::RepStos => true,
       // INS writes guest memory (the port's data is stored at ES:DI).
@@ -313,7 +315,8 @@ impl Opcode {
 
   pub fn is_call(&self) -> bool {
     match self {
-      Opcode::CallFar | Opcode::CallNear | Opcode::CallPtr | Opcode::CallArgs => true,
+      Opcode::CallFar | Opcode::CallNear | Opcode::CallNearPtr | Opcode::CallFarPtr
+        | Opcode::CallArgs => true,
       _ => false,
     }
   }
@@ -368,7 +371,8 @@ impl Opcode {
       Opcode::WriteVar32 => true,
       Opcode::CallFar => true,
       Opcode::CallNear => true,
-      Opcode::CallPtr => true,
+      Opcode::CallNearPtr => true,
+      Opcode::CallFarPtr => true,
       Opcode::CallArgs => true,
       Opcode::Int => true,
       Opcode::RetFar => true,
@@ -390,7 +394,8 @@ impl Opcode {
       Opcode::WriteVar32 => true,
       Opcode::CallFar => true,
       Opcode::CallNear => true,
-      Opcode::CallPtr => true,
+      Opcode::CallNearPtr => true,
+      Opcode::CallFarPtr => true,
       Opcode::CallArgs => true,
       Opcode::Int => true,
       Opcode::RepMovs => true,

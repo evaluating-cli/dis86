@@ -588,7 +588,11 @@ impl<'a> Builder<'a> {
         let exprs: Vec<_> = instr.operands.iter().map(|r| self.ref_to_expr_hex(*r, depth+1, true)).collect();
         Expr::Abstract("CALL_NEAR", exprs)
       }
-      ir::Opcode::CallPtr => {
+      ir::Opcode::CallNearPtr => {
+        let exprs: Vec<_> = instr.operands.iter().map(|r| self.ref_to_expr_hex(*r, depth+1, true)).collect();
+        Expr::Abstract("CALL_NEAR_INDIRECT", exprs)
+      }
+      ir::Opcode::CallFarPtr => {
         let exprs: Vec<_> = instr.operands.iter().map(|r| self.ref_to_expr_hex(*r, depth+1, true)).collect();
         Expr::Abstract("CALL_FAR_INDIRECT", exprs)
       }

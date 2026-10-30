@@ -16,6 +16,17 @@
 #include "native_host.h"
 #include "hydra_backend.h"
 
+/* Compile-only coverage for issue #145: generated C uses these macros, but
+ * this binary has no executing guest to call them. */
+__attribute__((unused))
+static void compile_only_indirect_call_macros(void)
+{
+  hydra_machine_t *m = NULL;
+  (void)CALL_NEAR_INDIRECT(0x1234, 0x5678);
+  (void)CALL_FAR_INDIRECT(0x12345678, 0x9abc);
+  (void)m;
+}
+
 static int g_failures;
 #define CHECK(cond, label) do {                                      \
   if (cond) printf("PASS: %s\n", label);                             \

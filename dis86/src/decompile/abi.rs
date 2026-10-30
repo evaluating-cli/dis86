@@ -209,9 +209,8 @@ fn is_projection(opcode: Opcode) -> bool {
 
 fn writes_dx(ir: &IR, instr: &Instr) -> bool {
   match instr.opcode {
-    // `CallPtr` is one arm until issue #145 splits it into near/far indirect
-    // calls; that split must update this list too.
-    Opcode::CallArgs | Opcode::CallNear | Opcode::CallFar | Opcode::CallPtr | Opcode::Int => true,
+    Opcode::CallArgs | Opcode::CallNear | Opcode::CallFar
+      | Opcode::CallNearPtr | Opcode::CallFarPtr | Opcode::Int => true,
     Opcode::WriteVar16 => {
       // Exit-state write-backs preserve the callee's DX value for its caller;
       // they do not clobber the value this function is still using.
