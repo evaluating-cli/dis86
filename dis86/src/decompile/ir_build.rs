@@ -5,6 +5,7 @@ use crate::asm::branch;
 use crate::binary;
 use crate::segoff::{Seg, Off, SegOff};
 use crate::config::{self, Config};
+use crate::diagnostics::{Cause, Diagnostic};
 use crate::spec;
 use crate::types::{Type, ArraySize};
 use crate::asm::intel_syntax::instr_str;
@@ -149,7 +150,7 @@ struct IRBuilder<'a> {
   // Diagnostics produced during a build pass. A pass is speculative (it runs
   // two or three times to fixpoint the carry analysis), so messages are
   // buffered and only the retained pass's warnings are printed, exactly once.
-  warnings: Vec<String>,
+  warnings: Vec<Diagnostic>,
 
   // Known calls whose undeclared-but-dirty registers may be callee inputs.
   // Recorded while building; checked once against the finished IR in `build`
@@ -415,8 +416,8 @@ impl<'a> IRBuilder<'a> {
   /// `ir::methods::block_exits`): an empty block has no exits, so the code
   /// after the transfer becomes an unreachable block and is dropped,
   /// instead of being modelled as a fallthrough that never happens.
-  fn append_unmodelled_transfer(&mut self, ins: &instr::Instr, msg: &str) {
-    self.warn(msg.to_string());
+  fn append_unmodelled_transfer(&mut self, ins: &instr::Instr, cause: Cause, msg: &str) {
+    self.warn_ins(cause, ins, msg);
     self.append_instr(Type::Void, Opcode::Unimpl, vec![]);
     let trap = self.new_block(&format!("transfer_out_{:04x}", ins.addr.off.0));
     self.append_jmp(trap);
@@ -715,8 +716,13 @@ impl IRBuilder<'_> {
   /// Buffer a diagnostic for the current build pass. The carry analysis runs
   /// the build speculatively, so warnings are collected per pass and only the
   /// retained pass's are emitted (see `build`/`emit_warnings`).
-  fn warn(&mut self, msg: String) {
-    self.warnings.push(msg);
+  fn warn(&mut self, cause: Cause, addr: Option<SegOff>, opcode: Option<instr::Opcode>,
+          msg: impl Into<String>) {
+    self.warnings.push(Diagnostic::new(cause, addr, opcode, msg));
+  }
+
+  fn warn_ins(&mut self, cause: Cause, ins: &instr::Instr, msg: impl Into<String>) {
+    self.warn(cause, Some(ins.addr), Some(ins.opcode), msg);
   }
 
   fn append_update_flags(&mut self, vref: Ref) {
@@ -1194,12 +1200,14 @@ impl IRBuilder<'_> {
     if bytes_pushed_before >= bytes_cleanup_after {
       assert!(bytes_cleanup_after%2 == 0);
       let n = bytes_cleanup_after/2;
-      self.warn(format!("WARN: {}, inferred {} arg(s)... possibly erroneously", warn_msg, n));
+      self.warn(Cause::AbiArgsInference, Some(ins.addr), Some(ins.opcode),
+                format!("WARN: {}, inferred {} arg(s)... possibly erroneously", warn_msg, n));
       n
     } else {
       // If more bytes are cleaned up then pushed.. pessimize
       let n = 0;
-      self.warn(format!("WARN: {}, failed to infer, assuming {} arg(s)...very likely erroneously", warn_msg, n));
+      self.warn(Cause::AbiArgsInference, Some(ins.addr), Some(ins.opcode),
+                format!("WARN: {}, failed to infer, assuming {} arg(s)...very likely erroneously", warn_msg, n));
       n
     }
   }
@@ -1540,7 +1548,7 @@ impl IRBuilder<'_> {
     if missing.is_empty() { return; }
     missing.sort_unstable();
     let pronoun = if missing.len() == 1 { "it" } else { "them" };
-    self.warn(format!(
+    self.warn(Cause::ExitContractMismatch, Some(self.spec.start), None, format!(
       "WARN: {}: changes {} at return but its regouts/clobbers annotation does not declare {}",
       self.spec.name, missing.join(", "), pronoun));
   }
@@ -2454,12 +2462,12 @@ impl IRBuilder<'_> {
               // not a run-time-only target: say so, so the operator can
               // add the region.
               IndirectTargets::NoConfigRegion => {
-                self.append_unmodelled_transfer(ins, &format!(
+                self.append_unmodelled_transfer(ins, Cause::IndirectJumpNoTable, &format!(
                   "WARN: Unmodelled indirect jump '{}' at {} — the config has no jump table for it; emitting UNIMPL marker",
                   instr_str(ins), ins.addr));
               }
               IndirectTargets::NotTableShape => {
-                self.append_unmodelled_transfer(ins, &format!(
+                self.append_unmodelled_transfer(ins, Cause::IndirectJumpRuntimeTarget, &format!(
                   "WARN: Unmodelled indirect jump '{}' at {} — target is only known at run time; emitting UNIMPL marker",
                   instr_str(ins), ins.addr));
               }
@@ -2472,7 +2480,7 @@ impl IRBuilder<'_> {
           // `jmp <reg>` (e.g. `jmp ax`): the target is a register value,
           // known only at run time.
           _ => {
-            self.append_unmodelled_transfer(ins, &format!(
+            self.append_unmodelled_transfer(ins, Cause::IndirectJumpRuntimeTarget, &format!(
               "WARN: Unmodelled indirect jump '{}' at {} — target is only known at run time; emitting UNIMPL marker",
               instr_str(ins), ins.addr));
           }
@@ -2505,7 +2513,7 @@ impl IRBuilder<'_> {
                 instr_str(ins), ins.addr),
               branch::UnresolvedTransfer::NearIndirect => unreachable!("a far jump is never near-indirect"),
             };
-            self.append_unmodelled_transfer(ins, &msg);
+            self.append_unmodelled_transfer(ins, Cause::UnmodelledFarJump, &msg);
           }
         }
       }
@@ -2799,7 +2807,8 @@ impl IRBuilder<'_> {
           _ => 1, // Unreachable via decode; fall through to the marker.
         };
         if level != 0 {
-          self.warn(format!("Unimpl ENTER nesting level {level} at {} — emitting UNIMPL marker", ins.addr));
+          self.warn_ins(Cause::Unimpl, ins,
+                        format!("Unimpl ENTER nesting level {level} at {} — emitting UNIMPL marker", ins.addr));
           self.append_instr(Type::Void, Opcode::Unimpl, vec![]);
         } else {
           let bp = self.ir.get_var(instr::Reg::BP, self.cur);
@@ -2850,7 +2859,8 @@ impl IRBuilder<'_> {
         let a = self.append_asm_src_operand(&ins.operands[0]);
         let b = self.append_asm_src_operand(&ins.operands[1]);
         let typ = self.deduce_type_binary(a, b);
-        self.warn(format!("Unimpl opcode {:?} at {} — emitting UNIMPL markers", ins.opcode, ins.addr));
+        self.warn_ins(Cause::Unimpl, ins,
+                      format!("Unimpl opcode {:?} at {} — emitting UNIMPL markers", ins.opcode, ins.addr));
         let lo = self.append_instr(typ.clone(), Opcode::Unimpl, vec![a, b]);
         self.append_asm_dst_operand(&ins.operands[0], lo);
         let hi = self.append_instr(typ, Opcode::Unimpl, vec![a, b]);
@@ -2861,7 +2871,8 @@ impl IRBuilder<'_> {
         // BCD adjust of AL: explicit unknown, flags defined-but-unknown.
         let a = self.append_asm_src_operand(&ins.operands[0]);
         let typ = self.deduce_type_unary(a);
-        self.warn(format!("Unimpl opcode {:?} at {} — emitting UNIMPL marker", ins.opcode, ins.addr));
+        self.warn_ins(Cause::Unimpl, ins,
+                      format!("Unimpl opcode {:?} at {} — emitting UNIMPL marker", ins.opcode, ins.addr));
         let vref = self.append_instr(typ, Opcode::Unimpl, vec![a]);
         self.append_asm_dst_operand(&ins.operands[0], vref);
         self.append_update_flags(vref);
@@ -2870,7 +2881,8 @@ impl IRBuilder<'_> {
         // IRET restores CS:IP and FLAGS, so DF becomes unknown for any code
         // that follows it in the block; the return itself is not modeled.
         self.df_clear = false;
-        self.warn(format!("Unimpl opcode {:?} at {} — emitting UNIMPL marker", ins.opcode, ins.addr));
+        self.warn_ins(Cause::Unimpl, ins,
+                      format!("Unimpl opcode {:?} at {} — emitting UNIMPL marker", ins.opcode, ins.addr));
         self.append_instr(Type::Void, Opcode::Unimpl, vec![]);
       }
       instr::Opcode::OP_HLT | instr::Opcode::OP_INTO | instr::Opcode::OP_INVAL => {
@@ -2879,7 +2891,8 @@ impl IRBuilder<'_> {
         // decompile at build time. INTO over-approximates: it traps only
         // on an untracked overflow, but staying loud forces the model gap
         // visible instead of silently succeeding.
-        self.warn(format!("Unimpl opcode {:?} at {} — emitting UNIMPL marker", ins.opcode, ins.addr));
+        self.warn_ins(Cause::Unimpl, ins,
+                      format!("Unimpl opcode {:?} at {} — emitting UNIMPL marker", ins.opcode, ins.addr));
         self.append_instr(Type::Void, Opcode::Unimpl, vec![]);
       }
       _ => {
@@ -2887,7 +2900,8 @@ impl IRBuilder<'_> {
         // instruction must not abort the whole decompile. The build-time
         // warning names the opcode; the runtime UNIMPL() trap fires only
         // if the instruction actually executes.
-        self.warn(format!("Unimpl opcode {:?} at {} — emitting UNIMPL marker", ins.opcode, ins.addr));
+        self.warn_ins(Cause::Unimpl, ins,
+                      format!("Unimpl opcode {:?} at {} — emitting UNIMPL marker", ins.opcode, ins.addr));
         self.append_instr(Type::Void, Opcode::Unimpl, vec![]);
       }
     }
@@ -2961,14 +2975,13 @@ impl IRBuilder<'_> {
     retained.write_back_exit_registers();
     retained.check_regargs_setups();
 
-    retained.emit_warnings();
     *self = retained;
   }
 
   /// Emit the retained build pass's buffered diagnostics (see `warn`).
   fn emit_warnings(&self) {
     for w in &self.warnings {
-      eprintln!("{}", w);
+      eprintln!("{}", w.message);
     }
   }
 
@@ -3008,7 +3021,7 @@ impl IRBuilder<'_> {
         .collect();
       if dropped.is_empty() { continue; }
       let pronoun = if dropped.len() == 1 { "it" } else { "them" };
-      self.warn(format!(
+      self.warn(Cause::RegargsSetupDropped, Some(cand.call_addr), None, format!(
         "WARN: {}: call to {} at {} sets up {} but the callee's regargs does not declare {}; the setup is dropped and the callee reads the stale register value",
         self.spec.name, cand.callee, cand.call_addr, dropped.join(", "), pronoun));
     }
@@ -3165,7 +3178,8 @@ impl IRBuilder<'_> {
           // instead of hiding the lost edge; the drop semantics are unchanged.
           for tgt in &explicit {
             if self.out_of_range_edge(*tgt, fallthrough) {
-              self.warn(format!("WARN: {}: branch at {} targets {} outside function {}; the edge is dropped from the output",
+              self.warn(Cause::BranchOutOfRange, Some(ins.addr), Some(ins.opcode),
+                        format!("WARN: {}: branch at {} targets {} outside function {}; the edge is dropped from the output",
                 self.spec.name, ins.addr, tgt, self.spec.range_description()));
             }
           }
@@ -3179,7 +3193,8 @@ impl IRBuilder<'_> {
             // to that address: it needs a block like any other target.
             block_start.insert(target);
             if self.out_of_range_edge(target, None) {
-              self.warn(format!("WARN: {}: branch at {} targets {} outside function {}; the edge is dropped from the output",
+              self.warn(Cause::BranchOutOfRange, Some(ins.addr), Some(ins.opcode),
+                        format!("WARN: {}: branch at {} targets {} outside function {}; the edge is dropped from the output",
                 self.spec.name, ins.addr, target, self.spec.range_description()));
             }
           }
@@ -3407,7 +3422,20 @@ fn offset_from<T>(slice: &[T], elt: &T) -> usize {
 pub fn build_from_instrs(instrs: &[instr::Instr], cfg: &Config, spec: &spec::Spec<'_>, binary: &binary::Binary, overlay: bool, pin_all: bool) -> IR {
   let mut bld = IRBuilder::new(cfg, instrs, spec, binary, overlay, pin_all);
   bld.build();
+  bld.emit_warnings();
   bld.ir
+}
+
+/// Build the IR without printing diagnostics, returning them for an aggregate
+/// report. Callers that want the historical stderr behavior use
+/// `build_from_instrs` instead.
+pub fn build_from_instrs_with_diagnostics(
+  instrs: &[instr::Instr], cfg: &Config, spec: &spec::Spec<'_>, binary: &binary::Binary,
+  overlay: bool, pin_all: bool,
+) -> (IR, Vec<Diagnostic>) {
+  let mut bld = IRBuilder::new(cfg, instrs, spec, binary, overlay, pin_all);
+  bld.build();
+  (bld.ir, bld.warnings)
 }
 
 #[cfg(test)]
@@ -3970,6 +3998,9 @@ mod tests {
     // still be reported exactly once, not once per pass.
     assert_eq!(b.warnings.len(), 1, "the out-of-range WARN must be emitted once: {:?}", b.warnings);
     assert!(b.warnings[0].contains("outside function range"));
+    assert_eq!(b.warnings[0].cause, Cause::BranchOutOfRange);
+    assert_eq!(b.warnings[0].addr, Some(SegOff { seg: Seg::Normal(0), off: Off(0x0006) }));
+    assert_eq!(b.warnings[0].opcode, Some(instr::Opcode::OP_JMP));
     let tgt = SegOff { seg: Seg::Normal(0), off: Off(0x000a) };
     let blk = *b.addrmap.get(&tgt).expect("out-of-range target still gets a block");
     assert_eq!(b.ir.block_instr_count(blk), 0, "target block must stay empty (drop semantics preserved)");
@@ -4867,10 +4898,23 @@ mod tests {
     let instrs = decode_all(&binary, &spec);
     let mut b = test_builder(&cfg, &instrs, &spec, &binary);
     b.build();
-    assert!(b.warnings.iter().any(|w| w.contains("target is only known at run time")),
+    assert!(b.warnings.iter().any(|w| w.cause == Cause::IndirectJumpRuntimeTarget
+                                     && w.contains("target is only known at run time")),
       "an indirect jump must report a run-time-only target: {:?}", b.warnings);
     assert!(b.warnings.iter().all(|w| w.starts_with("WARN: ")),
       "every diagnostic must carry the WARN prefix: {:?}", b.warnings);
+  }
+
+  #[test]
+  fn unimpl_warning_carries_the_source_opcode_and_address() {
+    let (_types, cfg, binary, spec) = bit_test_builder(&[0xF4, 0xC3]);
+    let instrs = decode_all(&binary, &spec);
+    let mut b = test_builder(&cfg, &instrs, &spec, &binary);
+    b.build();
+    let d = b.warnings.iter().find(|d| d.cause == Cause::Unimpl)
+      .unwrap_or_else(|| panic!("no UNIMPL diagnostic: {:?}", b.warnings));
+    assert_eq!(d.addr, Some(SegOff { seg: Seg::Normal(0), off: Off(0) }));
+    assert_eq!(d.opcode, Some(instr::Opcode::OP_HLT));
   }
 
   #[test]
@@ -4883,7 +4927,8 @@ mod tests {
     let instrs = decode_all(&binary, &spec);
     let mut b = test_builder(&cfg, &instrs, &spec, &binary);
     b.build();
-    assert!(b.warnings.iter().any(|w| w.contains("the config has no jump table for it")),
+    assert!(b.warnings.iter().any(|w| w.cause == Cause::IndirectJumpNoTable
+                                     && w.contains("the config has no jump table for it")),
       "the config-gap diagnostic must be specific: {:?}", b.warnings);
     assert!(!b.warnings.iter().any(|w| w.contains("only known at run time")),
       "the config-gap case must not be reported as a run-time-only target: {:?}", b.warnings);
