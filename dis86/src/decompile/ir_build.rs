@@ -1372,9 +1372,10 @@ impl IRBuilder<'_> {
   /// The same guest write, placed immediately before `before` in `blk`. Used by
   /// the deferred exit write-back, which runs after lowering has moved on.
   fn write_guest_register_before(&mut self, blk: BlockRef, before: Ref,
-                                 reg: instr::Reg, vref: Ref) -> Ref {
+                                 reg: instr::Reg, vref: Ref, extra_attrs: u8) -> Ref {
     let sym = self.ir.symbols.find_ref_by_name(sym::Table::Register, reg.info().name).unwrap();
-    self.insert_instr_before(blk, before, Type::U16, Attribute::PIN | Attribute::EXIT_STATE,
+    self.insert_instr_before(blk, before, Type::U16,
+                             Attribute::PIN | Attribute::EXIT_STATE | extra_attrs,
                              Opcode::WriteVar16, vec![Ref::Symbol(sym), vref])
   }
 
@@ -1399,6 +1400,12 @@ impl IRBuilder<'_> {
   /// `Ref::Init(reg)` *is* the live register, so writing it would be a no-op
   /// (this also keeps a `push reg`/`pop reg` pair that folds away from gaining
   /// a write).
+  ///
+  /// A changed `SS` is emitted after the flavor's frame teardown: `FRAME_LEAVE`
+  /// pops the saved BP through the entry stack segment, while the near/far
+  /// return must observe the new one. Its value is frozen before the other
+  /// exit writes when it reads a register they change, since the deferred
+  /// write no longer follows `order_guest_writes`.
   ///
   /// The return expression can read a register this write-back rewrites
   /// (`mov ax,cx; dec cx; ret` returns the pre-decrement CX). `Ref::Init(reg)`
@@ -1427,7 +1434,7 @@ impl IRBuilder<'_> {
     for RetExit { ret_ref, pending } in std::mem::take(&mut self.ret_exits) {
       let Ref::Instr(blk, _) = ret_ref else { continue; };
 
-      let pending: Vec<_> = pending.into_iter()
+      let mut pending: Vec<_> = pending.into_iter()
         .filter(|(reg, vref)| !Self::is_entry_value(&self.ir, *vref, *reg))
         .collect();
       if pending.is_empty() { continue; }
@@ -1444,8 +1451,23 @@ impl IRBuilder<'_> {
       }
       self.ir.instr_mut(ret_ref).unwrap().operands = operands;
 
+      // SS is written after the frame teardown, so freeze a value that reads a
+      // register an earlier exit write changes. Otherwise the deferred write
+      // would observe the new value instead of the one at the guest ret.
+      if let Some(pos) = pending.iter().position(|(reg, _)| *reg == instr::Reg::SS) {
+        let vref = pending[pos].1;
+        let reads_pending = pending.iter().any(|(reg, _)| {
+          *reg != instr::Reg::SS && Self::ref_reads_init(&self.ir, vref, *reg)
+        });
+        if reads_pending {
+          pending[pos].1 = self.insert_instr_before(blk, ret_ref, Type::U16,
+            Attribute::MATERIALISE, Opcode::Ref, vec![vref]);
+        }
+      }
+
       for (reg, vref) in Self::order_guest_writes(&self.ir, &pending) {
-        self.write_guest_register_before(blk, ret_ref, reg, vref);
+        let extra_attrs = if reg == instr::Reg::SS { Attribute::POST_FRAME } else { Attribute::NONE };
+        self.write_guest_register_before(blk, ret_ref, reg, vref, extra_attrs);
       }
     }
     self.check_exit_contract(&changed);
@@ -5144,10 +5166,10 @@ mod tests {
       "reading BL uses the BX setup: {:?}", b.warnings);
   }
 
-  /// `pin_registers` emits `Pin(get_var(DS))` at every return, but ast.rs
-  /// drops `Pin`, so it is not a caller read of a dropped DS setup.
+  /// A changed DS emits an exit-state write at the return, but that write is
+  /// not a caller read of a DS setup whose value it only preserves.
   #[test]
-  fn a_ret_pin_does_not_mask_a_ds_setup() {
+  fn a_ret_exit_write_does_not_mask_a_ds_setup() {
     let (_types, cfg, binary, spec) =
       test_spec_with_callee(0x0000, 0x0006, &[0xC3], 0x0100, Some(vec![]));
     let instrs = [
@@ -5160,7 +5182,7 @@ mod tests {
     b.build();
 
     assert_eq!(regargs_warning_count(&b), 1,
-      "the transparent ret pin must not hide the DS setup: {:?}", b.warnings);
+      "the ret exit write must not hide the DS setup: {:?}", b.warnings);
     assert!(b.warnings[0].contains("DS"), "the warning must name DS: {}", b.warnings[0]);
   }
 

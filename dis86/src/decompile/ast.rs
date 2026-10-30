@@ -141,6 +141,10 @@ pub enum ReturnType {
 pub struct Return {
   pub rt: ReturnType,
   pub vals: Vec<Expr>,
+  /// Exit-state writes that must observe the flavor's frame teardown. The
+  /// current case is a changed `SS`: `FRAME_LEAVE` still needs the entry
+  /// stack segment to pop the saved BP.
+  pub post_frame: Vec<Assign>,
 }
 
 #[derive(Debug, Clone)]
@@ -1142,6 +1146,7 @@ impl<'a> Builder<'a> {
     if self.ir.block_instr_count(bref) == 0 {
       return None;
     }
+    let mut post_frame = vec![];
     for r in self.ir.iter_instrs(bref) {
       let instr = self.ir.instr(r).unwrap();
       match instr.opcode {
@@ -1150,12 +1155,16 @@ impl<'a> Builder<'a> {
         ir::Opcode::Pin => continue, // ignored
         ir::Opcode::RetFar => {
           let vals: Vec<_> = instr.operands.iter().map(|r| self.ref_to_expr(*r, 1)).collect();
-          blk.push_stmt(Stmt::Return(Return{rt: ReturnType::Far, vals}));
+          blk.push_stmt(Stmt::Return(Return{
+            rt: ReturnType::Far, vals, post_frame: std::mem::take(&mut post_frame),
+          }));
           return None;
         }
         ir::Opcode::RetNear => {
           let vals: Vec<_> = instr.operands.iter().map(|r| self.ref_to_expr(*r, 1)).collect();
-          blk.push_stmt(Stmt::Return(Return{rt: ReturnType::Near, vals}));
+          blk.push_stmt(Stmt::Return(Return{
+            rt: ReturnType::Near, vals, post_frame: std::mem::take(&mut post_frame),
+          }));
           return None;
         }
         ir::Opcode::Jmp => {
@@ -1183,7 +1192,12 @@ impl<'a> Builder<'a> {
         ir::Opcode::WriteVar16 => {
           let lhs = self.symbol_to_expr(instr.operands[0].unwrap_symbol());
           let rhs = self.ref_to_expr(instr.operands[1], 1);
-          blk.push_stmt(Stmt::Assign(Assign { decltype: None, lhs, rhs }));
+          let assign = Assign { decltype: None, lhs, rhs };
+          if (instr.attrs & ir::Attribute::POST_FRAME) != 0 {
+            post_frame.push(assign);
+          } else {
+            blk.push_stmt(Stmt::Assign(assign));
+          }
         }
         ir::Opcode::WriteVar32 => {
           let lhs = self.symbol_to_expr(instr.operands[0].unwrap_symbol());

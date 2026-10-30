@@ -347,10 +347,11 @@ fn changed_es_is_written_back() {
   assert!(source[es..].contains("0x1234"), "ES must carry the changed value:\n{source}");
 }
 
-/// SS is stack state, but it is still exit state and must be written before the
-/// Hydra frame teardown/return consume the stack.
+/// SS is stack state, but it is still exit state. `FRAME_LEAVE` must pop the
+/// saved BP through the entry stack segment, while the return must see the new
+/// one, so the SS write belongs between them.
 #[test]
-fn changed_ss_is_written_back_before_the_hydra_return() {
+fn changed_ss_is_written_back_after_the_hydra_frame() {
   let code = [
     0xB8, 0x34, 0x12, // mov ax,0x1234
     0x8E, 0xD0,       // mov ss,ax
@@ -363,8 +364,31 @@ fn changed_ss_is_written_back_before_the_hydra_return() {
   );
   let ss = find(&source, "SS = ");
   assert!(source[ss..].contains("0x1234"), "SS must carry the changed value:\n{source}");
-  assert!(ss < find(&source, "FRAME_LEAVE()"), "SS must precede the frame teardown:\n{source}");
+  assert!(find(&source, "FRAME_LEAVE()") < ss, "SS must follow the frame teardown:\n{source}");
   assert!(ss < find(&source, "RETURN_NEAR()"), "SS must precede the return:\n{source}");
+}
+
+/// A deferred SS write must not observe an exit write that ran first. Here SS
+/// takes the entry BX, and BX changes afterward at the same ret, so the value
+/// has to be frozen before either write.
+#[test]
+fn changed_ss_does_not_observe_a_later_bx_write() {
+  let code = [
+    0x8E, 0xD3,       // mov ss,bx
+    0xBB, 0x78, 0x56, // mov bx,0x5678
+    0xC3,             // ret
+  ];
+  let source = decompile(
+    &code,
+    vec![func("main", 0x0000, 0x0006, None)],
+    Flavor::Hydra { relocatable_segs: vec![] },
+  );
+  let temp = find(&source, " = BX;");
+  assert!(temp < find(&source, "BX = 0x5678"), "SS entry value must be frozen before BX changes:\n{source}");
+  let ss = find(&source, "SS = ");
+  assert!(find(&source, "FRAME_LEAVE()") < ss, "SS must follow the frame teardown:\n{source}");
+  assert!(!source[ss..].starts_with("SS = BX;"), "the deferred SS write must use the frozen value:\n{source}");
+  assert!(!source[ss..].contains("0x5678"), "SS must not pick up the later BX value:\n{source}");
 }
 
 /// `pin_all` must not replace changed segment SSA with a `Pin` that AST
@@ -420,8 +444,9 @@ fn segment_write_observes_the_pre_write_gpr_value() {
   assert!(ds < bx, "DS must read BX before BX's own exit write:\n{source}");
 }
 
-/// The Hydra flavour places the exit writes before the frame teardown and the
-/// return, so the machine observes the restored register state.
+/// The Hydra flavour places GPR exit writes before the frame teardown and the
+/// return, so the machine observes the restored register state. SS is the
+/// exception and is covered by the frame-order test above.
 #[test]
 fn hydra_flavour_writes_exit_state_before_the_return() {
   let code = [
