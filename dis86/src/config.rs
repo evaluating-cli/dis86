@@ -20,6 +20,10 @@ pub struct Func {
   pub ret: Option<Type>,
   pub args: Option<u16>,  // None means "unknown", Some(0) means "no args"
   pub regargs: Option<Vec<Reg>>,
+  /// Registers whose final value is part of this function's observable result.
+  pub regouts: Option<Vec<Reg>>,
+  /// Registers a caller must not assume this function preserves.
+  pub clobbers: Option<Vec<Reg>>,
   pub dont_pop_args: bool,
 }
 
@@ -247,6 +251,31 @@ impl Config {
     Ok(())
   }
 
+  /// Parse the register lists used by the caller/callee contract annotations.
+  /// These describe full registers only: fragment aliases and the frame,
+  /// instruction-pointer, and flags registers are not call-visible outputs or
+  /// clobbers.
+  fn parse_contract_regs(key: &str, field: &str, value: Option<&str>)
+      -> Result<Option<Vec<Reg>>, String> {
+    let Some(value) = value else { return Ok(None) };
+    let mut regs = Vec::new();
+    for name in value.split(',') {
+      let name = name.trim();
+      let reg = Reg::from_str_upper(name)
+        .ok_or_else(|| format!("Failed to parse '{}.{}' register name: {}", key, field, name))?;
+      if !matches!(reg, Reg::AX | Reg::CX | Reg::DX | Reg::BX | Reg::SI | Reg::DI
+                        | Reg::ES | Reg::SS | Reg::DS) {
+        return Err(format!(
+          "Unsupported register '{}' in '{}.{}' (expected AX, CX, DX, BX, SI, DI, ES, SS, or DS)",
+          name, key, field));
+      }
+      if !regs.contains(&reg) {
+        regs.push(reg);
+      }
+    }
+    Ok(Some(regs))
+  }
+
   fn parse_functions(&mut self, root: &bsl::Root, types: &TypeDatabase) -> Result<(), String> {
     let func = root.get_node("dis86.functions")
       .ok_or_else(|| format!("Failed to get the functions node"))?;
@@ -271,6 +300,8 @@ impl Config {
       let indirect = f.get_str("indirect_call_location").is_some();
 
       let regargs = f.get_str("regargs");
+      let regouts = Self::parse_contract_regs(key, "regouts", f.get_str("regouts"))?;
+      let clobbers = Self::parse_contract_regs(key, "clobbers", f.get_str("clobbers"))?;
 
       let start: SegOff = start_str.parse()
         .map_err(|_| format!("Expected segoff for '{}.start', got '{}'", key, start_str))?;
@@ -321,9 +352,15 @@ impl Config {
           ret,
           args: if args >= 0 { Some(args as u16) } else { None },
           regargs,
+          regouts,
+          clobbers,
           dont_pop_args,
         });
       } else {
+        if regouts.is_some() || clobbers.is_some() {
+          return Err(format!(
+            "Indirect call '{}' cannot declare 'regouts' or 'clobbers'", key));
+        }
         if mode != CallMode::Far {
           return Err(format!("Indirect call '{}' must use 'mode far'", key));
         }

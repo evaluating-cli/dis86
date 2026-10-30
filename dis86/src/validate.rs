@@ -560,6 +560,8 @@ mod tests {
       ret: None,
       args: Some(0),
       regargs: None,
+      regouts: None,
+      clobbers: None,
       dont_pop_args: false,
     }
   }

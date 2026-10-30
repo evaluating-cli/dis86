@@ -7,7 +7,7 @@ use dis86::decompile::gen::{self, Flavor};
 use dis86::decompile::{ir, ir_build, opt, sym};
 use dis86::segoff::{Off, Seg, SegOff};
 use dis86::spec::Spec;
-use dis86::types::TypeDatabase;
+use dis86::types::{Type, TypeDatabase};
 
 fn func(name: &str, start: u16, end: u16, regargs: Option<Vec<Reg>>) -> Func {
   Func {
@@ -19,7 +19,19 @@ fn func(name: &str, start: u16, end: u16, regargs: Option<Vec<Reg>>) -> Func {
     ret: None,
     args: Some(0),
     regargs,
+    regouts: None,
+    clobbers: None,
     dont_pop_args: false,
+  }
+}
+
+fn func_contract(name: &str, start: u16, end: u16, ret: Type,
+                 regouts: Option<Vec<Reg>>, clobbers: Option<Vec<Reg>>) -> Func {
+  Func {
+    ret: Some(ret),
+    regouts,
+    clobbers,
+    ..func(name, start, end, None)
   }
 }
 
@@ -190,4 +202,44 @@ fn call_regargs_dedupe_repeated_registers() {
     1,
     "repeated regarg must emit exactly one write:\n{source}"
   );
+}
+
+#[test]
+fn call_contract_refreshes_declared_clobbers() {
+  let code = [
+    0xBB, 0x11, 0x11, // mov bx,0x1111
+    0xE8, 0x03, 0x00, // call f
+    0x89, 0xD8,       // mov ax,bx
+    0xC3,             // ret
+    0xC3,             // f: ret
+  ];
+  let funcs = vec![
+    func_contract("main", 0x0000, 0x0009, Type::U16, None, None),
+    func_contract("f", 0x0009, 0x000a, Type::U16, None, Some(vec![Reg::BX])),
+  ];
+  let source = decompile_with_funcs(&code, 0x0009, funcs);
+
+  let call = find(&source, "f(");
+  assert!(source[call..].contains("BX"), "post-call BX must be live:\n{source}");
+  assert!(!source[call..].contains("0x1111"), "post-call BX must not be the pre-call constant:\n{source}");
+}
+
+#[test]
+fn call_contract_refreshes_declared_regouts() {
+  let code = [
+    0x8E, 0xDB,       // mov ds,bx
+    0xE8, 0x03, 0x00, // call f
+    0x8C, 0xD8,       // mov ax,ds
+    0xC3,             // ret
+    0xC3,             // f: ret
+  ];
+  let funcs = vec![
+    func_contract("main", 0x0000, 0x0008, Type::U16, None, None),
+    func_contract("f", 0x0008, 0x0009, Type::U16, Some(vec![Reg::DS]), None),
+  ];
+  let source = decompile_with_funcs(&code, 0x0008, funcs);
+
+  let call = find(&source, "f(");
+  assert!(source[call..].contains("DS"), "post-call DS must be live:\n{source}");
+  assert!(!source[call..].contains("BX"), "post-call DS must not be the pre-call alias:\n{source}");
 }

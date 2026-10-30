@@ -15,6 +15,8 @@ fn func(name: &str, start: u16, end: u16, ret: Option<Type>, regargs: Option<Vec
     ret,
     args: Some(0),
     regargs,
+    regouts: None,
+    clobbers: None,
     dont_pop_args: false,
   }
 }

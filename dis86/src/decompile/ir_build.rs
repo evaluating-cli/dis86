@@ -1227,6 +1227,47 @@ impl IRBuilder<'_> {
     }
   }
 
+  /// Refresh the caller's view of a register the callee declares as an output
+  /// or clobber. `Ref::Init(reg)` renders as the live C variable, which the
+  /// callee has just changed; keeping the pre-call SSA value would make a later
+  /// read observe stale state. Return registers are handled by
+  /// `save_return_value`, so do not overwrite those with an unknown live value.
+  fn apply_call_contract(&mut self, func: &config::Func, ret_type: &Type) {
+    let mut regs = HashSet::new();
+    for list in [&func.regouts, &func.clobbers] {
+      if let Some(list) = list {
+        regs.extend(list.iter().copied());
+      }
+    }
+    for reg in regs {
+      if Self::is_return_register(ret_type, reg) { continue; }
+      self.ir.set_var(reg, self.cur, Ref::Init(reg));
+      let fragments = match reg {
+        instr::Reg::AX => Some((instr::Reg::AL, instr::Reg::AH)),
+        instr::Reg::BX => Some((instr::Reg::BL, instr::Reg::BH)),
+        instr::Reg::CX => Some((instr::Reg::CL, instr::Reg::CH)),
+        instr::Reg::DX => Some((instr::Reg::DL, instr::Reg::DH)),
+        _ => None,
+      };
+      if let Some((lo, hi)) = fragments {
+        self.ir.set_var(lo, self.cur, Ref::Init(lo));
+        self.ir.set_var(hi, self.cur, Ref::Init(hi));
+      }
+    }
+  }
+
+  /// Whether `reg` is already defined by the call's return-value handling.
+  fn is_return_register(ret_type: &Type, reg: instr::Reg) -> bool {
+    match ret_type {
+      Type::Void => false,
+      Type::U8 | Type::I8 | Type::U16 | Type::I16 => reg == instr::Reg::AX,
+      Type::U32 | Type::I32 | Type::Unknown => {
+        matches!(reg, instr::Reg::AX | instr::Reg::DX)
+      }
+      _ => false,
+    }
+  }
+
   fn process_callf_indirect(&mut self, ins: &instr::Instr) {
     let (ret_type, args) = if let Some(indirect) = self.cfg.indirect_lookup(ins.addr) {
       (&indirect.ret, indirect.args)
@@ -1258,6 +1299,7 @@ impl IRBuilder<'_> {
     let ret_type = func.return_type_defaulted();
     let ret_ref = self.append_instr(ret_type.clone(), Opcode::CallArgs, operands);
     self.save_return_value(&ret_type, ret_ref);
+    self.apply_call_contract(func, &ret_type);
 
     if func.dont_pop_args {
       let sp = self.ir.get_var(instr::Reg::SP, self.cur);
@@ -1381,6 +1423,7 @@ impl IRBuilder<'_> {
   /// the lowering-time `ret` too, not a fresh `get_var`: `pin_registers` can
   /// have replaced `AX` with a `Pin` under `pin_all`.
   fn write_back_exit_registers(&mut self) {
+    let mut changed = HashSet::new();
     for RetExit { ret_ref, pending } in std::mem::take(&mut self.ret_exits) {
       let Ref::Instr(blk, _) = ret_ref else { continue; };
 
@@ -1388,6 +1431,7 @@ impl IRBuilder<'_> {
         .filter(|(reg, vref)| !Self::is_entry_value(&self.ir, *vref, *reg))
         .collect();
       if pending.is_empty() { continue; }
+      changed.extend(pending.iter().map(|(reg, _)| *reg));
 
       // Snapshot first, then insert the writes: each insert lands immediately
       // before the `ret`, leaving the snapshots ahead of the writes.
@@ -1404,6 +1448,34 @@ impl IRBuilder<'_> {
         self.write_guest_register_before(blk, ret_ref, reg, vref);
       }
     }
+    self.check_exit_contract(&changed);
+  }
+
+  /// Warn when an explicitly annotated caller/callee contract does not cover a
+  /// register the function actually changes at a return. Correctness does not
+  /// depend on this annotation: the write-back above runs regardless. The
+  /// warning only helps keep the caller model honest when an operator opted
+  /// into `regouts`/`clobbers`.
+  fn check_exit_contract(&mut self, changed: &HashSet<instr::Reg>) {
+    let Some(func) = self.spec.func else { return; };
+    if func.regouts.is_none() && func.clobbers.is_none() { return; }
+
+    let mut declared = HashSet::new();
+    for list in [&func.regouts, &func.clobbers] {
+      if let Some(list) = list {
+        declared.extend(list.iter().copied());
+      }
+    }
+    let mut missing: Vec<&str> = changed.iter()
+      .filter(|reg| !declared.contains(reg))
+      .map(|reg| reg.info().name)
+      .collect();
+    if missing.is_empty() { return; }
+    missing.sort_unstable();
+    let pronoun = if missing.len() == 1 { "it" } else { "them" };
+    self.warn(format!(
+      "WARN: {}: changes {} at return but its regouts/clobbers annotation does not declare {}",
+      self.spec.name, missing.join(", "), pronoun));
   }
 
   /// The register values that may need write-back at a `ret`: the callee-saved
@@ -4690,6 +4762,56 @@ mod tests {
     }
   }
 
+  #[test]
+  fn exit_contract_warns_about_an_undeclared_segment_change() {
+    let code = &[
+      0xB8, 0x07, 0x06, // mov ax,0x0607
+      0x8E, 0xD8,       // mov ds,ax
+      0xC3,             // ret
+    ];
+    let (_types, mut cfg, binary, _) = test_spec(0x0000, 0x0006, code);
+    cfg.funcs.push(config::Func {
+      name: "main".to_string(),
+      start: SegOff { seg: Seg::Normal(0), off: Off(0) },
+      end: Some(SegOff { seg: Seg::Normal(0), off: Off(6) }),
+      entry: None,
+      mode: config::CallMode::Near,
+      ret: Some(Type::U16),
+      args: Some(0),
+      regargs: None,
+      regouts: Some(vec![instr::Reg::SI]),
+      clobbers: None,
+      dont_pop_args: false,
+    });
+    let spec = spec::Spec::from_config_name(&cfg, "main").expect("main");
+    let instrs = decode_all(&binary, &spec);
+    let mut b = test_builder(&cfg, &instrs, &spec, &binary);
+    b.build();
+
+    let contract_warnings: Vec<_> = b.warnings.iter()
+      .filter(|w| w.contains("regouts/clobbers"))
+      .collect();
+    assert_eq!(contract_warnings.len(), 1,
+      "the undeclared DS change must warn exactly once: {:?}", b.warnings);
+    assert!(contract_warnings[0].contains("DS"),
+      "the warning must name the changed register: {:?}", b.warnings);
+  }
+
+  #[test]
+  fn exit_contract_does_not_warn_when_none_are_declared() {
+    let code = &[
+      0xB8, 0x07, 0x06, // mov ax,0x0607
+      0x8E, 0xD8,       // mov ds,ax
+      0xC3,             // ret
+    ];
+    let (_types, cfg, binary, spec) = test_spec(0x0000, 0x0006, code);
+    let instrs = decode_all(&binary, &spec);
+    let mut b = test_builder(&cfg, &instrs, &spec, &binary);
+    b.build();
+    assert!(!b.warnings.iter().any(|w| w.contains("regouts/clobbers")),
+      "annotations are opt-in: {:?}", b.warnings);
+  }
+
   /// A caller range plus one configured near callee at `callee_start`.
   fn test_spec_with_callee(
     start: u16, end: u16, code: &[u8],
@@ -4705,6 +4827,8 @@ mod tests {
       ret: None,
       args: Some(0),
       regargs: callee_regargs,
+      regouts: None,
+      clobbers: None,
       dont_pop_args: false,
     });
     (types, cfg, binary, spec)
