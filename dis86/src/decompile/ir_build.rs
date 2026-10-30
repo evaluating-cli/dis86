@@ -156,11 +156,6 @@ struct IRBuilder<'a> {
   // (see `check_regargs_setups`), so each call site warns at most once.
   regargs_candidates: Vec<RegargsCandidate>,
 
-  // Instructions emitted only to materialise the exit register state at a
-  // `ret` (see `write_back_exit_registers`). They are not caller reads, so the
-  // #132 "is this setup value still used" check ignores them.
-  exit_state_writes: HashSet<Ref>,
-
   // Return instructions awaiting their exit register write-back, with the
   // register values captured at the ret. Recorded while lowering and
   // materialised by `write_back_exit_registers` after `build_once` has sealed
@@ -228,7 +223,6 @@ impl<'a> IRBuilder<'a> {
       entry_known_default: false,
       warnings: Vec::new(),
       regargs_candidates: Vec::new(),
-      exit_state_writes: HashSet::new(),
       ret_exits: Vec::new(),
     };
 
@@ -1127,7 +1121,8 @@ impl IRBuilder<'_> {
     self.ir.set_var(instr::Reg::SP, self.cur, sp);
 
     // store to SS:SP
-    self.append_instr(Type::Void, Opcode::Store16, vec![ss, sp, vref]);
+    self.append_instr_with_attrs(Type::Void, Attribute::STACK_SAVE, Opcode::Store16,
+                                 vec![ss, sp, vref]);
   }
 
   fn append_pop(&mut self) -> Ref {
@@ -1341,8 +1336,8 @@ impl IRBuilder<'_> {
   fn write_guest_register_before(&mut self, blk: BlockRef, before: Ref,
                                  reg: instr::Reg, vref: Ref) -> Ref {
     let sym = self.ir.symbols.find_ref_by_name(sym::Table::Register, reg.info().name).unwrap();
-    self.insert_instr_before(blk, before, Type::U16, Attribute::PIN, Opcode::WriteVar16,
-                             vec![Ref::Symbol(sym), vref])
+    self.insert_instr_before(blk, before, Type::U16, Attribute::PIN | Attribute::EXIT_STATE,
+                             Opcode::WriteVar16, vec![Ref::Symbol(sym), vref])
   }
 
   /// Materialise the function's exit register state at a `ret`.
@@ -1409,8 +1404,7 @@ impl IRBuilder<'_> {
       self.ir.instr_mut(ret_ref).unwrap().operands = operands;
 
       for (reg, vref) in Self::order_guest_writes(&self.ir, &pending) {
-        let write = self.write_guest_register_before(blk, ret_ref, reg, vref);
-        self.exit_state_writes.insert(write);
+        self.write_guest_register_before(blk, ret_ref, reg, vref);
       }
     }
   }
@@ -2894,7 +2888,7 @@ impl IRBuilder<'_> {
         let Some(instr) = self.ir.instr(r) else { continue; };
         let root = (instr.opcode.has_side_effects() || (instr.attrs & Attribute::PIN) != 0)
           && instr.opcode != Opcode::Pin
-          && !self.exit_state_writes.contains(&r);
+          && (instr.attrs & Attribute::EXIT_STATE) == 0;
         if root { roots.push(r); }
       }
     }
@@ -4902,7 +4896,10 @@ mod tests {
       assert!(!writes.contains_key(reg), "{reg} is untouched on every path: {writes:?}");
     }
     assert_eq!(materialised, 0, "an entry-value return needs no snapshot");
-    assert_eq!(b.exit_state_writes.len(), 1, "only the BX write is exit state");
+    let exit_state = b.ir.iter_blocks().flat_map(|blk| b.ir.iter_instrs(blk))
+      .filter(|r| b.ir.instr(*r).is_some_and(|i| i.attrs & Attribute::EXIT_STATE != 0))
+      .count();
+    assert_eq!(exit_state, 1, "only the BX write is exit state");
   }
 
   /// Decoding continues past a `ret` (padding, inline data, the next entry in
@@ -4940,7 +4937,10 @@ mod tests {
     for reg in ["CX", "DX", "SI", "DI"] {
       assert!(!writes.contains_key(reg), "{reg} is untouched at the ret: {writes:?}");
     }
-    assert_eq!(b.exit_state_writes.len(), 1, "only the BX write is exit state");
+    let exit_state = b.ir.iter_blocks().flat_map(|blk| b.ir.iter_instrs(blk))
+      .filter(|r| b.ir.instr(*r).is_some_and(|i| i.attrs & Attribute::EXIT_STATE != 0))
+      .count();
+    assert_eq!(exit_state, 1, "only the BX write is exit state");
   }
 
   /// A register that is dirty at the ret keeps the value captured there even

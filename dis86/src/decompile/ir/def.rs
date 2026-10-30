@@ -44,6 +44,15 @@ pub mod Attribute {
   /// write-back in `ir_build`), so folding it back into its consumer defeats
   /// the purpose.
   pub const MATERIALISE: u8 = 1<<3;
+  /// Deferred `ret` register write-back. It preserves the caller's exit state;
+  /// it is not a read of the callee's inputs. ABI inference must ignore these
+  /// roots, but keep ordinary `PIN` writes (notably `regargs` setup) live.
+  pub const EXIT_STATE: u8 = 1<<4;
+  /// A `push`'s stack store. Its value is consumed by a matching `pop` or by
+  /// the callee's stack argument; it is not an externally visible write by
+  /// itself, so ABI inference must not treat it as a root. Other stack stores
+  /// stay roots because their address may have escaped.
+  pub const STACK_SAVE: u8 = 1<<5;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

@@ -10,9 +10,9 @@ use crate::decompile::ast;
 use crate::decompile::ir_build;
 use crate::decompile::sym;
 use crate::decompile::opt;
-use crate::decompile::fuse;
 use crate::decompile::control_flow;
 use crate::spec::{self, Spec};
+use crate::app_infer::FailedFunc;
 use crate::validate::{self, ValidationScope};
 use std::fs::File;
 use std::io::Write;
@@ -28,6 +28,13 @@ fn print_help() {
   println!("");
   println!("MODE: ANALYZE");
   println!("  --analyze         analyze the binary using the configuration annotations");
+  println!("");
+  println!("MODE: INFER ABI");
+  println!("  --infer-abi       report inferred args, register inputs, and return width for the");
+  println!("                    selected functions (uses --name, --codeseg-name, or a range)");
+  println!("                    register inputs are iterated to a fixpoint (at most 8 passes)");
+  println!("                    call-site columns need callers in the selection; --name builds");
+  println!("                    only the named function");
   println!("");
   println!("MODE: VALIDATE CONFIG");
   println!("  --validate-config validate config ranges, decode, and call modes; then exit");
@@ -118,6 +125,7 @@ struct Args {
   codeseg_name: Option<String>,
 
   analyze: bool,
+  infer_abi: bool,
   validate_config: bool,
   strict: bool,
   trace_analyze: bool,
@@ -213,6 +221,7 @@ fn parse_args() -> Result<Args, pico_args::Error> {
     config:          pargs.opt_value_from_str("--config")?,
     binary:          parse_binary_fmt(&mut pargs, !trace_analyze)?,
     analyze:         false,
+    infer_abi:       false,
     validate_config: false,
     strict:          false,
     trace_analyze:   trace_analyze,
@@ -239,6 +248,7 @@ fn parse_args() -> Result<Args, pico_args::Error> {
 
   let mut remaining = pargs.finish();
   args.analyze         = match_flag(&mut remaining, "--analyze");
+  args.infer_abi       = match_flag(&mut remaining, "--infer-abi");
   args.validate_config = match_flag(&mut remaining, "--validate-config");
   args.strict          = match_flag(&mut remaining, "--strict");
   args.build_pin_all   = match_flag(&mut remaining, "--build-pin-all");
@@ -277,6 +287,25 @@ pub fn run() -> i32 {
     }
     if args.start_addr.is_some() || args.end_addr.is_some() {
       eprintln!("Error: --validate-config takes --name or --codeseg-name, not --start-addr/--end-addr.");
+      return 1;
+    }
+  }
+
+  if args.infer_abi {
+    if args.analyze {
+      eprintln!("Error: --infer-abi cannot be combined with --analyze.");
+      return 1;
+    }
+    if args.validate_config {
+      eprintln!("Error: --infer-abi cannot be combined with --validate-config.");
+      return 1;
+    }
+    if has_emit_flags(&args) {
+      eprintln!("Error: --infer-abi cannot be combined with an --emit-* mode.");
+      return 1;
+    }
+    if args.build_pin_all {
+      eprintln!("Error: --infer-abi cannot be combined with --build-pin-all.");
       return 1;
     }
   }
@@ -375,48 +404,67 @@ pub fn run() -> i32 {
   }
 
   // Batch modes get an automatic preflight: errors abort, warnings are
-  // reported but do not block unless --strict is set.
+  // reported but do not block unless --strict is set. Inference is a
+  // read-only report: a broken annotation must not suppress the findings for
+  // the functions that do decode, so it warns and continues. The validation
+  // verdict still decides the exit code below.
+  let mut preflight_failed = false;
   if args.name.is_some() || args.codeseg_name.is_some() {
     let report = validate::validate_config(&cfg, &binary, &scope);
     if report.should_fail(args.strict) {
       report.print();
-      return 1;
-    }
-    if report.warnings() != 0 {
+      preflight_failed = true;
+      if !args.infer_abi {
+        return 1;
+      }
+    } else if report.warnings() != 0 {
       report.print();
     }
   }
 
-  let specs =
-    if let Some(name) = &args.name {
-      match spec::Spec::from_config_name(&cfg, name) {
-        Some(spec) => vec![spec],
-        None => {
-          eprintln!("Error: Failed to lookup function named: {}", name);
-          return 1;
-        }
-      }
-    } else if let Some(name) = &args.codeseg_name {
-      spec::specs_from_codeseg_name(&cfg, name)
-    } else {
-      match (args.start_addr, args.end_addr) {
-        (Some(start), Some(end)) => {
-          if !binary.contains_region(start, end) {
-            eprintln!("Error: address range {}..{} is invalid or outside the loaded image", start, end);
+  let (specs, infer_failures) = if args.infer_abi {
+    match infer_specs(&cfg, &binary, &args) {
+      Ok(selections) => selections,
+      Err(()) => return 1,
+    }
+  } else {
+    let specs =
+      if let Some(name) = &args.name {
+        match spec::Spec::from_config_name(&cfg, name) {
+          Some(spec) => vec![spec],
+          None => {
+            eprintln!("Error: Failed to lookup function named: {}", name);
             return 1;
           }
-          vec![spec::Spec::from_start_and_end(Some(start), Some(end))]
         }
-        (None, None) => {
-          eprintln!("Error: one of --name, --codeseg-name, or --start-addr/--end-addr is required.");
-          return 1;
+      } else if let Some(name) = &args.codeseg_name {
+        spec::specs_from_codeseg_name(&cfg, name)
+      } else {
+        match (args.start_addr, args.end_addr) {
+          (Some(start), Some(end)) => {
+            if !binary.contains_region(start, end) {
+              eprintln!("Error: address range {}..{} is invalid or outside the loaded image", start, end);
+              return 1;
+            }
+            vec![spec::Spec::from_start_and_end(Some(start), Some(end))]
+          }
+          (None, None) => {
+            eprintln!("Error: one of --name, --codeseg-name, or --start-addr/--end-addr is required.");
+            return 1;
+          }
+          _ => {
+            eprintln!("Error: --start-addr and --end-addr must be provided together.");
+            return 1;
+          }
         }
-        _ => {
-          eprintln!("Error: --start-addr and --end-addr must be provided together.");
-          return 1;
-        }
-      }
-    };
+      };
+    (specs, Vec::new())
+  };
+
+  if args.infer_abi {
+    let rc = crate::app_infer::run(&cfg, &binary, specs, infer_failures);
+    return if preflight_failed { 1 } else { rc };
+  }
 
   let mut all_code = String::new();
   let mut failures = 0;
@@ -457,6 +505,69 @@ pub fn run() -> i32 {
   }
 
   0
+}
+
+/// Build the inference selection without the panicking `Spec::from_func`
+/// path, so a missing end or an out-of-image range becomes a report row
+/// instead of aborting the whole run.
+fn infer_specs<'a>(cfg: &'a Config, binary: &Binary, args: &Args)
+  -> Result<(Vec<Spec<'a>>, Vec<FailedFunc>), ()> {
+  if let Some(name) = &args.name {
+    let Some(func) = cfg.func_lookup_by_name(name) else {
+      eprintln!("Error: Failed to lookup function named: {}", name);
+      return Err(());
+    };
+    let (specs, failed) = match infer_spec(binary, func) {
+      Ok(spec) => (vec![spec], vec![]),
+      Err(f) => (vec![], vec![f]),
+    };
+    return Ok((specs, failed));
+  }
+  if let Some(name) = &args.codeseg_name {
+    let Some(codeseg) = cfg.code_seg_lookup_by_name(name) else {
+      eprintln!("Error: Failed to find code segment with name '{}'", name);
+      return Err(());
+    };
+    let mut specs = vec![];
+    let mut failed = vec![];
+    for func in cfg.func_lookup_by_seg(codeseg.seg) {
+      match infer_spec(binary, func) {
+        Ok(spec) => specs.push(spec),
+        Err(f) => failed.push(f),
+      }
+    }
+    return Ok((specs, failed));
+  }
+  match (args.start_addr, args.end_addr) {
+    (Some(start), Some(end)) => {
+      if !binary.contains_region(start, end) {
+        eprintln!("Error: address range {}..{} is invalid or outside the loaded image", start, end);
+        return Err(());
+      }
+      Ok((vec![Spec::from_start_and_end(Some(start), Some(end))], vec![]))
+    }
+    (None, None) => {
+      eprintln!("Error: one of --name, --codeseg-name, or --start-addr/--end-addr is required.");
+      Err(())
+    }
+    _ => {
+      eprintln!("Error: --start-addr and --end-addr must be provided together.");
+      Err(())
+    }
+  }
+}
+
+fn infer_spec<'a>(binary: &Binary, func: &'a crate::config::Func)
+  -> Result<Spec<'a>, FailedFunc> {
+  let Some(end) = func.end else {
+    return Err(FailedFunc::new(func.name.clone(), func.start, func.start,
+                               "missing end address".to_string()));
+  };
+  if !binary.contains_region(func.start, end) {
+    return Err(FailedFunc::new(func.name.clone(), func.start, end,
+                               "range outside the loaded image".to_string()));
+  }
+  Ok(Spec::from_func(func))
 }
 
 fn decompile_spec(args: &Args, cfg: &Config, binary: &Binary, spec: Spec<'_>, all_code: &mut String, relocatable_segs: &[u16]) -> i32 {
@@ -525,10 +636,7 @@ fn decompile_spec(args: &Args, cfg: &Config, binary: &Binary, spec: Spec<'_>, al
     return 0;
   }
 
-  fuse::fuse_mem(&mut ir);
-  opt::optimize(&mut ir);
-
-  ir::fin::finalize(&mut ir);
+  crate::decompile::finalize_for_emission(&mut ir);
   if let Some(path) = args.emit_ir_final.as_ref() {
     let text = ir::display::display_ir_with_uses(&ir).unwrap();
     write_to_path(path, &format!("{}", &text));

@@ -24,6 +24,14 @@ class FuncData:
             self.flags = str(func.flags)
             self.ret_unknown = False
             self.interim = ''
+        # `dont_pop_args` is independent of the call mode. C callstub flags
+        # are a bitmask, so combine it with NEAR (or an interim mode) instead
+        # of replacing it.
+        if func.dont_pop_args and 'DONT_POP_ARGS' not in self.flags:
+            if self.flags in ('0', ''):
+                self.flags = 'DONT_POP_ARGS'
+            else:
+                self.flags = f'{self.flags} | DONT_POP_ARGS'
 
 def build_func_data(functions):
     dat = []
