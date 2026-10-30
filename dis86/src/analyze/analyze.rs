@@ -1,7 +1,7 @@
 use crate::binary::{Binary, Fmt};
 use crate::config::{CallMode, Config, Func, FuncRegion};
 use crate::segoff::{Off, SegOff};
-use crate::util::range_set::RangeSet;
+use crate::coverage::{self, Coverage};
 
 use super::workqueue::WorkQueue;
 use super::code_segment::{CodeSegments};
@@ -33,32 +33,6 @@ fn analysis_func_lookup<'a>(cfg: &'a Config, addr: SegOff) -> Option<&'a Func> {
     .or_else(|| cfg.funcs.iter().find(|func| func.start == addr))
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct Coverage {
-  pub code: u32,
-  pub data: u32,
-  pub unknown: u32,
-  pub total: u32,
-}
-
-impl Coverage {
-  fn annotated(&self) -> u32 {
-    self.code + self.data
-  }
-
-  fn percent(&self, bytes: u32) -> f64 {
-    if self.total == 0 { 100.0 } else { 100.0 * bytes as f64 / self.total as f64 }
-  }
-}
-
-fn bytes_in(ranges: &RangeSet, start: u32, end: u32) -> u32 {
-  (end.saturating_sub(start)).saturating_sub(gaps_size(ranges, start, end))
-}
-
-fn gaps_size(ranges: &RangeSet, start: u32, end: u32) -> u32 {
-  ranges.gaps_within(start, end).iter().map(|gap| gap.end - gap.start).sum()
-}
-
 fn seg_end_of(code_seg: &crate::analyze::code_segment::CodeSegment) -> u32 {
   code_seg.primary.skip_off + code_seg.primary.size
 }
@@ -80,46 +54,6 @@ impl Analyze {
     self.binary.exe().unwrap().print();
   }
 
-  fn coverage_for_segment(&self, code_seg: &crate::analyze::code_segment::CodeSegment) -> Coverage {
-    let seg = code_seg.primary.seg;
-    let seg_start = code_seg.primary.skip_off;
-    let seg_end = seg_start + code_seg.primary.size;
-    let mut code = RangeSet::new();
-    let mut data = RangeSet::new();
-    let mut known = RangeSet::new();
-
-    for func in &self.cfg.funcs {
-      if func.start.seg != seg { continue; }
-      for region in self.cfg.code_regions(&func.effective_regions()) {
-        if region.start.seg != seg || region.end.seg != seg { continue; }
-        let start = (region.start.off.0 as u32).max(seg_start);
-        let end = (region.end.off.0 as u32).min(seg_end);
-        if start < end {
-          code.insert(start, end);
-          known.insert(start, end);
-        }
-      }
-    }
-
-    for region in self.cfg.text_regions_matching_segment(seg) {
-      if region.end.seg != seg { continue; }
-      let start = (region.start.off.0 as u32).max(seg_start);
-      let end = (region.end.off.0 as u32).min(seg_end);
-      if start < end {
-        data.insert(start, end);
-        known.insert(start, end);
-      }
-    }
-
-    let total = seg_end.saturating_sub(seg_start);
-    Coverage {
-      code: bytes_in(&code, seg_start, seg_end),
-      data: bytes_in(&data, seg_start, seg_end),
-      unknown: gaps_size(&known, seg_start, seg_end),
-      total,
-    }
-  }
-
   /// Configured coverage for every analyzed code segment, written to stderr
   /// so stdout stays a pasteable annotation fragment.
   pub fn report_coverage(&self) {
@@ -134,7 +68,9 @@ impl Analyze {
       let seg_name = self.cfg.code_seg_lookup(seg)
         .map(|s| s.name.as_str())
         .unwrap_or("?");
-      let cov = self.coverage_for_segment(code_seg);
+      let seg_start = code_seg.primary.skip_off;
+      let seg_end = seg_start + code_seg.primary.size;
+      let cov = coverage::for_span(&self.cfg, seg, seg_start, seg_end);
       let mut max_end = seg_end_of(code_seg);
       for func in &self.cfg.funcs {
         for region in func.effective_regions() {
@@ -605,71 +541,6 @@ fn generate_annotations(
 mod tests {
   use super::*;
   use crate::segoff::Seg;
-
-  #[test]
-  fn coverage_splits_configured_code_data_and_unknown() {
-    use crate::analyze::code_segment::{CodeSegment, Region};
-    use crate::config::{Config, Func, TextSectionRegion};
-    use std::rc::Rc;
-
-    let so = |off| SegOff { seg: Seg::Normal(0), off: Off(off) };
-    let cfg = Config {
-      types: Rc::new(crate::types::TypeDatabase::new()),
-      structs: vec![],
-      code_segs: vec![],
-      funcs: vec![Func {
-        name: "f".to_string(),
-        start: so(0),
-        end: Some(so(10)),
-        entry: None,
-        mode: CallMode::Near,
-        ret: None,
-        args: None,
-        regargs: None,
-        regouts: None,
-        clobbers: None,
-        dont_pop_args: false,
-        regions: vec![
-          FuncRegion { start: so(0), end: so(10) },
-          FuncRegion {
-            start: SegOff { seg: Seg::Normal(1), off: Off(12) },
-            end: SegOff { seg: Seg::Normal(1), off: Off(14) },
-          },
-        ],
-      }],
-      indirects: vec![],
-      globals: vec![],
-      text_section: vec![
-        TextSectionRegion {
-          name: "hole".to_string(), start: so(4), end: so(6), typ: None, access: None,
-        },
-        TextSectionRegion {
-          name: "table".to_string(), start: so(15), end: so(18), typ: None, access: None,
-        },
-        TextSectionRegion {
-          name: "cross".to_string(),
-          start: so(5),
-          end: SegOff { seg: Seg::Normal(1), off: Off(7) },
-          typ: None,
-          access: None,
-        },
-      ],
-    };
-    let a = Analyze {
-      cfg,
-      binary: Binary::from_raw(&[], None),
-      code_segments: CodeSegments(vec![CodeSegment {
-        primary: Region { seg: Seg::Normal(0), skip_off: 0, size: 20 },
-        stub: None,
-      }]),
-    };
-    assert_eq!(a.coverage_for_segment(&a.code_segments.0[0]), Coverage {
-      code: 8,
-      data: 5,
-      unknown: 7,
-      total: 20,
-    });
-  }
 
   #[test]
   fn ret_kind_flags_observed_kinds_are_authoritative() {

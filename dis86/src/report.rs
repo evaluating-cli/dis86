@@ -1,5 +1,6 @@
 use crate::asm::instr;
 use crate::config::Config;
+use crate::coverage::Coverage;
 use crate::diagnostics::{Cause, Diagnostic};
 use crate::segoff::Seg;
 use std::collections::BTreeMap;
@@ -15,6 +16,7 @@ pub struct TranslationLedger {
 
 #[derive(Debug, Default)]
 struct SegmentReport {
+  coverage: Option<Coverage>,
   configured: usize,
   attempted: usize,
   translated: usize,
@@ -37,6 +39,10 @@ struct OpcodeReport {
 }
 
 impl TranslationLedger {
+  pub fn set_coverage(&mut self, seg: Seg, coverage: Coverage) {
+    self.segment(seg).coverage = Some(coverage);
+  }
+
   pub fn set_configured(&mut self, seg: Seg, count: usize) {
     self.segment(seg).configured = count;
   }
@@ -91,6 +97,16 @@ impl TranslationLedger {
         .map(|code_seg| code_seg.name.as_str())
         .unwrap_or("?");
       writeln!(out, "segment {} ({})", seg, name).unwrap();
+      if let Some(coverage) = report.coverage {
+        let annotated_pct = if coverage.total == 0 {
+          0.0
+        } else {
+          coverage.percent(coverage.annotated())
+        };
+        writeln!(out, "  bytes size 0x{:04x} code 0x{:04x} data 0x{:04x} unknown 0x{:04x} annotated 0x{:04x} / 0x{:04x} ({:.2}%)",
+          coverage.total, coverage.code, coverage.data, coverage.unknown,
+          coverage.annotated(), coverage.total, annotated_pct).unwrap();
+      }
       writeln!(out, "  functions configured {} attempted {} translated {} failed {}",
                report.configured, report.attempted, report.translated, report.failed).unwrap();
       writeln!(out, "  failed by cause: {}", render_cause_counts(&report.failures_by_cause)).unwrap();
@@ -207,6 +223,41 @@ mod tests {
     ledger.blocker(seg, &diag(Cause::RegargsSetupDropped, 0x20, None));
     let text = ledger.render(&cfg());
     assert!(text.contains("blockers: none"), "{text}");
+  }
+
+  #[test]
+  fn renders_byte_coverage() {
+    let mut ledger = TranslationLedger::default();
+    let seg = Seg::Normal(0);
+    ledger.set_configured(seg, 1);
+    ledger.set_coverage(seg, Coverage { code: 1, data: 0, unknown: 3, total: 4 });
+    let text = ledger.render(&cfg());
+    assert!(text.contains(
+      "  bytes size 0x0004 code 0x0001 data 0x0000 unknown 0x0003 annotated 0x0001 / 0x0004 (25.00%)"),
+      "{text}");
+  }
+
+  #[test]
+  fn zero_length_coverage_is_not_reported_as_fully_annotated() {
+    let mut ledger = TranslationLedger::default();
+    let seg = Seg::Normal(0);
+    ledger.set_configured(seg, 0);
+    ledger.set_coverage(seg, Coverage::default());
+    let text = ledger.render(&cfg());
+    assert!(text.contains(
+      "  bytes size 0x0000 code 0x0000 data 0x0000 unknown 0x0000 annotated 0x0000 / 0x0000 (0.00%)"),
+      "{text}");
+  }
+
+  #[test]
+  fn call_target_in_data_is_a_blocker_and_failure() {
+    let mut ledger = TranslationLedger::default();
+    let seg = Seg::Normal(0);
+    ledger.set_configured(seg, 1);
+    ledger.failure(seg, diag(Cause::CallTargetInData, 0x10, None));
+    let text = ledger.render(&cfg());
+    assert!(text.contains("failed by cause: CALL_TARGET_IN_DATA 1"), "{text}");
+    assert!(text.contains("CALL_TARGET_IN_DATA 1 first 0000:0010"), "{text}");
   }
 
   #[test]

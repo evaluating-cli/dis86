@@ -4,6 +4,7 @@ use crate::asm::instr::{has_fallthrough, Instr, Operand};
 use crate::binary::Binary;
 use crate::segoff::SegOff;
 use crate::config::{self, Config, Func};
+use crate::diagnostics::Cause;
 use std::fmt;
 
 /// A decode failure with the exact instruction address that failed. `message`
@@ -11,6 +12,7 @@ use std::fmt;
 #[derive(Debug, Clone)]
 pub struct DecodeFailure {
   pub addr: SegOff,
+  pub cause: Cause,
   pub message: String,
 }
 
@@ -103,6 +105,7 @@ pub fn decode_regions<'a>(
   if let Some(data) = cfg.data_region_containing(spec.start) {
     return Err(DecodeFailure {
       addr: spec.start,
+      cause: Cause::CallTargetInData,
       message: format!(
         "function start {} is inside declared data '{}' [{}, {})",
         spec.start, data.name, data.start, data.end),
@@ -113,6 +116,7 @@ pub fn decode_regions<'a>(
   let Some(entry_region) = code_regions.iter().find(|region| region.contains(spec.start)) else {
     return Err(DecodeFailure {
       addr: spec.start,
+      cause: Cause::DecodeError,
       message: format!("function start {} is outside every code region", spec.start),
     });
   };
@@ -144,6 +148,7 @@ pub fn decode_regions<'a>(
         Ok(None) => break,
         Err(e) => return Err(DecodeFailure {
           addr: decoder.addr(),
+          cause: Cause::DecodeError,
           message: format!("decode failed at {}: {} in region [{}, {})", start, e, start, end),
         }),
       }
@@ -153,6 +158,7 @@ pub fn decode_regions<'a>(
         if has_fallthrough(last.opcode) {
           return Err(DecodeFailure {
             addr: last.addr,
+            cause: Cause::CallTargetInData,
             message: format!(
               "instruction at {} falls through into declared data '{}' [{}, {})",
               last.addr, data.name, data.start, data.end),
@@ -167,6 +173,7 @@ pub fn decode_regions<'a>(
       if let Some(data) = cfg.data_region_containing(target) {
         return Err(DecodeFailure {
           addr: instr.addr,
+          cause: Cause::CallTargetInData,
           message: format!(
             "instruction at {} targets declared data '{}' [{}, {})",
             instr.addr, data.name, data.start, data.end),
@@ -211,8 +218,10 @@ pub fn specs_from_codeseg_name<'a>(cfg: &'a Config, name: &str) -> Vec<Spec<'a>>
 #[cfg(test)]
 mod tests {
   use super::*;
-  use crate::config::{CallMode, FuncRegion};
+  use crate::config::{CallMode, FuncRegion, TextSectionRegion};
   use crate::segoff::{Off, Seg};
+  use crate::types::TypeDatabase;
+  use std::rc::Rc;
 
   fn so(off: u16) -> SegOff {
     SegOff { seg: Seg::Normal(0), off: Off(off) }
@@ -233,6 +242,57 @@ mod tests {
       dont_pop_args: false,
       regions,
     }
+  }
+
+  fn cfg_with_data(start: u16, end: u16) -> Config {
+    Config {
+      types: Rc::new(TypeDatabase::new()),
+      structs: vec![],
+      code_segs: vec![],
+      funcs: vec![],
+      indirects: vec![],
+      globals: vec![],
+      text_section: vec![TextSectionRegion {
+        name: "data".to_string(), start: so(start), end: so(end), typ: None, access: None,
+      }],
+    }
+  }
+
+  fn decode_err(code: &[u8], cfg: &Config, start: u16, end: u16) -> DecodeFailure {
+    let binary = Binary::from_raw(code, None);
+    let spec = Spec::from_start_and_end(Some(so(start)), Some(so(end)));
+    match decode_regions(&binary, cfg, &spec) {
+      Ok(_) => panic!("expected decode failure"),
+      Err(err) => err,
+    }
+  }
+
+  #[test]
+  fn direct_target_into_data_is_call_target_in_data() {
+    let err = decode_err(&[0xE8, 0x03, 0x00], &cfg_with_data(6, 8), 0, 3);
+    assert_eq!(err.addr, so(0));
+    assert_eq!(err.cause, Cause::CallTargetInData);
+  }
+
+  #[test]
+  fn fallthrough_into_data_is_call_target_in_data() {
+    let err = decode_err(&[0x90], &cfg_with_data(1, 2), 0, 1);
+    assert_eq!(err.addr, so(0));
+    assert_eq!(err.cause, Cause::CallTargetInData);
+  }
+
+  #[test]
+  fn start_inside_data_is_call_target_in_data() {
+    let err = decode_err(&[0x90], &cfg_with_data(0, 2), 0, 1);
+    assert_eq!(err.addr, so(0));
+    assert_eq!(err.cause, Cause::CallTargetInData);
+  }
+
+  #[test]
+  fn malformed_instruction_is_decode_error() {
+    let err = decode_err(&[0x0F, 0xFF], &cfg_with_data(10, 11), 0, 2);
+    assert_eq!(err.addr, so(0));
+    assert_eq!(err.cause, Cause::DecodeError);
   }
 
   #[test]
