@@ -2,6 +2,7 @@ use crate::util::arrayvec::ArrayVec;
 use crate::region::RegionIter;
 use crate::asm::instr::*;
 use crate::asm::instr_fmt;
+use crate::segoff::SegOff;
 
 // Mode is the 2-bits from [6..7] in the ModRM byte
 fn modrm_mode(modrm: u8) -> u8 { modrm>>6 }
@@ -332,6 +333,12 @@ impl<'a> Decoder<'a> {
 
   pub fn try_next(&mut self) -> Result<Option<(Instr, &'a [u8])>, String> {
     decode_one(&mut self.bin)
+  }
+
+  /// Address of the next instruction. After a decode error `decode_one` rolls
+  /// the iterator back, so this is the start of the instruction that failed.
+  pub fn addr(&self) -> SegOff {
+    self.bin.addr()
   }
 }
 

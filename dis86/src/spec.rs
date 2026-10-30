@@ -3,6 +3,27 @@ use crate::asm::instr::Instr;
 use crate::binary::Binary;
 use crate::segoff::SegOff;
 use crate::config::{self, Config, Func};
+use std::fmt;
+
+/// A decode failure with the exact instruction address that failed. `message`
+/// deliberately keeps the historical text used on stderr.
+#[derive(Debug, Clone)]
+pub struct DecodeFailure {
+  pub addr: SegOff,
+  pub message: String,
+}
+
+impl fmt::Display for DecodeFailure {
+  fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    write!(f, "{}", self.message)
+  }
+}
+
+impl From<DecodeFailure> for String {
+  fn from(failure: DecodeFailure) -> String {
+    failure.message
+  }
+}
 
 pub struct Spec<'a> {
   pub func: Option<&'a config::Func>,
@@ -78,9 +99,12 @@ impl<'a> Spec<'a> {
 pub fn decode_regions<'a>(
   binary: &'a Binary,
   spec: &Spec<'_>,
-) -> Result<(Vec<Instr>, Vec<&'a [u8]>), String> {
+) -> Result<(Vec<Instr>, Vec<&'a [u8]>), DecodeFailure> {
   let Some(entry_region) = spec.regions.iter().find(|region| region.contains(spec.start)) else {
-    return Err(format!("function start {} is outside every configured region", spec.start));
+    return Err(DecodeFailure {
+      addr: spec.start,
+      message: format!("function start {} is outside every configured region", spec.start),
+    });
   };
 
   let mut chunks = vec![(spec.start, entry_region.end)];
@@ -106,7 +130,10 @@ pub fn decode_regions<'a>(
           raw_list.push(raw);
         }
         Ok(None) => break,
-        Err(e) => return Err(format!("decode failed at {}: {} in region [{}, {})", start, e, start, end)),
+        Err(e) => return Err(DecodeFailure {
+          addr: decoder.addr(),
+          message: format!("decode failed at {}: {} in region [{}, {})", start, e, start, end),
+        }),
       }
     }
   }
