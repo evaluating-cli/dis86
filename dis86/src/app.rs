@@ -12,6 +12,8 @@ use crate::decompile::opt;
 use crate::decompile::control_flow;
 use crate::spec::{self, Spec};
 use crate::app_infer::FailedFunc;
+use crate::diagnostics::{Cause, Diagnostic};
+use crate::report::TranslationLedger;
 use crate::validate::{self, ValidationScope};
 use std::fs::File;
 use std::io::Write;
@@ -66,6 +68,9 @@ fn print_help() {
   println!("  --emit-ctrlflow   path to emit the inferred control-flow structure (optional)");
   println!("  --emit-ast        path to emit the constructed AST (optional)");
   println!("  --emit-code       path to emit c code (optional)");
+  println!("");
+  println!("REPORT:");
+  println!("  --report          path to emit a deterministic translation blocker ledger (optional)");
   println!("");
   println!("IR BUILD FLAGS:");
   println!("  --build-pin-all   keep every value alive as a versioned local (a DCE");
@@ -141,6 +146,7 @@ struct Args {
   emit_ctrlflow: Option<String>,
   emit_ast: Option<String>,
   emit_code: Option<String>,
+  report: Option<String>,
 
   build_pin_all: bool,
   codegen_hydra: bool,
@@ -240,6 +246,7 @@ fn parse_args() -> Result<Args, pico_args::Error> {
     emit_ctrlflow:   pargs.opt_value_from_str("--emit-ctrlflow")?,
     emit_ast:        pargs.opt_value_from_str("--emit-ast")?,
     emit_code:       pargs.opt_value_from_str("--emit-code")?,
+    report:          pargs.opt_value_from_str("--report")?,
     build_pin_all:   false,
     codegen_hydra:   false,
     relocatable_seg: pargs.opt_value_from_str("--relocatable-seg")?,
@@ -305,6 +312,25 @@ pub fn run() -> i32 {
     }
     if args.build_pin_all {
       eprintln!("Error: --infer-abi cannot be combined with --build-pin-all.");
+      return 1;
+    }
+  }
+
+  if args.report.is_some() {
+    if args.analyze {
+      eprintln!("Error: --report cannot be combined with --analyze.");
+      return 1;
+    }
+    if args.validate_config {
+      eprintln!("Error: --report cannot be combined with --validate-config.");
+      return 1;
+    }
+    if args.infer_abi {
+      eprintln!("Error: --report cannot be combined with --infer-abi.");
+      return 1;
+    }
+    if args.trace_analyze {
+      eprintln!("Error: --report cannot be combined with --trace-analyze.");
       return 1;
     }
   }
@@ -403,28 +429,52 @@ pub fn run() -> i32 {
   }
 
   // Batch modes get an automatic preflight: errors abort, warnings are
-  // reported but do not block unless --strict is set. Inference is a
-  // read-only report: a broken annotation must not suppress the findings for
-  // the functions that do decode, so it warns and continues. The validation
-  // verdict still decides the exit code below.
+  // reported but do not block unless --strict is set. Inference and --report
+  // are read-only/best-effort reports: a broken annotation must not suppress
+  // findings for the functions that do decode, so they warn and continue. The
+  // validation verdict still decides the exit code below.
+  let report_mode = args.report.is_some();
+  let mut ledger = TranslationLedger::default();
   let mut preflight_failed = false;
   if args.name.is_some() || args.codeseg_name.is_some() {
-    let report = validate::validate_config(&cfg, &binary, &scope);
-    if report.should_fail(args.strict) {
-      report.print();
+    let validation = validate::validate_config(&cfg, &binary, &scope);
+    if validation.should_fail(args.strict) {
+      validation.print();
       preflight_failed = true;
-      if !args.infer_abi {
+      if report_mode {
+        for diagnostic in &validation.diagnostics {
+          if diagnostic.severity == validate::Severity::Error || args.strict {
+            ledger.global_failure(Diagnostic::new(
+              Cause::ConfigError, diagnostic.addr, None, diagnostic.message.clone()));
+          }
+        }
+      }
+      if !args.infer_abi && !report_mode {
         return 1;
       }
-    } else if report.warnings() != 0 {
-      report.print();
+    } else if validation.warnings() != 0 {
+      validation.print();
     }
   }
 
-  let (specs, infer_failures) = if args.infer_abi {
+  if report_mode {
+    configure_report_segments(&cfg, &args, &mut ledger);
+  }
+
+  let (specs, infer_failures) = if args.infer_abi || report_mode {
     match infer_specs(&cfg, &binary, &args) {
       Ok(selections) => selections,
-      Err(()) => return 1,
+      Err(()) => {
+        if report_mode {
+          ledger.global_failure(Diagnostic::new(
+            Cause::ConfigError, None, None,
+            "function selection failed; see stderr for details"));
+          if let Err(err) = write_report(&args, &cfg, &ledger) {
+            eprintln!("Error: {}", err);
+          }
+        }
+        return 1;
+      }
     }
   } else {
     let specs =
@@ -465,37 +515,73 @@ pub fn run() -> i32 {
     return if preflight_failed { 1 } else { rc };
   }
 
+  if report_mode {
+    for failed in &infer_failures {
+      ledger.attempt(failed.start.seg);
+      ledger.failure(failed.start.seg, Diagnostic::new(
+        Cause::ConfigError, Some(failed.start), None, failed.note.clone()));
+    }
+  }
+
   let mut all_code = String::new();
   let mut failures = 0;
   for spec in specs {
     let name = spec.name.clone();
+    let seg = spec.start.seg;
+    let start = spec.start;
     // Contain panics per function: ControlFlow inference and AST building
     // still panic on degenerate input (goto cycles, unimplemented opcodes,
     // unsupported types). Without this, one such function unwinds past the
     // loop and aborts the whole batch. Truncate any partial output the
     // panicking spec appended before counting it as failed.
     let code_len = all_code.len();
+    if report_mode {
+      ledger.attempt(seg);
+    }
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-      decompile_spec(&args, &cfg, &binary, spec, &mut all_code, &relocatable_segs)
+      decompile_spec(&args, &cfg, &binary, spec, &mut all_code, &relocatable_segs, &mut ledger)
     }));
     match outcome {
-      Ok(0) => {}
-      Ok(_) => {
+      Ok(Ok(())) => {
+        if report_mode {
+          ledger.translated(seg);
+        }
+      }
+      Ok(Err(diagnostic)) => {
         // Best-effort batch decompile: one malformed function must not abort
         // the rest of the codeseg (the specific error was already reported by
         // decompile_spec above). Count it and continue.
         eprintln!("Error: Failed to decompile {}; continuing with the rest.", name);
         failures += 1;
+        if report_mode {
+          ledger.failure(seg, diagnostic);
+        }
       }
       Err(_) => {
         all_code.truncate(code_len);
         eprintln!("Error: Panicked while decompiling {}; continuing with the rest.", name);
         failures += 1;
+        if report_mode {
+          ledger.failure(seg, Diagnostic::new(
+            Cause::InternalPanic, Some(start), None,
+            format!("panicked while decompiling {}", name)));
+        }
       }
+    }
+  }
+
+  let mut report_failed = false;
+  if report_mode {
+    if let Err(err) = write_report(&args, &cfg, &ledger) {
+      eprintln!("Error: {}", err);
+      report_failed = true;
     }
   }
   if failures != 0 {
     eprintln!("Error: Failed to decompile {} function(s).", failures);
+    return 1;
+  }
+  if report_failed || preflight_failed {
     return 1;
   }
 
@@ -506,9 +592,35 @@ pub fn run() -> i32 {
   0
 }
 
-/// Build the inference selection without the panicking `Spec::from_func`
-/// path, so a missing end or an out-of-image range becomes a report row
-/// instead of aborting the whole run.
+fn configure_report_segments(cfg: &Config, args: &Args, ledger: &mut TranslationLedger) {
+  if let Some(name) = &args.name {
+    if let Some(func) = cfg.func_lookup_by_name(name) {
+      ledger.set_configured(func.start.seg, 1);
+    }
+  } else if let Some(name) = &args.codeseg_name {
+    if let Some(code_seg) = cfg.code_seg_lookup_by_name(name) {
+      ledger.set_configured(code_seg.seg, cfg.func_lookup_by_seg(code_seg.seg).len());
+    }
+  } else if let Some(start) = args.start_addr {
+    ledger.set_configured(start.seg, 1);
+  }
+}
+
+fn write_report(args: &Args, cfg: &Config, ledger: &TranslationLedger) -> Result<(), String> {
+  let Some(path) = args.report.as_ref() else { return Ok(()); };
+  let text = ledger.render(cfg);
+  let text = text.trim_end();
+  if path.starts_with('-') {
+    println!("{}", text);
+    return Ok(());
+  }
+  std::fs::write(path, format!("{}\n", text))
+    .map_err(|err| format!("failed to write report '{}': {}", path, err))
+}
+
+/// Build a selection without the panicking `Spec::from_func` path, so a
+/// missing end or an out-of-image range becomes a report row instead of
+/// aborting the whole run. Used by inference and `--report`.
 fn infer_specs<'a>(cfg: &'a Config, binary: &Binary, args: &Args)
   -> Result<(Vec<Spec<'a>>, Vec<FailedFunc>), ()> {
   if let Some(name) = &args.name {
@@ -571,12 +683,14 @@ fn infer_spec<'a>(binary: &Binary, func: &'a crate::config::Func)
   Ok(Spec::from_func(func))
 }
 
-fn decompile_spec(args: &Args, cfg: &Config, binary: &Binary, spec: Spec<'_>, all_code: &mut String, relocatable_segs: &[u16]) -> i32 {
+fn decompile_spec(args: &Args, cfg: &Config, binary: &Binary, spec: Spec<'_>,
+                  all_code: &mut String, relocatable_segs: &[u16],
+                  ledger: &mut TranslationLedger) -> Result<(), Diagnostic> {
   let (instr_list, raw_list) = match spec::decode_regions(binary, &spec) {
     Ok(decoded) => decoded,
     Err(e) => {
       eprintln!("Error: Failed to decode instruction: {}", e);
-      return 1;
+      return Err(Diagnostic::new(Cause::DecodeError, Some(e.addr), None, e.message));
     }
   };
   // FIXME: SIMPLIFY!!
@@ -589,34 +703,39 @@ fn decompile_spec(args: &Args, cfg: &Config, binary: &Binary, spec: Spec<'_>, al
       buf += "\n";
     }
     write_to_path(path, &buf);
-    return 0;
+    return Ok(());
   }
 
   let overlay = spec.start.is_overlay_addr();
 
-  let mut ir = ir_build::build_from_instrs(&instr_list, &cfg, &spec, &binary, overlay, args.build_pin_all);
+  let (mut ir, diagnostics) = ir_build::build_from_instrs_with_diagnostics(
+    &instr_list, &cfg, &spec, &binary, overlay, args.build_pin_all);
+  for diagnostic in diagnostics {
+    eprintln!("{}", diagnostic.message);
+    ledger.blocker(spec.start.seg, &diagnostic);
+  }
   if let Some(path) = args.emit_ir_initial.as_ref() {
     write_to_path(path, &format!("{}", ir));
-    return 0;
+    return Ok(());
   }
 
   opt::optimize(&mut ir);
   if let Some(path) = args.emit_ir_presym.as_ref() {
     write_to_path(path, &format!("{}", ir));
-    return 0;
+    return Ok(());
   }
 
   sym::symbolize(&mut ir, &cfg);
   if let Some(path) = args.emit_ir_sym.as_ref() {
     write_to_path(path, &format!("{}", ir));
-    return 0;
+    return Ok(());
   }
 
   opt::forward_store_to_load(&mut ir);
   opt::optimize(&mut ir);
   if let Some(path) = args.emit_ir_fwd.as_ref() {
     write_to_path(path, &format!("{}", ir));
-    return 0;
+    return Ok(());
   }
 
   opt::mem_symbol_to_ref(&mut ir);
@@ -624,27 +743,27 @@ fn decompile_spec(args: &Args, cfg: &Config, binary: &Binary, spec: Spec<'_>, al
   if let Some(path) = args.emit_ir_opt.as_ref() {
     let text = ir::display::display_ir_with_uses(&ir).unwrap();
     write_to_path(path, &format!("{}", &text));
-    return 0;
+    return Ok(());
   }
 
   crate::decompile::finalize_for_emission(&mut ir);
   if let Some(path) = args.emit_ir_final.as_ref() {
     let text = ir::display::display_ir_with_uses(&ir).unwrap();
     write_to_path(path, &format!("{}", &text));
-    return 0;
+    return Ok(());
   }
 
   if let Some(path) = args.emit_graph.as_ref() {
     let dot = ir::util::gen_graphviz_dotfile(&ir).unwrap();
     write_to_path(path, &dot);
-    return 0;
+    return Ok(());
   }
 
   let ctrlflow = control_flow::ControlFlow::from_ir(&ir);
   if let Some(path) = args.emit_ctrlflow.as_ref() {
     let text = control_flow::format(&ctrlflow).unwrap();
     write_to_path(path, &text);
-    return 0;
+    return Ok(());
   }
 
   let ret = spec.func.map(|f| f.return_type_defaulted());
@@ -652,13 +771,15 @@ fn decompile_spec(args: &Args, cfg: &Config, binary: &Binary, spec: Spec<'_>, al
     Ok(ast) => ast,
     Err(err) => {
       eprintln!("Error while building annotated accesses for {}: {}", spec.name, err);
-      return 1;
+      return Err(Diagnostic::new(
+        Cause::CodegenFailure, Some(spec.start), None,
+        format!("failed to build AST: {}", err)));
     }
   };
   if let Some(path) = args.emit_ast.as_ref() {
     let text = format!("{:#?}", ast);
     write_to_path(path, &text);
-    return 0;
+    return Ok(());
   }
 
   if args.emit_code.is_some() {
@@ -673,13 +794,21 @@ fn decompile_spec(args: &Args, cfg: &Config, binary: &Binary, spec: Spec<'_>, al
     } else {
       gen::Flavor::Standard
     };
-    let code = gen::generate(&ast, flavor).unwrap();
+    let code = match gen::generate(&ast, flavor) {
+      Ok(code) => code,
+      Err(err) => {
+        eprintln!("Error while generating code for {}: {}", spec.name, err);
+        return Err(Diagnostic::new(
+          Cause::CodegenFailure, Some(spec.start), None,
+          format!("code generation failed: {}", err)));
+      }
+    };
     all_code.push_str(&code);
     all_code.push('\n');
-    return 0;
+    return Ok(());
   }
 
-  return 0;
+  Ok(())
 }
 
 #[cfg(test)]
