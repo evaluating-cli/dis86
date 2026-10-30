@@ -10,7 +10,8 @@ use crate::analyze::code_segment::{CodeSegment, CodeSegments, Region};
 use crate::analyze::func_details::{first_undecodable_addr, FuncDetails, ReturnKind};
 use crate::asm::branch::{self, BranchTarget, UnresolvedTransfer};
 use crate::asm::decode::Decoder;
-use crate::asm::instr::has_fallthrough;
+use crate::asm::instr::{has_fallthrough, Opcode};
+use crate::spec::direct_target;
 use crate::binary::Binary;
 use crate::config::{CallMode, Config, Func, FuncRegion};
 use crate::segoff::{Seg, SegOff};
@@ -550,12 +551,6 @@ fn validate_direct_calls(
   report: &mut Report,
 ) {
   for (target, modes) in direct_call_kinds {
-    if let Some(data) = cfg.data_region_containing(*target) {
-      report.error(Some(func.start), format!(
-        "function '{}' calls declared data '{}' [{}, {}) at {}",
-        func.name, data.name, data.start, data.end, target));
-      continue;
-    }
     if modes.contains(&CallMode::Near) && modes.contains(&CallMode::Far) {
       report.error(Some(func.start), format!(
         "function '{}' calls {} as both near and far", func.name, target));
@@ -623,6 +618,16 @@ fn validate_branch_targets(
         Ok(None) => break,
         Err(_) => break,
       };
+      if matches!(instr.opcode, Opcode::OP_CALL | Opcode::OP_CALLF) {
+        if let Some(target) = direct_target(&instr) {
+          if let Some(data) = cfg.data_region_containing(target) {
+            report.error(Some(instr.addr), format!(
+              "function '{}' call at {} targets declared data '{}' [{}, {})",
+              func.name, instr.addr, data.name, data.start, data.end));
+            continue;
+          }
+        }
+      }
       let Some(target) = branch::branch_target(&instr) else { continue };
       match target {
         BranchTarget::Relative { target, .. } => {

@@ -288,7 +288,9 @@ impl Config {
     for region in regions {
       let mut data = RangeSet::new();
       for text in &self.text_section {
-        if text.start.seg != region.start.seg { continue; }
+        if text.start.seg != region.start.seg || text.end.seg != region.start.seg {
+          continue;
+        }
         let start = text.start.off.0.max(region.start.off.0) as u32;
         let end = text.end.off.0.min(region.end.off.0) as u32;
         data.insert(start, end);
@@ -986,6 +988,29 @@ dis86 {
 "#);
     let err = Config::from_path(tmp.path().to_str().unwrap()).unwrap_err();
     assert!(err.contains("must use 'mode far'"), "unexpected error: {}", err);
+  }
+
+  #[test]
+  fn code_regions_ignore_cross_segment_text_sections() {
+    use crate::segoff::{Off, Seg, SegOff};
+    let so = |off| SegOff { seg: Seg::Normal(0), off: Off(off) };
+    let cfg = Config {
+      types: Rc::new(TypeDatabase::new()),
+      structs: vec![],
+      code_segs: vec![CodeSeg { seg: Seg::Normal(0), name: "main".to_string() }],
+      funcs: vec![],
+      indirects: vec![],
+      globals: vec![],
+      text_section: vec![TextSectionRegion {
+        name: "cross".to_string(),
+        start: so(5),
+        end: SegOff { seg: Seg::Normal(1), off: Off(7) },
+        typ: None,
+        access: None,
+      }],
+    };
+    let regions = vec![FuncRegion { start: so(0), end: so(10) }];
+    assert_eq!(cfg.code_regions(&regions), regions);
   }
 
   #[test]

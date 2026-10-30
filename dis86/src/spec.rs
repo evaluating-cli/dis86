@@ -178,7 +178,7 @@ pub fn decode_regions<'a>(
   Ok((instr_list, raw_list))
 }
 
-fn direct_target(ins: &Instr) -> Option<SegOff> {
+pub(crate) fn direct_target(ins: &Instr) -> Option<SegOff> {
   if matches!(ins.opcode, crate::asm::instr::Opcode::OP_CALL | crate::asm::instr::Opcode::OP_CALLF) {
     for operand in &ins.operands {
       match operand {

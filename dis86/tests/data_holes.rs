@@ -113,6 +113,29 @@ fn branch_target_into_a_hole_is_an_error() {
 }
 
 #[test]
+fn unreachable_call_into_a_hole_fails_validation_and_decode() {
+  let dir = temp_dir();
+  // ret; unreachable call 0000:0005; ret; hole [5,7); ret at 7.
+  let raw = [0xC3, 0xE8, 0x01, 0x00, 0xC3, 0x63, 0x63, 0xC3];
+  let functions = "f { start 0000:0000 end 0000:0008 mode near ret u16 args 0 }";
+  let text = "hole { start 0000:0005 end 0000:0007 }";
+
+  let out = run(&dir, &raw, functions, text, &["--validate-config"]);
+  let stderr = String::from_utf8_lossy(&out.stderr);
+  assert!(!out.status.success());
+  assert!(stderr.contains("call at 0000:0001 targets declared data 'hole'"), "stderr: {}", stderr);
+
+  let out = run(&dir, &raw, functions, text, &[
+    "--start-addr", "0000:0000", "--end-addr", "0000:0008", "--emit-code", "-",
+  ]);
+  let stderr = String::from_utf8_lossy(&out.stderr);
+  assert!(!out.status.success());
+  assert!(stderr.contains("targets declared data 'hole'"), "stderr: {}", stderr);
+  assert!(!stderr.contains("panicked"), "stderr: {}", stderr);
+  let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn data_fully_covering_a_function_region_is_an_error() {
   let dir = temp_dir();
   let raw = [0xC3];

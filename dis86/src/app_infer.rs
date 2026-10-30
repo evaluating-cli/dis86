@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::asm::instr::{self, Instr as RawInstr, Operand, Reg};
+use crate::asm::instr::{self, has_fallthrough, Instr as RawInstr, Operand, Reg};
 use crate::asm::instr::Opcode::*;
 use crate::binary::Binary;
 use crate::config::{Config, FuncRegion};
@@ -243,8 +243,7 @@ fn reachable_raw(raw: &[RawInstr]) -> Vec<bool> {
     if i >= raw.len() || reachable[i] { continue; }
     reachable[i] = true;
     let ins = &raw[i];
-    let fallthrough = !matches!(ins.opcode,
-      OP_RET | OP_RETF | OP_HLT | OP_IRET | OP_JMP | OP_JMPF);
+    let fallthrough = has_fallthrough(ins.opcode);
     if follows_target(ins.opcode) {
       for op in &ins.operands {
         let target = match op {
