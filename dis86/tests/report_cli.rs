@@ -117,6 +117,63 @@ fn report_text_is_deterministic() {
 }
 
 #[test]
+fn report_counts_a_range_run_as_one_unit() {
+  let dir = temp_dir();
+  let report_path = dir.join("report.txt");
+  let out = run(
+    &dir,
+    &[0xC3, 0x90],
+    ONE_FUNC,
+    &["--start-addr", "0000:0000", "--end-addr", "0000:0002",
+      "--emit-code", "-", "--report", report_path.to_str().unwrap()],
+  );
+  let report = fs::read_to_string(&report_path).expect("read report");
+  assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+  assert!(report.contains("functions configured 1 attempted 1 translated 1 failed 0"),
+          "report: {}", report);
+  let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn report_records_preflight_failures_as_global_failures() {
+  let dir = temp_dir();
+  let report_path = dir.join("report.txt");
+  let functions = "f { start 0000:0000 end 0000:0002 entry 0000:0003 mode near ret u16 args 0 }";
+  let out = run(
+    &dir,
+    &[0xC3, 0x90],
+    functions,
+    &["--codeseg-name", "main", "--emit-code", "-",
+      "--report", report_path.to_str().unwrap()],
+  );
+  let report = fs::read_to_string(&report_path).expect("read report");
+  assert!(!out.status.success(), "the preflight error must fail the run");
+  assert!(report.contains("functions configured 1 attempted 1 translated 1 failed 0"),
+          "report: {}", report);
+  assert!(report.contains("global failure: CONFIG_ERROR:"), "report: {}", report);
+  assert!(report.contains("outside its configured range"), "report: {}", report);
+  let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn report_write_failure_is_reported_without_panicking() {
+  let dir = temp_dir();
+  let report_path = dir.join("missing").join("report.txt");
+  let out = run(
+    &dir,
+    &[0xC3, 0x90],
+    ONE_FUNC,
+    &["--codeseg-name", "main", "--emit-code", "-",
+      "--report", report_path.to_str().unwrap()],
+  );
+  let stderr = String::from_utf8_lossy(&out.stderr);
+  assert!(!out.status.success(), "an unwritable report must fail the run");
+  assert!(stderr.contains("failed to write report"), "stderr: {}", stderr);
+  assert!(!stderr.contains("panicked"), "stderr: {}", stderr);
+  let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn report_is_written_when_selection_fails() {
   let dir = temp_dir();
   let report_path = dir.join("report.txt");
@@ -141,6 +198,7 @@ fn report_rejects_incompatible_modes() {
     (vec!["--report", "-", "--analyze"], "cannot be combined with --analyze"),
     (vec!["--report", "-", "--validate-config"], "cannot be combined with --validate-config"),
     (vec!["--report", "-", "--infer-abi"], "cannot be combined with --infer-abi"),
+    (vec!["--report", "-", "--trace-analyze"], "cannot be combined with --trace-analyze"),
   ] {
     let dir = temp_dir();
     let out = run(&dir, &[0xC3], ONE_FUNC, &args);

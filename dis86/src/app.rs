@@ -437,15 +437,23 @@ pub fn run() -> i32 {
   let mut ledger = TranslationLedger::default();
   let mut preflight_failed = false;
   if args.name.is_some() || args.codeseg_name.is_some() {
-    let report = validate::validate_config(&cfg, &binary, &scope);
-    if report.should_fail(args.strict) {
-      report.print();
+    let validation = validate::validate_config(&cfg, &binary, &scope);
+    if validation.should_fail(args.strict) {
+      validation.print();
       preflight_failed = true;
+      if report_mode {
+        for diagnostic in &validation.diagnostics {
+          if diagnostic.severity == validate::Severity::Error || args.strict {
+            ledger.global_failure(Diagnostic::new(
+              Cause::ConfigError, diagnostic.addr, None, diagnostic.message.clone()));
+          }
+        }
+      }
       if !args.infer_abi && !report_mode {
         return 1;
       }
-    } else if report.warnings() != 0 {
-      report.print();
+    } else if validation.warnings() != 0 {
+      validation.print();
     }
   }
 
@@ -461,7 +469,9 @@ pub fn run() -> i32 {
           ledger.global_failure(Diagnostic::new(
             Cause::ConfigError, None, None,
             "function selection failed; see stderr for details"));
-          write_report(&args, &cfg, &ledger);
+          if let Err(err) = write_report(&args, &cfg, &ledger) {
+            eprintln!("Error: {}", err);
+          }
         }
         return 1;
       }
@@ -560,14 +570,18 @@ pub fn run() -> i32 {
     }
   }
 
+  let mut report_failed = false;
   if report_mode {
-    write_report(&args, &cfg, &ledger);
+    if let Err(err) = write_report(&args, &cfg, &ledger) {
+      eprintln!("Error: {}", err);
+      report_failed = true;
+    }
   }
   if failures != 0 {
     eprintln!("Error: Failed to decompile {} function(s).", failures);
     return 1;
   }
-  if preflight_failed {
+  if report_failed || preflight_failed {
     return 1;
   }
 
@@ -588,14 +602,20 @@ fn configure_report_segments(cfg: &Config, args: &Args, ledger: &mut Translation
       ledger.set_configured(code_seg.seg, cfg.func_lookup_by_seg(code_seg.seg).len());
     }
   } else if let Some(start) = args.start_addr {
-    ledger.set_configured(start.seg, 0);
+    ledger.set_configured(start.seg, 1);
   }
 }
 
-fn write_report(args: &Args, cfg: &Config, ledger: &TranslationLedger) {
-  if let Some(path) = args.report.as_ref() {
-    write_to_path(path, ledger.render(cfg).trim_end());
+fn write_report(args: &Args, cfg: &Config, ledger: &TranslationLedger) -> Result<(), String> {
+  let Some(path) = args.report.as_ref() else { return Ok(()); };
+  let text = ledger.render(cfg);
+  let text = text.trim_end();
+  if path.starts_with('-') {
+    println!("{}", text);
+    return Ok(());
   }
+  std::fs::write(path, format!("{}\n", text))
+    .map_err(|err| format!("failed to write report '{}': {}", path, err))
 }
 
 /// Build a selection without the panicking `Spec::from_func` path, so a
