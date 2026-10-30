@@ -1228,10 +1228,12 @@ impl IRBuilder<'_> {
   }
 
   /// Refresh the caller's view of a register the callee declares as an output
-  /// or clobber. `Ref::Init(reg)` renders as the live C variable, which the
-  /// callee has just changed; keeping the pre-call SSA value would make a later
-  /// read observe stale state. Return registers are handled by
-  /// `save_return_value`, so do not overwrite those with an unknown live value.
+  /// or clobber. The `CALL_CONTRACT` marker's `Init(reg)` operand renders as
+  /// the live C variable the callee has just changed; keeping the pre-call SSA
+  /// value would make a later read observe stale state. The marker also keeps
+  /// ABI inference from mistaking that callee output for a caller input. Return
+  /// registers are handled by `save_return_value`, so do not overwrite those
+  /// with an unknown live value.
   fn apply_call_contract(&mut self, func: &config::Func, ret_type: &Type) {
     let mut regs = HashSet::new();
     for list in [&func.regouts, &func.clobbers] {
@@ -1241,7 +1243,8 @@ impl IRBuilder<'_> {
     }
     for reg in regs {
       if Self::is_return_register(ret_type, reg) { continue; }
-      self.ir.set_var(reg, self.cur, Ref::Init(reg));
+      let vref = self.append_call_contract_reg(reg);
+      self.ir.set_var(reg, self.cur, vref);
       let fragments = match reg {
         instr::Reg::AX => Some((instr::Reg::AL, instr::Reg::AH)),
         instr::Reg::BX => Some((instr::Reg::BL, instr::Reg::BH)),
@@ -1250,10 +1253,20 @@ impl IRBuilder<'_> {
         _ => None,
       };
       if let Some((lo, hi)) = fragments {
-        self.ir.set_var(lo, self.cur, Ref::Init(lo));
-        self.ir.set_var(hi, self.cur, Ref::Init(hi));
+        let lo_ref = self.append_call_contract_reg(lo);
+        let hi_ref = self.append_call_contract_reg(hi);
+        self.ir.set_var(lo, self.cur, lo_ref);
+        self.ir.set_var(hi, self.cur, hi_ref);
       }
     }
+  }
+
+  /// The post-call live value of a contracted register. The marker keeps ABI
+  /// inference from treating the callee's output as a caller input, while
+  /// `Init(reg)` still renders as the live C variable the callee changed.
+  fn append_call_contract_reg(&mut self, reg: instr::Reg) -> Ref {
+    self.append_instr_with_attrs(Type::U16, Attribute::CALL_CONTRACT,
+                                 Opcode::Ref, vec![Ref::Init(reg)])
   }
 
   /// Whether `reg` is already defined by the call's return-value handling.
@@ -1434,6 +1447,13 @@ impl IRBuilder<'_> {
     for RetExit { ret_ref, pending } in std::mem::take(&mut self.ret_exits) {
       let Ref::Instr(blk, _) = ret_ref else { continue; };
 
+      // A contracted call already changed the live variable; there is no write
+      // to emit, but the register is still part of this function's exit state
+      // for contract diagnostics.
+      changed.extend(pending.iter()
+        .filter(|(_, vref)| Self::ref_has_call_contract(&self.ir, *vref))
+        .map(|(reg, _)| *reg));
+
       let mut pending: Vec<_> = pending.into_iter()
         .filter(|(reg, vref)| !Self::is_entry_value(&self.ir, *vref, *reg))
         .collect();
@@ -1505,7 +1525,8 @@ impl IRBuilder<'_> {
   /// lowering, before any instructions after the `ret` are lowered into the
   /// same block (they never execute, so they must not be the exit state). `DX`
   /// is skipped when it is the high half of the return value, which the return
-  /// expression already writes.
+  /// expression already writes. `AX` is the return value (#134); a void return
+  /// still leaves the caller modelling AX as preserved.
   fn exit_register_values(&mut self, dx_is_return: bool) -> Vec<(instr::Reg, Ref)> {
     let mut pending = vec![];
     for reg in [instr::Reg::BX, instr::Reg::CX, instr::Reg::DX, instr::Reg::SI, instr::Reg::DI,
@@ -1659,6 +1680,22 @@ impl IRBuilder<'_> {
     };
     memo.insert(r, result);
     result
+  }
+
+  /// Whether `r` was produced by a known call's `regouts`/`clobbers`
+  /// contract. Such a value renders as the live C variable but is not an entry
+  /// value for exit-contract diagnostics.
+  fn ref_has_call_contract(ir: &IR, r: Ref) -> bool {
+    let mut stack = vec![r];
+    let mut seen = HashSet::new();
+    while let Some(cur) = stack.pop() {
+      let Ref::Instr(_, _) = cur else { continue; };
+      if !seen.insert(cur) { continue; }
+      let Some(instr) = ir.instr(cur) else { continue; };
+      if (instr.attrs & Attribute::CALL_CONTRACT) != 0 { return true; }
+      stack.extend(instr.operands.iter().copied());
+    }
+    false
   }
 
   /// Whether the SSA value `r` (transitively) reads the live entry value
@@ -3005,12 +3042,16 @@ impl IRBuilder<'_> {
     let mut stack = vec![];
     for r in live {
       if let Some(instr) = self.ir.instr(*r) {
+        // A contract refresh reads the live register, not the caller setup
+        // that may have preceded the call.
+        if (instr.attrs & Attribute::CALL_CONTRACT) != 0 { continue; }
         stack.extend(instr.operands.iter().copied());
       }
     }
     while let Some(r) = stack.pop() {
       if !reads.insert(r) { continue; }
       if let Some(instr) = self.ir.instr(r) {
+        if (instr.attrs & Attribute::CALL_CONTRACT) != 0 { continue; }
         stack.extend(instr.operands.iter().copied());
       }
     }
@@ -4834,10 +4875,56 @@ mod tests {
       "annotations are opt-in: {:?}", b.warnings);
   }
 
+  #[test]
+  fn exit_contract_warns_about_a_reg_changed_by_a_contract_call() {
+    let code = &[
+      0xE8, 0xFD, 0x00, // call callee at 0x0100
+      0xC3,             // ret
+    ];
+    let (_types, mut cfg, binary, _) =
+      test_spec_with_callee_contract(0x0000, 0x0004, code, 0x0100, None, None,
+                                     Some(vec![instr::Reg::SI]));
+    cfg.funcs.push(config::Func {
+      name: "main".to_string(),
+      start: SegOff { seg: Seg::Normal(0), off: Off(0) },
+      end: Some(SegOff { seg: Seg::Normal(0), off: Off(4) }),
+      entry: None,
+      mode: config::CallMode::Near,
+      ret: Some(Type::U16),
+      args: Some(0),
+      regargs: None,
+      regouts: Some(vec![]),
+      clobbers: None,
+      dont_pop_args: false,
+    });
+    let spec = spec::Spec::from_config_name(&cfg, "main").expect("main");
+    let instrs = decode_all(&binary, &spec);
+    let mut b = test_builder(&cfg, &instrs, &spec, &binary);
+    b.build();
+
+    let contract_warnings: Vec<_> = b.warnings.iter()
+      .filter(|w| w.contains("regouts/clobbers"))
+      .collect();
+    assert_eq!(contract_warnings.len(), 1,
+      "the nested SI clobber must warn exactly once: {:?}", b.warnings);
+    assert!(contract_warnings[0].contains("SI"),
+      "the warning must name the changed register: {:?}", b.warnings);
+  }
+
   /// A caller range plus one configured near callee at `callee_start`.
   fn test_spec_with_callee(
     start: u16, end: u16, code: &[u8],
     callee_start: u16, callee_regargs: Option<Vec<instr::Reg>>,
+  ) -> (Rc<TypeDatabase>, Config, binary::Binary, spec::Spec<'static>) {
+    test_spec_with_callee_contract(start, end, code, callee_start, callee_regargs,
+                                   None, None)
+  }
+
+  fn test_spec_with_callee_contract(
+    start: u16, end: u16, code: &[u8],
+    callee_start: u16, callee_regargs: Option<Vec<instr::Reg>>,
+    callee_regouts: Option<Vec<instr::Reg>>,
+    callee_clobbers: Option<Vec<instr::Reg>>,
   ) -> (Rc<TypeDatabase>, Config, binary::Binary, spec::Spec<'static>) {
     let (types, mut cfg, binary, spec) = test_spec(start, end, code);
     cfg.funcs.push(config::Func {
@@ -4849,8 +4936,8 @@ mod tests {
       ret: None,
       args: Some(0),
       regargs: callee_regargs,
-      regouts: None,
-      clobbers: None,
+      regouts: callee_regouts,
+      clobbers: callee_clobbers,
       dont_pop_args: false,
     });
     (types, cfg, binary, spec)
@@ -4924,6 +5011,30 @@ mod tests {
     b.build();
 
     assert_eq!(regargs_warning_count(&b), 0, "a live value is not a dropped setup: {:?}", b.warnings);
+  }
+
+  /// A contract-refreshed value is the callee's output, not a read of the
+  /// caller setup that preceded the call, so it must not hide a dropped
+  /// regargs setup.
+  #[test]
+  fn contracted_clobber_does_not_mask_a_regargs_setup() {
+    let (_types, cfg, binary, spec) =
+      test_spec_with_callee_contract(0x0000, 0x0009, &[0xC3], 0x0100,
+        Some(vec![]), None, Some(vec![instr::Reg::BX]));
+    let instrs = [
+      located_instr(instr::Opcode::OP_MOV, 0x0000, 3,
+        vec![operand(instr::Reg::BX), imm_operand(0x1111)]),
+      located_instr(instr::Opcode::OP_CALL, 0x0003, 3, vec![rel_operand(0x00fa)]),
+      located_instr(instr::Opcode::OP_MOV, 0x0006, 2,
+        vec![operand(instr::Reg::AX), operand(instr::Reg::BX)]),
+      located_instr(instr::Opcode::OP_RET, 0x0008, 1, vec![]),
+    ];
+    let mut b = test_builder(&cfg, &instrs, &spec, &binary);
+    b.build();
+
+    assert_eq!(regargs_warning_count(&b), 1,
+      "the contract clobber must not mask the dropped BX setup: {:?}", b.warnings);
+    assert!(b.warnings[0].contains("BX"), "the warning must name BX: {}", b.warnings[0]);
   }
 
   /// `regargs: None` means no annotation to be incomplete: stay silent.

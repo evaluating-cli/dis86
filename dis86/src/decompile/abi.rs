@@ -4,8 +4,9 @@
 //! can reach the emitted output, not by scanning every `Ref::Init`. The
 //! distinction matters for prologues: `push bx` lowers to a local store of
 //! `Init(BX)`, and a naive scan would call `BX` an input even when the
-//! function only saves and restores it. Exit-state write-back is excluded for
-//! the same reason; ordinary `PIN` writes (including `regargs` setup before a
+//! function only saves and restores it. Exit-state write-back and values
+//! refreshed by a call's `regouts`/`clobbers` contract are excluded for the
+//! same reason; ordinary `PIN` writes (including `regargs` setup before a
 //! call) are kept as roots so callee inputs propagate into callers.
 
 use std::collections::HashSet;
@@ -41,6 +42,10 @@ pub fn infer_register_inputs(ir: &IR) -> Vec<instr::Reg> {
   let mut found = HashSet::new();
   for r in live {
     let Some(instr) = ir.instr(r) else { continue; };
+    // A contract refresh is the callee's output, not a value this function
+    // reads from the caller. Its `Init(reg)` operand renders the live C
+    // variable, but it must not become a `regargs` row.
+    if (instr.attrs & Attribute::CALL_CONTRACT) != 0 { continue; }
     let is_ret = matches!(instr.opcode, Opcode::RetNear | Opcode::RetFar);
     for operand in &instr.operands {
       if let Ref::Init(reg) = operand {

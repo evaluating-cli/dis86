@@ -15,8 +15,10 @@ fn operand_propagate(ir: &IR, mut r: Ref) -> Ref {
     if instr.opcode != Opcode::Ref { return r; }
     // A MATERIALISE ref is a deliberate snapshot taken before a register gets
     // rewritten; propagating through it would put the value back after the
-    // write and lose the pre-write state.
-    if (instr.attrs & Attribute::MATERIALISE) != 0 { return r; }
+    // write and lose the pre-write state. A CALL_CONTRACT ref must likewise
+    // survive: it marks a callee-produced value that ABI inference must not
+    // mistake for a caller-visible `Init`.
+    if (instr.attrs & (Attribute::MATERIALISE | Attribute::CALL_CONTRACT)) != 0 { return r; }
     if !seen.insert(r) { return r; }
     r = instr.operands[0];
   }

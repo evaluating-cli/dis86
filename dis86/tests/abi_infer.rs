@@ -182,6 +182,43 @@ fn callee_regargs_propagate_into_caller() {
 }
 
 #[test]
+fn contracted_clobber_is_not_a_caller_input() {
+  let code = [
+    0xBB, 0x11, 0x11, // mov bx,0x1111
+    0xE8, 0x0A, 0x00, // call callee at 0x0010; next IP is 0x0006
+    0x89, 0xD8,       // mov ax,bx
+    0xC3,             // ret
+    0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, // padding to 0x0010
+    0xC3,             // callee: ret
+  ];
+  let caller = func("clobber_caller", 0, 9, Some(Type::U16), None);
+  let mut callee = func("clobber_callee", 0x10, 0x11, Some(Type::Void), None);
+  callee.clobbers = Some(vec![Reg::BX]);
+  let cfg = config(vec![caller.clone(), callee]);
+  let got = infer(&code, &caller, &cfg);
+  assert!(got.is_empty(), "a contracted clobber is not a caller input: {:?}", got);
+}
+
+#[test]
+fn contracted_regout_is_not_a_caller_input() {
+  let code = [
+    0xB8, 0x34, 0x12, // mov ax,0x1234
+    0x8E, 0xD8,       // mov ds,ax
+    0xE8, 0x08, 0x00, // call callee at 0x0010; next IP is 0x0008
+    0x8C, 0xD8,       // mov ax,ds
+    0xC3,             // ret
+    0x90, 0x90, 0x90, 0x90, 0x90, // padding to 0x0010
+    0xC3,             // callee: ret
+  ];
+  let caller = func("regout_caller", 0, 11, Some(Type::U16), None);
+  let mut callee = func("regout_callee", 0x10, 0x11, Some(Type::Void), None);
+  callee.regouts = Some(vec![Reg::DS]);
+  let cfg = config(vec![caller.clone(), callee]);
+  let got = infer(&code, &caller, &cfg);
+  assert!(got.is_empty(), "a contracted regout is not a caller input: {:?}", got);
+}
+
+#[test]
 fn caller_dx_read_marks_u32_candidate() {
   let code = [
     0xE8, 0x0D, 0x00, // call callee at 0x0010; next IP is 0x0003
