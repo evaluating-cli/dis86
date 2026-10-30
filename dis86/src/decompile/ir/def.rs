@@ -57,6 +57,10 @@ pub mod Attribute {
   /// pops the saved BP through the entry stack segment, so a changed SS must
   /// become live only after that pop and before the near/far return.
   pub const POST_FRAME: u8 = 1<<6;
+  /// A transparent alias for a register refreshed by a known call's
+  /// `regouts`/`clobbers` contract. It renders as the live C variable, but the
+  /// value is produced by the callee, not read by this function.
+  pub const CALL_CONTRACT: u8 = 1<<7;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

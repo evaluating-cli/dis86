@@ -230,6 +230,25 @@ class RetUnknownFlagTests(unittest.TestCase):
         dat = build_func_data([func])
         self.assertEqual(dat[0].flags, 'NEAR')
 
+    def test_regouts_and_clobbers_serialize(self):
+        func = Function(reimpl=True, name='contract_regs', ret='u16', args=2,
+                        start_addr='0000:1234', end_addr='0000:1300',
+                        flags='NEAR', regargs=['AX', 'DS'],
+                        regouts=['DS', 'ES'], clobbers=['BX', 'SS'])
+        line = next(l for l in self._gen_functions_text([func]).splitlines() if 'contract_regs' in l)
+        self.assertIn('regargs AX,DS', line)
+        self.assertIn('regouts DS,ES', line)
+        self.assertIn('clobbers BX,SS', line)
+
+    def test_regouts_and_clobbers_default_to_absent(self):
+        func = Function(reimpl=True, name='no_contract_regs', ret='u16', args=0,
+                        start_addr='0000:1234', end_addr='0000:1300',
+                        flags='NEAR')
+        line = next(l for l in self._gen_functions_text([func]).splitlines() if 'no_contract_regs' in l)
+        self.assertNotIn('regargs', line)
+        self.assertNotIn('regouts', line)
+        self.assertNotIn('clobbers', line)
+
 
 if __name__ == '__main__':
     unittest.main()

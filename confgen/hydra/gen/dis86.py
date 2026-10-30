@@ -24,6 +24,10 @@ def gen_functions(functions):
             extra += f'entry {func.entry_stub} '
         if func.regargs is not None:
             extra += f'regargs {func.regargs} '
+        if func.regouts is not None:
+            extra += f'regouts {func.regouts} '
+        if func.clobbers is not None:
+            extra += f'clobbers {func.clobbers} '
         mode = 'far'
         if func.flags == 'NEAR':
             mode = 'near'

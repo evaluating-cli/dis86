@@ -162,7 +162,7 @@ def _verify_unique(name):
     FUNCTION_ALL_NAMES.add(name)
 
 class Function:
-    def __init__(self, reimpl, name, ret, args, start_addr, end_addr, flags=0, regargs=None, entry=None, dont_pop_args=False):
+    def __init__(self, reimpl, name, ret, args, start_addr, end_addr, flags=0, regargs=None, entry=None, dont_pop_args=False, regouts=None, clobbers=None):
         _verify_unique(name);
         self.name = name
         self.ret = ret
@@ -172,6 +172,8 @@ class Function:
         self.entry_stub = Addr(entry) if entry else None
         self.is_overlay_entry = self.start_addr.overlay and self.entry_stub is not None
         self.regargs = ','.join(regargs) if regargs else None
+        self.regouts = ','.join(regouts) if regouts else None
+        self.clobbers = ','.join(clobbers) if clobbers else None
         self.flags = flags
         # `ret imm` callees pop their own arguments. Keep this separate from
         # the call-mode/return-kind flag so a near function can carry both

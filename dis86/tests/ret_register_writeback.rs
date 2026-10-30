@@ -19,6 +19,8 @@ fn func(name: &str, start: u16, end: u16, regargs: Option<Vec<Reg>>) -> Func {
     ret: None,
     args: Some(0),
     regargs,
+    regouts: None,
+    clobbers: None,
     dont_pop_args: false,
   }
 }
