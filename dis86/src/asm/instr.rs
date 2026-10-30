@@ -21,6 +21,14 @@ impl Instr {
   }
 }
 
+/// Whether execution can continue at the next sequential address. `HLT`
+/// already has no continuation model, so it counts as not falling through.
+pub fn has_fallthrough(opcode: Opcode) -> bool {
+  !matches!(opcode,
+    Opcode::OP_RET | Opcode::OP_RETF | Opcode::OP_IRET |
+    Opcode::OP_JMP | Opcode::OP_JMPF | Opcode::OP_HLT)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Operand {
   Reg(OperandReg),

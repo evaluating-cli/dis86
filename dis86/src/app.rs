@@ -686,7 +686,7 @@ fn infer_spec<'a>(binary: &Binary, func: &'a crate::config::Func)
 fn decompile_spec(args: &Args, cfg: &Config, binary: &Binary, spec: Spec<'_>,
                   all_code: &mut String, relocatable_segs: &[u16],
                   ledger: &mut TranslationLedger) -> Result<(), Diagnostic> {
-  let (instr_list, raw_list) = match spec::decode_regions(binary, &spec) {
+  let (instr_list, raw_list) = match spec::decode_regions(binary, cfg, &spec) {
     Ok(decoded) => decoded,
     Err(e) => {
       eprintln!("Error: Failed to decode instruction: {}", e);
@@ -816,12 +816,26 @@ mod tests {
   use super::parse_relocatable_segs;
   use crate::spec::decode_regions;
   use crate::binary::Binary;
-  use crate::config::FuncRegion;
+  use crate::config::{Config, FuncRegion};
   use crate::segoff::{Off, Seg, SegOff};
   use crate::spec::Spec;
+  use crate::types::TypeDatabase;
+  use std::rc::Rc;
 
   fn so(off: u16) -> SegOff {
     SegOff { seg: Seg::Normal(0), off: Off(off) }
+  }
+
+  fn cfg() -> Config {
+    Config {
+      types: Rc::new(TypeDatabase::new()),
+      structs: vec![],
+      code_segs: vec![],
+      funcs: vec![],
+      indirects: vec![],
+      globals: vec![],
+      text_section: vec![],
+    }
   }
 
   #[test]
@@ -837,7 +851,7 @@ mod tests {
         FuncRegion { start: so(4), end: so(5) },
       ],
     };
-    let (instrs, raws) = decode_regions(&binary, &spec).unwrap();
+    let (instrs, raws) = decode_regions(&binary, &cfg(), &spec).unwrap();
     let addrs: Vec<u16> = instrs.iter().map(|instr| instr.addr.off.0).collect();
     assert_eq!(addrs, vec![0, 1, 4]);
     assert_eq!(raws.len(), 3);
@@ -856,7 +870,7 @@ mod tests {
         FuncRegion { start: so(2), end: so(3) },
       ],
     };
-    let (instrs, _) = decode_regions(&binary, &spec).unwrap();
+    let (instrs, _) = decode_regions(&binary, &cfg(), &spec).unwrap();
     let addrs: Vec<u16> = instrs.iter().map(|instr| instr.addr.off.0).collect();
     assert_eq!(addrs, vec![2, 0]);
   }

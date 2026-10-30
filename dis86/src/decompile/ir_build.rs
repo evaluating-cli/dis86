@@ -34,6 +34,8 @@ enum IndirectTargets {
   /// The jump is of that shape, but the config has no table for it: a
   /// missing annotation, not a run-time-only target.
   NoConfigRegion,
+  /// The matching text-section region is declared data, not a jump table.
+  DataRegion { name: String, start: SegOff, end: SegOff },
 }
 
 /// How a transfer that is not a relative branch is modeled.
@@ -90,6 +92,7 @@ struct IRBuilder<'a> {
   instrs: &'a [instr::Instr],
   cfg: &'a Config,
   spec: &'a spec::Spec<'a>,
+  code_regions: Vec<config::FuncRegion>,
   binary: &'a binary::Binary,
 
   ir: IR,
@@ -203,6 +206,7 @@ impl<'a> IRBuilder<'a> {
       instrs,
       cfg,
       spec,
+      code_regions: cfg.code_regions(&spec.regions),
       binary,
 
       ir: IR::new(cfg.types.clone()),
@@ -293,9 +297,16 @@ impl<'a> IRBuilder<'a> {
     let Some(region) = self.cfg.text_region_lookup(addr, ins.addr) else {
       return IndirectTargets::NoConfigRegion;
     };
+    let Some(typ) = &region.typ else {
+      return IndirectTargets::DataRegion {
+        name: region.name.clone(),
+        start: region.start,
+        end: region.end,
+      };
+    };
 
     // Unpack the array type
-    let Type::Array(basetype, ArraySize::Known(len)) = &region.typ else {
+    let Type::Array(basetype, ArraySize::Known(len)) = typ else {
       panic!("Expected text segment region to be an array of known length ({}) for: '{}'", region.name, instr_str(ins));
     };
 
@@ -472,7 +483,7 @@ impl<'a> IRBuilder<'a> {
   /// Anything outside (including another segment) decodes to zero
   /// instructions and is dropped from the output.
   fn target_in_range(&self, tgt: SegOff) -> bool {
-    self.spec.contains_addr(tgt)
+    self.code_regions.iter().any(|region| region.contains(tgt))
   }
 
   /// Whether an explicit branch target deserves the out-of-range WARN:
@@ -2471,6 +2482,11 @@ impl IRBuilder<'_> {
                   "WARN: Unmodelled indirect jump '{}' at {} — target is only known at run time; emitting UNIMPL marker",
                   instr_str(ins), ins.addr));
               }
+              IndirectTargets::DataRegion { name, start, end } => {
+                self.append_unmodelled_transfer(ins, Cause::IndirectJumpNoTable, &format!(
+                  "WARN: Unmodelled indirect jump '{}' at {} — operand lands on declared data '{}' [{}, {}) and is not a jump table; emitting UNIMPL marker",
+                  instr_str(ins), ins.addr, name, start, end));
+              }
             }
           }
           Some(instr::Operand::Rel(rel)) => {
@@ -3150,7 +3166,7 @@ impl IRBuilder<'_> {
     let mut block_start = HashSet::new();
     let first_addr = self.instrs.first().map(|ins| ins.addr);
     let mut region_boundaries = HashSet::new();
-    for region in &self.spec.regions {
+    for region in &self.code_regions {
       if Some(region.start) != first_addr {
         block_start.insert(region.start);
         region_boundaries.insert(region.start);
@@ -3180,7 +3196,7 @@ impl IRBuilder<'_> {
             if self.out_of_range_edge(*tgt, fallthrough) {
               self.warn_ins(Cause::BranchOutOfRange, ins,
                             format!("WARN: {}: branch at {} targets {} outside function {}; the edge is dropped from the output",
-                self.spec.name, ins.addr, tgt, self.spec.range_description()));
+                self.spec.name, ins.addr, tgt, self.spec.range_description_for(&self.code_regions)));
             }
           }
         }
@@ -3195,7 +3211,7 @@ impl IRBuilder<'_> {
             if self.out_of_range_edge(target, None) {
               self.warn_ins(Cause::BranchOutOfRange, ins,
                             format!("WARN: {}: branch at {} targets {} outside function {}; the edge is dropped from the output",
-                self.spec.name, ins.addr, target, self.spec.range_description()));
+                self.spec.name, ins.addr, target, self.spec.range_description_for(&self.code_regions)));
             }
           }
         }
@@ -3212,7 +3228,7 @@ impl IRBuilder<'_> {
     }
 
     // Step 3: iterate each instruction, building each block
-    let entry_region = self.spec.regions.iter()
+    let entry_region = self.code_regions.iter()
       .find(|region| region.contains(self.spec.start))
       .copied();
     let mut prestart_last = None;

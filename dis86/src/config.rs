@@ -1,7 +1,8 @@
-use crate::segoff::{Seg, SegOff};
+use crate::segoff::{Off, Seg, SegOff};
 use crate::bsl;
 use crate::types::{Type, TypeDatabase};
 use crate::asm::instr::Reg;
+use crate::util::range_set::RangeSet;
 use std::rc::Rc;
 
 #[derive(Debug, Clone)]
@@ -82,8 +83,16 @@ pub struct TextSectionRegion {
   pub name: String,
   pub start: SegOff,
   pub end: SegOff,
-  pub typ: Type,
+  /// `Some` keeps the region's jump-table meaning. `None` declares plain
+  /// data: a hole that the decoder and analyzer must not treat as code.
+  pub typ: Option<Type>,
   pub access: Option<SegOff>,
+}
+
+impl TextSectionRegion {
+  pub fn is_data_hole(&self) -> bool {
+    self.typ.is_none()
+  }
 }
 
 #[derive(Debug, Clone)]
@@ -255,6 +264,46 @@ impl Config {
       }
     }
     ret
+  }
+
+  pub fn data_region_containing(&self, addr: SegOff) -> Option<&TextSectionRegion> {
+    self.text_section.iter().find(|region|
+      addr.seg == region.start.seg
+        && addr.off >= region.start.off
+        && addr.off < region.end.off)
+  }
+
+  pub fn has_data_in_regions(&self, regions: &[FuncRegion]) -> bool {
+    regions.iter().any(|region| self.text_section.iter().any(|data|
+      data.start.seg == region.start.seg
+        && data.start < region.end
+        && region.start < data.end))
+  }
+
+  /// Subtract every declared data region in the same segment from `regions`.
+  /// The result is address-ordered and contains only runs the decoder may
+  /// interpret as instructions.
+  pub fn code_regions(&self, regions: &[FuncRegion]) -> Vec<FuncRegion> {
+    let mut code = vec![];
+    for region in regions {
+      let mut data = RangeSet::new();
+      for text in &self.text_section {
+        if text.start.seg != region.start.seg || text.end.seg != region.start.seg {
+          continue;
+        }
+        let start = text.start.off.0.max(region.start.off.0) as u32;
+        let end = text.end.off.0.min(region.end.off.0) as u32;
+        data.insert(start, end);
+      }
+      for gap in data.gaps_within(region.start.off.0 as u32, region.end.off.0 as u32) {
+        code.push(FuncRegion {
+          start: SegOff { seg: region.start.seg, off: Off(gap.start as u16) },
+          end: SegOff { seg: region.start.seg, off: Off(gap.end as u16) },
+        });
+      }
+    }
+    code.sort();
+    code
   }
 }
 
@@ -587,21 +636,28 @@ impl Config {
         .ok_or_else(|| format!("No text_section 'start' property for '{}'", key))?;
       let end_str = f.get_str("end")
         .ok_or_else(|| format!("No text_section 'end' property for '{}'", key))?;
-      let type_str = f.get_str("type")
-        .ok_or_else(|| format!("No text_section 'type' property for '{}'", key))?;
+      let type_str = f.get_str("type");
       let access_str = f.get_str("access");
 
       let start: SegOff = start_str.parse()
         .map_err(|_| format!("Expected segoff for '{}.start', got '{}'", key, start_str))?;
       let end: SegOff = end_str.parse()
         .map_err(|_| format!("Expected segoff for '{}.end', got '{}'", key, end_str))?;
-      let typ: Type = types.parse_type(type_str)
-        .map_err(|err| format!("Expected type for '{}.type', got '{}' | {}", key, type_str, err))?;
+      let typ: Option<Type> = match type_str {
+        None => None,
+        Some(type_str) => Some(types.parse_type(type_str)
+          .map_err(|err| format!("Expected type for '{}.type', got '{}' | {}", key, type_str, err))?),
+      };
       let access: Option<SegOff> = match access_str {
         None => None,
         Some(access) => Some(access.parse()
           .map_err(|err| format!("Expected segoff for '{}.access', got '{}' | {}", key, access, err))?),
       };
+      if typ.is_none() && access.is_some() {
+        return Err(format!(
+          "text_section '{}' declares access without a type; an untyped region is a data hole, not a jump table",
+          key));
+      }
 
       self.text_section.push(TextSectionRegion {
         name: key.to_string(),
@@ -932,5 +988,59 @@ dis86 {
 "#);
     let err = Config::from_path(tmp.path().to_str().unwrap()).unwrap_err();
     assert!(err.contains("must use 'mode far'"), "unexpected error: {}", err);
+  }
+
+  #[test]
+  fn code_regions_ignore_cross_segment_text_sections() {
+    use crate::segoff::{Off, Seg, SegOff};
+    let so = |off| SegOff { seg: Seg::Normal(0), off: Off(off) };
+    let cfg = Config {
+      types: Rc::new(TypeDatabase::new()),
+      structs: vec![],
+      code_segs: vec![CodeSeg { seg: Seg::Normal(0), name: "main".to_string() }],
+      funcs: vec![],
+      indirects: vec![],
+      globals: vec![],
+      text_section: vec![TextSectionRegion {
+        name: "cross".to_string(),
+        start: so(5),
+        end: SegOff { seg: Seg::Normal(1), off: Off(7) },
+        typ: None,
+        access: None,
+      }],
+    };
+    let regions = vec![FuncRegion { start: so(0), end: so(10) }];
+    assert_eq!(cfg.code_regions(&regions), regions);
+  }
+
+  #[test]
+  fn untyped_text_section_parses_and_subtracts_from_code() {
+    use crate::segoff::{Off, Seg, SegOff};
+    let tmp = TempConfig::write("dis86_text_hole_test.bsl", r#"
+dis86 {
+  code_segments {
+    _0000 { seg 0 name main }
+  }
+  functions {
+    F1 { start 0000:0000 end 0000:000a mode near ret u16 args 0
+         regions { _0 { start 0000:0000 end 0000:0005 } _1 { start 0000:0009 end 0000:000a } } }
+  }
+  structures {
+  }
+  globals {
+  }
+  text_section {
+    hole { start 0000:0005 end 0000:0009 }
+  }
+}
+"#);
+    let cfg = Config::from_path(tmp.path().to_str().unwrap()).unwrap();
+    assert!(cfg.text_section[0].is_data_hole());
+    let so = |off| SegOff { seg: Seg::Normal(0), off: Off(off) };
+    let regions = cfg.funcs[0].effective_regions();
+    assert_eq!(cfg.code_regions(&regions), vec![
+      FuncRegion { start: so(0), end: so(5) },
+      FuncRegion { start: so(9), end: so(10) },
+    ]);
   }
 }

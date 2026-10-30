@@ -1,5 +1,6 @@
+use crate::asm::branch::{self, BranchTarget, UnresolvedTransfer};
 use crate::asm::decode::Decoder;
-use crate::asm::instr::Instr;
+use crate::asm::instr::{has_fallthrough, Instr, Operand};
 use crate::binary::Binary;
 use crate::segoff::SegOff;
 use crate::config::{self, Config, Func};
@@ -71,20 +72,18 @@ impl<'a> Spec<'a> {
     self.regions.iter().any(|region| region.contains(addr))
   }
 
-  fn is_default_range(&self) -> bool {
-    self.regions.len() == 1 &&
-      self.regions[0].start == self.start &&
-      self.regions[0].end == self.end
-  }
-
   /// Human-readable range label used by IR diagnostics. The legacy
   /// `range [start, end)` wording is preserved for ordinary single-range
   /// functions; explicit non-contiguous bodies list every region.
   pub fn range_description(&self) -> String {
-    if self.is_default_range() {
+    self.range_description_for(&self.regions)
+  }
+
+  pub fn range_description_for(&self, regions: &[config::FuncRegion]) -> String {
+    if regions.len() == 1 && regions[0].start == self.start && regions[0].end == self.end {
       return format!("range [{}, {})", self.start, self.end);
     }
-    let regions = self.regions.iter()
+    let regions = regions.iter()
       .map(|region| format!("[{}, {})", region.start, region.end))
       .collect::<Vec<_>>()
       .join(", ");
@@ -98,12 +97,23 @@ impl<'a> Spec<'a> {
 /// follow in ascending order; gaps between them are never decoded.
 pub fn decode_regions<'a>(
   binary: &'a Binary,
+  cfg: &Config,
   spec: &Spec<'_>,
 ) -> Result<(Vec<Instr>, Vec<&'a [u8]>), DecodeFailure> {
-  let Some(entry_region) = spec.regions.iter().find(|region| region.contains(spec.start)) else {
+  if let Some(data) = cfg.data_region_containing(spec.start) {
     return Err(DecodeFailure {
       addr: spec.start,
-      message: format!("function start {} is outside every configured region", spec.start),
+      message: format!(
+        "function start {} is inside declared data '{}' [{}, {})",
+        spec.start, data.name, data.start, data.end),
+    });
+  }
+
+  let code_regions = cfg.code_regions(&spec.regions);
+  let Some(entry_region) = code_regions.iter().find(|region| region.contains(spec.start)) else {
+    return Err(DecodeFailure {
+      addr: spec.start,
+      message: format!("function start {} is outside every code region", spec.start),
     });
   };
 
@@ -112,7 +122,7 @@ pub fn decode_regions<'a>(
     chunks.push((entry_region.start, spec.start));
   }
 
-  let mut others: Vec<_> = spec.regions.iter()
+  let mut others: Vec<_> = code_regions.iter()
     .filter(|region| *region != entry_region)
     .copied()
     .collect();
@@ -123,9 +133,11 @@ pub fn decode_regions<'a>(
   let mut raw_list = vec![];
   for (start, end) in chunks {
     let mut decoder = Decoder::new(binary.region_iter(start, end));
+    let mut last = None;
     loop {
       match decoder.try_next() {
         Ok(Some((instr, raw))) => {
+          last = Some(instr);
           instr_list.push(instr);
           raw_list.push(raw);
         }
@@ -136,8 +148,52 @@ pub fn decode_regions<'a>(
         }),
       }
     }
+    if let Some(last) = last {
+      if let Some(data) = cfg.data_region_containing(end) {
+        if has_fallthrough(last.opcode) {
+          return Err(DecodeFailure {
+            addr: last.addr,
+            message: format!(
+              "instruction at {} falls through into declared data '{}' [{}, {})",
+              last.addr, data.name, data.start, data.end),
+          });
+        }
+      }
+    }
   }
+
+  for instr in &instr_list {
+    if let Some(target) = direct_target(instr) {
+      if let Some(data) = cfg.data_region_containing(target) {
+        return Err(DecodeFailure {
+          addr: instr.addr,
+          message: format!(
+            "instruction at {} targets declared data '{}' [{}, {})",
+            instr.addr, data.name, data.start, data.end),
+        });
+      }
+    }
+  }
+
   Ok((instr_list, raw_list))
+}
+
+pub(crate) fn direct_target(ins: &Instr) -> Option<SegOff> {
+  if matches!(ins.opcode, crate::asm::instr::Opcode::OP_CALL | crate::asm::instr::Opcode::OP_CALLF) {
+    for operand in &ins.operands {
+      match operand {
+        Operand::Rel(rel) => return Some(ins.rel_addr(rel)),
+        Operand::Far(far) => return Some(SegOff::new(far.seg, far.off)),
+        _ => {}
+      }
+    }
+  }
+  match branch::branch_target(ins) {
+    Some(BranchTarget::Relative { target, .. }) => Some(target),
+    Some(BranchTarget::Unresolved(UnresolvedTransfer::FarDirect { seg, off })) =>
+      Some(SegOff::new(seg, off)),
+    _ => None,
+  }
 }
 
 pub fn specs_from_codeseg_name<'a>(cfg: &'a Config, name: &str) -> Vec<Spec<'a>> {
