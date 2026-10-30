@@ -36,6 +36,23 @@ dis86 {{
   (raw_path, bsl_path)
 }
 
+fn mz_with_image(image: &[u8]) -> Vec<u8> {
+  let exe_end = 32 + image.len() as u32;
+  let (cp, cblp) = if exe_end % 512 == 0 {
+    (exe_end / 512, 0)
+  } else {
+    (exe_end / 512 + 1, exe_end % 512)
+  };
+  let mut data = vec![0u8; exe_end as usize];
+  data[0..2].copy_from_slice(b"MZ");
+  data[2..4].copy_from_slice(&(cblp as u16).to_le_bytes());
+  data[4..6].copy_from_slice(&(cp as u16).to_le_bytes());
+  data[8..10].copy_from_slice(&2u16.to_le_bytes());
+  data[24..26].copy_from_slice(&28u16.to_le_bytes());
+  data[32..].copy_from_slice(image);
+  data
+}
+
 fn run(dir: &PathBuf, raw: &[u8], functions: &str, extra: &[&str]) -> std::process::Output {
   let (raw_path, bsl_path) = write_case(dir, raw, functions);
   let mut cmd = Command::new(env!("CARGO_BIN_EXE_dis86"));
@@ -47,7 +64,61 @@ fn run(dir: &PathBuf, raw: &[u8], functions: &str, extra: &[&str]) -> std::proce
   cmd.output().expect("run dis86")
 }
 
+fn run_exe(dir: &PathBuf, image: &[u8], functions: &str, extra: &[&str])
+  -> std::process::Output
+{
+  let (_, bsl_path) = write_case(dir, &[], functions);
+  let exe_path = dir.join("program.exe");
+  fs::write(&exe_path, mz_with_image(image)).expect("write exe");
+  let mut cmd = Command::new(env!("CARGO_BIN_EXE_dis86"));
+  cmd.arg("--config").arg(&bsl_path)
+    .arg("--binary-exe").arg(&exe_path);
+  for arg in extra {
+    cmd.arg(arg);
+  }
+  cmd.output().expect("run dis86")
+}
+
 const ONE_FUNC: &str = "f { start 0000:0000 end 0000:0002 mode near ret u16 args 0 }";
+const ONE_BYTE_FUNC: &str = "f { start 0000:0000 end 0000:0001 mode near ret u16 args 0 }";
+
+#[test]
+fn report_includes_raw_byte_coverage() {
+  let dir = temp_dir();
+  let report_path = dir.join("report.txt");
+  let out = run(
+    &dir,
+    &[0xC3, 0x90, 0x90, 0x90],
+    ONE_BYTE_FUNC,
+    &["--codeseg-name", "main", "--emit-code", "-",
+      "--report", report_path.to_str().unwrap()],
+  );
+  let report = fs::read_to_string(&report_path).expect("read report");
+  assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+  assert!(report.contains(
+    "  bytes size 0x0004 code 0x0001 data 0x0000 unknown 0x0003 annotated 0x0001 / 0x0004 (25.00%)"),
+    "report: {}", report);
+  let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn report_includes_exe_byte_coverage() {
+  let dir = temp_dir();
+  let report_path = dir.join("report.txt");
+  let out = run_exe(
+    &dir,
+    &[0xC3, 0x90, 0x90, 0x90],
+    ONE_BYTE_FUNC,
+    &["--codeseg-name", "main", "--emit-code", "-",
+      "--report", report_path.to_str().unwrap()],
+  );
+  let report = fs::read_to_string(&report_path).expect("read report");
+  assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+  assert!(report.contains(
+    "  bytes size 0x0004 code 0x0001 data 0x0000 unknown 0x0003 annotated 0x0001 / 0x0004 (25.00%)"),
+    "report: {}", report);
+  let _ = fs::remove_dir_all(dir);
+}
 
 #[test]
 fn report_counts_an_unimpl_blocker() {

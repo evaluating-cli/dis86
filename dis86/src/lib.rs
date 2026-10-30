@@ -11,6 +11,7 @@ pub mod region;
 pub mod segoff;
 pub mod spec;
 pub mod config;
+pub mod coverage;
 pub mod diagnostics;
 pub mod validate;
 pub mod types;

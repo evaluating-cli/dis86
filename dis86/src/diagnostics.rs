@@ -12,6 +12,7 @@ pub enum Cause {
   IndirectJumpRuntimeTarget,
   UnmodelledFarJump,
   DecodeError,
+  CallTargetInData,
   AbiArgsInference,
   ExitContractMismatch,
   RegargsSetupDropped,
@@ -30,13 +31,18 @@ impl Cause {
         | Cause::IndirectJumpNoTable
         | Cause::IndirectJumpRuntimeTarget
         | Cause::UnmodelledFarJump
-        | Cause::DecodeError)
+        | Cause::DecodeError
+        | Cause::CallTargetInData)
   }
 
   /// A failure prevents the function from completing the requested pipeline.
   pub fn is_failure(self) -> bool {
     matches!(self,
-      Cause::DecodeError | Cause::CodegenFailure | Cause::ConfigError | Cause::InternalPanic)
+      Cause::DecodeError
+        | Cause::CallTargetInData
+        | Cause::CodegenFailure
+        | Cause::ConfigError
+        | Cause::InternalPanic)
   }
 
   pub fn label(self) -> &'static str {
@@ -47,6 +53,7 @@ impl Cause {
       Cause::IndirectJumpRuntimeTarget => "INDIRECT_JUMP_RUNTIME_TARGET",
       Cause::UnmodelledFarJump => "UNMODELLED_FAR_JUMP",
       Cause::DecodeError => "DECODE_ERROR",
+      Cause::CallTargetInData => "CALL_TARGET_IN_DATA",
       Cause::AbiArgsInference => "ABI_ARGS_INFERENCE",
       Cause::ExitContractMismatch => "EXIT_CONTRACT_MISMATCH",
       Cause::RegargsSetupDropped => "REGARGS_SETUP_DROPPED",
@@ -106,6 +113,8 @@ mod tests {
     }
     assert!(Cause::DecodeError.is_blocker());
     assert!(Cause::DecodeError.is_failure());
+    assert!(Cause::CallTargetInData.is_blocker());
+    assert!(Cause::CallTargetInData.is_failure());
     for cause in [Cause::AbiArgsInference, Cause::ExitContractMismatch, Cause::RegargsSetupDropped] {
       assert!(!cause.is_blocker(), "{} is advisory", cause.label());
       assert!(!cause.is_failure(), "{} is advisory", cause.label());

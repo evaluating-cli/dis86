@@ -3,6 +3,7 @@ use crate::binary::{self, Binary};
 use crate::segoff::SegOff;
 use crate::asm::intel_syntax;
 use crate::config::Config;
+use crate::coverage;
 use crate::decompile::ir;
 use crate::decompile::gen;
 use crate::decompile::ast;
@@ -70,7 +71,7 @@ fn print_help() {
   println!("  --emit-code       path to emit c code (optional)");
   println!("");
   println!("REPORT:");
-  println!("  --report          path to emit a deterministic translation blocker ledger (optional)");
+  println!("  --report          path to emit a deterministic translation blocker ledger with byte coverage (optional)");
   println!("");
   println!("IR BUILD FLAGS:");
   println!("  --build-pin-all   keep every value alive as a versioned local (a DCE");
@@ -458,7 +459,7 @@ pub fn run() -> i32 {
   }
 
   if report_mode {
-    configure_report_segments(&cfg, &args, &mut ledger);
+    configure_report_segments(&cfg, &args, &binary, &mut ledger);
   }
 
   let (specs, infer_failures) = if args.infer_abi || report_mode {
@@ -592,18 +593,48 @@ pub fn run() -> i32 {
   0
 }
 
-fn configure_report_segments(cfg: &Config, args: &Args, ledger: &mut TranslationLedger) {
-  if let Some(name) = &args.name {
-    if let Some(func) = cfg.func_lookup_by_name(name) {
-      ledger.set_configured(func.start.seg, 1);
+fn configure_report_segments(cfg: &Config, args: &Args, binary: &Binary,
+                             ledger: &mut TranslationLedger) {
+  let (seg, configured) = if let Some(name) = &args.name {
+    match cfg.func_lookup_by_name(name) {
+      Some(func) => (func.start.seg, 1),
+      None => return,
     }
   } else if let Some(name) = &args.codeseg_name {
-    if let Some(code_seg) = cfg.code_seg_lookup_by_name(name) {
-      ledger.set_configured(code_seg.seg, cfg.func_lookup_by_seg(code_seg.seg).len());
+    match cfg.code_seg_lookup_by_name(name) {
+      Some(code_seg) => (code_seg.seg, cfg.func_lookup_by_seg(code_seg.seg).len()),
+      None => return,
     }
   } else if let Some(start) = args.start_addr {
-    ledger.set_configured(start.seg, 1);
+    (start.seg, 1)
+  } else {
+    return;
+  };
+
+  ledger.set_configured(seg, configured);
+  if let Some(coverage) = report_coverage(cfg, binary, seg) {
+    ledger.set_coverage(seg, coverage);
   }
+}
+
+fn report_coverage(cfg: &Config, binary: &Binary, seg: crate::segoff::Seg)
+  -> Option<coverage::Coverage>
+{
+  if let Ok(code_segments) = crate::analyze::code_segment::CodeSegments::from_binary(binary) {
+    let code_seg = code_segments.find_by_segment(seg)?;
+    let start = code_seg.primary.skip_off;
+    return Some(coverage::for_span(cfg, seg, start, start + code_seg.primary.size));
+  }
+  if binary.exe().is_none() {
+    if let crate::segoff::Seg::Normal(paragraph) = seg {
+      let base = paragraph as usize * 16;
+      if base <= binary.image_len() {
+        return Some(coverage::for_span(
+          cfg, seg, 0, (binary.image_len() - base) as u32));
+      }
+    }
+  }
+  None
 }
 
 fn write_report(args: &Args, cfg: &Config, ledger: &TranslationLedger) -> Result<(), String> {
@@ -690,7 +721,7 @@ fn decompile_spec(args: &Args, cfg: &Config, binary: &Binary, spec: Spec<'_>,
     Ok(decoded) => decoded,
     Err(e) => {
       eprintln!("Error: Failed to decode instruction: {}", e);
-      return Err(Diagnostic::new(Cause::DecodeError, Some(e.addr), None, e.message));
+      return Err(Diagnostic::new(e.cause, Some(e.addr), None, e.message));
     }
   };
   // FIXME: SIMPLIFY!!
@@ -813,7 +844,8 @@ fn decompile_spec(args: &Args, cfg: &Config, binary: &Binary, spec: Spec<'_>,
 
 #[cfg(test)]
 mod tests {
-  use super::parse_relocatable_segs;
+  use super::{parse_relocatable_segs, report_coverage};
+  use crate::coverage::Coverage;
   use crate::spec::decode_regions;
   use crate::binary::Binary;
   use crate::config::{Config, FuncRegion};
@@ -836,6 +868,21 @@ mod tests {
       globals: vec![],
       text_section: vec![],
     }
+  }
+
+  #[test]
+  fn raw_coverage_starts_at_the_segment_base() {
+    let binary = Binary::from_raw(&[0u8; 20], None);
+    assert_eq!(report_coverage(&cfg(), &binary, Seg::Normal(1)), Some(Coverage {
+      code: 0,
+      data: 0,
+      unknown: 4,
+      total: 4,
+    }));
+    assert_eq!(report_coverage(&cfg(), &Binary::from_raw(&[0u8; 16], None), Seg::Normal(1)),
+               Some(Coverage::default()));
+    assert_eq!(report_coverage(&cfg(), &Binary::from_raw(&[0u8; 15], None), Seg::Normal(1)),
+               None);
   }
 
   #[test]
