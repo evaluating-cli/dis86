@@ -1085,23 +1085,19 @@ impl IRBuilder<'_> {
   }
 
   fn pin_registers(&mut self) {
-    // The general-purpose registers that can carry exit state are materialised
-    // as real writes by `write_back_exit_registers`; a `Pin` here is ignored by
-    // AST emission, so leaving them pinned too would only imply an exit-state
-    // marker that never reaches the output. Pin the rest: AX is the return
-    // value (pinned only for the debugging `pin_all`), ES is caller-saved
-    // (pin_all only), and SP/BP/SS/DS are frame or segment state this change
-    // does not write back.
+    // The registers that can carry exit state are materialised as real writes
+    // by `write_back_exit_registers`; a `Pin` here is ignored by AST emission,
+    // so leaving them pinned too would only imply an exit-state marker that
+    // never reaches the output. Pin the rest: AX is the return value (pinned
+    // only for the debugging `pin_all`), and SP/BP belong to the frame
+    // sequence. DS/ES/SS are written back when they change, so they must not be
+    // replaced by an ignored `Pin` here.
     if self.pin_all {
       self.pin_register(instr::Reg::AX);
-      self.pin_register(instr::Reg::ES);
     }
 
     self.pin_register(instr::Reg::SP);
     self.pin_register(instr::Reg::BP);
-
-    self.pin_register(instr::Reg::SS);
-    self.pin_register(instr::Reg::DS);
 
     // ??? Technically we should have this ???
     //self.pin_register(instr::Reg::FLAGS);
@@ -1334,9 +1330,10 @@ impl IRBuilder<'_> {
   /// The same guest write, placed immediately before `before` in `blk`. Used by
   /// the deferred exit write-back, which runs after lowering has moved on.
   fn write_guest_register_before(&mut self, blk: BlockRef, before: Ref,
-                                 reg: instr::Reg, vref: Ref) -> Ref {
+                                 reg: instr::Reg, vref: Ref, extra_attrs: u8) -> Ref {
     let sym = self.ir.symbols.find_ref_by_name(sym::Table::Register, reg.info().name).unwrap();
-    self.insert_instr_before(blk, before, Type::U16, Attribute::PIN | Attribute::EXIT_STATE,
+    self.insert_instr_before(blk, before, Type::U16,
+                             Attribute::PIN | Attribute::EXIT_STATE | extra_attrs,
                              Opcode::WriteVar16, vec![Ref::Symbol(sym), vref])
   }
 
@@ -1355,11 +1352,18 @@ impl IRBuilder<'_> {
   /// an explicit restore of those is exit state too. `AX` is the return value
   /// the return expression already writes, `DX` is skipped when it is the high
   /// half of that return value, and `SP`/`BP` belong to the frame sequence
-  /// (`FRAME_LEAVE`). Registers still holding their entry value are skipped: in
-  /// the emitted model `Ref::Init(reg)` *is* the live register, so writing it
-  /// would be a no-op (this also keeps a `push reg`/`pop reg` pair that folds
-  /// away from gaining a write). Segment registers are deliberately out of
-  /// scope here; that decision is pinned by a test.
+  /// (`FRAME_LEAVE`). `DS`/`ES`/`SS` are also observable exit state when the
+  /// function changes them, just like the general-purpose registers. Registers
+  /// still holding their entry value are skipped: in the emitted model
+  /// `Ref::Init(reg)` *is* the live register, so writing it would be a no-op
+  /// (this also keeps a `push reg`/`pop reg` pair that folds away from gaining
+  /// a write).
+  ///
+  /// A changed `SS` is emitted after the flavor's frame teardown: `FRAME_LEAVE`
+  /// pops the saved BP through the entry stack segment, while the near/far
+  /// return must observe the new one. Its value is frozen before the other
+  /// exit writes when it reads a register they change, since the deferred
+  /// write no longer follows `order_guest_writes`.
   ///
   /// The return expression can read a register this write-back rewrites
   /// (`mov ax,cx; dec cx; ret` returns the pre-decrement CX). `Ref::Init(reg)`
@@ -1387,7 +1391,7 @@ impl IRBuilder<'_> {
     for RetExit { ret_ref, pending } in std::mem::take(&mut self.ret_exits) {
       let Ref::Instr(blk, _) = ret_ref else { continue; };
 
-      let pending: Vec<_> = pending.into_iter()
+      let mut pending: Vec<_> = pending.into_iter()
         .filter(|(reg, vref)| !Self::is_entry_value(&self.ir, *vref, *reg))
         .collect();
       if pending.is_empty() { continue; }
@@ -1403,21 +1407,37 @@ impl IRBuilder<'_> {
       }
       self.ir.instr_mut(ret_ref).unwrap().operands = operands;
 
+      // SS is written after the frame teardown, so freeze a value that reads a
+      // register an earlier exit write changes. Otherwise the deferred write
+      // would observe the new value instead of the one at the guest ret.
+      if let Some(pos) = pending.iter().position(|(reg, _)| *reg == instr::Reg::SS) {
+        let vref = pending[pos].1;
+        let reads_pending = pending.iter().any(|(reg, _)| {
+          *reg != instr::Reg::SS && Self::ref_reads_init(&self.ir, vref, *reg)
+        });
+        if reads_pending {
+          pending[pos].1 = self.insert_instr_before(blk, ret_ref, Type::U16,
+            Attribute::MATERIALISE, Opcode::Ref, vec![vref]);
+        }
+      }
+
       for (reg, vref) in Self::order_guest_writes(&self.ir, &pending) {
-        self.write_guest_register_before(blk, ret_ref, reg, vref);
+        let extra_attrs = if reg == instr::Reg::SS { Attribute::POST_FRAME } else { Attribute::NONE };
+        self.write_guest_register_before(blk, ret_ref, reg, vref, extra_attrs);
       }
     }
   }
 
   /// The register values that may need write-back at a `ret`: the callee-saved
-  /// set plus the caller's `CX`/`DX`. Captured while lowering, before any
-  /// instructions after the `ret` are lowered into the same block (they never
-  /// execute, so they must not be the exit state). `DX` is skipped when it is
-  /// the high half of the return value, which the return expression already
-  /// writes.
+  /// set, the caller's `CX`/`DX`, and the segment registers. Captured while
+  /// lowering, before any instructions after the `ret` are lowered into the
+  /// same block (they never execute, so they must not be the exit state). `DX`
+  /// is skipped when it is the high half of the return value, which the return
+  /// expression already writes.
   fn exit_register_values(&mut self, dx_is_return: bool) -> Vec<(instr::Reg, Ref)> {
     let mut pending = vec![];
-    for reg in [instr::Reg::BX, instr::Reg::CX, instr::Reg::DX, instr::Reg::SI, instr::Reg::DI] {
+    for reg in [instr::Reg::BX, instr::Reg::CX, instr::Reg::DX, instr::Reg::SI, instr::Reg::DI,
+                instr::Reg::ES, instr::Reg::SS, instr::Reg::DS] {
       if dx_is_return && reg == instr::Reg::DX { continue; }
       pending.push((reg, self.ir.get_var(reg, self.cur)));
     }
@@ -5022,10 +5042,10 @@ mod tests {
       "reading BL uses the BX setup: {:?}", b.warnings);
   }
 
-  /// `pin_registers` emits `Pin(get_var(DS))` at every return, but ast.rs
-  /// drops `Pin`, so it is not a caller read of a dropped DS setup.
+  /// A changed DS emits an exit-state write at the return, but that write is
+  /// not a caller read of a DS setup whose value it only preserves.
   #[test]
-  fn a_ret_pin_does_not_mask_a_ds_setup() {
+  fn a_ret_exit_write_does_not_mask_a_ds_setup() {
     let (_types, cfg, binary, spec) =
       test_spec_with_callee(0x0000, 0x0006, &[0xC3], 0x0100, Some(vec![]));
     let instrs = [
@@ -5038,7 +5058,7 @@ mod tests {
     b.build();
 
     assert_eq!(regargs_warning_count(&b), 1,
-      "the transparent ret pin must not hide the DS setup: {:?}", b.warnings);
+      "the ret exit write must not hide the DS setup: {:?}", b.warnings);
     assert!(b.warnings[0].contains("DS"), "the warning must name DS: {}", b.warnings[0]);
   }
 

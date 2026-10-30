@@ -53,6 +53,10 @@ pub mod Attribute {
   /// itself, so ABI inference must not treat it as a root. Other stack stores
   /// stay roots because their address may have escaped.
   pub const STACK_SAVE: u8 = 1<<5;
+  /// Emit this exit-state write after the flavor's frame teardown. `FRAME_LEAVE`
+  /// pops the saved BP through the entry stack segment, so a changed SS must
+  /// become live only after that pop and before the near/far return.
+  pub const POST_FRAME: u8 = 1<<6;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

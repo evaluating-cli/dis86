@@ -17,9 +17,9 @@ use crate::decompile::ir::{Attribute, BlockRef, Instr, IR, Opcode, Ref};
 /// analysis supports. Frame/segment state (`SP`, `BP`, `SS`, `CS`) is not an
 /// argument; `IP`/`FLAGS` are never pinned as `regargs`.
 ///
-/// `DS`/`ES` are inputs only: this PR has no segment output model, so a
-/// callee that changes them still drops the change at `ret` (issue #144).
-/// Keep that asymmetry in mind when reading a `regargs` row.
+/// `DS`/`ES` are inputs only for this inference: a callee that changes them
+/// emits an exit-state write (issue #144), but that write is not evidence the
+/// callee read an input, so it does not become a `regargs` row.
 const CANDIDATES: [instr::Reg; 8] = [
   instr::Reg::AX,
   instr::Reg::BX,
