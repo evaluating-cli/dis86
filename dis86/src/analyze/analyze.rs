@@ -54,6 +54,14 @@ impl Analyze {
     self.binary.exe().unwrap().print();
   }
 
+  pub fn cfg(&self) -> &Config {
+    &self.cfg
+  }
+
+  pub fn binary(&self) -> &Binary {
+    &self.binary
+  }
+
   /// Configured coverage for every analyzed code segment, written to stderr
   /// so stdout stays a pasteable annotation fragment.
   pub fn report_coverage(&self) {

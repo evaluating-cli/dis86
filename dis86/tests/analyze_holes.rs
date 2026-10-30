@@ -83,6 +83,37 @@ fn analyze_skips_and_reports_calls_into_data() {
 }
 
 #[test]
+fn analyze_reports_translation_blockers() {
+  let image = [0x0F, 0x90, 0xC0, 0x50, 0xC3];
+  let functions = "f { start 0000:0000 end 0000:0005 mode near ret u16 args 0 }";
+  let out = run_analyze(&image, functions, "");
+  let stderr = String::from_utf8_lossy(&out.stderr);
+
+  assert!(out.status.success(), "stderr: {}", stderr);
+  assert!(stderr.contains("segment 0000 (main)"), "stderr: {}", stderr);
+  assert!(stderr.contains("functions configured 1 attempted 1 translated 1 failed 0"),
+    "stderr: {}", stderr);
+  assert!(stderr.contains("UNIMPL_FLAGS 1 first 0000:0000 (OP_SETO)"),
+    "stderr: {}", stderr);
+}
+
+#[test]
+fn analyze_reports_ast_failures() {
+  // mov bp, sp; mov ax, [bp-5]; ret: the local ends at -3, below the
+  // return-address slot, so AST construction fails.
+  let image = [0x89, 0xE5, 0x8B, 0x46, 0xFB, 0xC3];
+  let functions = "f { start 0000:0000 end 0000:0006 mode near ret u16 args 0 }";
+  let out = run_analyze(&image, functions, "");
+  let stderr = String::from_utf8_lossy(&out.stderr);
+
+  assert!(out.status.success(), "stderr: {}", stderr);
+  assert!(stderr.contains("functions configured 1 attempted 1 translated 0 failed 1"),
+    "stderr: {}", stderr);
+  assert!(stderr.contains("failed by cause: CODEGEN_FAILURE 1"),
+    "stderr: {}", stderr);
+}
+
+#[test]
 fn branch_target_after_a_hole_is_not_warned_as_unreachable() {
   // jmp 0008; hole [6,8); ret at 8, which is an explicit branch target.
   let image = [0xEB, 0x06, 0x90, 0x90, 0x90, 0x90, 0x63, 0x63, 0xC3];

@@ -277,6 +277,24 @@ impl Opcode {
     }
   }
 
+  pub fn is_flag_marker(&self) -> bool {
+    matches!(self,
+      Opcode::UpdateFlags
+        | Opcode::EqFlags
+        | Opcode::NeqFlags
+        | Opcode::GtFlags
+        | Opcode::GeqFlags
+        | Opcode::LtFlags
+        | Opcode::LeqFlags
+        | Opcode::UGtFlags
+        | Opcode::UGeqFlags
+        | Opcode::ULtFlags
+        | Opcode::ULeqFlags
+        | Opcode::SignFlags
+        | Opcode::OverflowFlags
+        | Opcode::ParityFlags)
+  }
+
   /// Whether this op may write arbitrary memory without carrying a
   /// `Store` operand: calls (callee side effects), interrupts (handlers),
   /// and the REP bulk string macros. Memory-reasoning passes

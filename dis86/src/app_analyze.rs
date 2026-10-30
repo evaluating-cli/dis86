@@ -1,5 +1,13 @@
 use crate::analyze::analyze::Analyze;
-use crate::config::Config;
+use crate::binary::Binary;
+use crate::config::{Config, Func};
+use crate::decompile::control_flow::ControlFlow;
+use crate::decompile::{finalize_for_emission, ir_build, opt, sym};
+use crate::diagnostics::{Cause, Diagnostic};
+use crate::report::TranslationLedger;
+use crate::spec;
+use std::collections::BTreeMap;
+use std::panic::{catch_unwind, AssertUnwindSafe};
 
 pub fn run(cfg: &Config, exe_path: &str) -> i32 {
   let a = match Analyze::new(cfg, exe_path) {
@@ -12,5 +20,70 @@ pub fn run(cfg: &Config, exe_path: &str) -> i32 {
   a.scan_for_all_functions(true);
   a.report_coverage();
 
+  let ledger = translation_summary(a.cfg(), a.binary());
+  eprint!("{}", ledger.render(a.cfg()));
+
   0
+}
+
+fn translation_summary(cfg: &Config, binary: &Binary) -> TranslationLedger {
+  let mut ledger = TranslationLedger::default();
+  let mut configured = BTreeMap::new();
+  for func in &cfg.funcs {
+    *configured.entry(func.start.seg).or_insert(0) += 1;
+  }
+  for (seg, count) in &configured {
+    ledger.set_configured(*seg, *count);
+  }
+
+  for func in &cfg.funcs {
+    let seg = func.start.seg;
+    ledger.attempt(seg);
+    let outcome = catch_unwind(AssertUnwindSafe(|| summarize_function(cfg, binary, func)));
+    match outcome {
+      Ok(Ok(diagnostics)) => {
+        for diagnostic in &diagnostics {
+          ledger.blocker(seg, diagnostic);
+        }
+        ledger.translated(seg);
+      }
+      Ok(Err(diagnostic)) => ledger.failure(seg, diagnostic),
+      Err(_) => ledger.failure(seg, Diagnostic::new(
+        Cause::InternalPanic, Some(func.start), None,
+        format!("panicked while summarizing {}", func.name))),
+    }
+  }
+
+  ledger
+}
+
+fn summarize_function(cfg: &Config, binary: &Binary, func: &Func)
+  -> Result<Vec<Diagnostic>, Diagnostic>
+{
+  let spec = crate::app::infer_spec(binary, func)
+    .map_err(|failed| Diagnostic::new(
+      Cause::ConfigError, Some(failed.start), None, failed.note))?;
+  let (instrs, _raw) = spec::decode_regions(binary, cfg, &spec)
+    .map_err(|failure| Diagnostic::new(
+      failure.cause, Some(failure.addr), None, failure.message))?;
+
+  let overlay = spec.start.is_overlay_addr();
+  let (mut ir, mut diagnostics, markers) = ir_build::build_from_instrs_with_diagnostics(
+    &instrs, cfg, &spec, binary, overlay, false);
+  opt::optimize(&mut ir);
+  sym::symbolize(&mut ir, cfg);
+  opt::forward_store_to_load(&mut ir);
+  opt::optimize(&mut ir);
+  opt::mem_symbol_to_ref(&mut ir);
+  opt::optimize(&mut ir);
+  finalize_for_emission(&mut ir);
+  diagnostics.extend(markers.diagnostics(&ir));
+
+  let ctrlflow = ControlFlow::from_ir(&ir);
+  crate::decompile::build_ast(cfg, &spec, &ir, &ctrlflow)
+    .map_err(|err| Diagnostic::new(
+      Cause::CodegenFailure, Some(spec.start), None,
+      format!("failed to build AST: {}", err)))?;
+
+  Ok(diagnostics)
 }

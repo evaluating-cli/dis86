@@ -24,6 +24,47 @@ enum BranchTargets {
   Unresolved(branch::UnresolvedTransfer),
 }
 
+#[derive(Debug, Clone, Copy)]
+struct MarkerSite {
+  addr: SegOff,
+  opcode: instr::Opcode,
+}
+
+/// Source sites for IR instructions that render as the non-fatal
+/// `UNIMPL_FLAGS` marker. Refs are stable across optimization, so scanning
+/// the finalized IR against this map reports only markers that survived.
+/// Reader sites name the instruction that reads flags; `UpdateFlags` sites
+/// name the flag-writing instruction.
+#[derive(Debug, Default)]
+pub struct FlagMarkers {
+  sites: HashMap<Ref, MarkerSite>,
+}
+
+impl FlagMarkers {
+  fn record(&mut self, r: Ref, site: MarkerSite) {
+    self.sites.insert(r, site);
+  }
+
+  pub fn diagnostics(&self, ir: &IR) -> Vec<Diagnostic> {
+    let mut out = vec![];
+    for blk in ir.iter_blocks() {
+      for r in ir.iter_instrs(blk) {
+        let Some(instr) = ir.instr(r) else { continue; };
+        if !instr.opcode.is_flag_marker() { continue; }
+        let site = self.sites.get(&r).copied();
+        let (addr, opcode, message) = match site {
+          Some(site) => (Some(site.addr), Some(site.opcode),
+                         format!("UNIMPL_FLAGS at {} ({:?})", site.addr, site.opcode)),
+          None => (None, None, "UNIMPL_FLAGS at unknown site".to_string()),
+        };
+        out.push(Diagnostic::new(Cause::UnimplFlags, addr, opcode, message));
+      }
+    }
+    out.sort_by_key(|diagnostic| diagnostic.addr);
+    out
+  }
+}
+
 /// The outcome of resolving an indirect jump's target.
 enum IndirectTargets {
   /// The config describes the jump table: these are its targets.
@@ -155,6 +196,10 @@ struct IRBuilder<'a> {
   // buffered and only the retained pass's warnings are printed, exactly once.
   warnings: Vec<Diagnostic>,
 
+  // Live flag-marker origins, keyed by the marker instruction's stable Ref.
+  flag_markers: FlagMarkers,
+  cur_site: Option<MarkerSite>,
+
   // Known calls whose undeclared-but-dirty registers may be callee inputs.
   // Recorded while building; checked once against the finished IR in `build`
   // (see `check_regargs_setups`), so each call site warns at most once.
@@ -227,6 +272,8 @@ impl<'a> IRBuilder<'a> {
       exit_known: HashMap::new(),
       entry_known_default: false,
       warnings: Vec::new(),
+      flag_markers: FlagMarkers::default(),
+      cur_site: None,
       regargs_candidates: Vec::new(),
       ret_exits: Vec::new(),
     };
@@ -405,13 +452,25 @@ impl<'a> IRBuilder<'a> {
 
   fn append_instr_with_attrs(&mut self, typ: Type, attrs: u8, opcode: Opcode, operands: Vec<Ref>) -> Ref {
     let instr = Self::make_instr(typ, attrs, opcode, operands);
-    self.ir.block_instr_append(self.cur, instr)
+    let r = self.ir.block_instr_append(self.cur, instr);
+    self.record_flag_marker(r, opcode);
+    r
   }
 
   fn insert_instr_before(&mut self, blk: BlockRef, before: Ref, typ: Type, attrs: u8,
                          opcode: Opcode, operands: Vec<Ref>) -> Ref {
     let instr = Self::make_instr(typ, attrs, opcode, operands);
-    self.ir.block_instr_insert_before(blk, before, instr)
+    let r = self.ir.block_instr_insert_before(blk, before, instr);
+    self.record_flag_marker(r, opcode);
+    r
+  }
+
+  fn record_flag_marker(&mut self, r: Ref, opcode: Opcode) {
+    if opcode.is_flag_marker() {
+      if let Some(site) = self.cur_site {
+        self.flag_markers.record(r, site);
+      }
+    }
   }
 
   fn append_jmp(&mut self, next: BlockRef) {
@@ -1981,6 +2040,12 @@ impl IRBuilder<'_> {
   }
 
   fn append_asm_instr(&mut self, ins: &instr::Instr) {
+    self.cur_site = Some(MarkerSite { addr: ins.addr, opcode: ins.opcode });
+    self.append_asm_instr_inner(ins);
+    self.cur_site = None;
+  }
+
+  fn append_asm_instr_inner(&mut self, ins: &instr::Instr) {
     //println!("## {}", intel_syntax::format(ins, &[], false).unwrap());
 
     // Consume the push-cs marker first: it only describes the *immediately*
@@ -3448,10 +3513,10 @@ pub fn build_from_instrs(instrs: &[instr::Instr], cfg: &Config, spec: &spec::Spe
 pub fn build_from_instrs_with_diagnostics(
   instrs: &[instr::Instr], cfg: &Config, spec: &spec::Spec<'_>, binary: &binary::Binary,
   overlay: bool, pin_all: bool,
-) -> (IR, Vec<Diagnostic>) {
+) -> (IR, Vec<Diagnostic>, FlagMarkers) {
   let mut bld = IRBuilder::new(cfg, instrs, spec, binary, overlay, pin_all);
   bld.build();
-  (bld.ir, bld.warnings)
+  (bld.ir, bld.warnings, bld.flag_markers)
 }
 
 #[cfg(test)]
@@ -4937,12 +5002,39 @@ mod tests {
   fn diagnostics_build_api_returns_the_retained_pass_diagnostics() {
     let (_types, cfg, binary, spec) = bit_test_builder(&[0xF4, 0xC3]);
     let instrs = decode_all(&binary, &spec);
-    let (_ir, diagnostics) =
+    let (_ir, diagnostics, _markers) =
       build_from_instrs_with_diagnostics(&instrs, &cfg, &spec, &binary, false, false);
     let d = diagnostics.iter().find(|d| d.cause == Cause::Unimpl)
       .unwrap_or_else(|| panic!("no UNIMPL diagnostic: {:?}", diagnostics));
     assert_eq!(d.addr, Some(SegOff { seg: Seg::Normal(0), off: Off(0) }));
     assert_eq!(d.opcode, Some(instr::Opcode::OP_HLT));
+  }
+
+  #[test]
+  fn flag_marker_diagnostics_keep_the_source_opcode_and_address() {
+    let (_types, cfg, binary, spec) = bit_test_builder(&[0x0F, 0x90, 0xC0, 0x50, 0xC3]);
+    let instrs = decode_all(&binary, &spec);
+    let (mut ir, _diagnostics, markers) =
+      build_from_instrs_with_diagnostics(&instrs, &cfg, &spec, &binary, false, false);
+    crate::decompile::finalize_for_emission(&mut ir);
+
+    let diagnostics = markers.diagnostics(&ir);
+    let diagnostic = diagnostics.iter().find(|d| d.cause == Cause::UnimplFlags)
+      .unwrap_or_else(|| panic!("no UNIMPL_FLAGS diagnostic: {:?}", diagnostics));
+    assert_eq!(diagnostic.addr, Some(SegOff { seg: Seg::Normal(0), off: Off(0) }));
+    assert_eq!(diagnostic.opcode, Some(instr::Opcode::OP_SETO));
+  }
+
+  #[test]
+  fn optimized_away_flag_markers_are_not_reported() {
+    let (_types, cfg, binary, spec) = bit_test_builder(&[0x01, 0xD8, 0x74, 0x01, 0x90, 0xC3]);
+    let instrs = decode_all(&binary, &spec);
+    let (mut ir, _diagnostics, markers) =
+      build_from_instrs_with_diagnostics(&instrs, &cfg, &spec, &binary, false, false);
+    crate::decompile::finalize_for_emission(&mut ir);
+
+    assert!(markers.diagnostics(&ir).is_empty(),
+      "a simplified branch must not leave a stale UNIMPL_FLAGS count");
   }
 
   #[test]
