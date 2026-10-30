@@ -237,9 +237,16 @@
 #define CALL_FAR_INDIRECT(addr, ...) ({         \
   u16 args[] = {__VA_ARGS__}; \
   PUSH_ARGS(args); \
-  hydra_impl_call_far_indirect(addr); \
+  u32 ret = hydra_impl_call_far_indirect(addr); \
   POP_ARGS(args);                \
-  AX; })
+  ret; })
+
+#define CALL_NEAR_INDIRECT(addr, ...) ({        \
+  u16 args[] = {__VA_ARGS__}; \
+  PUSH_ARGS(args); \
+  u32 ret = hydra_impl_call_near_off(addr, 0); \
+  POP_ARGS(args);                \
+  ret; })
 
 #define CALL_NEAR_OFF(off) hydra_impl_call_near_off(off, 0)
 #define CALL_NEAR_OFF_RELOC(off) hydra_impl_call_near_off(off, 1)

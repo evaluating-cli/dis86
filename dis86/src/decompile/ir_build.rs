@@ -1243,7 +1243,7 @@ impl IRBuilder<'_> {
     let addr = self.append_asm_src_operand(&ins.operands[0]);
     let mut operands = vec![addr];
     operands.append(&mut self.load_args_from_stack(args));
-    let ret_ref = self.append_instr(ret_type.clone(), Opcode::CallPtr, operands);
+    let ret_ref = self.append_instr(ret_type.clone(), Opcode::CallFarPtr, operands);
     self.save_return_value(ret_type, ret_ref);
   }
 
@@ -1473,7 +1473,7 @@ impl IRBuilder<'_> {
     let addr = self.append_asm_src_operand(&ins.operands[0]);
     let mut operands = vec![addr];
     operands.append(&mut self.load_args_from_stack(nargs));
-    let ret_ref = self.append_instr(Type::Unknown, Opcode::CallPtr, operands);
+    let ret_ref = self.append_instr(Type::Unknown, Opcode::CallNearPtr, operands);
     self.save_return_value(&Type::Unknown, ret_ref);
   }
 
@@ -1495,8 +1495,8 @@ impl IRBuilder<'_> {
 
   fn process_calln(&mut self, ins: &instr::Instr, cs_pushed: bool) {
     // Register- or memory-indirect near calls (`call ax`, `call [bx]`)
-    // have no static target; model them like far-indirect calls (CallPtr
-    // with heuristically inferred stack args) instead of aborting.
+    // have no static target; model them as near-indirect calls with
+    // heuristically inferred stack args instead of aborting.
     let instr::Operand::Rel(rel) = &ins.operands[0] else {
       return self.process_calln_indirect(ins);
     };
@@ -2943,7 +2943,8 @@ impl IRBuilder<'_> {
     let result = match r {
       Ref::Instr(_, _) => match ir.instr(r) {
         Some(instr) => match instr.opcode {
-          Opcode::CallNear | Opcode::CallFar | Opcode::CallPtr | Opcode::CallArgs => true,
+          Opcode::CallNear | Opcode::CallFar | Opcode::CallNearPtr | Opcode::CallFarPtr
+            | Opcode::CallArgs => true,
           Opcode::Ref | Opcode::Upper16 | Opcode::Lower16 => instr.operands.iter()
             .any(|operand| Self::is_call_result_inner(ir, *operand, memo, visiting)),
           Opcode::And | Opcode::Or | Opcode::UShr | Opcode::Shl => {
@@ -4409,8 +4410,9 @@ mod tests {
 
   #[test]
   fn may_clobber_memory_covers_calls_int_and_rep() {
-    for op in [Opcode::CallFar, Opcode::CallNear, Opcode::CallPtr, Opcode::CallArgs,
-               Opcode::Int, Opcode::RepMovs, Opcode::RepStos, Opcode::Ins, Opcode::RepIns] {
+    for op in [Opcode::CallFar, Opcode::CallNear, Opcode::CallNearPtr, Opcode::CallFarPtr,
+               Opcode::CallArgs, Opcode::Int, Opcode::RepMovs, Opcode::RepStos,
+               Opcode::Ins, Opcode::RepIns] {
       assert!(op.may_clobber_memory(), "{op:?} must be a memory barrier");
     }
     for op in [Opcode::Load8, Opcode::Store8, Opcode::Add, Opcode::RetNear, Opcode::Unimpl,

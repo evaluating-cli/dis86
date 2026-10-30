@@ -16,6 +16,37 @@
 #include "native_host.h"
 #include "hydra_backend.h"
 
+/* COMPILE-ONLY, and that word is the whole point: this function proves the
+ * two indirect-call macros accept the argument shapes generated C passes, and
+ * nothing else. It is never called.
+ *
+ * It cannot be called from here. Both macros route through the driver's call
+ * seam: hydra_impl_call_far_indirect()/hydra_impl_call_near_off() need the
+ * active execution context that only a running hook has (exec.c fails loud
+ * outside one), and in a real driver they signal the host and block until it
+ * dispatches. So a plain call in this binary would abort on the missing
+ * context rather than exercise the thing worth testing.
+ *
+ * Deliberately NOT checked here - do not read the line above as "verified":
+ *
+ *   - the push depth of each form (near: sp -= 2 and a 0xff00 + exec_id
+ *     sentinel; far: sp -= 4 and a 0xffff / exec_id pair), and
+ *   - the far form's seg >= CODE_START_SEG precondition, which aborts when a
+ *     near target is mis-routed into it (the pre-#145 bug),
+ *
+ * because both need a guest or a driver to observe. The rendered form (which
+ * macro a near/far site becomes, and the 16- vs 32-bit operand) is covered by
+ * dis86/tests/indirect_calls.rs; the stack layout has no executing coverage
+ * yet, since no fixture, golden or testprog guest contains an indirect call. */
+__attribute__((unused))
+static void compile_only_indirect_call_macros(void)
+{
+  hydra_machine_t *m = NULL;
+  (void)CALL_NEAR_INDIRECT(0x1234, 0x5678);
+  (void)CALL_FAR_INDIRECT(0x12345678, 0x9abc);
+  (void)m;
+}
+
 static int g_failures;
 #define CHECK(cond, label) do {                                      \
   if (cond) printf("PASS: %s\n", label);                             \

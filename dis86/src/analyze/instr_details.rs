@@ -69,7 +69,7 @@ fn determine_calln(ins: &Instr, _binary: &Binary) -> Result<Call, String> {
   } else if let Operand::Reg(_) = &ins.operands[0] {
     // Register-indirect near calls (`call cx`) have no static target;
     // counted as indirect like memory-indirect calls. Matches the
-    // decompiler, which models them via CallPtr (ir_build.rs).
+    // decompiler, which models them via CallNearPtr (ir_build.rs).
     Ok(Call::Indirect)
   } else {
     Err(format!("Unsupported operand to CALL for '{}'", instr_str(ins)))
@@ -293,7 +293,7 @@ mod tests {
   #[test]
   fn register_indirect_call_counts_as_indirect() {
     // `call cx` (FF D1) has no static target; it must not error, matching
-    // the decompiler which models it via CallPtr.
+    // the decompiler which models it via CallNearPtr.
     let d = details_for(&[0xFF, 0xD1, 0xC3]);
     assert!(matches!(d.call, Some(Call::Indirect)));
   }
