@@ -1200,14 +1200,14 @@ impl IRBuilder<'_> {
     if bytes_pushed_before >= bytes_cleanup_after {
       assert!(bytes_cleanup_after%2 == 0);
       let n = bytes_cleanup_after/2;
-      self.warn(Cause::AbiArgsInference, Some(ins.addr), Some(ins.opcode),
-                format!("WARN: {}, inferred {} arg(s)... possibly erroneously", warn_msg, n));
+      self.warn_ins(Cause::AbiArgsInference, ins,
+                    format!("WARN: {}, inferred {} arg(s)... possibly erroneously", warn_msg, n));
       n
     } else {
       // If more bytes are cleaned up then pushed.. pessimize
       let n = 0;
-      self.warn(Cause::AbiArgsInference, Some(ins.addr), Some(ins.opcode),
-                format!("WARN: {}, failed to infer, assuming {} arg(s)...very likely erroneously", warn_msg, n));
+      self.warn_ins(Cause::AbiArgsInference, ins,
+                    format!("WARN: {}, failed to infer, assuming {} arg(s)...very likely erroneously", warn_msg, n));
       n
     }
   }
@@ -3178,8 +3178,8 @@ impl IRBuilder<'_> {
           // instead of hiding the lost edge; the drop semantics are unchanged.
           for tgt in &explicit {
             if self.out_of_range_edge(*tgt, fallthrough) {
-              self.warn(Cause::BranchOutOfRange, Some(ins.addr), Some(ins.opcode),
-                        format!("WARN: {}: branch at {} targets {} outside function {}; the edge is dropped from the output",
+              self.warn_ins(Cause::BranchOutOfRange, ins,
+                            format!("WARN: {}: branch at {} targets {} outside function {}; the edge is dropped from the output",
                 self.spec.name, ins.addr, tgt, self.spec.range_description()));
             }
           }
@@ -3193,8 +3193,8 @@ impl IRBuilder<'_> {
             // to that address: it needs a block like any other target.
             block_start.insert(target);
             if self.out_of_range_edge(target, None) {
-              self.warn(Cause::BranchOutOfRange, Some(ins.addr), Some(ins.opcode),
-                        format!("WARN: {}: branch at {} targets {} outside function {}; the edge is dropped from the output",
+              self.warn_ins(Cause::BranchOutOfRange, ins,
+                            format!("WARN: {}: branch at {} targets {} outside function {}; the edge is dropped from the output",
                 self.spec.name, ins.addr, target, self.spec.range_description()));
             }
           }
@@ -4913,6 +4913,18 @@ mod tests {
     b.build();
     let d = b.warnings.iter().find(|d| d.cause == Cause::Unimpl)
       .unwrap_or_else(|| panic!("no UNIMPL diagnostic: {:?}", b.warnings));
+    assert_eq!(d.addr, Some(SegOff { seg: Seg::Normal(0), off: Off(0) }));
+    assert_eq!(d.opcode, Some(instr::Opcode::OP_HLT));
+  }
+
+  #[test]
+  fn diagnostics_build_api_returns_the_retained_pass_diagnostics() {
+    let (_types, cfg, binary, spec) = bit_test_builder(&[0xF4, 0xC3]);
+    let instrs = decode_all(&binary, &spec);
+    let (_ir, diagnostics) =
+      build_from_instrs_with_diagnostics(&instrs, &cfg, &spec, &binary, false, false);
+    let d = diagnostics.iter().find(|d| d.cause == Cause::Unimpl)
+      .unwrap_or_else(|| panic!("no UNIMPL diagnostic: {:?}", diagnostics));
     assert_eq!(d.addr, Some(SegOff { seg: Seg::Normal(0), off: Off(0) }));
     assert_eq!(d.opcode, Some(instr::Opcode::OP_HLT));
   }
