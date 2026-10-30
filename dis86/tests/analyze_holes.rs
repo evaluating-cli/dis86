@@ -98,3 +98,18 @@ fn branch_target_after_a_hole_is_not_warned_as_unreachable() {
   assert!(stderr.contains("Coverage 0000 (main): code 7 (77.78%), data 2 (22.22%), unknown 0 (0.00%)"),
     "stderr: {}", stderr);
 }
+
+#[test]
+fn gap_filling_hole_warns_for_a_non_target_region_start() {
+  // Explicit regions [0,4) and [8,12), with the gap [4,8) declared as a
+  // hole. The second region start is not a branch target or entry.
+  let image = [0xC3, 0x90, 0x90, 0x90, 0x63, 0x63, 0x63, 0x63, 0xC3, 0x90, 0x90, 0x90];
+  let functions = "f { start 0000:0000 end 0000:000c mode near ret u16 args 0 regions { _0 { start 0000:0000 end 0000:0004 } _1 { start 0000:0008 end 0000:000c } } }";
+  let text = "hole { start 0000:0004 end 0000:0008 }";
+  let out = run_analyze(&image, functions, text);
+  let stderr = String::from_utf8_lossy(&out.stderr);
+
+  assert!(out.status.success(), "stderr: {}", stderr);
+  assert!(stderr.contains("WARN: f: code at 0000:0008 follows declared data 'hole'"),
+    "stderr: {}", stderr);
+}

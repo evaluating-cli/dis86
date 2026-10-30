@@ -102,6 +102,7 @@ impl Analyze {
     }
 
     for region in self.cfg.text_regions_matching_segment(seg) {
+      if region.end.seg != seg { continue; }
       let start = (region.start.off.0 as u32).max(seg_start);
       let end = (region.end.off.0 as u32).min(seg_end);
       if start < end {
@@ -143,7 +144,9 @@ impl Analyze {
         }
       }
       for region in self.cfg.text_regions_matching_segment(seg) {
-        max_end = max_end.max(region.end.off.0 as u32);
+        if region.end.seg == seg {
+          max_end = max_end.max(region.end.off.0 as u32);
+        }
       }
       if max_end > seg_end_of(code_seg) {
         eprintln!("WARN: configured ranges exceed segment {} (expected end {}, got {})",
@@ -226,11 +229,14 @@ impl Analyze {
   fn warn_unreachable_after_holes(&self, func: &Func) {
     let regions = func.effective_regions();
     if regions.is_empty() { return; }
+    let span_start = regions.first().map(|region| region.start).unwrap();
+    let span_end = regions.last().map(|region| region.end).unwrap();
     let has_hole = self.cfg.text_section.iter().any(|data|
-      data.is_data_hole() && regions.iter().any(|region|
-        data.start.seg == region.start.seg
-          && data.start < region.end
-          && region.start < data.end));
+      data.is_data_hole()
+        && data.start.seg == span_start.seg
+        && data.end.seg == span_start.seg
+        && data.start < span_end
+        && span_start < data.end);
     if !has_hole { return; }
     let code_regions = self.cfg.code_regions(&regions);
     let targets = self.direct_targets_in_regions(&regions);
@@ -639,6 +645,13 @@ mod tests {
         },
         TextSectionRegion {
           name: "table".to_string(), start: so(15), end: so(18), typ: None, access: None,
+        },
+        TextSectionRegion {
+          name: "cross".to_string(),
+          start: so(5),
+          end: SegOff { seg: Seg::Normal(1), off: Off(7) },
+          typ: None,
+          access: None,
         },
       ],
     };
