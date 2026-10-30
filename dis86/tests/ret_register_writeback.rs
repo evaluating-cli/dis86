@@ -27,7 +27,7 @@ fn func_ret(name: &str, start: u16, end: u16, regargs: Option<Vec<Reg>>, ret: Ty
   Func { ret: Some(ret), ..func(name, start, end, regargs) }
 }
 
-fn decompile(code: &[u8], funcs: Vec<Func>, flavor: Flavor) -> String {
+fn decompile_with_pin_all(code: &[u8], funcs: Vec<Func>, flavor: Flavor, pin_all: bool) -> String {
   let types = std::rc::Rc::new(TypeDatabase::new());
   let cfg = Config {
     types,
@@ -47,7 +47,7 @@ fn decompile(code: &[u8], funcs: Vec<Func>, flavor: Flavor) -> String {
     instr_list.push(ins);
   }
 
-  let mut ir = ir_build::build_from_instrs(&instr_list, &cfg, &spec, &binary, false, false);
+  let mut ir = ir_build::build_from_instrs(&instr_list, &cfg, &spec, &binary, false, pin_all);
   opt::optimize(&mut ir);
   sym::symbolize(&mut ir, &cfg);
   opt::forward_store_to_load(&mut ir);
@@ -61,6 +61,10 @@ fn decompile(code: &[u8], funcs: Vec<Func>, flavor: Flavor) -> String {
   let cf = ControlFlow::from_ir(&ir);
   let ast = Function::from_ir(&cfg, "main", None, &ir, &cf).expect("ast");
   gen::generate(&ast, flavor).expect("codegen")
+}
+
+fn decompile(code: &[u8], funcs: Vec<Func>, flavor: Flavor) -> String {
+  decompile_with_pin_all(code, funcs, flavor, false)
 }
 
 fn standard(code: &[u8], funcs: Vec<Func>) -> String {
@@ -298,10 +302,9 @@ fn every_return_path_writes_back_exit_state() {
   assert_eq!(count(&source, "SI = "), 2, "each return path needs its own write:\n{source}");
 }
 
-/// Segment registers are deliberately out of this change's scope: the decision
-/// is pinned here so a later change has to argue it explicitly.
+/// A segment register the function never changes must not gain a write.
 #[test]
-fn segment_registers_are_not_written_back() {
+fn unchanged_segment_registers_are_not_written_back() {
   let code = [
     0x1E, // push ds
     0x5E, // pop si
@@ -312,6 +315,107 @@ fn segment_registers_are_not_written_back() {
   for seg in ["DS = ", "ES = ", "SS = "] {
     assert_eq!(count(&source, &format!("{seg}")), 0, "{seg} must not be written back:\n{source}");
   }
+}
+
+/// A changed DS is part of the function's observable exit state.
+#[test]
+fn changed_ds_is_written_back_in_both_flavours() {
+  let code = [
+    0xB8, 0x07, 0x06, // mov ax,0x0607
+    0x8E, 0xD8,       // mov ds,ax
+    0xC3,             // ret
+  ];
+  for flavor in [Flavor::Standard, Flavor::Hydra { relocatable_segs: vec![] }] {
+    let source = decompile(&code, vec![func("main", 0x0000, 0x0006, None)], flavor);
+    let ds = find(&source, "DS = ");
+    assert!(source[ds..].contains("0x607"), "DS must carry the changed value:\n{source}");
+  }
+}
+
+/// A changed ES is caller-visible even without `pin_all`.
+#[test]
+fn changed_es_is_written_back() {
+  let code = [
+    0xB8, 0x34, 0x12, // mov ax,0x1234
+    0x8E, 0xC0,       // mov es,ax
+    0xC3,             // ret
+  ];
+  let source = standard(&code, vec![func("main", 0x0000, 0x0006, None)]);
+  let es = find(&source, "ES = ");
+  assert!(source[es..].contains("0x1234"), "ES must carry the changed value:\n{source}");
+}
+
+/// SS is stack state, but it is still exit state and must be written before the
+/// Hydra frame teardown/return consume the stack.
+#[test]
+fn changed_ss_is_written_back_before_the_hydra_return() {
+  let code = [
+    0xB8, 0x34, 0x12, // mov ax,0x1234
+    0x8E, 0xD0,       // mov ss,ax
+    0xC3,             // ret
+  ];
+  let source = decompile(
+    &code,
+    vec![func("main", 0x0000, 0x0006, None)],
+    Flavor::Hydra { relocatable_segs: vec![] },
+  );
+  let ss = find(&source, "SS = ");
+  assert!(source[ss..].contains("0x1234"), "SS must carry the changed value:\n{source}");
+  assert!(ss < find(&source, "FRAME_LEAVE()"), "SS must precede the frame teardown:\n{source}");
+  assert!(ss < find(&source, "RETURN_NEAR()"), "SS must precede the return:\n{source}");
+}
+
+/// `pin_all` must not replace changed segment SSA with a `Pin` that AST
+/// emission drops.
+#[test]
+fn pin_all_keeps_changed_segment_exit_state() {
+  let code = [
+    0xB8, 0x07, 0x06, // mov ax,0x0607
+    0x8E, 0xD8,       // mov ds,ax
+    0xC3,             // ret
+  ];
+  let source = decompile_with_pin_all(
+    &code,
+    vec![func("main", 0x0000, 0x0006, None)],
+    Flavor::Standard,
+    true,
+  );
+  assert!(source.contains("DS = "), "the changed DS write survives pin_all:\n{source}");
+  assert!(source.contains("0x607"), "the DS value is materialised:\n{source}");
+}
+
+/// A return expression that reads DS must see the value before the exit write
+/// changes it.
+#[test]
+fn ret_value_reading_ds_is_snapshotted_before_the_segment_write() {
+  let code = [
+    0x8C, 0xD8, // mov ax,ds
+    0x8E, 0xDB, // mov ds,bx
+    0xC3,       // ret
+  ];
+  let source = standard(&code, vec![func_ret("main", 0x0000, 0x0005, None, Type::U16)]);
+  let snapshot = find(&source, "tmp_0 = DS;");
+  let write_back = find(&source, "DS = BX;");
+  assert!(snapshot < write_back, "the return value must be captured first:\n{source}");
+  let ret = source.rfind("return").expect("a return");
+  let ret_line = &source[ret..];
+  assert!(ret_line.contains("tmp_0"), "the return must read the snapshot:\n{source}");
+  assert!(!ret_line.contains("DS"), "the return must not read the rewritten DS:\n{source}");
+}
+
+/// Segment writes participate in the same program-order dependency handling as
+/// the general-purpose registers: DS reads the pre-write BX.
+#[test]
+fn segment_write_observes_the_pre_write_gpr_value() {
+  let code = [
+    0x8E, 0xDB,       // mov ds,bx
+    0xBB, 0x34, 0x12, // mov bx,0x1234
+    0xC3,             // ret
+  ];
+  let source = standard(&code, vec![func("main", 0x0000, 0x0006, None)]);
+  let ds = find(&source, "DS = BX;");
+  let bx = find(&source, "BX = 0x1234;");
+  assert!(ds < bx, "DS must read BX before BX's own exit write:\n{source}");
 }
 
 /// The Hydra flavour places the exit writes before the frame teardown and the

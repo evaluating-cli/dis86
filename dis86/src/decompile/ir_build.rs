@@ -1085,23 +1085,19 @@ impl IRBuilder<'_> {
   }
 
   fn pin_registers(&mut self) {
-    // The general-purpose registers that can carry exit state are materialised
-    // as real writes by `write_back_exit_registers`; a `Pin` here is ignored by
-    // AST emission, so leaving them pinned too would only imply an exit-state
-    // marker that never reaches the output. Pin the rest: AX is the return
-    // value (pinned only for the debugging `pin_all`), ES is caller-saved
-    // (pin_all only), and SP/BP/SS/DS are frame or segment state this change
-    // does not write back.
+    // The registers that can carry exit state are materialised as real writes
+    // by `write_back_exit_registers`; a `Pin` here is ignored by AST emission,
+    // so leaving them pinned too would only imply an exit-state marker that
+    // never reaches the output. Pin the rest: AX is the return value (pinned
+    // only for the debugging `pin_all`), and SP/BP belong to the frame
+    // sequence. DS/ES/SS are written back when they change, so they must not be
+    // replaced by an ignored `Pin` here.
     if self.pin_all {
       self.pin_register(instr::Reg::AX);
-      self.pin_register(instr::Reg::ES);
     }
 
     self.pin_register(instr::Reg::SP);
     self.pin_register(instr::Reg::BP);
-
-    self.pin_register(instr::Reg::SS);
-    self.pin_register(instr::Reg::DS);
 
     // ??? Technically we should have this ???
     //self.pin_register(instr::Reg::FLAGS);
@@ -1355,11 +1351,12 @@ impl IRBuilder<'_> {
   /// an explicit restore of those is exit state too. `AX` is the return value
   /// the return expression already writes, `DX` is skipped when it is the high
   /// half of that return value, and `SP`/`BP` belong to the frame sequence
-  /// (`FRAME_LEAVE`). Registers still holding their entry value are skipped: in
-  /// the emitted model `Ref::Init(reg)` *is* the live register, so writing it
-  /// would be a no-op (this also keeps a `push reg`/`pop reg` pair that folds
-  /// away from gaining a write). Segment registers are deliberately out of
-  /// scope here; that decision is pinned by a test.
+  /// (`FRAME_LEAVE`). `DS`/`ES`/`SS` are also observable exit state when the
+  /// function changes them, just like the general-purpose registers. Registers
+  /// still holding their entry value are skipped: in the emitted model
+  /// `Ref::Init(reg)` *is* the live register, so writing it would be a no-op
+  /// (this also keeps a `push reg`/`pop reg` pair that folds away from gaining
+  /// a write).
   ///
   /// The return expression can read a register this write-back rewrites
   /// (`mov ax,cx; dec cx; ret` returns the pre-decrement CX). `Ref::Init(reg)`
@@ -1410,14 +1407,15 @@ impl IRBuilder<'_> {
   }
 
   /// The register values that may need write-back at a `ret`: the callee-saved
-  /// set plus the caller's `CX`/`DX`. Captured while lowering, before any
-  /// instructions after the `ret` are lowered into the same block (they never
-  /// execute, so they must not be the exit state). `DX` is skipped when it is
-  /// the high half of the return value, which the return expression already
-  /// writes.
+  /// set, the caller's `CX`/`DX`, and the segment registers. Captured while
+  /// lowering, before any instructions after the `ret` are lowered into the
+  /// same block (they never execute, so they must not be the exit state). `DX`
+  /// is skipped when it is the high half of the return value, which the return
+  /// expression already writes.
   fn exit_register_values(&mut self, dx_is_return: bool) -> Vec<(instr::Reg, Ref)> {
     let mut pending = vec![];
-    for reg in [instr::Reg::BX, instr::Reg::CX, instr::Reg::DX, instr::Reg::SI, instr::Reg::DI] {
+    for reg in [instr::Reg::BX, instr::Reg::CX, instr::Reg::DX, instr::Reg::SI, instr::Reg::DI,
+                instr::Reg::ES, instr::Reg::SS, instr::Reg::DS] {
       if dx_is_return && reg == instr::Reg::DX { continue; }
       pending.push((reg, self.ir.get_var(reg, self.cur)));
     }
