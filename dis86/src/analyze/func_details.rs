@@ -5,7 +5,7 @@ use crate::binary::Binary;
 use crate::asm::instr::{Instr, Opcode, Operand, OperandReg, Reg};
 use crate::asm::decode::Decoder;
 use crate::asm::intel_syntax::instr_str;
-use crate::config::CallMode;
+use crate::config::{CallMode, FuncRegion};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
@@ -90,10 +90,26 @@ impl fmt::Display for Block {
 
 impl FuncDetails {
   pub fn build(func_start: SegOff, end: Option<SegOff>, code_seg: &CodeSegment, binary: &Binary) -> Result<FuncDetails, String> {
+    Self::build_with_regions(func_start, end, &[], code_seg, binary)
+  }
+
+  pub fn build_with_regions(
+    func_start: SegOff,
+    end: Option<SegOff>,
+    regions: &[FuncRegion],
+    code_seg: &CodeSegment,
+    binary: &Binary,
+  ) -> Result<FuncDetails, String> {
     if func_start < code_seg.start() {
       return Err(format!("function start {} is before code segment start {}", func_start, code_seg.start()));
     }
     let code_seg_end = code_seg.end();
+    let region_for = |addr: SegOff| {
+      regions.iter().find(|region| region.contains(addr)).copied()
+    };
+    if !regions.is_empty() && region_for(func_start).is_none() {
+      return Err(format!("function start {} is outside every configured region", func_start));
+    }
 
     let mut workqueue = WorkQueue::new();
     workqueue.insert(func_start);
@@ -122,8 +138,22 @@ impl FuncDetails {
       // Iterate over instructions in the block (until we reach a terminator)
       let mut block_complete = false;
       while !block_complete {
-        // Decode next instruction
-        let instr = decode_one_instr(&binary, addr, code_seg_end)?;
+        // Decode next instruction, bounded by the containing region when the
+        // function has explicit regions. An address outside every region is
+        // a validation error, not something to decode into a gap.
+        let current_region = if regions.is_empty() {
+          None
+        } else {
+          match region_for(addr) {
+            Some(region) => Some(region),
+            None => return Err(format!("instruction address {} is outside every configured region", addr)),
+          }
+        };
+        let decode_end = match current_region {
+          Some(region) if region.end.seg == code_seg_end.seg && region.end < code_seg_end => region.end,
+          _ => code_seg_end,
+        };
+        let instr = decode_one_instr(&binary, addr, decode_end)?;
         let end_addr = instr.end_addr();
         if end_addr > largest_addr { largest_addr = end_addr; }
 
@@ -161,11 +191,20 @@ impl FuncDetails {
         // Figure out what to do next
         match details.next {
           Next::Fallthrough(target) => {
-            // Respect the annotated (exclusive) end bound: a fallthrough
-            // that reaches or passes it is the function exit (e.g. a stub
-            // ending in a call followed by data). Without this, discovery
-            // walks off into bytes that are not code.
-            if end.is_some_and(|end| target >= end) {
+            if let Some(region) = current_region {
+              // A region end is a hard boundary: ordinary fallthrough does
+              // not cross into the gap or into another region.
+              if region.contains(target) {
+                addr = target;
+                continue;
+              }
+              block.exits = vec![];
+              block_complete = true;
+            } else if end.is_some_and(|end| target >= end) {
+              // Respect the annotated (exclusive) end bound: a fallthrough
+              // that reaches or passes it is the function exit (e.g. a stub
+              // ending in a call followed by data). Without this, discovery
+              // walks off into bytes that are not code.
               block.exits = vec![];
               block_complete = true;
             } else if !code_seg.contains(target) {
@@ -208,15 +247,25 @@ impl FuncDetails {
                   tgt, code_seg.start(), code_seg_end);
                 continue;
               }
+              if !regions.is_empty() && region_for(*tgt).is_none() {
+                eprintln!("WARN: branch target {} is inside the analyzed segment but outside every configured function region; it is not followed", tgt);
+                continue;
+              }
               workqueue.insert(*tgt);
               followed.push(*tgt);
             }
             // The implicit fallthrough of a conditional branch is where
             // the branch lands when it is not taken, not a branch
-            // target: it is followed when it is inside the segment, and
+            // target: it is followed when it is inside the segment (and,
+            // with explicit regions, inside the current region), and
             // ends the block quietly when the code simply runs out.
             if let Some(fallthrough) = fallthrough {
-              if code_seg.contains(fallthrough) {
+              let follow = if regions.is_empty() {
+                code_seg.contains(fallthrough)
+              } else {
+                region_for(fallthrough).is_some()
+              };
+              if follow {
                 workqueue.insert(fallthrough);
                 followed.push(fallthrough);
               }
@@ -259,6 +308,7 @@ impl FuncDetails {
 mod tests {
   use super::*;
   use super::super::code_segment::{CodeSegment, Region};
+  use crate::config::FuncRegion;
   use crate::segoff::{Seg, Off};
 
   fn test_seg(size: u32) -> CodeSegment {
@@ -287,6 +337,97 @@ mod tests {
     assert_eq!(bounded.end_addr_inferred, segoff(3));
     assert_eq!(bounded.indirect_calls, 0);
     assert_eq!(bounded.direct_calls.len(), 1);
+  }
+
+  #[test]
+  fn analysis_follows_legacy_branch_past_annotated_end() {
+    // `jmp 0x06; ...; ret`: without explicit regions the original
+    // [start, end) behavior follows a same-segment branch outside `end`.
+    let mut code = vec![0xE9, 0x03, 0x00];
+    code.resize(6, 0x90);
+    code.push(0xC3);
+    let binary = Binary::from_raw(&code, None);
+    let details = FuncDetails::build(
+      segoff(0), Some(segoff(3)), &test_seg(7), &binary,
+    ).unwrap();
+    assert_eq!(details.return_kind, Some(ReturnKind::Near),
+      "legacy analysis must follow the branch even though it leaves [start, end)");
+    assert_eq!(details.end_addr_inferred, segoff(7));
+  }
+
+  #[test]
+  fn analysis_follows_branch_across_disjoint_regions() {
+    // `jmp 0x20` at 0, invalid bytes in the gap, `ret` at 0x20.
+    let mut code = vec![0xE9, 0x1D, 0x00];
+    code.resize(0x20, 0x63);
+    code.push(0xC3);
+    let binary = Binary::from_raw(&code, None);
+    let regions = [
+      FuncRegion { start: segoff(0x00), end: segoff(0x03) },
+      FuncRegion { start: segoff(0x20), end: segoff(0x21) },
+    ];
+    let details = FuncDetails::build_with_regions(
+      segoff(0), Some(segoff(0x21)), &regions, &test_seg(0x21), &binary,
+    ).unwrap();
+    assert_eq!(details.end_addr_inferred, segoff(0x21));
+    assert_eq!(details.return_kind, Some(ReturnKind::Near),
+      "the branch into the second region must be followed");
+  }
+
+  #[test]
+  fn analysis_does_not_follow_branch_into_gap() {
+    // `jmp 0x08` at 0, but only [0, 3) is a function region.
+    let binary = Binary::from_raw(&[0xE9, 0x05, 0x00, 0x63, 0x63, 0x63, 0x63, 0x63, 0xC3], None);
+    let regions = [FuncRegion { start: segoff(0), end: segoff(3) }];
+    let details = FuncDetails::build_with_regions(
+      segoff(0), Some(segoff(9)), &regions, &test_seg(9), &binary,
+    ).unwrap();
+    assert_eq!(details.return_kind, None,
+      "a target in the gap is not decoded or followed");
+    assert_eq!(details.end_addr_inferred, segoff(3));
+  }
+
+  #[test]
+  fn analysis_reaches_shared_epilogue_before_entry() {
+    // Entry at 0x10 jumps back to a shared `ret` at 0.
+    let mut code = vec![0xC3];
+    code.resize(0x10, 0x90);
+    code.extend_from_slice(&[0xEB, 0xEE]);
+    let binary = Binary::from_raw(&code, None);
+    let regions = [
+      FuncRegion { start: segoff(0x00), end: segoff(0x01) },
+      FuncRegion { start: segoff(0x10), end: segoff(0x12) },
+    ];
+    let details = FuncDetails::build_with_regions(
+      segoff(0x10), Some(segoff(0x12)), &regions, &test_seg(0x12), &binary,
+    ).unwrap();
+    assert_eq!(details.return_kind, Some(ReturnKind::Near),
+      "the shared epilogue before the entry must be reachable");
+  }
+
+  #[test]
+  fn analysis_stops_fallthrough_at_region_end() {
+    // A NOP at 0 falls through to offset 1, which is outside the region.
+    let binary = Binary::from_raw(&[0x90, 0x63], None);
+    let regions = [FuncRegion { start: segoff(0), end: segoff(1) }];
+    let details = FuncDetails::build_with_regions(
+      segoff(0), Some(segoff(2)), &regions, &test_seg(2), &binary,
+    ).unwrap();
+    assert_eq!(details.end_addr_inferred, segoff(1));
+    assert_eq!(details.return_kind, None);
+  }
+
+  #[test]
+  fn analysis_rejects_entry_outside_regions() {
+    let binary = Binary::from_raw(&[0xC3], None);
+    let regions = [FuncRegion { start: segoff(1), end: segoff(2) }];
+    let err = match FuncDetails::build_with_regions(
+      segoff(0), Some(segoff(2)), &regions, &test_seg(2), &binary,
+    ) {
+      Ok(_) => panic!("entry outside the region must be rejected"),
+      Err(err) => err,
+    };
+    assert!(err.contains("outside every configured region"), "unexpected error: {}", err);
   }
 
   #[test]
@@ -512,4 +653,15 @@ pub fn first_undecodable_addr(binary: &Binary, start: SegOff, end: SegOff) -> Op
       Err(_) => return Some(addr),
     }
   }
+}
+
+/// First undecodable address across a set of regions. Each region is probed
+/// independently; gaps between regions are intentionally ignored.
+pub fn first_undecodable_addr_in_regions(
+  binary: &Binary,
+  regions: &[FuncRegion],
+) -> Option<(FuncRegion, SegOff)> {
+  regions.iter()
+    .find_map(|region| first_undecodable_addr(binary, region.start, region.end)
+      .map(|gap| (*region, gap)))
 }

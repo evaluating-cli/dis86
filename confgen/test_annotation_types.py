@@ -250,5 +250,53 @@ class RetUnknownFlagTests(unittest.TestCase):
         self.assertNotIn('clobbers', line)
 
 
+class FunctionRegionTests(unittest.TestCase):
+    def _gen_functions_text(self, funcs):
+        buf = io.StringIO()
+        prev, dis86_gen.out = dis86_gen.out, buf
+        try:
+            dis86_gen.gen_functions(funcs)
+        finally:
+            dis86_gen.out = prev
+        return buf.getvalue()
+
+    def test_regions_emit_only_when_present(self):
+        plain = Function(reimpl=False, name='region_plain', ret=None, args=None,
+                         start_addr='0000:1200', end_addr='0000:1300')
+        plain_text = self._gen_functions_text([plain])
+        plain_line = next(l for l in plain_text.splitlines() if 'region_plain' in l)
+        self.assertNotIn('regions', plain_line)
+
+        split = Function(reimpl=False, name='region_split', ret=None, args=None,
+                         start_addr='0000:1200', end_addr='0000:1300',
+                         regions=[('0000:1200', '0000:1210'),
+                                  ('0000:1280', '0000:1290')])
+        split_text = self._gen_functions_text([split])
+        split_line = next(l for l in split_text.splitlines() if 'region_split' in l)
+        self.assertIn(
+            'regions { _0 { start 0000:1200 end 0000:1210 } '
+            '_1 { start 0000:1280 end 0000:1290 } }',
+            split_line)
+
+    def test_regions_combine_with_contract_fields(self):
+        func = Function(reimpl=True, name='region_contract', ret='u16', args=2,
+                        start_addr='0000:1200', end_addr='0000:1300',
+                        flags='NEAR', regargs=['CX'], regouts=['DS'],
+                        clobbers=['BX'], regions=[('0000:1200', '0000:1210'),
+                                                  ('0000:1280', '0000:1290')])
+        line = next(l for l in self._gen_functions_text([func]).splitlines() if 'region_contract' in l)
+        self.assertIn('regargs CX', line)
+        self.assertIn('regouts DS', line)
+        self.assertIn('clobbers BX', line)
+        self.assertIn('regions { _0 { start 0000:1200 end 0000:1210 } '
+                      '_1 { start 0000:1280 end 0000:1290 } }', line)
+
+    def test_invalid_region_is_rejected(self):
+        with self.assertRaises(Exception):
+            Function(reimpl=False, name='region_backwards', ret=None, args=None,
+                     start_addr='0000:1200', end_addr='0000:1300',
+                     regions=[('0000:1210', '0000:1200')])
+
+
 if __name__ == '__main__':
     unittest.main()

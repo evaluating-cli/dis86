@@ -162,7 +162,7 @@ def _verify_unique(name):
     FUNCTION_ALL_NAMES.add(name)
 
 class Function:
-    def __init__(self, reimpl, name, ret, args, start_addr, end_addr, flags=0, regargs=None, entry=None, dont_pop_args=False, regouts=None, clobbers=None):
+    def __init__(self, reimpl, name, ret, args, start_addr, end_addr, flags=0, regargs=None, entry=None, dont_pop_args=False, regouts=None, clobbers=None, regions=None):
         _verify_unique(name);
         self.name = name
         self.ret = ret
@@ -181,6 +181,17 @@ class Function:
         # still accepted for existing annotations.
         self.dont_pop_args = bool(dont_pop_args or flags == 'DONT_POP_ARGS')
         self.reimpl = reimpl
+        self.regions = []
+        for i, region in enumerate(regions or []):
+            if len(region) != 2:
+                raise Exception(f'Function {name} region {i} must be a (start, end) pair')
+            rstart = Addr(region[0])
+            rend = Addr(region[1])
+            if rstart.overlay != rend.overlay or rstart.seg != rend.seg:
+                raise Exception(f'Function {name} region {i} crosses segments: {rstart}..{rend}')
+            if rend.off <= rstart.off:
+                raise Exception(f'Function {name} region {i} has an invalid range: {rstart}..{rend}')
+            self.regions.append((rstart, rend))
 
 class Global:
     def __init__(self, name, typ, off, flags=''):

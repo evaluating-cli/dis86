@@ -467,15 +467,15 @@ impl<'a> IRBuilder<'a> {
     self.df_clear = self.df_clear_entry.get(&bref).copied().unwrap_or(self.df_entry_default);
   }
 
-  /// Whether a branch target lies inside the function's decoded
-  /// `[start, end)` range. Anything outside (including another segment)
-  /// decodes to zero instructions and is dropped from the output.
+  /// Whether a branch target lies inside any configured function region.
+  /// Anything outside (including another segment) decodes to zero
+  /// instructions and is dropped from the output.
   fn target_in_range(&self, tgt: SegOff) -> bool {
-    tgt.seg == self.spec.start.seg && tgt.off >= self.spec.start.off && tgt.off < self.spec.end.off
+    self.spec.contains_addr(tgt)
   }
 
   /// Whether an explicit branch target deserves the out-of-range WARN:
-  /// outside `[start, end)` and not the branch's own fallthrough (a
+  /// outside the function regions and not the branch's own fallthrough (a
   /// branch-to-next like `jz $+2` links both arms to the existing
   /// fallthrough block, so no edge is dropped). Pure so tests can pin
   /// the warn/skip matrix without capturing stderr.
@@ -499,6 +499,31 @@ impl<'a> IRBuilder<'a> {
     // Switch to the next block
     self.switch_blk(next_bref);
     assert!(self.ir.block_instr_count(self.cur) == 0);
+  }
+
+  /// Start a block at a hard region boundary. Unlike an ordinary fallthrough
+  /// block, no edge is added: the bytes between regions are not code, so
+  /// control cannot fall through into the next region.
+  fn start_next_region_blk(&mut self, next: SegOff) {
+    let next_bref = self.get_block(next);
+    self.switch_blk(next_bref);
+    assert!(self.ir.block_instr_count(self.cur) == 0);
+  }
+
+  /// A region that spans `spec.start` is split so the entry chunk decodes
+  /// first. The pre-start chunk is emitted later even though execution can
+  /// fall through from it into the entry, so restore that contiguous edge
+  /// unless the chunk already ends in a control transfer.
+  fn link_prestart_fallthrough(&mut self, block: BlockRef) {
+    let has_transfer = matches!(
+      self.ir.block_last_instr(block).map(|ins| ins.opcode),
+      Some(Opcode::Jmp | Opcode::Jne | Opcode::JmpTbl | Opcode::RetFar | Opcode::RetNear));
+    if has_transfer { return; }
+    let target = self.addrmap.get(&self.spec.start).copied().unwrap_or(BlockRef(0));
+    if target == block { return; }
+    self.ir.block_mut(target).preds.push(block);
+    self.ir.block_instr_append(block,
+      Self::make_instr(Type::Void, Attribute::NONE, Opcode::Jmp, vec![Ref::Block(target)]));
   }
 }
 
@@ -3110,6 +3135,14 @@ impl IRBuilder<'_> {
 
     // Step 1: Infer basic-block boundaries
     let mut block_start = HashSet::new();
+    let first_addr = self.instrs.first().map(|ins| ins.addr);
+    let mut region_boundaries = HashSet::new();
+    for region in &self.spec.regions {
+      if Some(region.start) != first_addr {
+        block_start.insert(region.start);
+        region_boundaries.insert(region.start);
+      }
+    }
     let mut last_was_jump = false;
     for ins in self.instrs {
       if last_was_jump {
@@ -3132,8 +3165,8 @@ impl IRBuilder<'_> {
           // instead of hiding the lost edge; the drop semantics are unchanged.
           for tgt in &explicit {
             if self.out_of_range_edge(*tgt, fallthrough) {
-              self.warn(format!("WARN: {}: branch at {} targets {} outside function range [{}, {}); the edge is dropped from the output",
-                self.spec.name, ins.addr, tgt, self.spec.start, self.spec.end));
+              self.warn(format!("WARN: {}: branch at {} targets {} outside function {}; the edge is dropped from the output",
+                self.spec.name, ins.addr, tgt, self.spec.range_description()));
             }
           }
         }
@@ -3146,8 +3179,8 @@ impl IRBuilder<'_> {
             // to that address: it needs a block like any other target.
             block_start.insert(target);
             if self.out_of_range_edge(target, None) {
-              self.warn(format!("WARN: {}: branch at {} targets {} outside function range [{}, {}); the edge is dropped from the output",
-                self.spec.name, ins.addr, target, self.spec.start, self.spec.end));
+              self.warn(format!("WARN: {}: branch at {} targets {} outside function {}; the edge is dropped from the output",
+                self.spec.name, ins.addr, target, self.spec.range_description()));
             }
           }
         }
@@ -3164,12 +3197,33 @@ impl IRBuilder<'_> {
     }
 
     // Step 3: iterate each instruction, building each block
+    let entry_region = self.spec.regions.iter()
+      .find(|region| region.contains(self.spec.start))
+      .copied();
+    let mut prestart_last = None;
     for ins in self.instrs {
       if DEBUG { println!("DEBUG: {}", instr_str(ins)); }
       if block_start.get(&ins.addr).is_some() {
-        self.start_next_blk(ins.addr);
+        if region_boundaries.contains(&ins.addr) {
+          self.start_next_region_blk(ins.addr);
+        } else {
+          self.start_next_blk(ins.addr);
+        }
+      }
+      if let Some(region) = entry_region {
+        if ins.addr.seg == region.start.seg
+          && ins.addr.off >= region.start.off
+          && ins.addr.off < self.spec.start.off
+        {
+          prestart_last = Some((ins.end_addr(), self.cur));
+        }
       }
       self.append_asm_instr(ins);
+    }
+    if let Some((last_end, block)) = prestart_last {
+      if last_end == self.spec.start {
+        self.link_prestart_fallthrough(block);
+      }
     }
     // The last block is never switched away from; record its carry/DF exit.
     self.exit_known.insert(self.cur, self.carry_known);
@@ -3725,6 +3779,98 @@ mod tests {
     assert!(!b.target_in_range(end), "range end is exclusive");
     assert!(!b.target_in_range(past));
     assert!(!b.target_in_range(other_seg), "far targets are outside the range");
+  }
+
+  #[test]
+  fn target_in_range_accepts_region_union_and_rejects_gaps() {
+    let types = Rc::new(TypeDatabase::new());
+    let cfg = Config { types: types.clone(), structs: vec![], code_segs: vec![], funcs: vec![], indirects: vec![], globals: vec![], text_section: vec![] };
+    let binary = binary::Binary::from_raw(&[0xC3], None);
+    let so = |off| SegOff { seg: Seg::Normal(0), off: Off(off) };
+    let spec = spec::Spec {
+      func: None,
+      name: "split".to_string(),
+      start: so(0x10),
+      end: so(0x28),
+      regions: vec![
+        config::FuncRegion { start: so(0x10), end: so(0x18) },
+        config::FuncRegion { start: so(0x20), end: so(0x28) },
+      ],
+    };
+    let b = test_builder(&cfg, &[], &spec, &binary);
+    assert!(b.target_in_range(so(0x10)), "first region start is inclusive");
+    assert!(b.target_in_range(so(0x17)), "first region end is exclusive");
+    assert!(!b.target_in_range(so(0x18)));
+    assert!(!b.target_in_range(so(0x1f)), "gap is outside every region");
+    assert!(b.target_in_range(so(0x20)), "second region start is inclusive");
+    assert!(b.target_in_range(so(0x27)));
+    assert!(!b.target_in_range(so(0x28)), "second region end is exclusive");
+    assert!(!b.target_in_range(SegOff { seg: Seg::Normal(1), off: Off(0x12) }));
+  }
+
+  #[test]
+  fn region_boundary_does_not_emit_a_fallthrough_jump() {
+    let types = Rc::new(TypeDatabase::new());
+    let cfg = Config { types: types.clone(), structs: vec![], code_segs: vec![], funcs: vec![], indirects: vec![], globals: vec![], text_section: vec![] };
+    let binary = binary::Binary::from_raw(&[0xC3], None);
+    let so = |off| SegOff { seg: Seg::Normal(0), off: Off(off) };
+    let spec = spec::Spec {
+      func: None,
+      name: "split".to_string(),
+      start: so(0x10),
+      end: so(0x21),
+      regions: vec![
+        config::FuncRegion { start: so(0x10), end: so(0x11) },
+        config::FuncRegion { start: so(0x20), end: so(0x21) },
+      ],
+    };
+    let instrs = [
+      located_instr(instr::Opcode::OP_MOV, 0x10, 1, vec![
+        instr::Operand::Reg(instr::OperandReg(instr::Reg::AX)),
+        instr::Operand::Reg(instr::OperandReg(instr::Reg::BX)),
+      ]),
+      located_instr(instr::Opcode::OP_MOV, 0x20, 1, vec![
+        instr::Operand::Reg(instr::OperandReg(instr::Reg::CX)),
+        instr::Operand::Reg(instr::OperandReg(instr::Reg::DX)),
+      ]),
+    ];
+    let mut b = test_builder(&cfg, &instrs, &spec, &binary);
+    b.build();
+    assert!(b.ir.block_exits(BlockRef(0)).is_empty(),
+      "region end must not link to the next region");
+    let second = *b.addrmap.get(&so(0x20)).expect("second region gets a block");
+    assert!(b.ir.block_instr_count(second) > 0, "second region decoded into its own block");
+    assert!(b.ir.block(second).preds.is_empty(), "no false fallthrough predecessor");
+  }
+
+  #[test]
+  fn prestart_chunk_falls_through_to_the_entry() {
+    let types = Rc::new(TypeDatabase::new());
+    let cfg = Config { types: types.clone(), structs: vec![], code_segs: vec![], funcs: vec![], indirects: vec![], globals: vec![], text_section: vec![] };
+    let binary = binary::Binary::from_raw(&[0x90; 6], None);
+    let so = |off| SegOff { seg: Seg::Normal(0), off: Off(off) };
+    let spec = spec::Spec {
+      func: None,
+      name: "split".to_string(),
+      start: so(3),
+      end: so(6),
+      regions: vec![config::FuncRegion { start: so(0), end: so(6) }],
+    };
+    // The entry is `jmp 0`; the pre-start chunk is `mov ax,1`, which must
+    // fall through to the entry at 0x0003.
+    let instrs = [
+      jmp_instr(instr::Opcode::OP_JMP, 3, 3, 0xFFFA),
+      located_instr(instr::Opcode::OP_MOV, 0, 3, vec![
+        instr::Operand::Reg(instr::OperandReg(instr::Reg::AX)),
+        instr::Operand::Imm(instr::OperandImm { sz: instr::Size::Size16, val: 1 }),
+      ]),
+    ];
+    let mut b = test_builder(&cfg, &instrs, &spec, &binary);
+    b.build();
+    let prestart = *b.addrmap.get(&so(0)).expect("pre-start block exists");
+    assert_eq!(b.ir.block_exits(prestart), vec![BlockRef(0)],
+      "the pre-start chunk must link to the entry block");
+    assert_eq!(b.ir.block(BlockRef(0)).name, "entry");
   }
 
   #[test]
@@ -4845,6 +4991,7 @@ mod tests {
       regouts: Some(vec![instr::Reg::SI]),
       clobbers: None,
       dont_pop_args: false,
+      regions: vec![],
     });
     let spec = spec::Spec::from_config_name(&cfg, "main").expect("main");
     let instrs = decode_all(&binary, &spec);
@@ -4896,6 +5043,7 @@ mod tests {
       regouts: Some(vec![]),
       clobbers: None,
       dont_pop_args: false,
+      regions: vec![],
     });
     let spec = spec::Spec::from_config_name(&cfg, "main").expect("main");
     let instrs = decode_all(&binary, &spec);
@@ -4939,6 +5087,7 @@ mod tests {
       regouts: callee_regouts,
       clobbers: callee_clobbers,
       dont_pop_args: false,
+      regions: vec![],
     });
     (types, cfg, binary, spec)
   }

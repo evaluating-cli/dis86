@@ -1,11 +1,11 @@
 use crate::binary::{Binary, Fmt};
-use crate::config::{CallMode, Config};
+use crate::config::{CallMode, Config, Func, FuncRegion};
 use crate::segoff::{Seg, SegOff};
 use crate::util::range_set::RangeSet;
 
 use super::workqueue::WorkQueue;
 use super::code_segment::{CodeSegments};
-use super::func_details::{FuncDetails, ReturnKind, first_undecodable_addr};
+use super::func_details::{FuncDetails, ReturnKind, first_undecodable_addr, first_undecodable_addr_in_regions};
 
 use std::collections::{BTreeMap, HashSet};
 
@@ -13,6 +13,21 @@ pub struct Analyze {
   cfg: Config,
   binary: Binary,
   pub code_segments: CodeSegments,
+}
+
+/// Regions for analyzing the function resolved at `start`. A normal-segment
+/// overlay stub resolves to the overlay function's entry, but the stub itself
+/// is not part of the overlay body: analyze it with the legacy range path.
+fn analysis_regions_for(func: &Func, start: SegOff) -> Vec<FuncRegion> {
+  if func.start == start { func.analysis_regions() } else { vec![] }
+}
+
+/// Resolve a workqueue address for analysis. Calls target `Func::entry`, but
+/// overlay workqueues start at the body address; fall back to `start` so the
+/// body keeps its name and regions instead of becoming an unknown function.
+fn analysis_func_lookup<'a>(cfg: &'a Config, addr: SegOff) -> Option<&'a Func> {
+  cfg.func_lookup(addr)
+    .or_else(|| cfg.funcs.iter().find(|func| func.start == addr))
 }
 
 impl Analyze {
@@ -40,11 +55,15 @@ impl Analyze {
     // Add all ranges implied by function config
     for f in &self.cfg.funcs {
       if f.start.seg != code_seg.primary.seg { continue };
-      let Some(end) = &f.end else {
+      let regions = f.effective_regions();
+      if regions.is_empty() {
         println!("Unknown end address for {}", f.name);
         continue;
-      };
-      r.insert(f.start.off.0 as u32, end.off.0 as u32);
+      }
+      for region in regions {
+        if region.start.seg != code_seg.primary.seg { continue };
+        r.insert(region.start.off.0 as u32, region.end.off.0 as u32);
+      }
     }
 
     // Add all ranges implied by the text section data
@@ -108,7 +127,14 @@ impl Analyze {
     let func = self.cfg.func_lookup_by_name(name).unwrap(); // FIXME
     let code_seg = self.code_segments.find_for_function(func).unwrap(); // FIXME
     assert!(func.start >= code_seg.start());
-    FuncDetails::build(func.start, func.end, code_seg, &self.binary).unwrap() // HAX FIXME
+    let regions = func.analysis_regions();
+    if regions.is_empty() {
+      FuncDetails::build(func.start, func.end, code_seg, &self.binary).unwrap()
+    } else {
+      FuncDetails::build_with_regions(
+        func.start, func.outer_end(), &regions, code_seg, &self.binary,
+      ).unwrap()
+    } // HAX FIXME
   }
 
   pub fn analyze_function_by_start(&self, start: SegOff) -> Result<FuncDetails, String> {
@@ -116,8 +142,19 @@ impl Analyze {
       return Err(format!("Failed to find code segement"));
     };
     assert!(start >= code_seg.start());
-    let end = self.cfg.func_lookup(start).and_then(|f| f.end);
-    FuncDetails::build(start, end, code_seg, &self.binary)
+    match analysis_func_lookup(&self.cfg, start) {
+      Some(func) => {
+        let regions = analysis_regions_for(func, start);
+        if regions.is_empty() {
+          FuncDetails::build(start, func.end, code_seg, &self.binary)
+        } else {
+          FuncDetails::build_with_regions(
+            start, func.outer_end(), &regions, code_seg, &self.binary,
+          )
+        }
+      }
+      None => FuncDetails::build(start, None, code_seg, &self.binary),
+    }
   }
 
   // Scan known functions to find new functions, then scan those, return a big list of all found functions
@@ -164,7 +201,7 @@ fn dump_functions(functions: &BTreeMap<SegOff, Result<FuncDetails, String>>, cfg
       current_seg = Some(seg);
     }
 
-    let name = match cfg.func_lookup(*addr) {
+    let name = match analysis_func_lookup(cfg, *addr) {
       Some(func) => func.name.clone(),
       None => "UNKNOWN".to_string(),
     };
@@ -254,6 +291,18 @@ fn ret_kind_flags(kind: Option<ReturnKind>, configured: Option<CallMode>) -> &'s
 /// (rendered by render_ignored_indirect/render_ignored_error below) emit
 /// no F(...) line at all, so grepping the output is not a complete
 /// inventory of unresolved call modes.
+fn suggestion_end(inferred: SegOff, configured: Option<SegOff>) -> SegOff {
+  configured.unwrap_or(inferred)
+}
+
+fn render_region_arg(regions: &[FuncRegion]) -> String {
+  let items = regions.iter()
+    .map(|region| format!("(\"{}\", \"{}\")", region.start, region.end))
+    .collect::<Vec<_>>()
+    .join(", ");
+  format!(", regions = [{}]", items)
+}
+
 fn render_suggestion(
   bare_name: &str,
   addr: SegOff,
@@ -266,6 +315,7 @@ fn render_suggestion(
   flags: &str,
   configured: Option<CallMode>,
   ignored: &[ReturnKind],
+  configured_regions: Option<&[FuncRegion]>,
 ) -> Vec<String> {
   let mut lines = vec![];
   if matches!(kind, None | Some(ReturnKind::Interrupt)) {
@@ -307,7 +357,11 @@ fn render_suggestion(
         bare_name, addr, kind, others.join(", ")));
     }
   }
-  lines.push(format!("    F( {:<30} {:<7} {:<12} {} {}{} ),", quoted_name, ret_str, args_str, start, end, flags));
+  let region_arg = configured_regions
+    .filter(|regions| !regions.is_empty())
+    .map(render_region_arg)
+    .unwrap_or_default();
+  lines.push(format!("    F( {:<30} {:<7} {:<12} {} {}{}{} ),", quoted_name, ret_str, args_str, start, end, flags, region_arg));
   lines
 }
 
@@ -349,10 +403,21 @@ fn generate_annotations(functions: &BTreeMap<SegOff, Result<FuncDetails, String>
     }
 
 
-    let (name, ret, args, configured_mode) = match cfg.func_lookup(*addr) {
-      Some(func) => (func.name.clone(), func.ret.clone(), func.args, Some(func.mode)),
-      None       => (function_names.compute_unique(&seg_name), None, None, None),
-    };
+    let (name, ret, args, configured_mode, suggestion_regions, configured_end) =
+      match analysis_func_lookup(cfg, *addr) {
+        Some(func) => {
+          let has_regions = func.start == *addr && !func.regions.is_empty();
+          (
+            func.name.clone(),
+            func.ret.clone(),
+            func.args,
+            Some(func.mode),
+            if has_regions { Some(func.regions.clone()) } else { None },
+            if has_regions { func.outer_end() } else { None },
+          )
+        }
+        None => (function_names.compute_unique(&seg_name), None, None, None, None, None),
+      };
 
     match result {
       Ok(details) => {
@@ -360,8 +425,23 @@ fn generate_annotations(functions: &BTreeMap<SegOff, Result<FuncDetails, String>
         // span bytes that are not code; decompilation decodes the range
         // linearly and aborts there. Flag it before the suggestion (and
         // before the IGNORED line, which also carries the range).
-        if let Some(gap) = first_undecodable_addr(binary, details.start_addr, details.end_addr_inferred) {
-          println!("{}", render_undecodable_gap(&name, *addr, details.start_addr, details.end_addr_inferred, gap));
+        // Configured function regions are probed individually; their gaps
+        // are intentional and must not produce a false diagnostic.
+        let configured_regions = analysis_func_lookup(cfg, *addr)
+          .map(|func| analysis_regions_for(func, *addr))
+          .filter(|regions| !regions.is_empty());
+        match configured_regions {
+          Some(regions) => {
+            if let Some((region, gap)) = first_undecodable_addr_in_regions(binary, &regions) {
+              println!("{}", render_undecodable_gap(
+                &name, *addr, region.start, region.end, gap));
+            }
+          }
+          None => {
+            if let Some(gap) = first_undecodable_addr(binary, details.start_addr, details.end_addr_inferred) {
+              println!("{}", render_undecodable_gap(&name, *addr, details.start_addr, details.end_addr_inferred, gap));
+            }
+          }
         }
         if details.indirect_calls > 0 {
           println!("{}", render_ignored_indirect(&name, *addr, details.start_addr, details.end_addr_inferred, details.indirect_calls));
@@ -372,7 +452,7 @@ fn generate_annotations(functions: &BTreeMap<SegOff, Result<FuncDetails, String>
           let bare_name = name.as_str();
           let name     = format!("\"{}\",", name);
           let start    = format!("\"{}\",", details.start_addr);
-          let end      = format!("\"{}\"", details.end_addr_inferred);
+          let end      = format!("\"{}\"", suggestion_end(details.end_addr_inferred, configured_end));
           let flags    = ret_kind_flags(details.return_kind, configured_mode);
 
           let ret_str  = match ret {
@@ -388,7 +468,7 @@ fn generate_annotations(functions: &BTreeMap<SegOff, Result<FuncDetails, String>
           for line in render_suggestion(
             bare_name, *addr, &name, &ret_str, &args_str, &start, &end,
             details.return_kind, flags, configured_mode,
-            &details.ignored_return_kinds,
+            &details.ignored_return_kinds, suggestion_regions.as_deref(),
           ) {
             println!("{}", line);
           }
@@ -443,7 +523,7 @@ mod tests {
     let lines = render_suggestion(
       "F_new", segoff(0x100),
       "\"F_new\",", "None,", "None,", "\"0000:0100\",", "\"0000:0110\"",
-      None, ", flags = \"RET_UNKNOWN\"", None, &[],
+      None, ", flags = \"RET_UNKNOWN\"", None, &[], None,
     );
     assert_eq!(lines.len(), 2);
     assert!(lines[0].starts_with("    # RET KIND UNKNOWN | F_new | 0000:0100 | no return instruction observed"),
@@ -457,7 +537,7 @@ mod tests {
     let lines = render_suggestion(
       "F_cfg", segoff(0x200),
       "\"F_cfg\",", "None,", "None,", "\"0000:0200\",", "\"0000:0210\"",
-      None, ", flags = \"RET_UNKNOWN_CONFIG_FAR\"", Some(CallMode::Far), &[],
+      None, ", flags = \"RET_UNKNOWN_CONFIG_FAR\"", Some(CallMode::Far), &[], None,
     );
     assert_eq!(lines.len(), 2);
     assert!(lines[0].contains("(keeping configured far)"), "unexpected diagnostic: {}", lines[0]);
@@ -469,10 +549,75 @@ mod tests {
     let lines = render_suggestion(
       "F_known", segoff(0x300),
       "\"F_known\",", "None,", "None,", "\"0000:0300\",", "\"0000:0310\"",
-      Some(ReturnKind::Near), ", flags = \"NEAR\"", Some(CallMode::Near), &[],
+      Some(ReturnKind::Near), ", flags = \"NEAR\"", Some(CallMode::Near), &[], None,
     );
     assert_eq!(lines.len(), 1);
     assert!(lines[0].contains("NEAR"), "unexpected entry: {}", lines[0]);
+  }
+
+  #[test]
+  fn overlay_stub_entry_uses_the_legacy_analysis_path() {
+    use crate::segoff::Off;
+    let body_start = SegOff { seg: Seg::Overlay(0), off: Off(0) };
+    let body_end = SegOff { seg: Seg::Overlay(0), off: Off(4) };
+    let stub = segoff(0x20);
+    let func = Func {
+      name: "ovl".to_string(),
+      start: body_start,
+      end: Some(body_end),
+      entry: Some(stub),
+      mode: CallMode::Far,
+      ret: None,
+      args: Some(0),
+      regargs: None,
+      regouts: None,
+      clobbers: None,
+      dont_pop_args: false,
+      regions: vec![FuncRegion { start: body_start, end: body_end }],
+    };
+    assert!(analysis_regions_for(&func, stub).is_empty(),
+      "the stub address must not inherit the overlay body regions");
+    assert_eq!(analysis_regions_for(&func, body_start),
+      vec![FuncRegion { start: body_start, end: body_end }]);
+
+    let cfg = Config {
+      types: std::rc::Rc::new(crate::types::TypeDatabase::new()),
+      structs: vec![],
+      code_segs: vec![],
+      funcs: vec![func],
+      indirects: vec![],
+      globals: vec![],
+      text_section: vec![],
+    };
+    assert_eq!(analysis_func_lookup(&cfg, stub).map(|f| f.name.as_str()), Some("ovl"));
+    let body = analysis_func_lookup(&cfg, body_start).expect("body start resolves");
+    assert_eq!(analysis_regions_for(body, body_start),
+      vec![FuncRegion { start: body_start, end: body_end }]);
+  }
+
+  #[test]
+  fn suggestion_end_keeps_the_configured_region_bound() {
+    assert_eq!(suggestion_end(segoff(0x10), None), segoff(0x10));
+    assert_eq!(suggestion_end(segoff(0x10), Some(segoff(0x20))), segoff(0x20),
+      "a trailing region past the inferred end must not make the suggestion invalid");
+  }
+
+  #[test]
+  fn suggestion_preserves_explicit_regions() {
+    let regions = [
+      FuncRegion { start: segoff(0x800), end: segoff(0x810) },
+      FuncRegion { start: segoff(0x880), end: segoff(0x890) },
+    ];
+    let lines = render_suggestion(
+      "F_regions", segoff(0x800),
+      "\"F_regions\",", "None,", "None,", "\"0000:0800\",", "\"0000:0890\"",
+      Some(ReturnKind::Near), ", flags = \"NEAR\"", Some(CallMode::Near), &[],
+      Some(&regions),
+    );
+    assert_eq!(lines.len(), 1);
+    assert!(lines[0].contains(
+      "regions = [(\"0000:0800\", \"0000:0810\"), (\"0000:0880\", \"0000:0890\")]"),
+      "unexpected entry: {}", lines[0]);
   }
 
   #[test]
@@ -484,7 +629,7 @@ mod tests {
     let lines = render_suggestion(
       "F_irq", segoff(0x400),
       "\"F_irq\",", "None,", "None,", "\"0000:0400\",", "\"0000:0401\"",
-      Some(ReturnKind::Interrupt), ", flags = \"RET_UNKNOWN_CONFIG_FAR\"", Some(CallMode::Far), &[],
+      Some(ReturnKind::Interrupt), ", flags = \"RET_UNKNOWN_CONFIG_FAR\"", Some(CallMode::Far), &[], None,
     );
     assert_eq!(lines.len(), 2);
     assert!(lines[0].contains("interrupt-return terminator"), "unexpected diagnostic: {}", lines[0]);
@@ -495,7 +640,7 @@ mod tests {
     let unconfigured = render_suggestion(
       "F_irq2", segoff(0x500),
       "\"F_irq2\",", "None,", "None,", "\"0000:0500\",", "\"0000:0501\"",
-      Some(ReturnKind::Interrupt), ", flags = \"RET_UNKNOWN\"", None, &[],
+      Some(ReturnKind::Interrupt), ", flags = \"RET_UNKNOWN\"", None, &[], None,
     );
     assert_eq!(unconfigured.len(), 2);
     assert!(!unconfigured[0].contains("keeping configured"), "unexpected diagnostic: {}", unconfigured[0]);
@@ -512,7 +657,7 @@ mod tests {
     let lines = render_suggestion(
       "F_mix", segoff(0x600),
       "\"F_mix\",", "None,", "None,", "\"0000:0600\",", "\"0000:0610\"",
-      Some(ReturnKind::Near), ", flags = \"NEAR\"", None, &ignored,
+      Some(ReturnKind::Near), ", flags = \"NEAR\"", None, &ignored, None,
     );
     assert_eq!(lines.len(), 2);
     assert!(lines[0].starts_with("    # MIXED RETURN KINDS | F_mix | 0000:0600 | classified near by the first exit in ascending block order; other exits: interrupt, far"),
@@ -529,7 +674,7 @@ mod tests {
     let lines = render_suggestion(
       "F_none", segoff(0x700),
       "\"F_none\",", "None,", "None,", "\"0000:0700\",", "\"0000:0710\"",
-      None, ", flags = \"RET_UNKNOWN\"", None, &[ReturnKind::Interrupt],
+      None, ", flags = \"RET_UNKNOWN\"", None, &[ReturnKind::Interrupt], None,
     );
     assert!(lines.iter().all(|l| !l.contains("MIXED RETURN KINDS")),
       "unexpected mixed diagnostic: {:?}", lines);

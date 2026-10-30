@@ -22,6 +22,7 @@ fn func(start: u16, end: u16) -> Func {
     regouts: None,
     clobbers: None,
     dont_pop_args: false,
+    regions: vec![],
   }
 }
 

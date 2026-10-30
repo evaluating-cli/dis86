@@ -1,7 +1,6 @@
 use pico_args;
 use crate::binary::{self, Binary};
 use crate::segoff::SegOff;
-use crate::asm::decode::Decoder;
 use crate::asm::intel_syntax;
 use crate::config::Config;
 use crate::decompile::ir;
@@ -559,35 +558,27 @@ fn infer_specs<'a>(cfg: &'a Config, binary: &Binary, args: &Args)
 
 fn infer_spec<'a>(binary: &Binary, func: &'a crate::config::Func)
   -> Result<Spec<'a>, FailedFunc> {
-  let Some(end) = func.end else {
+  if func.outer_end().is_none() {
     return Err(FailedFunc::new(func.name.clone(), func.start, func.start,
                                "missing end address".to_string()));
-  };
-  if !binary.contains_region(func.start, end) {
-    return Err(FailedFunc::new(func.name.clone(), func.start, end,
-                               "range outside the loaded image".to_string()));
+  }
+  for region in func.effective_regions() {
+    if !binary.contains_region(region.start, region.end) {
+      return Err(FailedFunc::new(func.name.clone(), region.start, region.end,
+                                 "region outside the loaded image".to_string()));
+    }
   }
   Ok(Spec::from_func(func))
 }
 
 fn decompile_spec(args: &Args, cfg: &Config, binary: &Binary, spec: Spec<'_>, all_code: &mut String, relocatable_segs: &[u16]) -> i32 {
-  let region = binary.region_iter(spec.start, spec.end);
-  let mut decoder = Decoder::new(region);
-  let mut instr_list = vec![];
-  let mut raw_list = vec![];
-  loop {
-    match decoder.try_next() {
-      Ok(Some((instr, raw))) => {
-        instr_list.push(instr);
-        raw_list.push(raw);
-      }
-      Ok(None) => break,
-      Err(e) => {
-        eprintln!("Error: Failed to decode instruction: {}", e);
-        return 1;
-      }
+  let (instr_list, raw_list) = match spec::decode_regions(binary, &spec) {
+    Ok(decoded) => decoded,
+    Err(e) => {
+      eprintln!("Error: Failed to decode instruction: {}", e);
+      return 1;
     }
-  }
+  };
   // FIXME: SIMPLIFY!!
   if let Some(path) = args.emit_dis.as_ref() {
     let mut buf = String::new();
@@ -694,6 +685,52 @@ fn decompile_spec(args: &Args, cfg: &Config, binary: &Binary, spec: Spec<'_>, al
 #[cfg(test)]
 mod tests {
   use super::parse_relocatable_segs;
+  use crate::spec::decode_regions;
+  use crate::binary::Binary;
+  use crate::config::FuncRegion;
+  use crate::segoff::{Off, Seg, SegOff};
+  use crate::spec::Spec;
+
+  fn so(off: u16) -> SegOff {
+    SegOff { seg: Seg::Normal(0), off: Off(off) }
+  }
+
+  #[test]
+  fn region_decode_skips_gap_bytes() {
+    let binary = Binary::from_raw(&[0x90, 0x90, 0x63, 0x63, 0x90], None);
+    let spec = Spec {
+      func: None,
+      name: "split".to_string(),
+      start: so(0),
+      end: so(5),
+      regions: vec![
+        FuncRegion { start: so(0), end: so(2) },
+        FuncRegion { start: so(4), end: so(5) },
+      ],
+    };
+    let (instrs, raws) = decode_regions(&binary, &spec).unwrap();
+    let addrs: Vec<u16> = instrs.iter().map(|instr| instr.addr.off.0).collect();
+    assert_eq!(addrs, vec![0, 1, 4]);
+    assert_eq!(raws.len(), 3);
+  }
+
+  #[test]
+  fn entry_region_decodes_before_shared_epilogue() {
+    let binary = Binary::from_raw(&[0x90, 0x90, 0x90], None);
+    let spec = Spec {
+      func: None,
+      name: "shared_tail".to_string(),
+      start: so(2),
+      end: so(3),
+      regions: vec![
+        FuncRegion { start: so(0), end: so(1) },
+        FuncRegion { start: so(2), end: so(3) },
+      ],
+    };
+    let (instrs, _) = decode_regions(&binary, &spec).unwrap();
+    let addrs: Vec<u16> = instrs.iter().map(|instr| instr.addr.off.0).collect();
+    assert_eq!(addrs, vec![2, 0]);
+  }
 
   #[test]
   fn relocatable_seg_list_parses_hex_with_optional_prefix() {

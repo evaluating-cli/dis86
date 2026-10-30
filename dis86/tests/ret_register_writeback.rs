@@ -22,6 +22,7 @@ fn func(name: &str, start: u16, end: u16, regargs: Option<Vec<Reg>>) -> Func {
     regouts: None,
     clobbers: None,
     dont_pop_args: false,
+    regions: vec![],
   }
 }
 

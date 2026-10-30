@@ -11,7 +11,7 @@ use crate::analyze::func_details::{first_undecodable_addr, FuncDetails, ReturnKi
 use crate::asm::branch::{self, BranchTarget, UnresolvedTransfer};
 use crate::asm::decode::Decoder;
 use crate::binary::Binary;
-use crate::config::{CallMode, Config, Func};
+use crate::config::{CallMode, Config, Func, FuncRegion};
 use crate::segoff::{Seg, SegOff};
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
@@ -253,12 +253,13 @@ fn validate_function(
   validate_local_indirects: bool,
   report: &mut Report,
 ) {
-  let Some(end) = func.end else {
+  let start = func.start;
+  let raw_max_end = func.regions.iter().map(|region| region.end).max();
+  let Some(end) = func.end.or(raw_max_end) else {
     report.error(Some(func.start), format!(
       "function '{}' has no end address; batch decompilation has no range", func.name));
     return;
   };
-  let start = func.start;
   if start.seg != end.seg {
     report.error(Some(start), format!(
       "function '{}' range crosses segments: {}..{}", func.name, start, end));
@@ -278,7 +279,13 @@ fn validate_function(
       "function '{}' is in segment {}, which is not declared in dis86.code_segments", func.name, start.seg));
   }
 
-  let code_seg = match code_segment_for_function(binary, start, end) {
+  // Size a synthetic code segment to cover every region even when an
+  // optional `end` is before the highest region end; the explicit region
+  // check below reports that mismatch against `end`.
+  let body_end = func.regions.iter()
+    .map(|region| region.end)
+    .fold(end, |acc, region_end| acc.max(region_end));
+  let code_seg = match code_segment_for_function(binary, start, body_end) {
     Ok(code_seg) => code_seg,
     Err(err) => {
       report.error(Some(func.start), format!(
@@ -287,7 +294,70 @@ fn validate_function(
     }
   };
 
-  if !binary.contains_region(start, end) {
+  let regions = func.effective_regions();
+  let analysis_regions = func.analysis_regions();
+  let mut region_errors = false;
+  if !func.regions.is_empty() {
+    let mut sorted = func.regions.clone();
+    sorted.sort();
+    let mut previous: Option<FuncRegion> = None;
+
+    for region in &sorted {
+      let mut bad = false;
+      if region.start.seg != start.seg || region.end.seg != start.seg {
+        report.error(Some(region.start), format!(
+          "function '{}' region [{}, {}) crosses or leaves function segment {}",
+          func.name, region.start, region.end, start.seg));
+        bad = true;
+      }
+      if region.end <= region.start {
+        report.error(Some(region.start), format!(
+          "function '{}' has an invalid region: [{}, {})", func.name, region.start, region.end));
+        bad = true;
+      }
+      if let Some(end) = func.end {
+        if region.end > end {
+          report.error(Some(region.start), format!(
+            "function '{}' region [{}, {}) extends past function end {}",
+            func.name, region.start, region.end, end));
+          bad = true;
+        }
+      }
+      if region.start.seg == region.end.seg && !binary.contains_region(region.start, region.end) {
+        let mut message = format!(
+          "function '{}' region [{}, {}) is outside the loaded image",
+          func.name, region.start, region.end);
+        if let Some(hint) = file_offset_hint(binary, region.end) {
+          message.push_str("; ");
+          message.push_str(&hint);
+        }
+        report.error(Some(region.start), message);
+        bad = true;
+      }
+      if !code_seg.contains(region.start) || region.end > code_seg.end() {
+        report.error(Some(region.start), format!(
+          "function '{}' region [{}, {}) is outside its code segment [{}, {})",
+          func.name, region.start, region.end, code_seg.start(), code_seg.end()));
+        bad = true;
+      }
+      if let Some(previous) = previous {
+        if previous.start.seg == region.start.seg && region.start < previous.end {
+          report.error(Some(region.start), format!(
+            "function '{}' regions [{}, {}) and [{}, {}) overlap",
+            func.name, previous.start, previous.end, region.start, region.end));
+          bad = true;
+        }
+      }
+      previous = Some(*region);
+      region_errors |= bad;
+    }
+
+    if !func.regions.iter().any(|region| region.contains(start)) {
+      report.error(Some(start), format!(
+        "function '{}' start {} is outside every configured region", func.name, start));
+      region_errors = true;
+    }
+  } else if !binary.contains_region(start, end) {
     let mut message = format!(
       "function '{}' range {}..{} is outside the loaded image", func.name, start, end);
     if let Some(hint) = file_offset_hint(binary, end) {
@@ -297,21 +367,25 @@ fn validate_function(
     report.error(Some(start), message);
     return;
   }
+
   if !code_seg.contains(start) {
     report.error(Some(start), format!(
       "function '{}' starts outside its code segment [{}, {})",
       func.name, code_seg.start(), code_seg.end()));
     return;
   }
-  if end > code_seg.end() {
+  if func.regions.is_empty() && end > code_seg.end() {
     report.error(Some(start), format!(
       "function '{}' end {} is past the code segment end {} (segment range [{}, {}))",
       func.name, end, code_seg.end(), code_seg.start(), code_seg.end()));
     return;
   }
+  if region_errors {
+    return;
+  }
 
   if let Some(entry) = func.entry {
-    let in_primary = entry.seg == start.seg && entry >= start && entry < end;
+    let in_primary = regions.iter().any(|region| region.contains(entry));
     // An overlay entry is a normal-segment stub that launchers call into.
     let in_stub = code_seg.stub.as_ref().is_some_and(|stub| {
       entry.seg == stub.seg
@@ -325,18 +399,19 @@ fn validate_function(
   }
 
   for text in &cfg.text_section {
-    if text.start.seg == start.seg && ranges_overlap(start, end, text.start, text.end) {
-      report.error(Some(text.start), format!(
-        "text section '{}' [{}..{}) overlaps function '{}' range [{}, {})",
-        text.name, text.start, text.end, func.name, start, end));
+    for region in &regions {
+      if text.start.seg == region.start.seg && ranges_overlap(region.start, region.end, text.start, text.end) {
+        report.error(Some(text.start), format!(
+          "text section '{}' [{}..{}) overlaps function '{}' region [{}, {})",
+          text.name, text.start, text.end, func.name, region.start, region.end));
+      }
     }
   }
 
   if validate_local_indirects {
     for indirect in &cfg.indirects {
       if indirect.addr.seg == start.seg
-        && indirect.addr >= start
-        && indirect.addr < end
+        && regions.iter().any(|region| region.contains(indirect.addr))
         && !binary.contains_addr(indirect.addr)
       {
         report.error(Some(indirect.addr), format!(
@@ -345,16 +420,18 @@ fn validate_function(
     }
   }
 
-  if let Some(gap) = first_undecodable_addr(binary, start, end) {
-    report.error(Some(gap), format!(
-      "function '{}' linear decode of [{}, {}) fails at {}; the range spans non-code bytes (split the range or declare the data in text_section)",
-      func.name, start, end, gap));
-    return;
+  for region in &regions {
+    if let Some(gap) = first_undecodable_addr(binary, region.start, region.end) {
+      report.error(Some(gap), format!(
+        "function '{}' linear decode of region [{}, {}) fails at {}; the region spans non-code bytes (split the region or declare the data in text_section)",
+        func.name, region.start, region.end, gap));
+      return;
+    }
   }
 
-  validate_branch_targets(func, start, end, binary, report);
+  validate_branch_targets(func, &regions, binary, report);
 
-  let details = match FuncDetails::build(start, Some(end), &code_seg, binary) {
+  let details = match FuncDetails::build_with_regions(start, Some(end), &analysis_regions, &code_seg, binary) {
     Ok(details) => details,
     Err(err) => {
       // The decompiler emits a non-fatal UNIMPL marker for opcodes the
@@ -450,39 +527,40 @@ fn validate_direct_calls(
 
 fn validate_branch_targets(
   func: &Func,
-  start: SegOff,
-  end: SegOff,
+  regions: &[FuncRegion],
   binary: &Binary,
   report: &mut Report,
 ) {
   let in_range = |target: SegOff| {
-    target.seg == start.seg && target >= start && target < end
+    regions.iter().any(|region| region.contains(target))
   };
-  let mut decoder = Decoder::new(binary.region_iter(start, end));
-  loop {
-    let instr = match decoder.try_next() {
-      Ok(Some((instr, _raw))) => instr,
-      Ok(None) => break,
-      Err(_) => break,
-    };
-    let Some(target) = branch::branch_target(&instr) else { continue };
-    match target {
-      BranchTarget::Relative { target, .. } => {
-        if !in_range(target) {
-          report.warning(Some(instr.addr), format!(
-            "function '{}' branch at {} targets {}, outside its configured range",
-            func.name, instr.addr, target));
+  for region in regions {
+    let mut decoder = Decoder::new(binary.region_iter(region.start, region.end));
+    loop {
+      let instr = match decoder.try_next() {
+        Ok(Some((instr, _raw))) => instr,
+        Ok(None) => break,
+        Err(_) => break,
+      };
+      let Some(target) = branch::branch_target(&instr) else { continue };
+      match target {
+        BranchTarget::Relative { target, .. } => {
+          if !in_range(target) {
+            report.warning(Some(instr.addr), format!(
+              "function '{}' branch at {} targets {}, outside its configured range",
+              func.name, instr.addr, target));
+          }
         }
-      }
-      BranchTarget::Unresolved(UnresolvedTransfer::FarDirect { seg, off }) => {
-        let target = SegOff::new(seg, off);
-        if !in_range(target) {
-          report.warning(Some(instr.addr), format!(
-            "function '{}' far branch at {} targets {}, outside its configured range",
-            func.name, instr.addr, target));
+        BranchTarget::Unresolved(UnresolvedTransfer::FarDirect { seg, off }) => {
+          let target = SegOff::new(seg, off);
+          if !in_range(target) {
+            report.warning(Some(instr.addr), format!(
+              "function '{}' far branch at {} targets {}, outside its configured range",
+              func.name, instr.addr, target));
+          }
         }
+        BranchTarget::Unresolved(_) => {}
       }
-      BranchTarget::Unresolved(_) => {}
     }
   }
 }
@@ -541,7 +619,7 @@ fn mode_str(mode: CallMode) -> &'static str {
 mod tests {
   use super::*;
   use crate::binfmt::mz;
-  use crate::config::{CodeSeg, Indirect, TextSectionRegion};
+  use crate::config::{CodeSeg, FuncRegion, Indirect, TextSectionRegion};
   use crate::segoff::{Off, Seg};
   use crate::types::{Type, TypeDatabase};
   use std::rc::Rc;
@@ -563,6 +641,7 @@ mod tests {
       regouts: None,
       clobbers: None,
       dont_pop_args: false,
+      regions: vec![],
     }
   }
 
@@ -643,6 +722,133 @@ mod tests {
     let report = validate_config(&cfg, &binary, &ValidationScope::All);
     assert_eq!(report.errors(), 0);
     assert_eq!(report.warnings(), 0);
+  }
+
+  fn region(start: u16, end: u16) -> FuncRegion {
+    FuncRegion { start: segoff(start), end: segoff(end) }
+  }
+
+  #[test]
+  fn valid_disjoint_regions_pass_without_linear_gap_decode() {
+    let binary = Binary::from_raw(&[0x90, 0x90, 0x63, 0x63, 0x90], None);
+    let mut f = func("f", 0, 5, CallMode::Near);
+    f.regions = vec![region(0, 2), region(4, 5)];
+    let cfg = config(vec![f], vec![], vec![]);
+    let report = validate_config(&cfg, &binary, &ValidationScope::All);
+    assert_eq!(report.errors(), 0, "{:?}", report.diagnostics);
+  }
+
+  #[test]
+  fn region_before_entry_can_share_an_epilogue() {
+    let mut code = vec![0xC3];
+    code.resize(0x10, 0x90);
+    code.extend_from_slice(&[0xEB, 0xEE]);
+    let binary = Binary::from_raw(&code, None);
+    let mut f = func("f", 0x10, 0x12, CallMode::Near);
+    f.regions = vec![region(0, 1), region(0x10, 0x12)];
+    let cfg = config(vec![f], vec![], vec![]);
+    let report = validate_config(&cfg, &binary, &ValidationScope::All);
+    assert_eq!(report.errors(), 0, "{:?}", report.diagnostics);
+  }
+
+  #[test]
+  fn inverted_region_is_an_error() {
+    let binary = Binary::from_raw(&[0x90, 0x90, 0x90], None);
+    let mut f = func("f", 0, 3, CallMode::Near);
+    f.regions = vec![region(2, 1)];
+    let cfg = config(vec![f], vec![], vec![]);
+    let report = validate_config(&cfg, &binary, &ValidationScope::All);
+    assert!(report.diagnostics.iter().any(|d| d.message.contains("invalid region")),
+      "{:?}", report.diagnostics);
+  }
+
+  #[test]
+  fn cross_segment_region_is_an_error() {
+    let binary = Binary::from_raw(&[0x90, 0x90, 0x90], None);
+    let mut f = func("f", 0, 3, CallMode::Near);
+    f.regions = vec![FuncRegion {
+      start: segoff(0),
+      end: SegOff { seg: Seg::Normal(1), off: Off(1) },
+    }];
+    let cfg = config(vec![f], vec![], vec![]);
+    let report = validate_config(&cfg, &binary, &ValidationScope::All);
+    assert!(report.diagnostics.iter().any(|d| d.message.contains("crosses or leaves function segment")),
+      "{:?}", report.diagnostics);
+  }
+
+  #[test]
+  fn overlapping_regions_are_an_error() {
+    let binary = Binary::from_raw(&[0x90, 0x90, 0x90, 0x90], None);
+    let mut f = func("f", 0, 4, CallMode::Near);
+    f.regions = vec![region(0, 3), region(2, 4)];
+    let cfg = config(vec![f], vec![], vec![]);
+    let report = validate_config(&cfg, &binary, &ValidationScope::All);
+    assert!(report.diagnostics.iter().any(|d| d.message.contains("overlap")),
+      "{:?}", report.diagnostics);
+  }
+
+  #[test]
+  fn region_past_function_end_is_an_error() {
+    let binary = Binary::from_raw(&[0x90, 0x90, 0x90, 0x90], None);
+    let mut f = func("f", 0, 2, CallMode::Near);
+    f.regions = vec![region(0, 3)];
+    let cfg = config(vec![f], vec![], vec![]);
+    let report = validate_config(&cfg, &binary, &ValidationScope::All);
+    assert!(report.diagnostics.iter().any(|d| d.message.contains("past function end")),
+      "{:?}", report.diagnostics);
+  }
+
+  #[test]
+  fn region_outside_image_is_an_error() {
+    let binary = Binary::from_raw(&[0x90, 0x90], None);
+    let mut f = func("f", 0, 4, CallMode::Near);
+    f.regions = vec![region(0, 4)];
+    let cfg = config(vec![f], vec![], vec![]);
+    let report = validate_config(&cfg, &binary, &ValidationScope::All);
+    assert!(report.diagnostics.iter().any(|d| d.message.contains("region")
+      && d.message.contains("outside the loaded image")),
+      "{:?}", report.diagnostics);
+  }
+
+  #[test]
+  fn start_outside_regions_is_an_error() {
+    let binary = Binary::from_raw(&[0x90, 0x90, 0x90], None);
+    let mut f = func("f", 0, 3, CallMode::Near);
+    f.regions = vec![region(1, 3)];
+    let cfg = config(vec![f], vec![], vec![]);
+    let report = validate_config(&cfg, &binary, &ValidationScope::All);
+    assert!(report.diagnostics.iter().any(|d| d.message.contains("start")
+      && d.message.contains("outside every configured region")),
+      "{:?}", report.diagnostics);
+  }
+
+  #[test]
+  fn entry_outside_regions_is_an_error() {
+    let binary = Binary::from_raw(&[0x90, 0x90, 0x90], None);
+    let mut f = func("f", 0, 3, CallMode::Near);
+    f.entry = Some(segoff(2));
+    f.regions = vec![region(0, 2)];
+    let cfg = config(vec![f], vec![], vec![]);
+    let report = validate_config(&cfg, &binary, &ValidationScope::All);
+    assert!(report.diagnostics.iter().any(|d| d.message.contains("entry")
+      && d.message.contains("outside its configured range")),
+      "{:?}", report.diagnostics);
+  }
+
+  #[test]
+  fn branch_into_region_gap_warns_without_decoding_the_gap() {
+    let mut code = vec![0xE9, 0x1D, 0x00];
+    code.resize(0x20, 0x63);
+    code.push(0xC3);
+    let binary = Binary::from_raw(&code, None);
+    let mut f = func("f", 0, 0x21, CallMode::Near);
+    f.regions = vec![region(0, 3)];
+    let cfg = config(vec![f], vec![], vec![]);
+    let report = validate_config(&cfg, &binary, &ValidationScope::All);
+    assert_eq!(report.errors(), 0, "{:?}", report.diagnostics);
+    assert!(report.diagnostics.iter().any(|d| d.message.contains("branch")
+      && d.message.contains("outside its configured range")),
+      "{:?}", report.diagnostics);
   }
 
   #[test]
@@ -753,6 +959,25 @@ mod tests {
       let report = validate_config(&cfg, &binary, &scope);
       assert_eq!(report.errors(), 0, "overlay function must pass: {:?}", report.diagnostics);
     }
+  }
+
+  #[test]
+  fn legacy_overlay_branch_outside_end_still_validates() {
+    // `jmp 0x03; nop; retf`: the branch leaves the annotated [0, 2) end but
+    // stays in the overlay segment, so the legacy analysis path must follow
+    // it and observe the far return. The out-of-range warning is expected;
+    // "no observed return" would mean the analysis used hard regions.
+    let mut data = synthetic_fbov_exe();
+    data[112..116].copy_from_slice(&[0xEB, 0x01, 0x90, 0xCB]);
+    let exe = mz::Exe::decode(&data).expect("valid synthetic MZ/FBOV fixture");
+    let binary = Binary::from_exe(&exe, None);
+    let mut f = overlay_func();
+    f.end = Some(SegOff { seg: Seg::Overlay(0), off: Off(2) });
+    let cfg = config(vec![f], vec![], vec![]);
+    let report = validate_config(&cfg, &binary, &ValidationScope::All);
+    assert_eq!(report.errors(), 0, "{:?}", report.diagnostics);
+    assert!(!report.diagnostics.iter().any(|d| d.message.contains("no observed return")),
+      "{:?}", report.diagnostics);
   }
 
   #[test]

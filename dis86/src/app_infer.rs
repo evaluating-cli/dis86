@@ -1,10 +1,9 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::asm::decode::Decoder;
 use crate::asm::instr::{self, Instr as RawInstr, Operand, Reg};
 use crate::asm::instr::Opcode::*;
 use crate::binary::Binary;
-use crate::config::Config;
+use crate::config::{Config, FuncRegion};
 use crate::decompile::ir::{Opcode as IrOpcode, Ref, IR};
 use crate::decompile::{abi, ir_build, opt, sym};
 use crate::segoff::{Off, Seg, SegOff};
@@ -25,6 +24,7 @@ struct SpecSeed {
   func_name: Option<String>,
   start: SegOff,
   end: SegOff,
+  regions: Vec<FuncRegion>,
 }
 
 /// A selected function that could not be analyzed. Structural range failures
@@ -52,6 +52,7 @@ pub fn run(cfg: &Config, binary: &Binary, specs: Vec<Spec<'_>>,
     func_name: spec.func.map(|f| f.name.clone()),
     start: spec.start,
     end: spec.end,
+    regions: spec.regions,
   }).collect();
 
   // Regargs propagate caller-ward: a caller pins a callee's declared register
@@ -67,12 +68,14 @@ pub fn run(cfg: &Config, binary: &Binary, specs: Vec<Spec<'_>>,
         name: seed.name.clone(),
         start: seed.start,
         end: seed.end,
+        regions: seed.regions.clone(),
       }),
       None => Spec {
         func: None,
         name: seed.name.clone(),
         start: seed.start,
         end: seed.end,
+        regions: seed.regions.clone(),
       },
     }).collect();
     (built, failed) = build_all(&working, binary, specs);
@@ -160,7 +163,7 @@ fn infer_args(cfg: &Config, built: &[BuiltFunc]) -> std::collections::HashMap<St
       if !matches!(ins.opcode, OP_CALL | OP_CALLF) { continue; }
       let Some(target) = direct_call_target(ins) else { continue; };
       let Some(callee) = cfg.func_lookup(target) else { continue; };
-      let Some(bytes) = cleanup_bytes(&caller.raw, i + 1) else { continue; };
+      let Some(bytes) = cleanup_bytes(&caller.raw, i) else { continue; };
       if bytes % 2 != 0 { continue; }
       // A post-call `add sp, imm` needs pushed argument slots to corroborate
       // it. Without them the adjustment is more likely frame teardown, which
@@ -254,7 +257,9 @@ fn reachable_raw(raw: &[RawInstr]) -> Vec<bool> {
         }
       }
     }
-    if fallthrough && i + 1 < raw.len() { stack.push(i + 1); }
+    if fallthrough {
+      if let Some(&j) = index.get(&ins.end_addr()) { stack.push(j); }
+    }
   }
   reachable
 }
@@ -273,8 +278,13 @@ fn follows_target(opcode: instr::Opcode) -> bool {
 /// idiom is measured, and only within a short window that contains no other
 /// stack write or control transfer. Cleanup done by `pop reg`, behind a
 /// branch, or through a frame teardown yields no evidence rather than a guess.
-fn cleanup_bytes(raw: &[RawInstr], start: usize) -> Option<u16> {
-  for ins in raw.iter().skip(start).take(CLEANUP_LOOKAHEAD) {
+fn cleanup_bytes(raw: &[RawInstr], call: usize) -> Option<u16> {
+  let mut expected = raw.get(call)?.end_addr();
+  for ins in raw.iter().skip(call + 1).take(CLEANUP_LOOKAHEAD) {
+    // Regions are decoded separately, so the next vector element may belong
+    // to another region or the shared-epilogue chunk. Only a contiguous
+    // post-call instruction belongs to this call's cleanup window.
+    if ins.addr != expected { return None; }
     if ins.opcode == OP_ADD && first_is_sp(ins) {
       return match ins.operands.get(1) {
         Some(Operand::Imm(imm)) => Some(imm.val),
@@ -282,6 +292,7 @@ fn cleanup_bytes(raw: &[RawInstr], start: usize) -> Option<u16> {
       };
     }
     if writes_sp(ins) || is_control_transfer(ins.opcode) { return None; }
+    expected = ins.end_addr();
   }
   None
 }
@@ -296,11 +307,15 @@ fn first_is_sp(ins: &RawInstr) -> bool {
 /// post-call `add sp, imm`; mirrors the IR builder's call-argument heuristic.
 fn pushed_bytes_before(raw: &[RawInstr], call: usize) -> u16 {
   let mut bytes = 0u16;
+  let Some(mut expected) = raw.get(call).map(|ins| ins.addr) else { return 0; };
   let mut j = call;
   while j > 0 {
     j -= 1;
-    if raw[j].opcode != OP_PUSH { break; }
+    // Do not walk backward across a region boundary: the previous vector
+    // element may be the end of another region, not this call's setup.
+    if raw[j].end_addr() != expected || raw[j].opcode != OP_PUSH { break; }
     bytes += 2;
+    expected = raw[j].addr;
   }
   bytes
 }
@@ -368,20 +383,13 @@ fn build(cfg: &Config, binary: &Binary, spec: &Spec<'_>) -> Result<(IR, Vec<RawI
 /// pipeline instead of copying it.
 pub fn build_ir_for_analysis(cfg: &Config, binary: &Binary, spec: &Spec<'_>, pin_all: bool)
   -> Result<(IR, Vec<RawInstr>), String> {
-  let start = spec.start;
-  let end = spec.end;
-  if !binary.contains_region(start, end) {
-    return Err(format!("invalid range {}..{} (outside the loaded image)", start, end));
-  }
-  let mut instrs = vec![];
-  let mut decoder = Decoder::new(binary.region_iter(start, end));
-  loop {
-    match decoder.try_next() {
-      Ok(Some((instr, _raw))) => instrs.push(instr),
-      Ok(None) => break,
-      Err(err) => return Err(format!("decode failed at {}: {}", start, err)),
+  for region in &spec.regions {
+    if !binary.contains_region(region.start, region.end) {
+      return Err(format!(
+        "invalid region {}..{} (outside the loaded image)", region.start, region.end));
     }
   }
+  let (instrs, _raw) = crate::spec::decode_regions(binary, spec)?;
   build_ir_from_instrs(cfg, binary, spec, instrs, pin_all)
 }
 
@@ -433,6 +441,7 @@ fn direct_call_target(ins: &RawInstr) -> Option<SegOff> {
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::asm::decode::Decoder;
 
   fn decode(code: &[u8]) -> Vec<RawInstr> {
     let binary = crate::binary::Binary::from_raw(code, None);
@@ -467,31 +476,31 @@ mod tests {
   #[test]
   fn caller_stack_cleanup_is_measured() {
     let raw = decode(&[0xE8, 0x00, 0x00, 0x83, 0xC4, 0x04]);
-    assert_eq!(cleanup_bytes(&raw, 1), Some(4));
+    assert_eq!(cleanup_bytes(&raw, 0), Some(4));
   }
 
   #[test]
   fn cleanup_scan_stops_at_stack_writes() {
     // call; mov sp,bp; add sp,4
     let raw = decode(&[0xE8, 0x00, 0x00, 0x89, 0xEC, 0x83, 0xC4, 0x04]);
-    assert_eq!(cleanup_bytes(&raw, 1), None);
+    assert_eq!(cleanup_bytes(&raw, 0), None);
     // call; leave; add sp,4
     let raw = decode(&[0xE8, 0x00, 0x00, 0xC9, 0x83, 0xC4, 0x04]);
-    assert_eq!(cleanup_bytes(&raw, 1), None);
+    assert_eq!(cleanup_bytes(&raw, 0), None);
     // call; add sp,ax; add sp,4
     let raw = decode(&[0xE8, 0x00, 0x00, 0x01, 0xC4, 0x83, 0xC4, 0x04]);
-    assert_eq!(cleanup_bytes(&raw, 1), None);
+    assert_eq!(cleanup_bytes(&raw, 0), None);
     // call; pusha; add sp,4
     let raw = decode(&[0xE8, 0x00, 0x00, 0x60, 0x83, 0xC4, 0x04]);
-    assert_eq!(cleanup_bytes(&raw, 1), None);
+    assert_eq!(cleanup_bytes(&raw, 0), None);
   }
 
   #[test]
   fn cleanup_scan_is_bounded() {
     let raw = decode(&[0xE8, 0x00, 0x00, 0x90, 0x90, 0x90, 0x90, 0x83, 0xC4, 0x04]);
-    assert_eq!(cleanup_bytes(&raw, 1), None);
+    assert_eq!(cleanup_bytes(&raw, 0), None);
     let raw = decode(&[0xE8, 0x00, 0x00, 0x90, 0x90, 0x90, 0x83, 0xC4, 0x04]);
-    assert_eq!(cleanup_bytes(&raw, 1), Some(4));
+    assert_eq!(cleanup_bytes(&raw, 0), Some(4));
   }
 
   #[test]
@@ -500,6 +509,30 @@ mod tests {
     assert_eq!(pushed_bytes_before(&raw, 2), 4);
     let raw = decode(&[0x50, 0x90, 0xE8, 0x00, 0x00]);
     assert_eq!(pushed_bytes_before(&raw, 2), 0);
+  }
+
+  #[test]
+  fn reachability_does_not_fall_through_a_region_gap() {
+    let mut raw = decode(&[0xE8, 0x00, 0x00, 0xC2, 0x04, 0x00]);
+    raw[1].addr = SegOff { seg: Seg::Normal(0), off: Off(8) };
+    assert_eq!(ret_imm_args(&raw), None,
+      "the ret in a later region must not become the call's fallthrough");
+  }
+
+  #[test]
+  fn cleanup_scan_does_not_cross_a_region_gap() {
+    let mut raw = decode(&[0xE8, 0x00, 0x00, 0x83, 0xC4, 0x04]);
+    raw[1].addr = SegOff { seg: Seg::Normal(0), off: Off(8) };
+    assert_eq!(cleanup_bytes(&raw, 0), None,
+      "an add sp in a later region is not this call's cleanup");
+  }
+
+  #[test]
+  fn push_scan_does_not_cross_a_region_gap() {
+    let mut raw = decode(&[0x50, 0x53, 0xE8, 0x00, 0x00]);
+    raw[0].addr = SegOff { seg: Seg::Normal(0), off: Off(0x100) };
+    assert_eq!(pushed_bytes_before(&raw, 2), 2,
+      "only the contiguous push below the call may count");
   }
 
   #[test]
