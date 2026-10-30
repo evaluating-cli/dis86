@@ -1,13 +1,16 @@
 use crate::binary::{Binary, Fmt};
 use crate::config::{CallMode, Config, Func, FuncRegion};
-use crate::segoff::{Seg, SegOff};
+use crate::segoff::{Off, SegOff};
 use crate::util::range_set::RangeSet;
 
 use super::workqueue::WorkQueue;
 use super::code_segment::{CodeSegments};
-use super::func_details::{FuncDetails, ReturnKind, first_undecodable_addr, first_undecodable_addr_in_regions};
+use super::func_details::{FuncDetails, ReturnKind, first_undecodable_addr_in_regions};
 
-use std::collections::{BTreeMap, HashSet};
+use crate::asm::decode::Decoder;
+use crate::spec::direct_target;
+
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 
 pub struct Analyze {
   cfg: Config,
@@ -30,6 +33,36 @@ fn analysis_func_lookup<'a>(cfg: &'a Config, addr: SegOff) -> Option<&'a Func> {
     .or_else(|| cfg.funcs.iter().find(|func| func.start == addr))
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Coverage {
+  pub code: u32,
+  pub data: u32,
+  pub unknown: u32,
+  pub total: u32,
+}
+
+impl Coverage {
+  fn annotated(&self) -> u32 {
+    self.code + self.data
+  }
+
+  fn percent(&self, bytes: u32) -> f64 {
+    if self.total == 0 { 100.0 } else { 100.0 * bytes as f64 / self.total as f64 }
+  }
+}
+
+fn bytes_in(ranges: &RangeSet, start: u32, end: u32) -> u32 {
+  (end.saturating_sub(start)).saturating_sub(gaps_size(ranges, start, end))
+}
+
+fn gaps_size(ranges: &RangeSet, start: u32, end: u32) -> u32 {
+  ranges.gaps_within(start, end).iter().map(|gap| gap.end - gap.start).sum()
+}
+
+fn seg_end_of(code_seg: &crate::analyze::code_segment::CodeSegment) -> u32 {
+  code_seg.primary.skip_off + code_seg.primary.size
+}
+
 impl Analyze {
   pub fn new(cfg: &Config, exe_path: &str) -> Result<Self, String> {
     let fmt = Fmt::Exe(exe_path.to_string());
@@ -47,80 +80,94 @@ impl Analyze {
     self.binary.exe().unwrap().print();
   }
 
-  pub fn analyze_code_segment(&self, seg: Seg) -> (u32, u32) {
-    let code_seg = self.code_segments.find_by_segment(seg).unwrap();
-
-    let mut r = RangeSet::new();
-
-    // Add all ranges implied by function config
-    for f in &self.cfg.funcs {
-      if f.start.seg != code_seg.primary.seg { continue };
-      let regions = f.effective_regions();
-      if regions.is_empty() {
-        println!("Unknown end address for {}", f.name);
-        continue;
-      }
-      for region in regions {
-        if region.start.seg != code_seg.primary.seg { continue };
-        r.insert(region.start.off.0 as u32, region.end.off.0 as u32);
-      }
-    }
-
-    // Add all ranges implied by the text section data
-    for t in self.cfg.text_regions_matching_segment(code_seg.primary.seg) {
-      r.insert(t.start.off.0 as u32, t.end.off.0 as u32);
-    }
-
+  fn coverage_for_segment(&self, code_seg: &crate::analyze::code_segment::CodeSegment) -> Coverage {
+    let seg = code_seg.primary.seg;
     let seg_start = code_seg.primary.skip_off;
     let seg_end = seg_start + code_seg.primary.size;
+    let mut code = RangeSet::new();
+    let mut data = RangeSet::new();
+    let mut known = RangeSet::new();
 
-    if let Some(span_end) = r.span_end() {
-      if span_end > seg_end {
-        println!("WARN: Function ranges exceed the segment! (expected: {}, got: {})", seg_end, span_end);
+    for func in &self.cfg.funcs {
+      if func.start.seg != seg { continue; }
+      for region in self.cfg.code_regions(&func.effective_regions()) {
+        if region.start.seg != seg || region.end.seg != seg { continue; }
+        let start = (region.start.off.0 as u32).max(seg_start);
+        let end = (region.end.off.0 as u32).min(seg_end);
+        if start < end {
+          code.insert(start, end);
+          known.insert(start, end);
+        }
       }
     }
 
-    let gaps = r.gaps_within(seg_start, seg_end);
-    let mut total_gap = 0;
-    for gap in &gaps {
-      total_gap += gap.end - gap.start;
-    }
-
-    let total_size = code_seg.primary.size;
-    let perc = if total_size > 0 {
-      100.0 * (1.0 - (total_gap as f64) / (total_size as f64))
-    } else {
-      100.0
-    };
-    println!("Percent annotated: {:.2}", perc);
-
-    if gaps.len() > 0 {
-      println!("Gaps:");
-      for gap in &gaps {
-        println!("   [ 0x{:04x}, 0x{:04x} )   size: {}", gap.start, gap.end, gap.end - gap.start);
+    for region in self.cfg.text_regions_matching_segment(seg) {
+      if region.end.seg != seg { continue; }
+      let start = (region.start.off.0 as u32).max(seg_start);
+      let end = (region.end.off.0 as u32).min(seg_end);
+      if start < end {
+        data.insert(start, end);
+        known.insert(start, end);
       }
     }
 
-    (total_gap, total_size)
+    let total = seg_end.saturating_sub(seg_start);
+    Coverage {
+      code: bytes_in(&code, seg_start, seg_end),
+      data: bytes_in(&data, seg_start, seg_end),
+      unknown: gaps_size(&known, seg_start, seg_end),
+      total,
+    }
   }
 
-  pub fn analyze_code_segments_and_report(&self) {
-    //self.code_segments.dump();
-    let mut total_gap = 0;
-    let mut total_size = 0;
-    for c in &self.code_segments.0 {
-      let seg = c.primary.seg;
-      println!("Segment {}", seg);
-      println!("===============================");
-      let (gap, size) = self.analyze_code_segment(seg);
-      total_gap += gap;
-      total_size += size;
-      println!("");
+  /// Configured coverage for every analyzed code segment, written to stderr
+  /// so stdout stays a pasteable annotation fragment.
+  pub fn report_coverage(&self) {
+    for func in &self.cfg.funcs {
+      if func.effective_regions().is_empty() {
+        eprintln!("WARN: {}: unknown end address; not counted in coverage", func.name);
+      }
     }
-
-    let perc = 100.0 * (1.0 - (total_gap as f64) / (total_size as f64));
-    println!("Total completion: {} / {} = {:.2} %", total_size - total_gap, total_size, perc);
-
+    let mut total = Coverage::default();
+    for code_seg in &self.code_segments.0 {
+      let seg = code_seg.primary.seg;
+      let seg_name = self.cfg.code_seg_lookup(seg)
+        .map(|s| s.name.as_str())
+        .unwrap_or("?");
+      let cov = self.coverage_for_segment(code_seg);
+      let mut max_end = seg_end_of(code_seg);
+      for func in &self.cfg.funcs {
+        for region in func.effective_regions() {
+          if region.start.seg == seg && region.end.seg == seg {
+            max_end = max_end.max(region.end.off.0 as u32);
+          }
+        }
+      }
+      for region in self.cfg.text_regions_matching_segment(seg) {
+        if region.end.seg == seg {
+          max_end = max_end.max(region.end.off.0 as u32);
+        }
+      }
+      if max_end > seg_end_of(code_seg) {
+        eprintln!("WARN: configured ranges exceed segment {} (expected end {}, got {})",
+          seg, seg_end_of(code_seg), max_end);
+      }
+      eprintln!("Coverage {} ({}): code {} ({:.2}%), data {} ({:.2}%), unknown {} ({:.2}%), annotated {} / {} ({:.2}%)",
+        seg, seg_name,
+        cov.code, cov.percent(cov.code),
+        cov.data, cov.percent(cov.data),
+        cov.unknown, cov.percent(cov.unknown),
+        cov.annotated(), cov.total, cov.percent(cov.annotated()));
+      total.code += cov.code;
+      total.data += cov.data;
+      total.unknown += cov.unknown;
+      total.total += cov.total;
+    }
+    eprintln!("Coverage total: code {} ({:.2}%), data {} ({:.2}%), unknown {} ({:.2}%), annotated {} / {} ({:.2}%)",
+      total.code, total.percent(total.code),
+      total.data, total.percent(total.data),
+      total.unknown, total.percent(total.unknown),
+      total.annotated(), total.total, total.percent(total.annotated()));
   }
 
   pub fn analyze_function(&self, name: &str) -> FuncDetails {
@@ -129,10 +176,12 @@ impl Analyze {
     assert!(func.start >= code_seg.start());
     let regions = func.analysis_regions();
     if regions.is_empty() {
-      FuncDetails::build(func.start, func.end, code_seg, &self.binary).unwrap()
+      FuncDetails::build_with_regions_and_data(
+        func.start, func.end, &[], code_seg, &self.binary, &self.cfg.text_section,
+      ).unwrap()
     } else {
-      FuncDetails::build_with_regions(
-        func.start, func.outer_end(), &regions, code_seg, &self.binary,
+      FuncDetails::build_with_regions_and_data(
+        func.start, func.outer_end(), &regions, code_seg, &self.binary, &self.cfg.text_section,
       ).unwrap()
     } // HAX FIXME
   }
@@ -146,14 +195,60 @@ impl Analyze {
       Some(func) => {
         let regions = analysis_regions_for(func, start);
         if regions.is_empty() {
-          FuncDetails::build(start, func.end, code_seg, &self.binary)
+          FuncDetails::build_with_regions_and_data(
+            start, func.end, &[], code_seg, &self.binary, &self.cfg.text_section,
+          )
         } else {
-          FuncDetails::build_with_regions(
-            start, func.outer_end(), &regions, code_seg, &self.binary,
+          FuncDetails::build_with_regions_and_data(
+            start, func.outer_end(), &regions, code_seg, &self.binary, &self.cfg.text_section,
           )
         }
       }
-      None => FuncDetails::build(start, None, code_seg, &self.binary),
+      None => FuncDetails::build_with_regions_and_data(
+        start, None, &[], code_seg, &self.binary, &self.cfg.text_section,
+      ),
+    }
+  }
+
+  fn direct_targets_in_regions(&self, regions: &[FuncRegion]) -> BTreeSet<SegOff> {
+    let mut targets = BTreeSet::new();
+    for region in self.cfg.code_regions(regions) {
+      let mut decoder = Decoder::new(self.binary.region_iter(region.start, region.end));
+      while let Ok(Some((instr, _raw))) = decoder.try_next() {
+        if let Some(target) = direct_target(&instr) {
+          targets.insert(target);
+        }
+      }
+    }
+    targets
+  }
+
+  /// Warn when a code run after an untyped hole is neither a direct-transfer
+  /// target nor the function entry. The code may still be reached indirectly,
+  /// so this is a warning, not an error.
+  fn warn_unreachable_after_holes(&self, func: &Func) {
+    let regions = func.effective_regions();
+    if regions.is_empty() { return; }
+    let span_start = regions.first().map(|region| region.start).unwrap();
+    let span_end = regions.last().map(|region| region.end).unwrap();
+    let has_hole = self.cfg.text_section.iter().any(|data|
+      data.is_data_hole()
+        && data.start.seg == span_start.seg
+        && data.end.seg == span_start.seg
+        && data.start < span_end
+        && span_start < data.end);
+    if !has_hole { return; }
+    let code_regions = self.cfg.code_regions(&regions);
+    let targets = self.direct_targets_in_regions(&regions);
+    for region in code_regions {
+      if region.start.off.0 == 0 { continue; }
+      let prev = SegOff { seg: region.start.seg, off: Off(region.start.off.0 - 1) };
+      let Some(data) = self.cfg.data_region_containing(prev) else { continue; };
+      if !data.is_data_hole() { continue; }
+      if region.start == func.start || Some(region.start) == func.entry { continue; }
+      if targets.contains(&region.start) { continue; }
+      eprintln!("WARN: {}: code at {} follows declared data '{}' [{}, {}) but is not a branch target or entry in this function; it may be reached from another function or indirectly",
+        func.name, region.start, data.name, data.start, data.end);
     }
   }
 
@@ -167,13 +262,25 @@ impl Analyze {
     }
 
     let mut functions = BTreeMap::new();
+    let mut call_targets_in_data: BTreeMap<SegOff, BTreeSet<SegOff>> = BTreeMap::new();
     while let Some(addr) = workqueue.pop() {
       let result = self.analyze_function_by_start(addr);
 
-      // Add all new calls to the work queue
+      // Add all new calls to the work queue, except calls that point at
+      // declared data. Those are reported in the annotation output instead
+      // of being analyzed as bogus functions.
       if let Ok(details) = &result {
         for call in &details.direct_calls {
-          workqueue.insert(*call);
+          if self.cfg.data_region_containing(*call).is_some() {
+            call_targets_in_data.entry(addr).or_default().insert(*call);
+          } else {
+            workqueue.insert(*call);
+          }
+        }
+        if let Some(func) = analysis_func_lookup(&self.cfg, addr) {
+          if func.start == addr {
+            self.warn_unreachable_after_holes(func);
+          }
         }
       }
 
@@ -182,7 +289,7 @@ impl Analyze {
 
     if emit_annotation_format {
       // Synthesize annotations
-      generate_annotations(&functions, &self.cfg, &self.binary);
+      generate_annotations(&functions, &self.cfg, &self.binary, &call_targets_in_data);
     } else {
       // Print out a report
       dump_functions(&functions, &self.cfg);
@@ -383,7 +490,17 @@ fn render_undecodable_gap(name: &str, addr: SegOff, start: SegOff, end: SegOff, 
     name, addr, start, end, gap)
 }
 
-fn generate_annotations(functions: &BTreeMap<SegOff, Result<FuncDetails, String>>, cfg: &Config, binary: &Binary) {
+fn render_call_target_in_data(name: &str, target: SegOff, data: &crate::config::TextSectionRegion) -> String {
+  format!("    # CALL TARGET IN DATA | {} | {} | {} [{}, {})",
+    name, target, data.name, data.start, data.end)
+}
+
+fn generate_annotations(
+  functions: &BTreeMap<SegOff, Result<FuncDetails, String>>,
+  cfg: &Config,
+  binary: &Binary,
+  call_targets_in_data: &BTreeMap<SegOff, BTreeSet<SegOff>>,
+) {
   let mut function_names = FunctionNames::from_cfg(cfg);
 
   let mut current_seg = None;
@@ -423,23 +540,26 @@ fn generate_annotations(functions: &BTreeMap<SegOff, Result<FuncDetails, String>
       Ok(details) => {
         // #65: analysis follows control flow, so the inferred end can
         // span bytes that are not code; decompilation decodes the range
-        // linearly and aborts there. Flag it before the suggestion (and
-        // before the IGNORED line, which also carries the range).
-        // Configured function regions are probed individually; their gaps
-        // are intentional and must not produce a false diagnostic.
+        // linearly and aborts there. Probe the net code runs so declared
+        // data holes are not reported as false gaps.
         let configured_regions = analysis_func_lookup(cfg, *addr)
           .map(|func| analysis_regions_for(func, *addr))
           .filter(|regions| !regions.is_empty());
-        match configured_regions {
-          Some(regions) => {
-            if let Some((region, gap)) = first_undecodable_addr_in_regions(binary, &regions) {
-              println!("{}", render_undecodable_gap(
-                &name, *addr, region.start, region.end, gap));
-            }
-          }
-          None => {
-            if let Some(gap) = first_undecodable_addr(binary, details.start_addr, details.end_addr_inferred) {
-              println!("{}", render_undecodable_gap(&name, *addr, details.start_addr, details.end_addr_inferred, gap));
+        let probe_regions = match &configured_regions {
+          Some(regions) => cfg.code_regions(regions),
+          None if details.end_addr_inferred > details.start_addr => cfg.code_regions(&[
+            FuncRegion { start: details.start_addr, end: details.end_addr_inferred },
+          ]),
+          None => vec![],
+        };
+        if let Some((region, gap)) = first_undecodable_addr_in_regions(binary, &probe_regions) {
+          println!("{}", render_undecodable_gap(
+            &name, *addr, region.start, region.end, gap));
+        }
+        if let Some(targets) = call_targets_in_data.get(addr) {
+          for target in targets {
+            if let Some(data) = cfg.data_region_containing(*target) {
+              println!("{}", render_call_target_in_data(&name, *target, data));
             }
           }
         }
@@ -484,6 +604,72 @@ fn generate_annotations(functions: &BTreeMap<SegOff, Result<FuncDetails, String>
 #[cfg(test)]
 mod tests {
   use super::*;
+  use crate::segoff::Seg;
+
+  #[test]
+  fn coverage_splits_configured_code_data_and_unknown() {
+    use crate::analyze::code_segment::{CodeSegment, Region};
+    use crate::config::{Config, Func, TextSectionRegion};
+    use std::rc::Rc;
+
+    let so = |off| SegOff { seg: Seg::Normal(0), off: Off(off) };
+    let cfg = Config {
+      types: Rc::new(crate::types::TypeDatabase::new()),
+      structs: vec![],
+      code_segs: vec![],
+      funcs: vec![Func {
+        name: "f".to_string(),
+        start: so(0),
+        end: Some(so(10)),
+        entry: None,
+        mode: CallMode::Near,
+        ret: None,
+        args: None,
+        regargs: None,
+        regouts: None,
+        clobbers: None,
+        dont_pop_args: false,
+        regions: vec![
+          FuncRegion { start: so(0), end: so(10) },
+          FuncRegion {
+            start: SegOff { seg: Seg::Normal(1), off: Off(12) },
+            end: SegOff { seg: Seg::Normal(1), off: Off(14) },
+          },
+        ],
+      }],
+      indirects: vec![],
+      globals: vec![],
+      text_section: vec![
+        TextSectionRegion {
+          name: "hole".to_string(), start: so(4), end: so(6), typ: None, access: None,
+        },
+        TextSectionRegion {
+          name: "table".to_string(), start: so(15), end: so(18), typ: None, access: None,
+        },
+        TextSectionRegion {
+          name: "cross".to_string(),
+          start: so(5),
+          end: SegOff { seg: Seg::Normal(1), off: Off(7) },
+          typ: None,
+          access: None,
+        },
+      ],
+    };
+    let a = Analyze {
+      cfg,
+      binary: Binary::from_raw(&[], None),
+      code_segments: CodeSegments(vec![CodeSegment {
+        primary: Region { seg: Seg::Normal(0), skip_off: 0, size: 20 },
+        stub: None,
+      }]),
+    };
+    assert_eq!(a.coverage_for_segment(&a.code_segments.0[0]), Coverage {
+      code: 8,
+      data: 5,
+      unknown: 7,
+      total: 20,
+    });
+  }
 
   #[test]
   fn ret_kind_flags_observed_kinds_are_authoritative() {

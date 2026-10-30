@@ -69,6 +69,9 @@ def gen_data_section(datasection):
 def gen_text_section(textsection):
     emit("  text_section {");
     for var in textsection:
+        if var.typ is None:
+            emit(f'    {var.name:30} {{ start {var.start_addr}  end {var.end_addr} }}')
+            continue
         extra = ''
         if var.access_at is not None:
             extra += f'access {var.access_at} '

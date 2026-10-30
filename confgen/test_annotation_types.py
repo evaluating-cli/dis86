@@ -4,7 +4,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from hydra.annotations import Function, Global, Member, Struct, Type, validate_data_section
+from hydra.annotations import Function, Global, Member, Struct, TextData, Type, validate_data_section
 from hydra.gen import dis86 as dis86_gen
 from hydra.gen.appdata import build_func_data, gen_hdr
 
@@ -82,6 +82,36 @@ class AnnotationTypeTests(unittest.TestCase):
             subprocess.run(['cc', '-std=c11', '-Wall', '-Werror', str(source), '-o', str(exe)], check=True)
             result = subprocess.run([str(exe)], check=True, capture_output=True, text=True)
             self.assertIn('guest memory fixture passed', result.stdout)
+
+
+class TextDataTests(unittest.TestCase):
+    def _gen_text(self, regions):
+        buf = io.StringIO()
+        prev, dis86_gen.out = dis86_gen.out, buf
+        try:
+            dis86_gen.gen_text_section(regions)
+        finally:
+            dis86_gen.out = prev
+        return buf.getvalue()
+
+    def test_untyped_text_region_is_a_data_hole(self):
+        hole = TextData('banner', None, '0000:1234', '0000:1280')
+        self.assertIsNone(hole.typ)
+        line = next(l for l in self._gen_text([hole]).splitlines() if 'banner' in l)
+        self.assertIn('start 0000:1234', line)
+        self.assertIn('end 0000:1280', line)
+        self.assertNotIn('type', line)
+        self.assertNotIn('access', line)
+
+    def test_typed_text_region_keeps_type_and_access(self):
+        table = TextData('jt', 'u16[2]', '0000:1234', '0000:1238', access_at='0000:1200')
+        line = next(l for l in self._gen_text([table]).splitlines() if 'jt' in l)
+        self.assertIn('type u16[2]', line)
+        self.assertIn('access 0000:1200', line)
+
+    def test_untyped_text_region_rejects_access(self):
+        with self.assertRaisesRegex(Exception, 'access without a type'):
+            TextData('bad_hole', None, '0000:1234', '0000:1280', access_at='0000:1200')
 
 
 class RetUnknownFlagTests(unittest.TestCase):

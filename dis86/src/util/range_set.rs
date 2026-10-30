@@ -52,10 +52,6 @@ impl RangeSet {
     Some(self.span()?.start)
   }
 
-  pub fn span_end(&self) -> Option<u32> {
-    Some(self.span()?.end)
-  }
-
   pub fn gaps_within(&self, start: u32, end: u32) -> Vec<Range> {
     let query = Range {start, end};
 
