@@ -222,14 +222,22 @@ def validate_data_section(ds):
 class TextData:
     def __init__(self, name, typ, start_addr, end_addr, access_at=None):
         self.name = name
-        self.typ = Type.from_str(typ)
         self.start_addr = Addr(start_addr)
         self.end_addr = Addr(end_addr)
         self.access_at = access_at
 
-        ## infer array size
         nbytes = self.end_addr.bytes_since(self.start_addr)
         if nbytes < 0: raise Exception(f"Negatively sized text-section region: {name}")
+
+        # No type means a data hole: a negative code hint, not a table.
+        if typ is None:
+            if access_at is not None:
+                raise Exception(f"Text-section region {name} declares access without a type")
+            self.typ = None
+            return
+
+        self.typ = Type.from_str(typ)
+        ## infer array size
         if not self.typ.is_array: raise Exception(f"Expected array for text-section region: {name}")
         eltsz = self.typ.as_basetype().size_in_bytes()
         if eltsz is None:

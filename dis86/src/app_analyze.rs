@@ -10,8 +10,7 @@ pub fn run(cfg: &Config, exe_path: &str) -> i32 {
     }
   };
   a.scan_for_all_functions(true);
-
-  //a.analyze_code_segments_and_report();
+  a.report_coverage();
 
   0
 }

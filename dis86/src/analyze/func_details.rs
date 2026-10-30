@@ -5,7 +5,7 @@ use crate::binary::Binary;
 use crate::asm::instr::{Instr, Opcode, Operand, OperandReg, Reg};
 use crate::asm::decode::Decoder;
 use crate::asm::intel_syntax::instr_str;
-use crate::config::{CallMode, FuncRegion};
+use crate::config::{CallMode, FuncRegion, TextSectionRegion};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
@@ -100,6 +100,19 @@ impl FuncDetails {
     code_seg: &CodeSegment,
     binary: &Binary,
   ) -> Result<FuncDetails, String> {
+    Self::build_with_regions_and_data(
+      func_start, end, regions, code_seg, binary, &[],
+    )
+  }
+
+  pub fn build_with_regions_and_data(
+    func_start: SegOff,
+    end: Option<SegOff>,
+    regions: &[FuncRegion],
+    code_seg: &CodeSegment,
+    binary: &Binary,
+    data: &[TextSectionRegion],
+  ) -> Result<FuncDetails, String> {
     if func_start < code_seg.start() {
       return Err(format!("function start {} is before code segment start {}", func_start, code_seg.start()));
     }
@@ -109,6 +122,10 @@ impl FuncDetails {
     };
     if !regions.is_empty() && region_for(func_start).is_none() {
       return Err(format!("function start {} is outside every configured region", func_start));
+    }
+    if let Some(region) = data_region_containing(data, func_start) {
+      return Err(format!("function start {} is inside declared data '{}' [{}, {})",
+        func_start, region.name, region.start, region.end));
     }
 
     let mut workqueue = WorkQueue::new();
@@ -149,10 +166,19 @@ impl FuncDetails {
             None => return Err(format!("instruction address {} is outside every configured region", addr)),
           }
         };
-        let decode_end = match current_region {
+        if let Some(region) = data_region_containing(data, addr) {
+          return Err(format!("instruction address {} is inside declared data '{}' [{}, {})",
+            addr, region.name, region.start, region.end));
+        }
+        let mut decode_end = match current_region {
           Some(region) if region.end.seg == code_seg_end.seg && region.end < code_seg_end => region.end,
           _ => code_seg_end,
         };
+        if let Some(data_start) = next_data_start(data, addr) {
+          if data_start < decode_end {
+            decode_end = data_start;
+          }
+        }
         let instr = decode_one_instr(&binary, addr, decode_end)?;
         let end_addr = instr.end_addr();
         if end_addr > largest_addr { largest_addr = end_addr; }
@@ -191,7 +217,12 @@ impl FuncDetails {
         // Figure out what to do next
         match details.next {
           Next::Fallthrough(target) => {
-            if let Some(region) = current_region {
+            if let Some(data) = data_region_containing(data, target) {
+              eprintln!("WARN: fallthrough at {} enters declared data '{}' [{}, {}); analysis stops the block",
+                instr.addr, data.name, data.start, data.end);
+              block.exits = vec![];
+              block_complete = true;
+            } else if let Some(region) = current_region {
               // A region end is a hard boundary: ordinary fallthrough does
               // not cross into the gap or into another region.
               if region.contains(target) {
@@ -237,6 +268,14 @@ impl FuncDetails {
           Next::Jump { targets, fallthrough } => {
             let mut followed = vec![];
             for tgt in &targets {
+              // A target inside declared data is a config/code contradiction:
+              // never decode it as instructions. Validation reports the hard
+              // error; analysis just refuses to follow it.
+              if let Some(data) = data_region_containing(data, *tgt) {
+                eprintln!("WARN: branch target {} is declared data '{}' [{}, {}); it is not followed",
+                  tgt, data.name, data.start, data.end);
+                continue;
+              }
               // A branch target outside the analyzed segment has no code
               // to continue at: decoding there would read past the
               // segment's bytes (or from another segment entirely).
@@ -260,7 +299,11 @@ impl FuncDetails {
             // with explicit regions, inside the current region), and
             // ends the block quietly when the code simply runs out.
             if let Some(fallthrough) = fallthrough {
-              let follow = if regions.is_empty() {
+              let follow = if data_region_containing(data, fallthrough).is_some() {
+                eprintln!("WARN: conditional fallthrough at {} enters declared data; it is not followed",
+                  instr.addr);
+                false
+              } else if regions.is_empty() {
                 code_seg.contains(fallthrough)
               } else {
                 region_for(fallthrough).is_some()
@@ -320,6 +363,81 @@ mod tests {
 
   fn segoff(off: u16) -> SegOff {
     SegOff { seg: Seg::Normal(0), off: Off(off) }
+  }
+
+  fn hole(start: u16, end: u16) -> TextSectionRegion {
+    TextSectionRegion {
+      name: "hole".to_string(),
+      start: segoff(start),
+      end: segoff(end),
+      typ: None,
+      access: None,
+    }
+  }
+
+  #[test]
+  fn data_hole_stops_fallthrough_without_decoding_it() {
+    // nop; hole [1,3); ret at 3. The fallthrough at 1 ends the block; the
+    // hole bytes are never decoded.
+    let binary = Binary::from_raw(&[0x90, 0x63, 0x63, 0xC3], None);
+    let data = [hole(1, 3)];
+    let details = FuncDetails::build_with_regions_and_data(
+      segoff(0), Some(segoff(4)), &[], &test_seg(4), &binary, &data,
+    ).unwrap();
+    assert_eq!(details.end_addr_inferred, segoff(1));
+    assert_eq!(details.return_kind, None);
+  }
+
+  #[test]
+  fn data_hole_rejects_an_instruction_that_straddles_it() {
+    // mov ax,0x1234 needs three bytes, but the hole starts after the first.
+    let binary = Binary::from_raw(&[0xB8, 0x34, 0x12, 0xC3], None);
+    let data = [hole(1, 3)];
+    let err = match FuncDetails::build_with_regions_and_data(
+      segoff(0), Some(segoff(4)), &[], &test_seg(4), &binary, &data,
+    ) {
+      Ok(_) => panic!("a straddling instruction must not be decoded"),
+      Err(err) => err,
+    };
+    assert!(!err.is_empty());
+  }
+
+  #[test]
+  fn branch_target_into_data_is_not_followed() {
+    // jmp 3; hole [3,4): the analysis does not decode the hole as code.
+    let binary = Binary::from_raw(&[0xEB, 0x01, 0x90, 0x63], None);
+    let data = [hole(3, 4)];
+    let details = FuncDetails::build_with_regions_and_data(
+      segoff(0), Some(segoff(4)), &[], &test_seg(4), &binary, &data,
+    ).unwrap();
+    assert_eq!(details.end_addr_inferred, segoff(2));
+    assert_eq!(details.return_kind, None);
+  }
+
+  #[test]
+  fn direct_call_into_data_is_recorded_but_not_analyzed() {
+    // call 4; ret; hole [4,6). Discovery still records the target so the
+    // annotation pass can report it.
+    let binary = Binary::from_raw(&[0xE8, 0x01, 0x00, 0xC3, 0x63, 0x63], None);
+    let data = [hole(4, 6)];
+    let details = FuncDetails::build_with_regions_and_data(
+      segoff(0), Some(segoff(6)), &[], &test_seg(6), &binary, &data,
+    ).unwrap();
+    assert_eq!(details.end_addr_inferred, segoff(4));
+    assert!(details.direct_calls.contains(&segoff(4)));
+  }
+
+  #[test]
+  fn function_start_inside_data_is_rejected() {
+    let binary = Binary::from_raw(&[0xC3], None);
+    let data = [hole(0, 1)];
+    let err = match FuncDetails::build_with_regions_and_data(
+      segoff(0), Some(segoff(1)), &[], &test_seg(1), &binary, &data,
+    ) {
+      Ok(_) => panic!("a function cannot start in data"),
+      Err(err) => err,
+    };
+    assert!(err.contains("inside declared data"), "unexpected error: {}", err);
   }
 
   #[test]
@@ -616,6 +734,20 @@ mod tests {
 fn pushes_cs(instr: &Instr) -> bool {
   instr.opcode == Opcode::OP_PUSH
     && matches!(instr.operands.as_slice().first(), Some(Operand::Reg(OperandReg(Reg::CS))))
+}
+
+fn data_region_containing<'a>(data: &'a [TextSectionRegion], addr: SegOff) -> Option<&'a TextSectionRegion> {
+  data.iter().find(|region|
+    addr.seg == region.start.seg
+      && addr.off >= region.start.off
+      && addr.off < region.end.off)
+}
+
+fn next_data_start(data: &[TextSectionRegion], addr: SegOff) -> Option<SegOff> {
+  data.iter()
+    .filter(|region| region.start.seg == addr.seg && region.start > addr && region.end > addr)
+    .map(|region| region.start)
+    .min()
 }
 
 // FIXME: THIS FUNCTION IS WAY TOO COMPLICATED FOR ITS SIMPLE TASK: APIs NEED IMPROVEMENT
