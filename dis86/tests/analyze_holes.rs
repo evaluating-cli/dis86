@@ -31,6 +31,11 @@ fn mz_with_image(image: &[u8]) -> Vec<u8> {
 }
 
 fn run_analyze(image: &[u8], functions: &str, text_section: &str) -> std::process::Output {
+  run_analyze_with_args(image, functions, text_section, &[])
+}
+
+fn run_analyze_with_args(image: &[u8], functions: &str, text_section: &str,
+                         extra: &[&str]) -> std::process::Output {
   let dir = temp_dir();
   let exe_path = dir.join("program.exe");
   let bsl_path = dir.join("config.bsl");
@@ -52,11 +57,14 @@ dis86 {{
   }}
 }}
 "#, functions, text_section)).expect("write bsl");
-  let out = Command::new(env!("CARGO_BIN_EXE_dis86"))
-    .arg("--config").arg(&bsl_path)
+  let mut cmd = Command::new(env!("CARGO_BIN_EXE_dis86"));
+  cmd.arg("--config").arg(&bsl_path)
     .arg("--binary-exe").arg(&exe_path)
-    .arg("--analyze")
-    .output().expect("run dis86 --analyze");
+    .arg("--analyze");
+  for arg in extra {
+    cmd.arg(arg);
+  }
+  let out = cmd.output().expect("run dis86 --analyze");
   let _ = fs::remove_dir_all(dir);
   out
 }
@@ -80,6 +88,73 @@ fn analyze_skips_and_reports_calls_into_data() {
     "stderr: {}", stderr);
   assert!(stderr.contains("Coverage 0000 (main): code 7 (77.78%), data 2 (22.22%), unknown 0 (0.00%)"),
     "stderr: {}", stderr);
+}
+
+#[test]
+fn analyze_reports_translation_blockers() {
+  let image = [0x0F, 0x90, 0xC0, 0x50, 0xC3];
+  let functions = "f { start 0000:0000 end 0000:0005 mode near ret u16 args 0 }";
+  let out = run_analyze(&image, functions, "");
+  let stderr = String::from_utf8_lossy(&out.stderr);
+
+  assert!(out.status.success(), "stderr: {}", stderr);
+  assert!(stderr.contains("segment 0000 (main)"), "stderr: {}", stderr);
+  assert!(stderr.contains("functions configured 1 attempted 1 translated 1 failed 0"),
+    "stderr: {}", stderr);
+  assert!(stderr.contains("UNIMPL_FLAGS 1 first 0000:0000 (OP_SETO)"),
+    "stderr: {}", stderr);
+}
+
+#[test]
+fn analyze_reports_ast_failures() {
+  // mov bp, sp; mov ax, [bp-5]; ret: the local ends at -3, below the
+  // return-address slot, so AST construction fails.
+  let image = [0x89, 0xE5, 0x8B, 0x46, 0xFB, 0xC3];
+  let functions = "f { start 0000:0000 end 0000:0006 mode near ret u16 args 0 }";
+  let out = run_analyze(&image, functions, "");
+  let stderr = String::from_utf8_lossy(&out.stderr);
+
+  assert!(out.status.success(), "stderr: {}", stderr);
+  assert!(stderr.contains("functions configured 1 attempted 1 translated 0 failed 1"),
+    "stderr: {}", stderr);
+  assert!(stderr.contains("failed by cause: CODEGEN_FAILURE 1"),
+    "stderr: {}", stderr);
+}
+
+#[test]
+fn analyze_retains_blockers_when_ast_build_fails() {
+  // mov bp, sp; seto al; mov [bp-5], al; ret: the marker survives long enough
+  // to report, and the local below the return slot still fails AST construction.
+  let image = [0x89, 0xE5, 0x0F, 0x90, 0xC0, 0x88, 0x46, 0xFB, 0xC3];
+  let functions = "f { start 0000:0000 end 0000:0009 mode near ret u16 args 0 }";
+  let out = run_analyze(&image, functions, "");
+  let stderr = String::from_utf8_lossy(&out.stderr);
+
+  assert!(out.status.success(), "stderr: {}", stderr);
+  assert!(stderr.contains("functions configured 1 attempted 1 translated 0 failed 1"),
+    "stderr: {}", stderr);
+  assert!(stderr.contains("failed by cause: CODEGEN_FAILURE 1"),
+    "stderr: {}", stderr);
+  assert!(stderr.contains("UNIMPL_FLAGS 1 first 0000:0002 (OP_SETO)"),
+    "stderr: {}", stderr);
+}
+
+#[test]
+fn analyze_honors_build_pin_all() {
+  // seto al; mov al, 0; ret: the unused seto is removed normally but kept as a
+  // pinned versioned local, so its marker must appear only with the flag.
+  let image = [0x0F, 0x90, 0xC0, 0xB0, 0x00, 0xC3];
+  let functions = "f { start 0000:0000 end 0000:0006 mode near ret u16 args 0 }";
+  let plain = run_analyze(&image, functions, "");
+  let pinned = run_analyze_with_args(&image, functions, "", &["--build-pin-all"]);
+  let plain_stderr = String::from_utf8_lossy(&plain.stderr);
+  let pinned_stderr = String::from_utf8_lossy(&pinned.stderr);
+
+  assert!(plain.status.success(), "stderr: {}", plain_stderr);
+  assert!(pinned.status.success(), "stderr: {}", pinned_stderr);
+  assert!(!plain_stderr.contains("UNIMPL_FLAGS"), "stderr: {}", plain_stderr);
+  assert!(pinned_stderr.contains("UNIMPL_FLAGS 1 first 0000:0000 (OP_SETO)"),
+    "stderr: {}", pinned_stderr);
 }
 
 #[test]

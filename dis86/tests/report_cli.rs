@@ -146,6 +146,114 @@ fn report_counts_an_unimpl_blocker() {
 }
 
 #[test]
+fn report_records_an_ast_failure() {
+  let dir = temp_dir();
+  let report_path = dir.join("report.txt");
+  let functions = "f { start 0000:0000 end 0000:0006 mode near ret u16 args 0 }";
+  let out = run(
+    &dir,
+    &[0x89, 0xE5, 0x8B, 0x46, 0xFB, 0xC3],
+    functions,
+    &["--codeseg-name", "main", "--emit-code", "-",
+      "--report", report_path.to_str().unwrap()],
+  );
+  let report = fs::read_to_string(&report_path).expect("read report");
+  assert!(!out.status.success(), "an AST failure must fail the run");
+  assert!(report.contains("functions configured 1 attempted 1 translated 0 failed 1"),
+    "report: {}", report);
+  assert!(report.contains("failed by cause: CODEGEN_FAILURE 1"),
+    "report: {}", report);
+  let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn report_counts_an_unimpl_flags_marker() {
+  let dir = temp_dir();
+  let report_path = dir.join("report.txt");
+  let functions = "f { start 0000:0000 end 0000:0005 mode near ret u16 args 0 }";
+  let out = run(
+    &dir,
+    &[0x0F, 0x90, 0xC0, 0x50, 0xC3],
+    functions,
+    &["--codeseg-name", "main", "--emit-code", "-",
+      "--report", report_path.to_str().unwrap()],
+  );
+  let report = fs::read_to_string(&report_path).expect("read report");
+  assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+  assert!(report.contains("UNIMPL_FLAGS 1 first 0000:0000 (OP_SETO)"),
+    "report: {}", report);
+  let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn report_retains_markers_when_an_ast_failure_follows() {
+  let dir = temp_dir();
+  let report_path = dir.join("report.txt");
+  // mov bp, sp; seto al; mov [bp-5], al; ret: the marker is recorded before
+  // AST construction fails on the local below the return slot.
+  let image = [0x89, 0xE5, 0x0F, 0x90, 0xC0, 0x88, 0x46, 0xFB, 0xC3];
+  let functions = "f { start 0000:0000 end 0000:0009 mode near ret u16 args 0 }";
+  let out = run(
+    &dir,
+    &image,
+    functions,
+    &["--codeseg-name", "main", "--emit-code", "-",
+      "--report", report_path.to_str().unwrap()],
+  );
+  let report = fs::read_to_string(&report_path).expect("read report");
+  assert!(!out.status.success(), "an AST failure must fail the run");
+  assert!(report.contains("functions configured 1 attempted 1 translated 0 failed 1"),
+    "report: {}", report);
+  assert!(report.contains("failed by cause: CODEGEN_FAILURE 1"),
+    "report: {}", report);
+  assert!(report.contains("UNIMPL_FLAGS 1 first 0000:0002 (OP_SETO)"),
+    "report: {}", report);
+  let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn report_counts_markers_with_a_pre_final_emit() {
+  let dir = temp_dir();
+  let report_path = dir.join("report.txt");
+  let ir_path = dir.join("ir.txt");
+  let functions = "f { start 0000:0000 end 0000:0005 mode near ret u16 args 0 }";
+  let out = run(
+    &dir,
+    &[0x0F, 0x90, 0xC0, 0x50, 0xC3],
+    functions,
+    &["--codeseg-name", "main",
+      "--emit-ir-opt", ir_path.to_str().unwrap(),
+      "--report", report_path.to_str().unwrap()],
+  );
+  let report = fs::read_to_string(&report_path).expect("read report");
+  assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+  assert!(!fs::read_to_string(&ir_path).expect("read ir").trim().is_empty(),
+    "the requested IR artifact must still be written");
+  assert!(report.contains("UNIMPL_FLAGS 1 first 0000:0000 (OP_SETO)"),
+    "report: {}", report);
+  let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn report_honors_build_pin_all() {
+  let dir = temp_dir();
+  let report_path = dir.join("report.txt");
+  let functions = "f { start 0000:0000 end 0000:0006 mode near ret u16 args 0 }";
+  let out = run(
+    &dir,
+    &[0x0F, 0x90, 0xC0, 0xB0, 0x00, 0xC3],
+    functions,
+    &["--codeseg-name", "main", "--emit-code", "-",
+      "--build-pin-all", "--report", report_path.to_str().unwrap()],
+  );
+  let report = fs::read_to_string(&report_path).expect("read report");
+  assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+  assert!(report.contains("UNIMPL_FLAGS 1 first 0000:0000 (OP_SETO)"),
+    "report: {}", report);
+  let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
 fn report_continues_after_a_decode_failure() {
   let dir = temp_dir();
   let report_path = dir.join("report.txt");

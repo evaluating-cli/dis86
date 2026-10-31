@@ -7,6 +7,7 @@ use std::fmt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Cause {
   Unimpl,
+  UnimplFlags,
   BranchOutOfRange,
   IndirectJumpNoTable,
   IndirectJumpRuntimeTarget,
@@ -27,6 +28,7 @@ impl Cause {
   pub fn is_blocker(self) -> bool {
     matches!(self,
       Cause::Unimpl
+        | Cause::UnimplFlags
         | Cause::BranchOutOfRange
         | Cause::IndirectJumpNoTable
         | Cause::IndirectJumpRuntimeTarget
@@ -48,6 +50,7 @@ impl Cause {
   pub fn label(self) -> &'static str {
     match self {
       Cause::Unimpl => "UNIMPL",
+      Cause::UnimplFlags => "UNIMPL_FLAGS",
       Cause::BranchOutOfRange => "BRANCH_OUT_OF_RANGE",
       Cause::IndirectJumpNoTable => "INDIRECT_JUMP_NO_TABLE",
       Cause::IndirectJumpRuntimeTarget => "INDIRECT_JUMP_RUNTIME_TARGET",
@@ -113,6 +116,8 @@ mod tests {
     }
     assert!(Cause::DecodeError.is_blocker());
     assert!(Cause::DecodeError.is_failure());
+    assert!(Cause::UnimplFlags.is_blocker());
+    assert!(!Cause::UnimplFlags.is_failure());
     assert!(Cause::CallTargetInData.is_blocker());
     assert!(Cause::CallTargetInData.is_failure());
     for cause in [Cause::AbiArgsInference, Cause::ExitContractMismatch, Cause::RegargsSetupDropped] {

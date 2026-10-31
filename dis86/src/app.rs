@@ -6,7 +6,6 @@ use crate::config::Config;
 use crate::coverage;
 use crate::decompile::ir;
 use crate::decompile::gen;
-use crate::decompile::ast;
 use crate::decompile::ir_build;
 use crate::decompile::sym;
 use crate::decompile::opt;
@@ -29,7 +28,8 @@ fn print_help() {
   println!("  --binary-raw      path to raw binary on the filesystem (exactly 1 --binary-* flag required)");
   println!("");
   println!("MODE: ANALYZE");
-  println!("  --analyze         analyze the binary using the configuration annotations");
+  println!("  --analyze         analyze the binary using the configuration annotations,");
+  println!("                    writing coverage and a translation blocker summary to stderr");
   println!("");
   println!("MODE: INFER ABI");
   println!("  --infer-abi       report inferred args, register inputs, and return width for the");
@@ -401,7 +401,7 @@ pub fn run() -> i32 {
       eprintln!("Error: --analyze requires --binary-exe.");
       return 1;
     };
-    return crate::app_analyze::run(&cfg, path);
+    return crate::app_analyze::run(&cfg, path, args.build_pin_all);
   }
 
   let Some(binary_fmt) = &args.binary else {
@@ -699,7 +699,7 @@ fn infer_specs<'a>(cfg: &'a Config, binary: &Binary, args: &Args)
   }
 }
 
-fn infer_spec<'a>(binary: &Binary, func: &'a crate::config::Func)
+pub(crate) fn infer_spec<'a>(binary: &Binary, func: &'a crate::config::Func)
   -> Result<Spec<'a>, FailedFunc> {
   if func.outer_end().is_none() {
     return Err(FailedFunc::new(func.name.clone(), func.start, func.start,
@@ -724,6 +724,9 @@ fn decompile_spec(args: &Args, cfg: &Config, binary: &Binary, spec: Spec<'_>,
       return Err(Diagnostic::new(e.cause, Some(e.addr), None, e.message));
     }
   };
+  // Debug emit modes normally stop at the requested stage. Reporting needs
+  // the finalized IR, so keep going when a report was requested.
+  let stop_after_emit = args.report.is_none();
   // FIXME: SIMPLIFY!!
   if let Some(path) = args.emit_dis.as_ref() {
     let mut buf = String::new();
@@ -734,12 +737,14 @@ fn decompile_spec(args: &Args, cfg: &Config, binary: &Binary, spec: Spec<'_>,
       buf += "\n";
     }
     write_to_path(path, &buf);
-    return Ok(());
+    if stop_after_emit {
+      return Ok(());
+    }
   }
 
   let overlay = spec.start.is_overlay_addr();
 
-  let (mut ir, diagnostics) = ir_build::build_from_instrs_with_diagnostics(
+  let (mut ir, diagnostics, flag_markers) = ir_build::build_from_instrs_with_diagnostics(
     &instr_list, &cfg, &spec, &binary, overlay, args.build_pin_all);
   for diagnostic in diagnostics {
     eprintln!("{}", diagnostic.message);
@@ -747,26 +752,34 @@ fn decompile_spec(args: &Args, cfg: &Config, binary: &Binary, spec: Spec<'_>,
   }
   if let Some(path) = args.emit_ir_initial.as_ref() {
     write_to_path(path, &format!("{}", ir));
-    return Ok(());
+    if stop_after_emit {
+      return Ok(());
+    }
   }
 
   opt::optimize(&mut ir);
   if let Some(path) = args.emit_ir_presym.as_ref() {
     write_to_path(path, &format!("{}", ir));
-    return Ok(());
+    if stop_after_emit {
+      return Ok(());
+    }
   }
 
   sym::symbolize(&mut ir, &cfg);
   if let Some(path) = args.emit_ir_sym.as_ref() {
     write_to_path(path, &format!("{}", ir));
-    return Ok(());
+    if stop_after_emit {
+      return Ok(());
+    }
   }
 
   opt::forward_store_to_load(&mut ir);
   opt::optimize(&mut ir);
   if let Some(path) = args.emit_ir_fwd.as_ref() {
     write_to_path(path, &format!("{}", ir));
-    return Ok(());
+    if stop_after_emit {
+      return Ok(());
+    }
   }
 
   opt::mem_symbol_to_ref(&mut ir);
@@ -774,10 +787,17 @@ fn decompile_spec(args: &Args, cfg: &Config, binary: &Binary, spec: Spec<'_>,
   if let Some(path) = args.emit_ir_opt.as_ref() {
     let text = ir::display::display_ir_with_uses(&ir).unwrap();
     write_to_path(path, &format!("{}", &text));
-    return Ok(());
+    if stop_after_emit {
+      return Ok(());
+    }
   }
 
   crate::decompile::finalize_for_emission(&mut ir);
+  if args.report.is_some() {
+    for diagnostic in flag_markers.diagnostics(&ir) {
+      ledger.blocker(spec.start.seg, &diagnostic);
+    }
+  }
   if let Some(path) = args.emit_ir_final.as_ref() {
     let text = ir::display::display_ir_with_uses(&ir).unwrap();
     write_to_path(path, &format!("{}", &text));
@@ -797,8 +817,7 @@ fn decompile_spec(args: &Args, cfg: &Config, binary: &Binary, spec: Spec<'_>,
     return Ok(());
   }
 
-  let ret = spec.func.map(|f| f.return_type_defaulted());
-  let ast = match ast::Function::from_ir(&cfg, &spec.name, ret, &ir, &ctrlflow) {
+  let ast = match crate::decompile::build_ast(&cfg, &spec, &ir, &ctrlflow) {
     Ok(ast) => ast,
     Err(err) => {
       eprintln!("Error while building annotated accesses for {}: {}", spec.name, err);

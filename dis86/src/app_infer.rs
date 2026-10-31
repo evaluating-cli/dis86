@@ -5,7 +5,7 @@ use crate::asm::instr::Opcode::*;
 use crate::binary::Binary;
 use crate::config::{Config, FuncRegion};
 use crate::decompile::ir::{Opcode as IrOpcode, Ref, IR};
-use crate::decompile::{abi, ir_build, opt, sym};
+use crate::decompile::{abi, build_ir_with_diagnostics};
 use crate::segoff::{Off, Seg, SegOff};
 use crate::spec::Spec;
 use crate::types::Type;
@@ -395,15 +395,9 @@ pub fn build_ir_for_analysis(cfg: &Config, binary: &Binary, spec: &Spec<'_>, pin
 fn build_ir_from_instrs(cfg: &Config, binary: &Binary, spec: &Spec<'_>,
                         instrs: Vec<RawInstr>, pin_all: bool)
   -> Result<(IR, Vec<RawInstr>), String> {
-  let overlay = spec.start.is_overlay_addr();
-  let mut ir = ir_build::build_from_instrs(&instrs, cfg, spec, binary, overlay, pin_all);
-  opt::optimize(&mut ir);
-  sym::symbolize(&mut ir, cfg);
-  opt::forward_store_to_load(&mut ir);
-  opt::optimize(&mut ir);
-  opt::mem_symbol_to_ref(&mut ir);
-  opt::optimize(&mut ir);
-  crate::decompile::finalize_for_emission(&mut ir);
+  let mut diagnostics = vec![];
+  let (ir, _markers) =
+    build_ir_with_diagnostics(&instrs, cfg, spec, binary, pin_all, &mut diagnostics);
   Ok((ir, instrs))
 }
 
