@@ -401,7 +401,7 @@ pub fn run() -> i32 {
       eprintln!("Error: --analyze requires --binary-exe.");
       return 1;
     };
-    return crate::app_analyze::run(&cfg, path);
+    return crate::app_analyze::run(&cfg, path, args.build_pin_all);
   }
 
   let Some(binary_fmt) = &args.binary else {
@@ -724,6 +724,9 @@ fn decompile_spec(args: &Args, cfg: &Config, binary: &Binary, spec: Spec<'_>,
       return Err(Diagnostic::new(e.cause, Some(e.addr), None, e.message));
     }
   };
+  // Debug emit modes normally stop at the requested stage. Reporting needs
+  // the finalized IR, so keep going when a report was requested.
+  let stop_after_emit = args.report.is_none();
   // FIXME: SIMPLIFY!!
   if let Some(path) = args.emit_dis.as_ref() {
     let mut buf = String::new();
@@ -734,7 +737,9 @@ fn decompile_spec(args: &Args, cfg: &Config, binary: &Binary, spec: Spec<'_>,
       buf += "\n";
     }
     write_to_path(path, &buf);
-    return Ok(());
+    if stop_after_emit {
+      return Ok(());
+    }
   }
 
   let overlay = spec.start.is_overlay_addr();
@@ -747,26 +752,34 @@ fn decompile_spec(args: &Args, cfg: &Config, binary: &Binary, spec: Spec<'_>,
   }
   if let Some(path) = args.emit_ir_initial.as_ref() {
     write_to_path(path, &format!("{}", ir));
-    return Ok(());
+    if stop_after_emit {
+      return Ok(());
+    }
   }
 
   opt::optimize(&mut ir);
   if let Some(path) = args.emit_ir_presym.as_ref() {
     write_to_path(path, &format!("{}", ir));
-    return Ok(());
+    if stop_after_emit {
+      return Ok(());
+    }
   }
 
   sym::symbolize(&mut ir, &cfg);
   if let Some(path) = args.emit_ir_sym.as_ref() {
     write_to_path(path, &format!("{}", ir));
-    return Ok(());
+    if stop_after_emit {
+      return Ok(());
+    }
   }
 
   opt::forward_store_to_load(&mut ir);
   opt::optimize(&mut ir);
   if let Some(path) = args.emit_ir_fwd.as_ref() {
     write_to_path(path, &format!("{}", ir));
-    return Ok(());
+    if stop_after_emit {
+      return Ok(());
+    }
   }
 
   opt::mem_symbol_to_ref(&mut ir);
@@ -774,7 +787,9 @@ fn decompile_spec(args: &Args, cfg: &Config, binary: &Binary, spec: Spec<'_>,
   if let Some(path) = args.emit_ir_opt.as_ref() {
     let text = ir::display::display_ir_with_uses(&ir).unwrap();
     write_to_path(path, &format!("{}", &text));
-    return Ok(());
+    if stop_after_emit {
+      return Ok(());
+    }
   }
 
   crate::decompile::finalize_for_emission(&mut ir);
